@@ -1,0 +1,338 @@
+{
+  "name": "cannbot_92B_A3_INT8_3P8_1D8_kv_offload_gy_byscript",
+  "version": "1.0.0",
+  "description": "",
+  "type": "REAL_TIME",
+  "deploy_type": "MULTI",
+  "group_configs": [
+    {
+      "description": "",
+      "framework": "COMMON",
+      "count": 1,
+      "weight": 100,
+      "priority": 3,
+      "system_log_dump_enable": false,
+      "secret_type": "dew",
+      "unit_configs": [
+        {
+          "role": "COMMON",
+          "image": {
+            "source": "SWR_PRO",
+            "swr_path": "swr-aifm-exp-mt7nab.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_develop-vllm-202609120014:0.0.1",
+            "id": "8257e506-397e-11f1-8eb5-0255ac1001b4"
+          },
+          "count": 1,
+          "name": "prefill-0",
+          "group_count": 1,
+          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/deploy/model_arts\n\nexport PYTHONHASHSEED=1234\nexport log_level_proxy=info\nexport core_num=4\nexport start_core_index=16\nexport pd_policy=sequential\nexport max_num_batched_tokens=300000\n\nTORCH_DEVICE_BACKEND_AUTOLOAD=0 bash \"${SCRIPT_PATH}/proxy.sh\" \\\n  --subrequest-output-buffer-size 10M \\\n  --omni-proxy-pd-policy sequential \\\n  --omni-proxy-schedule-algo header_affinity \\\n  --omni-proxy-affinity-header X-Session-Id \\\n  --omni-proxy-max-batch-num-token 300000 \\\n  --omni-proxy-prefill-max-num-seqs 12 \\\n  --omni-proxy-decode-max-num-seqs 8 &&\n\nexport TASK_QUEUE_ENABLE=2\nexport HCCL_BUFFSIZE=100\nexport gpu_util=0.92\nexport max_num_seqs=12\nexport max_num_batched_tokens=32768\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_p_open.json\"\nexport kv_transfer_config='{\"kv_buffer_device\":\"npu\",\"kv_connector\":\"LLMDataDistConnector\",\"kv_parallel_size\":1,\"kv_role\":\"kv_producer\",\"kv_rank\":0}'\n\nbash \"${SCRIPT_PATH}/prefill.sh\" \\\n  --block-size 128 \\\n  --mamba-block-size 128 \\\n  --enable-prefix-caching \\\n  --enable-chunked-prefill \\\n  --max-model-len 524288 \\\n  --max-num-batched-tokens 32768 \\\n  --max-num-seqs 12 \\\n  --dtype bfloat16 \\\n  --kv-cache-dtype li_int8_ds_mla \\\n  --enforce-eager \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --enable-prompt-tokens-details \\\n  --scheduling-policy priority \\\n  --trust-request-chat-template \\\n  --enable-lopt \\\n  --lopt-pool-size 16 \\\n  --lopt-chunk-size 4096 \\\n  --reasoning-config '{\"reasoning_start_str\":\"<think>\",\"reasoning_end_str\":\"</think>\"}' \\\n  --additional-config '{\"enable_low_latency\":true}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity",
+          "custom_spec": {
+            "memory": 2000000,
+            "cpu": 300,
+            "card": 8
+          },
+          "envs": {
+            "MODEL_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/d00827726/models/pangu_92b/global_step_26-iterative-int8-0626/",
+            "MODEL_NAME": "pangu_ultra_moe",
+            "PREFILL_INSTANCE_NUM": "3",
+            "DECODE_INSTANCE_NUM": "1",
+            "npu": "8",
+            "PROXY_PORT": "7000",
+            "ENABLE_OMNI_CACHE": "0",
+            "dtype": "bfloat16",
+            "max_model_len": "524288",
+            "VLLM_DISABLE_PYNCCL": "1",
+            "HCCL_CONNECT_TIMEOUT": "1800",
+            "HCCL_EXEC_TIMEOUT": "1800",
+            "HCCL_OP_RETRY_ENABLE": "L0:0,L1:0,L2:0",
+            "HCCL_OP_EXPANSION_MODE": "AIV",
+            "ASCEND_GLOBAL_LOG_LEVEL": "3",
+            "VLLM_PLUGINS": "omni-npu,omni_npu_patches,omni_custom_models",
+            "OMNI_HYBRID_ATTN_GROUP_SIZE": "17",
+            "OMNI_VLLM_PATCHES_DIR": "pangu_v2_hybrid,pangu_v2_moe",
+            "OMNI_VLLM_PATCHES": "ALL",
+            "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+            "VLLM_MQ_MAX_CHUNK_BYTES_MB": "100",
+            "OMNI_CUSTOM_MODEL_CONFIG_PATH": "low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_p_open.json",
+            "TORCH_COMPILE_DISABLE": "1",
+            "gpu_util": "0.92",
+            "OMNI_LLMDATADIST_LINK_RECYCLE_DELAY": "3600",
+            "TASK_QUEUE_ENABLE": "2",
+            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+            "LOG_PATH_PROXY": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/ma_deploy/cannbot_92B_3P8_1D8_int8/proxy_logs/p0",
+            "LOG_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/ma_deploy/cannbot_92B_3P8_1D8_int8/logs/p0",
+            "HCCL_BUFFSIZE": "100",
+            "OMNI_SKIP_DECODE_TOKENIZE": "1",
+            "OMNI_REUSE_PREFILLED_TOKENS": "1",
+            "OMNI_PANGU_TOOL_CALL_ENDS_THINKING": "1",
+            "ENABLE_KV_EVENT": "true",
+            "kv_offload": "true",
+            "hugepage_enabled": "false",
+            "enable_kv_offload_write": "false",
+            "OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE": "true",
+            "cpu_bytes_to_use": "858993459200",
+            "PROFILE_DIR": "/home/ma-user/"
+          },
+          "termination_grace": {
+            "termination_grace_period_seconds": 30
+          },
+          "npu_reset_enable": false,
+          "recovery": "Instance"
+        },
+        {
+          "role": "COMMON",
+          "image": {
+            "source": "SWR_PRO",
+            "swr_path": "swr-aifm-exp-mt7nab.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_develop-vllm-202609120014:0.0.1",
+            "id": "8257e506-397e-11f1-8eb5-0255ac1001b4"
+          },
+          "count": 1,
+          "name": "prefill-1",
+          "group_count": 1,
+          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/deploy/model_arts\n\nexport PYTHONHASHSEED=1234\nexport log_level_proxy=info\nexport core_num=4\nexport start_core_index=16\nexport pd_policy=sequential\nexport max_num_batched_tokens=300000\n\nTORCH_DEVICE_BACKEND_AUTOLOAD=0 bash \"${SCRIPT_PATH}/proxy.sh\" \\\n  --subrequest-output-buffer-size 10M \\\n  --omni-proxy-pd-policy sequential \\\n  --omni-proxy-schedule-algo header_affinity \\\n  --omni-proxy-affinity-header X-Session-Id \\\n  --omni-proxy-max-batch-num-token 300000 \\\n  --omni-proxy-prefill-max-num-seqs 12 \\\n  --omni-proxy-decode-max-num-seqs 8 &&\n\nexport TASK_QUEUE_ENABLE=2\nexport HCCL_BUFFSIZE=100\nexport gpu_util=0.92\nexport max_num_seqs=12\nexport max_num_batched_tokens=32768\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_p_open.json\"\nexport kv_transfer_config='{\"kv_buffer_device\":\"npu\",\"kv_connector\":\"LLMDataDistConnector\",\"kv_parallel_size\":1,\"kv_role\":\"kv_producer\",\"kv_rank\":0}'\n\nbash \"${SCRIPT_PATH}/prefill.sh\" \\\n  --block-size 128 \\\n  --mamba-block-size 128 \\\n  --enable-prefix-caching \\\n  --enable-chunked-prefill \\\n  --max-model-len 524288 \\\n  --max-num-batched-tokens 32768 \\\n  --max-num-seqs 12 \\\n  --dtype bfloat16 \\\n  --kv-cache-dtype li_int8_ds_mla \\\n  --enforce-eager \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --enable-prompt-tokens-details \\\n  --scheduling-policy priority \\\n  --trust-request-chat-template \\\n  --enable-lopt \\\n  --lopt-pool-size 16 \\\n  --lopt-chunk-size 4096 \\\n  --reasoning-config '{\"reasoning_start_str\":\"<think>\",\"reasoning_end_str\":\"</think>\"}' \\\n  --additional-config '{\"enable_low_latency\":true}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity",
+          "custom_spec": {
+            "memory": 2000000,
+            "cpu": 300,
+            "card": 8
+          },
+          "envs": {
+            "MODEL_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/d00827726/models/pangu_92b/global_step_26-iterative-int8-0626/",
+            "MODEL_NAME": "pangu_ultra_moe",
+            "PREFILL_INSTANCE_NUM": "3",
+            "DECODE_INSTANCE_NUM": "1",
+            "npu": "8",
+            "PROXY_PORT": "7000",
+            "ENABLE_OMNI_CACHE": "0",
+            "dtype": "bfloat16",
+            "max_model_len": "524288",
+            "VLLM_DISABLE_PYNCCL": "1",
+            "HCCL_CONNECT_TIMEOUT": "1800",
+            "HCCL_EXEC_TIMEOUT": "1800",
+            "HCCL_OP_RETRY_ENABLE": "L0:0,L1:0,L2:0",
+            "HCCL_OP_EXPANSION_MODE": "AIV",
+            "ASCEND_GLOBAL_LOG_LEVEL": "3",
+            "VLLM_PLUGINS": "omni-npu,omni_npu_patches,omni_custom_models",
+            "OMNI_HYBRID_ATTN_GROUP_SIZE": "17",
+            "OMNI_VLLM_PATCHES_DIR": "pangu_v2_hybrid,pangu_v2_moe",
+            "OMNI_VLLM_PATCHES": "ALL",
+            "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+            "VLLM_MQ_MAX_CHUNK_BYTES_MB": "100",
+            "OMNI_CUSTOM_MODEL_CONFIG_PATH": "low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_p_open.json",
+            "TORCH_COMPILE_DISABLE": "1",
+            "gpu_util": "0.92",
+            "OMNI_LLMDATADIST_LINK_RECYCLE_DELAY": "3600",
+            "TASK_QUEUE_ENABLE": "2",
+            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+            "LOG_PATH_PROXY": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/ma_deploy/cannbot_92B_3P8_1D8_int8/proxy_logs/p1",
+            "LOG_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/ma_deploy/cannbot_92B_3P8_1D8_int8/logs/p1",
+            "HCCL_BUFFSIZE": "100",
+            "OMNI_REUSE_PREFILLED_TOKENS": "1",
+            "OMNI_PANGU_TOOL_CALL_ENDS_THINKING": "1",
+            "ENABLE_KV_EVENT": "true",
+            "kv_offload": "true",
+            "hugepage_enabled": "false",
+            "enable_kv_offload_write": "false",
+            "OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE": "true",
+            "cpu_bytes_to_use": "858993459200",
+            "PROFILE_DIR": "/home/ma-user/",
+            "OMNI_SKIP_DECODE_TOKENIZE": "1"
+          },
+          "termination_grace": {
+            "termination_grace_period_seconds": 30
+          },
+          "npu_reset_enable": false,
+          "recovery": "Instance"
+        },
+        {
+          "role": "COMMON",
+          "image": {
+            "source": "SWR_PRO",
+            "swr_path": "swr-aifm-exp-mt7nab.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_develop-vllm-202609120014:0.0.1",
+            "id": "8257e506-397e-11f1-8eb5-0255ac1001b4"
+          },
+          "count": 1,
+          "name": "prefill-2",
+          "group_count": 1,
+          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/deploy/model_arts\n\nexport PYTHONHASHSEED=1234\nexport log_level_proxy=info\nexport core_num=4\nexport start_core_index=16\nexport pd_policy=sequential\nexport max_num_batched_tokens=300000\n\nTORCH_DEVICE_BACKEND_AUTOLOAD=0 bash \"${SCRIPT_PATH}/proxy.sh\" \\\n  --subrequest-output-buffer-size 10M \\\n  --omni-proxy-pd-policy sequential \\\n  --omni-proxy-schedule-algo header_affinity \\\n  --omni-proxy-affinity-header X-Session-Id \\\n  --omni-proxy-max-batch-num-token 300000 \\\n  --omni-proxy-prefill-max-num-seqs 12 \\\n  --omni-proxy-decode-max-num-seqs 8 &&\n\nexport TASK_QUEUE_ENABLE=2\nexport HCCL_BUFFSIZE=100\nexport gpu_util=0.92\nexport max_num_seqs=12\nexport max_num_batched_tokens=32768\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_p_open.json\"\nexport kv_transfer_config='{\"kv_buffer_device\":\"npu\",\"kv_connector\":\"LLMDataDistConnector\",\"kv_parallel_size\":1,\"kv_role\":\"kv_producer\",\"kv_rank\":0}'\n\nbash \"${SCRIPT_PATH}/prefill.sh\" \\\n  --block-size 128 \\\n  --mamba-block-size 128 \\\n  --enable-prefix-caching \\\n  --enable-chunked-prefill \\\n  --max-model-len 524288 \\\n  --max-num-batched-tokens 32768 \\\n  --max-num-seqs 12 \\\n  --dtype bfloat16 \\\n  --kv-cache-dtype li_int8_ds_mla \\\n  --enforce-eager \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --enable-prompt-tokens-details \\\n  --scheduling-policy priority \\\n  --trust-request-chat-template \\\n  --enable-lopt \\\n  --lopt-pool-size 16 \\\n  --lopt-chunk-size 4096 \\\n  --reasoning-config '{\"reasoning_start_str\":\"<think>\",\"reasoning_end_str\":\"</think>\"}' \\\n  --additional-config '{\"enable_low_latency\":true}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity",
+          "custom_spec": {
+            "memory": 2000000,
+            "cpu": 300,
+            "card": 8
+          },
+          "envs": {
+            "MODEL_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/d00827726/models/pangu_92b/global_step_26-iterative-int8-0626/",
+            "MODEL_NAME": "pangu_ultra_moe",
+            "PREFILL_INSTANCE_NUM": "3",
+            "DECODE_INSTANCE_NUM": "1",
+            "npu": "8",
+            "PROXY_PORT": "7000",
+            "ENABLE_OMNI_CACHE": "0",
+            "dtype": "bfloat16",
+            "max_model_len": "524288",
+            "VLLM_DISABLE_PYNCCL": "1",
+            "HCCL_CONNECT_TIMEOUT": "1800",
+            "HCCL_EXEC_TIMEOUT": "1800",
+            "HCCL_OP_RETRY_ENABLE": "L0:0,L1:0,L2:0",
+            "HCCL_OP_EXPANSION_MODE": "AIV",
+            "ASCEND_GLOBAL_LOG_LEVEL": "3",
+            "VLLM_PLUGINS": "omni-npu,omni_npu_patches,omni_custom_models",
+            "OMNI_HYBRID_ATTN_GROUP_SIZE": "17",
+            "OMNI_VLLM_PATCHES_DIR": "pangu_v2_hybrid,pangu_v2_moe",
+            "OMNI_VLLM_PATCHES": "ALL",
+            "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+            "VLLM_MQ_MAX_CHUNK_BYTES_MB": "100",
+            "OMNI_CUSTOM_MODEL_CONFIG_PATH": "low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_p_open.json",
+            "TORCH_COMPILE_DISABLE": "1",
+            "gpu_util": "0.92",
+            "OMNI_LLMDATADIST_LINK_RECYCLE_DELAY": "3600",
+            "TASK_QUEUE_ENABLE": "2",
+            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+            "LOG_PATH_PROXY": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/ma_deploy/cannbot_92B_3P8_1D8_int8/proxy_logs/p2",
+            "LOG_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/ma_deploy/cannbot_92B_3P8_1D8_int8/logs/p2",
+            "HCCL_BUFFSIZE": "100",
+            "OMNI_SKIP_DECODE_TOKENIZE": "1",
+            "OMNI_REUSE_PREFILLED_TOKENS": "1",
+            "OMNI_PANGU_TOOL_CALL_ENDS_THINKING": "1",
+            "ENABLE_KV_EVENT": "true",
+            "kv_offload": "true",
+            "hugepage_enabled": "false",
+            "enable_kv_offload_write": "false",
+            "OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE": "true",
+            "cpu_bytes_to_use": "858993459200",
+            "PROFILE_DIR": "/home/ma-user/"
+          },
+          "termination_grace": {
+            "termination_grace_period_seconds": 30
+          },
+          "npu_reset_enable": false,
+          "recovery": "Instance"
+        },
+        {
+          "role": "COMMON",
+          "image": {
+            "source": "SWR_PRO",
+            "swr_path": "swr-aifm-exp-mt7nab.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_develop-vllm-202609120014:0.0.1",
+            "id": "8257e506-397e-11f1-8eb5-0255ac1001b4"
+          },
+          "count": 1,
+          "name": "decode",
+          "group_count": 1,
+          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/deploy/model_arts\n\nunset TORCH_DEVICE_BACKEND_AUTOLOAD\n\nexport PYTHONHASHSEED=1234\nexport TASK_QUEUE_ENABLE=1\nexport HCCL_BUFFSIZE=1200\nexport gpu_util=0.85\nexport max_num_seqs=8\nexport max_num_batched_tokens=2048\nexport ENABLE_DP_LB=false\nexport VLLM_DATA_PARALLEL_EXTERNAL_LB=false\nexport VLLM_CACHE_ROOT=\"./graph_cache\"\nexport VLLM_DISABLE_COMPILE_CACHE=1\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_d_open.json\"\nexport kv_transfer_config='{\"kv_buffer_device\":\"npu\",\"kv_connector\":\"LLMDataDistConnector\",\"kv_parallel_size\":1,\"kv_role\":\"kv_consumer\",\"kv_rank\":0}'\n\nbash \"${SCRIPT_PATH}/decode.sh\" \\\n  --block-size 128 \\\n  --mamba-block-size 128 \\\n  --enable-prefix-caching \\\n  --enable-chunked-prefill \\\n  --distributed-executor-backend mp \\\n  --max-model-len 524288 \\\n  --max-num-seqs 8 \\\n  --max-num-batched-tokens 2048 \\\n  --dtype bfloat16 \\\n  --kv-cache-dtype li_int8_ds_mla \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --compilation-config '{\"mode\":3,\"cudagraph_mode\":\"FULL\",\"cudagraph_capture_sizes\":[32],\"backend\":\"\",\"compile_sizes\":[32]}' \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --enable-prompt-tokens-details \\\n  --scheduling-policy priority \\\n  --trust-request-chat-template \\\n  --enable-lopt \\\n  --lopt-pool-size 16 \\\n  --lopt-chunk-size 4096 \\\n  --reasoning-config '{\"reasoning_start_str\":\"<think>\",\"reasoning_end_str\":\"</think>\"}' \\\n  --additional-config '{\"enable_low_latency\":true,\"npugraph_ex_config\":{\"enable\":true,\"super_kernel_optimize\":false,\"static_kernel_compile\":false}}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity\n",
+          "custom_spec": {
+            "memory": 2000000,
+            "cpu": 300,
+            "card": 8
+          },
+          "envs": {
+            "MODEL_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/d00827726/models/pangu_92b/global_step_26-iterative-int8-0626/",
+            "MODEL_NAME": "pangu_ultra_moe",
+            "PREFILL_INSTANCE_NUM": "3",
+            "DECODE_INSTANCE_NUM": "1",
+            "npu": "8",
+            "PROXY_PORT": "7000",
+            "ENABLE_OMNI_CACHE": "0",
+            "dtype": "bfloat16",
+            "max_model_len": "524288",
+            "VLLM_DISABLE_PYNCCL": "1",
+            "HCCL_CONNECT_TIMEOUT": "1800",
+            "HCCL_EXEC_TIMEOUT": "1800",
+            "HCCL_OP_RETRY_ENABLE": "L0:0,L1:0,L2:0",
+            "HCCL_OP_EXPANSION_MODE": "AIV",
+            "ASCEND_GLOBAL_LOG_LEVEL": "3",
+            "VLLM_PLUGINS": "omni-npu,omni_npu_patches,omni_custom_models",
+            "OMNI_HYBRID_ATTN_GROUP_SIZE": "17",
+            "OMNI_VLLM_PATCHES_DIR": "pangu_v2_hybrid,pangu_v2_moe",
+            "OMNI_VLLM_PATCHES": "ALL",
+            "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+            "VLLM_MQ_MAX_CHUNK_BYTES_MB": "100",
+            "OMNI_CUSTOM_MODEL_CONFIG_PATH": "low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_p_open.json",
+            "TORCH_COMPILE_DISABLE": "1",
+            "gpu_util": "0.92",
+            "OMNI_LLMDATADIST_LINK_RECYCLE_DELAY": "3600",
+            "TASK_QUEUE_ENABLE": "2",
+            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+            "LOG_PATH_PROXY": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/ma_deploy/cannbot_92B_3P8_1D8_int8/proxy_logs/d0",
+            "LOG_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/ma_deploy/cannbot_92B_3P8_1D8_int8/logs/d0",
+            "HCCL_BUFFSIZE": "100",
+            "OMNI_SKIP_DECODE_TOKENIZE": "1",
+            "OMNI_REUSE_PREFILLED_TOKENS": "1",
+            "OMNI_PANGU_TOOL_CALL_ENDS_THINKING": "1",
+            "ENABLE_KV_EVENT": "true",
+            "kv_offload": "true",
+            "hugepage_enabled": "false",
+            "enable_kv_offload_write": "false",
+            "OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE": "true",
+            "cpu_bytes_to_use": "858993459200",
+            "PROFILE_DIR": "/home/ma-user/"
+          },
+          "termination_grace": {
+            "termination_grace_period_seconds": 30
+          },
+          "npu_reset_enable": false,
+          "recovery": "Instance"
+        }
+      ],
+      "advanced_config": {
+        "protocol": "HTTP",
+        "port": 7000,
+        "deploy_timeout_minutes": 60,
+        "dynamic_routing_enable": false,
+        "ems_enable": false,
+        "upgrade_config": {
+          "type": "ROLLING",
+          "rolling_update": {
+            "max_surge": "25%",
+            "max_unavailable": "25%"
+          }
+        },
+        "service_secret": {
+          "secret_volumes": [],
+          "secret_enable": false
+        }
+      },
+      "model": {
+        "source": "EFS",
+        "mount_path": "/mnt/sfs_turbo/",
+        "efs_sub_path": "/",
+        "read_only": false,
+        "host_cache": false,
+        "source_id": "f926682f-5756-43a5-a931-03bea45aef4a",
+        "os_warm_up": false
+      },
+      "schedule_strategy": "HIGH_AVAILABILITY",
+      "pool_id": "pool-07f4dd6a-1cb5-4043-ada6-42c09b2676e6",
+      "workload_type": "LWS",
+      "deploy_type": "MULTI",
+      "name": "deploy-cannbot_92B_A3_BF16_3P8_1D8_kv_offload_gy_byscript_0917_new",
+      "secret_name": "aifm-infra-infer_MA_secret"
+    }
+  ],
+  "workspace_id": "23e3571d195b4f358000f1799d426b3c",
+  "workload_type": "LWS",
+  "runtime_config": {
+    "service_invoke": {
+      "port": 7000,
+      "protocol": "HTTP",
+      "auth_type": "API_KEY",
+      "dynamic_routing_enable": false,
+      "ems_enable": false,
+      "internet_access_enable": true,
+      "intranet_approval_enable": true,
+      "request_retry_enable": false
+    },
+    "service_limit": {
+      "rate_limit": {
+        "num": 500,
+        "unit": "SECONDS"
+      },
+      "request_size_limit": 50,
+      "request_timeout": 1200,
+      "ip_white_list": [],
+      "ip_black_list": []
+    },
+    "service_secret": {
+      "group_enable": false,
+      "secret_enable": false,
+      "secret_volumes": []
+    }
+  }
+}

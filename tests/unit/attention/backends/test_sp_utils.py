@@ -6,6 +6,7 @@ import queue
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -374,9 +375,15 @@ class TaskDist:
                 threads.append(t)
                 t.start()
             for t in threads:
-                t.join()
+                t.join(timeout=60)
+                if t.is_alive():
+                    self.errors.put(
+                        TimeoutError(f"TaskDist worker thread hung: {t.name}")
+                    )
 
-        assert self.errors.empty(), self.errors.get()
+        if not self.errors.empty():
+            err = self.errors.get()
+            raise err
 
     def _worker(
         self,
@@ -386,8 +393,15 @@ class TaskDist:
         try:
             self.thread_local.rank = rank
             task()
-        except Exception as e:
+        except BaseException as e:
+            # BaseException: surface silent thread deaths that Exception misses.
             self.errors.put(e)
+            # Unblock peers stuck in _exchange.get().
+            for q in self.mailboxes:
+                try:
+                    q.put_nowait((-1, None))
+                except Exception:
+                    pass
 
     def _group(self) -> MockGroup:
         return self.groups[self.thread_local.rank]
@@ -401,7 +415,17 @@ class TaskDist:
             self.mailboxes[dst].put((rank, piece))
         recvs = [None] * self.ranks
         for _ in range(self.ranks):
-            src, piece = self.mailboxes[rank].get()
+            try:
+                src, piece = self.mailboxes[rank].get(timeout=30)
+            except queue.Empty as exc:
+                raise TimeoutError(
+                    f"TaskDist rank {rank} timed out in exchange "
+                    f"(peer likely crashed)"
+                ) from exc
+            if src < 0:
+                raise RuntimeError(
+                    f"TaskDist rank {rank} aborted: peer reported failure"
+                )
             recvs[src] = piece
         return recvs
 
@@ -819,24 +843,26 @@ class TestCPAttn:
         page_size: int = _PAGE_SIZE,
         table_size: int = _TABLE_SIZE,
     ) -> None:
+        # cp_attn_meta is per-rank local math (no collective). Drive ranks
+        # sequentially so CI load cannot flake via TaskDist thread races.
         cn = np.array(cumlens, dtype=np.int32)
         cp_len = self._cp_len(cn, ranks)
-        sp = TaskDist(ranks=ranks)
-        results: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-
-        def task():
-            mgr = _init_cp_manager(cumlens, computed, page_size, table_size, cn)
-            q_cumlens, kv_lens, _, _ = mgr.cp_attn_meta()
-            results[sp.thread_local.rank] = (q_cumlens.clone(), kv_lens.clone())
-
+        computed_t = torch.tensor(computed, **cfg_i32).repeat_interleave(2)
         with _utils_env():
-            sp.run(task)
-
-        for rank in range(ranks):
-            q_cumlens, kv_lens = results[rank]
-            assert q_cumlens[-1].item() == cp_len
-            assert kv_lens.numel() == 2 * len(computed)
-            assert kv_lens.ge(torch.tensor(computed, **cfg_i32).repeat_interleave(2)).all()
+            for rank in range(ranks):
+                group = SimpleNamespace(
+                    rank_in_group=rank,
+                    world_size=ranks,
+                    device_group=None,
+                )
+                with patch(f"{MODULE}.get_tp_group", return_value=group):
+                    mgr = _init_cp_manager(
+                        cumlens, computed, page_size, table_size, cn
+                    )
+                    q_cumlens, kv_lens, _, _ = mgr.cp_attn_meta()
+                assert q_cumlens[-1].item() == cp_len
+                assert kv_lens.numel() == 2 * len(computed)
+                assert kv_lens.ge(computed_t).all()
 
     def test_cp_attn_meta_single_exact(self):
         self._run_cp_attn_meta_case([0, 16], [0])
