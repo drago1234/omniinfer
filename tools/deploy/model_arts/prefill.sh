@@ -16,7 +16,7 @@ export ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/latest}
 export PYTHONHASHSEED=${PYTHONHASHSEED:-1234}
 export AUTO_USE_UC_MEMORY=${AUTO_USE_UC_MEMORY:-1}
 export CODE_PATH=${CODE_PATH:-/workspace/omniinfer}
-export CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-2}
+export CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-0}
 export LOG_PATH=${LOG_PATH:-"/home/ma-user/scripts/prefill/log"}
 LOG_PATH=${LOG_PATH}/${POD_IP}
 rm -rf ${LOG_PATH}
@@ -94,8 +94,6 @@ export LOCAL_DECODE_SERVER_IP_LIST=${LOCAL_DECODE_SERVER_IP_LIST:-}
 export MASTER_PORT=${MASTER_PORT:-8000}
 
 export OMNI_USE_DSV3=${OMNI_USE_DSV3:-1}
-export OMNI_REUSE_PREFILLED_TOKENS=${OMNI_REUSE_PREFILLED_TOKENS:-1}
-export OMNI_SKIP_DECODE_TOKENIZE=${OMNI_SKIP_DECODE_TOKENIZE:-1}
 export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}
 
 export ROLE=${ROLE:-prefill}
@@ -123,7 +121,6 @@ export HCCL_OP_RETRY_ENABLE=${HCCL_OP_RETRY_ENABLE:-"L0:0, L1:0, L2:0"}
 export HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT:-32000}
 export OMNI_NPU_VLLM_PATCHES=${OMNI_NPU_VLLM_PATCHES:-"ALL"}
 export VLLM_PLUGINS=${VLLM_PLUGINS:-"omni-npu,omni_npu_patches,omni_pangu_models,omni_custom_models"}
-export VLLM_ALL2ALL_BACKEND=${VLLM_ALL2ALL_BACKEND:-"naive"}
 npu=${npu:-16}
 export NUM_DIE_PER_MACH=${npu}
 export PREFILL_POD_NUM=${PREFILL_INSTANCE_NUM:-1}
@@ -191,7 +188,6 @@ else
     kv_transfer_config='{"kv_buffer_device":"npu","kv_connector":"__KV_CONNECTOR__","kv_parallel_size":__KV_PARALLEL_SIZE__,"kv_role":"kv_producer","kv_rank":__KV_RANK__,"kv_port":5568}'
 fi
 
-export ENABLE_OVERWRITE_REQ_IDS=${ENABLE_OVERWRITE_REQ_IDS:-0}
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
 export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-100}
 
