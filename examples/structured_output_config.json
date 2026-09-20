@@ -1,0 +1,25 @@
+{
+  "response_format": {
+    "type": "structural_tag",
+    "structures": [
+      {
+        "begin": "<|tool_call_start|>\n",
+        "schema": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {"type": "string"},
+              "arguments": {"type": "object"}
+            },
+            "required": ["name", "arguments"],
+            "additionalProperties": false
+          }
+        },
+        "end": "\n<|tool_call_end|>"
+      }
+    ],
+    "triggers": ["<|tool_call_start|>\n"]
+  }
+}

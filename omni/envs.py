@@ -315,7 +315,7 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # ban_tool_end_in_thinking).
     # Priority: env > CLI > disabled. A malformed env value logs an error and
     # leaves the CLI value in place.
-    # Consumers: patch_thinking_limit.py:78-102.
+    # Consumers: patch_thinking_limit.py (_reasoning_config_from_env).
     "OMNI_REASONING_CONFIG":
     lambda: get_env_with_fallback("OMNI_REASONING_CONFIG", ["REASONING_CONFIG"], None),
 
