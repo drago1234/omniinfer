@@ -4,6 +4,10 @@ This directory contains comprehensive tests for the omni-npu package, separated 
 
 **Current Status:** NPUCommunicator tests implemented and serving as template for other components.
 
+## UT pipeline
+For the scripts currently running in the OmniInfer pipeline and the local testing methods for developers, please refer to UT_GATE_PIPELINE.md.
+
+
 ## Test Structure
 
 Tests are organized to mirror the source code structure in `omni/`.
