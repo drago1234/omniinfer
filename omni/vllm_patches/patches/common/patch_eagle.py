@@ -53,6 +53,7 @@ class DraftAttnGroup:
     kv_cache_group_id: int
     layer_names: list[str] = field(default_factory=list)
     builder: AttentionMetadataBuilder | None = None
+    is_base: bool = False  # True for group containing attn_layer_names[0]
 
 
 @register_patch("TorchEagleProposer", EagleProposer)
@@ -279,13 +280,11 @@ class EagleProposerPatch(VLLMPatch):
                 if not is_graph_capturing else min(self.num_speculative_tokens, self.n_predict)
         ):
             if self.n_predict == 1 and fwd_idx == 1 and cudagraph_mode == CUDAGraphMode.NONE:
-                num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
-                    num_tokens_unpadded=num_tokens,
-                    num_tokens_padded=num_tokens,
+                _, num_input_tokens, num_tokens_across_dp = (
+                    self._determine_batch_execution_and_padding(
+                        num_tokens, use_cudagraphs=False
+                    )
                 )
-                num_input_tokens = num_tokens_dp_padded
-                if num_tokens_across_dp is not None:
-                    num_tokens_across_dp[self.dp_rank] = num_input_tokens
 
             # Adapt: pass attn_metadata and batch_descriptor to set_forward_context, change cudagraph_runtime_mode
             with set_forward_context(
@@ -454,25 +453,38 @@ class EagleProposerPatch(VLLMPatch):
         Initialize AttentionGroups for draft layers using kv_cache_config.
         Called from the model runner's initialize_metadata_builders.
         """
-        kv_cache_spec = None
-        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
-            if self._draft_attn_layer_names & set(group.layer_names):
-                self.kv_cache_gid = gid
-                kv_cache_spec = group.kv_cache_spec
-                break
+        base_layer = (
+            self.attn_layer_names[0] if self.attn_layer_names else None
+        )
 
         self.draft_attn_groups = []
         for kv_cache_group_id, kv_attn_groups in enumerate(self.runner.attn_groups):
             for attn_group in kv_attn_groups:
                 draft_in_group = set(attn_group.layer_names) & set(self.attn_layer_names)
                 if draft_in_group:
+                    is_base = (
+                        base_layer is not None
+                        and base_layer in draft_in_group
+                    )
                     self.draft_attn_groups.append(
                         DraftAttnGroup(
                             kv_cache_group_id=kv_cache_group_id,
                             layer_names=sorted(list(draft_in_group)),
-                            builder=attn_group.get_metadata_builder()
+                            builder=attn_group.get_metadata_builder(),
+                            is_base=is_base,
                         )
                     )
+
+        # Sort so the base group comes first.  This ensures the base CM is
+        # updated in-place before other groups shallow-copy from it.
+        self.draft_attn_groups.sort(
+            key=lambda g: (not g.is_base, g.kv_cache_group_id)
+        )
+        self.kv_cache_gid = next(
+            (g.kv_cache_group_id for g in self.draft_attn_groups if g.is_base),
+            None,
+        )
+
         self.block_size = self.draft_attn_groups[0].builder.kv_cache_spec.block_size
         logger.debug("Using block size %d for drafting layers", self.block_size)
 
@@ -511,6 +523,7 @@ class EagleProposerPatch(VLLMPatch):
             self,
             common_attn_metadata: CommonAttentionMetadata,
             draft_index: int = 0,
+            use_mome_step0_offset: bool = False,
     ) -> tuple[list[object], dict[str, object]]:
         """Build per-group / per-layer attention metadata for all draft groups.
 
@@ -523,8 +536,9 @@ class EagleProposerPatch(VLLMPatch):
             extra_attn_metadata_args = {}
             if isinstance(group.builder, NPUMomeAttentionMetadataBuilder):
                 num_reqs = common_attn_metadata.num_reqs
-                extra_attn_metadata_args['num_accepted_tokens'] = \
-                    self.runner.num_accepted_tokens.gpu[:num_reqs]
+                if not use_mome_step0_offset:
+                    extra_attn_metadata_args['num_accepted_tokens'] = \
+                        self.runner.num_accepted_tokens.gpu[:num_reqs]
                 extra_attn_metadata_args['num_prompt_tokens'] = \
                     self.runner.num_prompt_tokens.gpu[:num_reqs]
 
@@ -590,18 +604,22 @@ class EagleProposerPatch(VLLMPatch):
             if group.kv_cache_group_id == self.kv_cache_gid:
                 # Update base CM in-place (preserves current behaviour)
                 common_attn_metadata.block_table_tensor = blk_table_tensor
-                common_attn_metadata.slot_mapping = slot_mapping
+                common_attn_metadata.slot_mapping[:slot_mapping.numel()] = slot_mapping
                 group_cm = common_attn_metadata
             else:
                 group_cm = copy(common_attn_metadata)
                 group_cm.block_table_tensor = blk_table_tensor
-                group_cm.slot_mapping = slot_mapping
+                group_cm.slot_mapping[:slot_mapping.numel()] = slot_mapping
+            group_cm.slot_mapping[slot_mapping.numel():] = -1
 
             extra_attn_metadata_args = {}
             if isinstance(builder, NPUMomeAttentionMetadataBuilder):
                 num_reqs = common_attn_metadata.num_reqs
-                extra_attn_metadata_args['num_accepted_tokens'] = \
-                    self.runner.num_accepted_tokens.gpu[:num_reqs]
+                if token_index == 0:
+                    # step1 needs the verification accepted count to locate the
+                    # committed tail inside the full step0 window.
+                    extra_attn_metadata_args['num_accepted_tokens'] = \
+                        self.runner.num_accepted_tokens.gpu[:num_reqs]
                 extra_attn_metadata_args['num_prompt_tokens'] = \
                     self.runner.num_prompt_tokens.gpu[:num_reqs]
 
@@ -773,6 +791,7 @@ class EagleProposerPatch(VLLMPatch):
         ) = self.build_per_group_and_layer_attn_metadata(
             common_attn_metadata=common_attn_metadata,
             draft_index=0,
+            use_mome_step0_offset=(self.n_predict == 1 and self.num_speculative_tokens > 1),
         )
 
         if self.runner is None:
@@ -889,9 +908,16 @@ class EagleProposerPatch(VLLMPatch):
             input_batch_size = num_input_tokens
             batch_size_across_dp = num_tokens_across_dp
         else:
-            cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
-                self._determine_batch_execution_and_padding(batch_size)
-            )
+            if cudagraph_runtime_mode == CUDAGraphMode.NONE:
+                batch_descriptor = None
+                cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
+                    self._determine_batch_execution_and_padding(
+                        batch_size, use_cudagraphs=False
+                    )
+                )
+            else:
+                input_batch_size = num_input_tokens
+                batch_size_across_dp = num_tokens_across_dp
 
             common_attn_metadata.num_actual_tokens = input_batch_size
             common_attn_metadata.max_query_len = 1
@@ -900,6 +926,7 @@ class EagleProposerPatch(VLLMPatch):
             common_attn_metadata.query_start_loc_cpu[: batch_size + 1] = torch.from_numpy(
                 self.token_arange_np[: batch_size + 1]).clone()
             common_attn_metadata.query_start_loc_cpu[batch_size:] = common_attn_metadata.query_start_loc_cpu[batch_size]
+            common_attn_metadata._num_computed_tokens_cache = None
 
             # In padded drafter batch, we need to adjust the sequence lengths
             # to remove the "padding" (i.e. rejected tokens).
@@ -911,6 +938,7 @@ class EagleProposerPatch(VLLMPatch):
                 # Invalidate the CPU-side shadows to avoid H<>D sync.
                 common_attn_metadata._seq_lens_cpu = None
                 common_attn_metadata._num_computed_tokens_cpu = None
+                common_attn_metadata._num_computed_tokens_cache = None
 
         for token_index in range(self.num_speculative_tokens - 1):
             spec_step_idx = None
@@ -982,6 +1010,7 @@ class EagleProposerPatch(VLLMPatch):
                     common_attn_metadata._seq_lens_cpu[:batch_size] += 1
                 if common_attn_metadata._num_computed_tokens_cpu is not None:
                     common_attn_metadata._num_computed_tokens_cpu[:batch_size] += 1
+                common_attn_metadata._num_computed_tokens_cache = None
 
                 # Compute slot mapping and rebuild attention metadata for all
                 # draft groups (each with its own block table and block size).
@@ -1025,7 +1054,6 @@ class EagleProposerPatch(VLLMPatch):
                     num_tokens=input_batch_size,
                     num_tokens_across_dp=batch_size_across_dp,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
-                    slot_mapping=self._get_slot_mapping(num_tokens=input_batch_size),
                     batch_descriptor=batch_descriptor,
             ):
                 forward_context = (

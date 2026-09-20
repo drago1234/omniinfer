@@ -16,6 +16,7 @@ from vllm.utils.math_utils import cdiv
 
 from omni_npu import envs
 from omni_npu.layers.utils import named_stream
+from omni_npu.model_config.config_loader.loader import model_extra_config
 
 logger = init_logger(__name__)
 NPU_ATTENTION_BACKEND = {}
@@ -602,6 +603,9 @@ class SPManager:
         tmp = self._get_buffer("sp_to_cp", tmp_shape, dtype=sp.dtype, device=sp.device)
         for it in sends:
             it.slice_dst(tmp).copy_(it.slice_src(sp))
+            # Communication sends it.len rows, but only it.raw rows were copied; clear stale padding.
+            if it.len > it.raw:
+                tmp[it.dst + it.raw:it.dst + it.len].zero_()
         cp = sp.new_empty(cp_len, *sp.shape[1:])
         # split could be all 0, for send-only or recv-only case
         torch.distributed.all_to_all_single(cp, tmp, cp_split, sp_split, group=self.sp_comm)
@@ -1351,12 +1355,13 @@ def conv_sp(
     metadata: tuple[tuple],
     inplace: bool = False,
 ):
-    current_stream = torch.npu.current_stream()
-    sub_stream = named_stream("mome_sp_ag")
     a2a_meta, conv_meta, batch_meta, _ = metadata
     send_idx, send_split, recv_split = a2a_meta
     prefix, cumlens, reorg_idx = conv_meta
     batch_size, state_len, kernel_size, sp_len, sp_group = batch_meta
+    allgather_multi_stream = (
+        model_extra_config.operator_opt_config.mome_sp_allgather_multi_stream
+    )
     dim = x.size(1)
 
     assert list(x.shape) == [sp_len, dim], f"{x.shape} {[sp_len, dim]}"
@@ -1378,13 +1383,19 @@ def conv_sp(
     load_part = prefix.size(0) * kernel_size
     loads = workspace[:load_part].view(-1, kernel_size, dim)
     saves = workspace[load_part:].view(-1, state_len, dim)
-    sub_stream.wait_stream(current_stream)
+    if allgather_multi_stream:
+        current_stream = torch.npu.current_stream()
+        sub_stream = named_stream("mome_sp_ag")
+        sub_stream.wait_stream(current_stream)
 
     y = simple_conv(x, w, loads, prefix, cumlens, inplace)
 
-    with torch.npu.stream(sub_stream):
+    if allgather_multi_stream:
+        with torch.npu.stream(sub_stream):
+            gathered_saves = sp_group.all_gather(saves, dim=0)
+            current_stream.wait_stream(sub_stream)
+    else:
         gathered_saves = sp_group.all_gather(saves, dim=0)
-        current_stream.wait_stream(sub_stream)
     save_states(cache, save_idx, gathered_saves[: save_idx.size(0)])
 
     return y

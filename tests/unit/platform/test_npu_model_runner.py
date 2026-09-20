@@ -1581,29 +1581,40 @@ class TestNPUModelRunner:
 
         assert kv_caches["attn_layer"].stride() != original_stride
 
-    def test_get_kv_cache_spec_fallback(self, monkeypatch):
-        """Test get_kv_cache_spec fallback branch (covers line 130).
-
-        Verifies that when use_mla is False, the method falls back to
-        calling super().get_kv_cache_spec().
-        """
+    @pytest.mark.parametrize("cla_mapping", [None, [[7, 3]]])
+    def test_get_kv_cache_spec_fallback_handles_cla_aliases(self, monkeypatch, cla_mapping):
+        """Remove cache aliases only when CLA sharing is configured."""
         # Set use_mla to False, should call super().get_kv_cache_spec()
         self.runner.vllm_config.model_config.use_mla = False
+        self.runner.vllm_config.model_config.hf_config = SimpleNamespace(cla_explicit_mapping=cla_mapping)
 
         super_called = {"called": False}
 
         def mock_super_get_kv_cache_spec():
             super_called["called"] = True
-            return {"layer_0": MagicMock()}
+            return {"layer_0": MagicMock(), "layer_alias": MagicMock()}
 
         monkeypatch.setattr(
             GPUModelRunner,
             "get_kv_cache_spec",
             lambda self: mock_super_get_kv_cache_spec(),
         )
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.get_layers_from_vllm_config",
+            lambda *_: {
+                "layer_0": SimpleNamespace(kv_sharing_target_layer_name=None),
+                "layer_alias": SimpleNamespace(kv_sharing_target_layer_name="layer_0"),
+            },
+        )
 
         result = self.runner.get_kv_cache_spec()
         assert super_called["called"] is True
+        if cla_mapping:
+            assert set(result) == {"layer_0"}
+            assert self.runner.shared_kv_cache_layers["layer_alias"] == "layer_0"
+        else:
+            assert set(result) == {"layer_0", "layer_alias"}
+            assert "layer_alias" not in self.runner.shared_kv_cache_layers
 
     def test_get_model_with_acl_graph_wrapper(self, monkeypatch):
         """Test get_model with ACLGraphWrapper branch (covers line 187).
@@ -1674,6 +1685,62 @@ class TestNPUModelRunner:
                                                         skip_eplb=True)
         assert hidden_states is not None
         assert logits is not None
+
+    def test_dummy_run_invalid_arguments_raise_explicit_exceptions(self):
+        invalid_mode = SimpleNamespace(valid_runtime_modes=lambda: False)
+
+        with pytest.raises(ValueError, match="valid runtime mode"):
+            self.runner._dummy_run(
+                num_tokens=1, cudagraph_runtime_mode=invalid_mode)
+
+        with pytest.raises(ValueError, match="must not exceed max_num_tokens"):
+            self.runner._dummy_run(num_tokens=self.runner.max_num_tokens + 1)
+
+        with pytest.raises(ValueError,
+                           match="cannot both be true"):
+            self.runner._dummy_run(
+                num_tokens=1, uniform_decode=True, create_mixed_batch=True)
+
+    def test_sync_dummy_run_rejects_invalid_runner_state(self):
+        runner = object.__new__(NPUModelRunner)
+        runner.intermediate_tensors = {}
+
+        with pytest.raises(RuntimeError, match="must not synchronize"):
+            runner.sync_and_slice_intermediate_tensors_dummy_run(
+                num_tokens=1, intermediate_tensors=None, sync_self=True)
+
+        runner.intermediate_tensors = None
+        with pytest.raises(RuntimeError, match="must be initialized"):
+            runner.sync_and_slice_intermediate_tensors_dummy_run(
+                num_tokens=1, intermediate_tensors=None, sync_self=False)
+
+    def test_dummy_run_rejects_inconsistent_schedule(self, monkeypatch):
+        monkeypatch.setattr(runner_module, "sum", lambda _: 0,
+                            raising=False)
+        with pytest.raises(RuntimeError, match="scheduled token count"):
+            self.runner._dummy_run(num_tokens=1)
+
+        monkeypatch.undo()
+        builtin_len = len
+        monkeypatch.setattr(runner_module, "len",
+                            lambda value: builtin_len(value) + 1,
+                            raising=False)
+        with pytest.raises(RuntimeError, match="scheduled token list length"):
+            self.runner._dummy_run(num_tokens=1)
+
+        class FalseThenTrue:
+            def __init__(self):
+                self.calls = 0
+
+            def __bool__(self):
+                self.calls += 1
+                return self.calls > 1
+
+        with pytest.raises(ValueError,
+                           match="uniform_decode cannot be used"):
+            self.runner._dummy_run(num_tokens=1,
+                                   uniform_decode=True,
+                                   create_mixed_batch=FalseThenTrue())
 
     def test_dummy_run_force_attention(self, monkeypatch):
         """Test _dummy_run with force_attention=True (covers lines 333-355, 319)."""
@@ -1755,14 +1822,21 @@ class TestNPUModelRunner:
             cudagraph_runtime_mode=mock_mode)
         assert hidden_states2 is not None
         assert logits2 is not None
-        # Test line 319: when cudagraph_runtime_mode doesn't match, assertion should fail
+        # A mismatched cudagraph runtime mode must raise an explicit exception.
         mock_mode2 = MagicMock()
-        with pytest.raises(AssertionError,
+        with pytest.raises(RuntimeError,
                            match="Cudagraph runtime mode mismatch"):
             self.runner._dummy_run(num_tokens=10,
                                    force_attention=True,
                                    skip_eplb=True,
                                    cudagraph_runtime_mode=mock_mode2)
+
+        batch_desc.num_tokens = self.runner.max_num_tokens + 1
+        with pytest.raises(RuntimeError, match="padded token count"):
+            self.runner._dummy_run(num_tokens=10,
+                                   force_attention=True,
+                                   skip_eplb=True,
+                                   cudagraph_runtime_mode=mock_mode)
 
     def test_dummy_run_supports_mm_inputs(self, monkeypatch):
         """Test _dummy_run with supports_mm_inputs=True (covers lines 367-373, 375-377, 383, 385, 392-401, 409-411, 434)."""
@@ -1961,6 +2035,10 @@ class TestNPUModelRunner:
             assert call.args == (None, 10)
             assert "attn_metadata" not in call.kwargs
             assert "slot_mappings" not in call.kwargs
+
+        self.runner.drafter = MagicMock()
+        with pytest.raises(RuntimeError, match="requires an EagleProposer"):
+            self.runner._dummy_run(num_tokens=10, skip_eplb=True)
 
     def test_dummy_run_skip_eplb(self, monkeypatch):
         """Test _dummy_run with skip_eplb=True (covers line 469)."""

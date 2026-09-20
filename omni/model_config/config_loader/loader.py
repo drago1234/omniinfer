@@ -195,6 +195,7 @@ class ModelOperatorOptConfig:
     use_rope_fusion_op: bool = False # 是否使用npu_apply_rotary_pos_emb融合算子，默认不开启，CANN>=9.0.0可开启
     use_mhc_fusion_op: bool = False # 是否使用mhc大融合算子，默认不开启
     use_mome_inplace_update: bool = False
+    use_gpt_oss_sink_rescale: bool = False
     moe_comm_strategy: MoECommStrategyType = "dispatch_combine" # MoE通信策略，默认为dispatch_combine
     moe_tbo_threshold: int = -1 # MoE: two batch overlap batch threshold, -1 for disable
     moe_dispatch_combine_max_batch_size: int = 128
@@ -204,6 +205,7 @@ class ModelOperatorOptConfig:
     li_prolog_multi_stream: bool = False # 是否在 li_prolog 中使用 ki_stream 和 wi_stream 多流并行，会影响确定性
     num_extra_reserved_blocks: int = 0 # 保留额外block数用于APC
     enable_mome_sp: bool = False # prefill only, support prefix cache
+    mome_sp_allgather_multi_stream: bool = True # Whether MoME-SP cache-state AllGather runs on a side stream
     optimize_first_chunk: bool = False # Whether turn off PA (non-absorb mode) and use MoME SP for the first chunk
 
     def __post_init__(self):
