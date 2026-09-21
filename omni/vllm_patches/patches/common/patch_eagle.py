@@ -94,7 +94,13 @@ class EagleProposerPatch(VLLMPatch):
         self.n_predict = getattr(
             self.draft_model_config.hf_config, "n_predict", 1
         )
-        logger.info(f"n_predict = {self.n_predict}, num_speculative_tokens = {self.num_speculative_tokens}.")
+        self.prefill_single_step = (
+            self.method == "mtp"
+            and self.n_predict == 1
+            and getattr(vllm_config.kv_transfer_config, "kv_role", None) == "kv_producer"
+        )
+        logger.info("n_predict=%d, num_speculative_tokens=%d, prefill_single_step=%s",
+                    self.n_predict, self.num_speculative_tokens, self.prefill_single_step)
 
         self.fix_multi_mtp_kvcache = (
                 self.n_predict > 1 and model_extra_config.operator_opt_config.fix_multi_mtp_kvcache)
@@ -275,9 +281,9 @@ class EagleProposerPatch(VLLMPatch):
             )
         # NOTE: when using tree-based specdec, adjust number of forward-passes
         # according to the depth of the tree.
+        num_forward_steps = 1 if self.prefill_single_step else self.num_speculative_tokens
         for fwd_idx in range(
-                self.num_speculative_tokens
-                if not is_graph_capturing else min(self.num_speculative_tokens, self.n_predict)
+            num_forward_steps if not is_graph_capturing else min(num_forward_steps, self.n_predict)
         ):
             if self.n_predict == 1 and fwd_idx == 1 and cudagraph_mode == CUDAGraphMode.NONE:
                 _, num_input_tokens, num_tokens_across_dp = (
@@ -858,7 +864,8 @@ class EagleProposerPatch(VLLMPatch):
         first_spec_step_idx = 0 if use_multi_mtp else None
 
         # Early exit if there is only one draft token to be generated.
-        if self.num_speculative_tokens == 1 or self.parallel_drafting:
+        num_draft_steps = 1 if self.prefill_single_step else num_speculative_tokens
+        if num_draft_steps == 1 or self.parallel_drafting:
             draft_token_ids, draft_probs = self._sample_draft_tokens(
                 hidden_states=sample_hidden_states,
                 sampling_metadata=sampling_metadata,
@@ -866,9 +873,9 @@ class EagleProposerPatch(VLLMPatch):
             )
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
-                    -1, self.num_speculative_tokens, draft_probs.shape[-1]
+                    -1, num_draft_steps, draft_probs.shape[-1]
                 ).contiguous()
-            return draft_token_ids.view(-1, self.num_speculative_tokens)
+            return draft_token_ids.view(-1, num_draft_steps)
 
         if not use_multi_mtp:
             if self.uses_mrope:
