@@ -17,6 +17,7 @@ from vllm.config import (
 )
 from vllm.forward_context import set_forward_context, get_forward_context
 from vllm.logger import init_logger
+from vllm.triton_utils import HAS_TRITON
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
@@ -31,7 +32,10 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.eagle import EagleProposer
+from omni_npu.sample.rejection_sampler import compute_probs, generate_random_sequence
+from omni_npu.sample.ops.draft_sampling import sample_draft_logits
 from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from omni_npu.attention.backends.mome import NPUMomeAttentionMetadataBuilder
@@ -68,6 +72,7 @@ class EagleProposerPatch(VLLMPatch):
         'dummy_run',
         'load_model',
         '_sample_draft_tokens',
+        '_sample_from_logits',
         'propose',
         'set_inputs_first_pass',
         'initialize_attn_backend',
@@ -94,7 +99,13 @@ class EagleProposerPatch(VLLMPatch):
         self.n_predict = getattr(
             self.draft_model_config.hf_config, "n_predict", 1
         )
-        logger.info(f"n_predict = {self.n_predict}, num_speculative_tokens = {self.num_speculative_tokens}.")
+        self.prefill_single_step = (
+            self.method == "mtp"
+            and self.n_predict == 1
+            and getattr(vllm_config.kv_transfer_config, "kv_role", None) == "kv_producer"
+        )
+        logger.info("n_predict=%d, num_speculative_tokens=%d, prefill_single_step=%s",
+                    self.n_predict, self.num_speculative_tokens, self.prefill_single_step)
 
         self.fix_multi_mtp_kvcache = (
                 self.n_predict > 1 and model_extra_config.operator_opt_config.fix_multi_mtp_kvcache)
@@ -275,9 +286,9 @@ class EagleProposerPatch(VLLMPatch):
             )
         # NOTE: when using tree-based specdec, adjust number of forward-passes
         # according to the depth of the tree.
+        num_forward_steps = 1 if self.prefill_single_step else self.num_speculative_tokens
         for fwd_idx in range(
-                self.num_speculative_tokens
-                if not is_graph_capturing else min(self.num_speculative_tokens, self.n_predict)
+            num_forward_steps if not is_graph_capturing else min(num_forward_steps, self.n_predict)
         ):
             if self.n_predict == 1 and fwd_idx == 1 and cudagraph_mode == CUDAGraphMode.NONE:
                 _, num_input_tokens, num_tokens_across_dp = (
@@ -631,6 +642,73 @@ class EagleProposerPatch(VLLMPatch):
             for name in group.layer_names:
                 per_layer_attn_metadata[name] = attn_metadata
 
+    def _sample_from_logits(
+            self,
+            logits: torch.Tensor,
+            sampling_metadata: SamplingMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Sample draft tokens and cache the proposal distribution q for verify.
+
+        vLLM 0.25 upstream only applies temperature when building draft_probs.
+        Target verify uses ``compute_probs`` (temperature + top_k + top_p) for p.
+        Align draft q with the same constraints so standard p/q rejection sampling
+        can improve acceptance length under top_p / top_k.
+        """
+        if not self._enable_probabilistic_draft_probs:
+            return logits.argmax(dim=-1), None
+        if sampling_metadata.all_greedy:
+            return logits.argmax(dim=-1), None
+
+        if HAS_TRITON and logits.device.type == "npu":
+            return sample_draft_logits(
+                logits, sampling_metadata, model_extra_config.dtype, _SAMPLING_EPS
+            )
+
+        temperature = sampling_metadata.temperature
+
+        num_token_rows = logits.shape[0]
+        num_reqs = temperature.shape[0]
+        tokens_per_req = num_token_rows // num_reqs
+
+        cu_num_tokens = torch.arange(
+            tokens_per_req,
+            num_token_rows + 1,
+            tokens_per_req,
+            dtype=torch.int32,
+            device=logits.device,
+        )
+
+        draft_logits = logits.to(torch.float32).clone()
+
+        processed_logits = compute_probs(
+            draft_logits,
+            cu_num_tokens,
+            sampling_metadata,
+            use_npu_sample=logits.device.type == "npu",
+        )
+        draft_probs = processed_logits.softmax(dim=-1, dtype=torch.float32)
+
+        if tokens_per_req == 1:
+            noise = generate_random_sequence(draft_probs, sampling_metadata)
+        else:
+            # Parallel drafting (e.g. DFlash): one row per draft slot per request.
+            # Upstream uses undifferentiated exponential noise here as well.
+            noise = torch.empty_like(draft_probs, dtype=torch.float32)
+            noise.exponential_()
+
+        draft_token_ids = (draft_probs / noise).argmax(dim=-1)
+
+        if not sampling_metadata.all_random:
+            is_greedy = temperature < _SAMPLING_EPS
+            if tokens_per_req > 1:
+                is_greedy = is_greedy.repeat_interleave(tokens_per_req, dim=0)
+            greedy_token_ids = draft_probs.argmax(dim=-1)
+            draft_token_ids = torch.where(
+                is_greedy, greedy_token_ids, draft_token_ids
+            )
+
+        return draft_token_ids, draft_probs
+
     def _sample_draft_tokens(
             self,
             hidden_states: torch.Tensor,
@@ -858,7 +936,8 @@ class EagleProposerPatch(VLLMPatch):
         first_spec_step_idx = 0 if use_multi_mtp else None
 
         # Early exit if there is only one draft token to be generated.
-        if self.num_speculative_tokens == 1 or self.parallel_drafting:
+        num_draft_steps = 1 if self.prefill_single_step else num_speculative_tokens
+        if num_draft_steps == 1 or self.parallel_drafting:
             draft_token_ids, draft_probs = self._sample_draft_tokens(
                 hidden_states=sample_hidden_states,
                 sampling_metadata=sampling_metadata,
@@ -866,9 +945,9 @@ class EagleProposerPatch(VLLMPatch):
             )
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
-                    -1, self.num_speculative_tokens, draft_probs.shape[-1]
+                    -1, num_draft_steps, draft_probs.shape[-1]
                 ).contiguous()
-            return draft_token_ids.view(-1, self.num_speculative_tokens)
+            return draft_token_ids.view(-1, num_draft_steps)
 
         if not use_multi_mtp:
             if self.uses_mrope:
@@ -1029,10 +1108,24 @@ class EagleProposerPatch(VLLMPatch):
                     positions=clamped_positions,
                 )
                 self.hidden_states[:batch_size] = hidden_states
+
+                # Pad cudagraph tail slots so forward reads safe values.
+                if input_batch_size > batch_size:
+                    self.input_ids[batch_size:input_batch_size].fill_(0)
+                    self.hidden_states[batch_size:input_batch_size].zero_()
+                    pad_positions = self._get_positions(
+                        num_tokens=input_batch_size
+                    )
+                    pad_positions[batch_size:input_batch_size].fill_(0)
+
                 if self.supports_mm_inputs:
                     self.inputs_embeds[:batch_size] = self.model.embed_input_ids(
                         input_ids=input_ids
                     )
+                    if input_batch_size > batch_size:
+                        self.inputs_embeds[
+                            batch_size:input_batch_size
+                        ].zero_()
                     input_ids = None
                     inputs_embeds = self.inputs_embeds[:input_batch_size]
                 else:

@@ -5,6 +5,7 @@ parallel = True
 concurrency = multiprocessing, thread
 
 omit =
+    */omni/sample/ops/draft_sampling.py
     */omni/vllm_patches/*
     */omni/v1/layers/attention/npu_pangu.py
     *.cpp

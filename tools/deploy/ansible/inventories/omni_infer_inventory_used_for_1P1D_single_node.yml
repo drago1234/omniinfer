@@ -20,7 +20,7 @@ all:
   vars:
     ansible_user: root
     ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o IdentitiesOnly=yes'
-    ansible_ssh_private_key_file: /path/to/key.pem
+    # ansible_ssh_private_key_file: /path/to/key.pem
     single_node_ip: "127.0.0.1"
     global_port_base: 8000
     base_api_port: 9000

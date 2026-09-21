@@ -23,6 +23,12 @@ _metadata.entry_points = _filtered_entry_points
 
 import pytest
 
+# Paths are relative to this conftest.py, independent of the pytest cwd.
+collect_ignore = [
+    "integration/test_draft_sampling_npu.py",
+    "unit/sample/test_draft_sampling_kernels.py",
+]
+
 
 @pytest.fixture
 def default_vllm_config():

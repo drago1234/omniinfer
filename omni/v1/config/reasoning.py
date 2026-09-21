@@ -15,10 +15,12 @@ class ReasoningConfig(VllmReasoningConfig):
     """vLLM reasoning configuration extended with Omni thinking bans.
 
     The upstream fields and token initialisation remain authoritative. Omni
-    adds only compatibility aliases and the Pangu tool-marker ban switches.
-    `thinking_token_budget` is retained solely so existing JSON configs can
-    still be parsed; request budgets are handled by vLLM's native field and
-    native `ThinkingBudgetStateHolder`.
+    adds only compatibility aliases, the Pangu tool-marker ban switches, and a
+    server-side ``thinking_token_budget`` default. Per-request budgets still
+    use vLLM's native ``SamplingParams.thinking_token_budget`` field and native
+    ``ThinkingBudgetStateHolder``; ``thinking_token_budget`` here is the
+    launch-time default applied when a request omits its own (see
+    ``patch_thinking_limit.py``).
     """
 
     think_start_str: str = ""
@@ -27,7 +29,10 @@ class ReasoningConfig(VllmReasoningConfig):
     """Deprecated alias for `reasoning_end_str`."""
 
     thinking_token_budget: int | None = None
-    """Deprecated server-config compatibility field; not used for wiring."""
+    """Server-side default thinking-token budget. Applied per-request when the
+    request omits its own ``thinking_token_budget`` (see
+    ``patch_thinking_limit.py``). The request's own budget always wins and is
+    carried by vLLM's native ``SamplingParams.thinking_token_budget`` field."""
 
     ban_tool_start_in_thinking: bool = False
     """Ban the tool-call start marker while reasoning is still open."""

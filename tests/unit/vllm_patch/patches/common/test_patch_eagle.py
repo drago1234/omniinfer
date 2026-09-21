@@ -36,6 +36,7 @@ def _fake_proposer(attn_metadata):
     fake.attn_layer_names = ["layer0"]
     fake.num_speculative_tokens = 1
     fake.n_predict = 1
+    fake.prefill_single_step = False
     fake.supports_mm_inputs = False
     fake.method = "eagle"
     fake.vllm_config = MagicMock()
@@ -452,3 +453,37 @@ def test_propose_step0_offset_predicate(n_predict, num_speculative_tokens, expec
         _propose_step0_offset_flag(n_predict, num_speculative_tokens) is expected
     )
 
+
+@pytest.mark.parametrize("role,method,n_predict,expected", [
+    pytest.param("kv_producer", "mtp", 1, True, id="prefill-mtp"),
+    pytest.param("kv_consumer", "mtp", 1, False, id="decode-mtp"),
+    pytest.param(None, "mtp", 1, False, id="no-kv-transfer"),
+])
+def test_prefill_single_step_scope(monkeypatch, role, method, n_predict, expected):
+    """Only a single-head MTP producer enables the initialization-time flag."""
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role=role) if role else None,
+    )
+    fake = SimpleNamespace(
+        method=method,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(n_predict=n_predict)),
+        num_speculative_tokens=7,
+    )
+    monkeypatch.setattr(eagle_mod, "EagleProposer_original_init", lambda *args, **kwargs: None)
+    EagleProposerPatch.__init__(fake, config, torch.device("cpu"))
+    assert fake.prefill_single_step is expected
+
+
+@pytest.mark.parametrize("prefill_single_step,expected_forwards", [(True, 1), (False, 7)])
+def test_dummy_run_respects_prefill_single_step(monkeypatch, prefill_single_step, expected_forwards):
+    """Warmup runs one step on P and preserves seven steps on D."""
+    fake = _fake_proposer(None)
+    fake.method = "mtp"
+    fake.num_speculative_tokens = 7
+    fake.prefill_single_step = prefill_single_step
+    fake._determine_batch_execution_and_padding = MagicMock(return_value=(None, 2, None))
+    monkeypatch.setattr(eagle_mod, "set_forward_context", lambda **kw: nullcontext())
+    monkeypatch.setattr(eagle_mod, "get_forward_context", lambda: SimpleNamespace())
+    EagleProposerPatch.dummy_run(fake, num_tokens=2)
+    assert fake.model.call_count == expected_forwards
+    assert fake.num_speculative_tokens == 7
