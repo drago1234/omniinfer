@@ -108,6 +108,8 @@ def start_single_node_api_servers(
     num_speculative_tokens=1,
     no_enable_chunked_prefill=False,
     use_inventory_devices=False,
+    rejection_sample_method=None,
+    draft_sample_method=None,
 ):
     """Start multiple VLLM API servers with specified configurations."""
 
@@ -214,7 +216,12 @@ def start_single_node_api_servers(
                 "--data-parallel-rank", str(rank + server_offset // tp),
             ])
         if enable_mtp:
-            cmd.extend(["--speculative_config", '{"method": "mtp", "num_speculative_tokens": ' + str(num_speculative_tokens) + '}'])
+            speculative_config = {"method": "mtp", "num_speculative_tokens": num_speculative_tokens}
+            if rejection_sample_method:
+                speculative_config["rejection_sample_method"] = rejection_sample_method
+            if draft_sample_method:
+                speculative_config["draft_sample_method"] = draft_sample_method
+            cmd.extend(["--speculative_config", json.dumps(speculative_config)])
         if kv_transfer_config:
             cmd.extend(["--kv-transfer-config", str(kv_transfer_config)])
         if extra_args:
@@ -316,6 +323,8 @@ if __name__ == "__main__":
                 "ascend_rt_visible_devices, e.g. '2,3') per server so vLLM can start from "
                 "arbitrary physical devices instead of always 0,1.")
     parser.add_argument("--num-speculative-tokens", type=int, default=1)
+    parser.add_argument("--rejection-sample-method", choices=("standard", "synthetic", "block"), default=None)
+    parser.add_argument("--draft-sample-method", choices=("greedy", "probabilistic"), default=None)
     parser.add_argument("--pp", type=int, default=1, help="Pipeline parallelism size")
     parser.add_argument("--distributed-executor-backend", type=str, default=None, help="Distributed executor backend for vLLM (e.g., 'mp', 'ray')")
 
@@ -350,6 +359,8 @@ if __name__ == "__main__":
         additional_config=args.additional_config,
         enable_mtp=args.enable_mtp,
         num_speculative_tokens=args.num_speculative_tokens,
+        rejection_sample_method=args.rejection_sample_method,
+        draft_sample_method=args.draft_sample_method,
         no_enable_chunked_prefill=args.no_enable_chunked_prefill,
         use_inventory_devices=args.use_inventory_devices
     )

@@ -123,6 +123,8 @@
         - --hccl-buffsize 500
         - --hccl-op-expansion-mode AIV
         - --num-speculative-tokens 3
+        - --rejection-sample-method standard    # 标准拒绝采样
+        - --draft-sample-method probabilistic   # 使用概率采样
 
     run_server_common_profile:
       single_node_prefill_wait_seconds: 5

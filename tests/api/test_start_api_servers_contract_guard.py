@@ -245,6 +245,8 @@ def test_start_single_node_api_servers_signature_contract():
         "num_speculative_tokens",
         "no_enable_chunked_prefill",
         "use_inventory_devices",
+        "rejection_sample_method",
+        "draft_sample_method",
     ]
 
     assert params["server_offset"].default == 0
@@ -264,6 +266,8 @@ def test_start_single_node_api_servers_signature_contract():
     assert params["num_speculative_tokens"].default == 1
     assert params["no_enable_chunked_prefill"].default is False
     assert params["use_inventory_devices"].default is False
+    assert params["rejection_sample_method"].default is None
+    assert params["draft_sample_method"].default is None
 
 
 # ==============================================================================
