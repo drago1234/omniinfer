@@ -165,24 +165,46 @@ class TestNPUAttentionBackendMLAUtilsFunc(unittest.TestCase):
         """Auto-use fixture that stores data for unittest.TestCase methods."""
         self.mla_setup = mla_setup
 
-    def test_lazy_slot_mapping_2d_reuses_cached_tensor(self):
+    def test_lazy_slot_mapping_2d_rebuilds_when_capture_state_changes(self):
         builder_cls = self.mla_setup["builder"]
         builder = builder_cls.__new__(builder_cls)
         builder.kv_cache_spec = types.SimpleNamespace(block_size=16)
         metadata = types.SimpleNamespace(
-            slot_mapping=torch.tensor([0, 17, 34], dtype=torch.long),
+            slot_mapping=torch.tensor([-1, -1, -1], dtype=torch.long),
             slot_mapping_2d=None,
         )
         callback = builder._lazy_slot_mapping_2d(metadata)
+        forward_context = types.SimpleNamespace(capturing=False)
 
-        with patch.object(torch, "stack", wraps=torch.stack) as stack_mock:
-            first = callback()
-            reused = callback()
+        with (
+            patch.object(torch, "stack", wraps=torch.stack) as stack_mock,
+            patch(
+                "omni_npu.attention.backends.mla.get_forward_context",
+                return_value=forward_context,
+            ),
+        ):
+            eager = callback()
+            eager_reused = callback()
+            metadata.slot_mapping.copy_(torch.tensor([0, 17, 34]))
+            forward_context.capturing = True
+            captured = callback()
+            captured_reused = callback()
+            forward_context.capturing = False
+            eager_after_capture = callback()
+            eager_after_capture_reused = callback()
 
-        self.assertIs(first, reused)
-        self.assertIs(first, metadata.slot_mapping_2d)
-        self.assertEqual(first.data_ptr(), reused.data_ptr())
-        stack_mock.assert_called_once()
+        self.assertIs(eager, eager_reused)
+        self.assertIs(captured, captured_reused)
+        self.assertIs(eager_after_capture, eager_after_capture_reused)
+        self.assertIsNot(eager, captured)
+        self.assertIsNot(captured, eager_after_capture)
+        self.assertIsNone(metadata.slot_mapping_2d)
+        self.assertTrue(torch.equal(eager, torch.tensor([[-1, 15]] * 3)))
+        self.assertTrue(
+            torch.equal(captured, torch.tensor([[0, 0], [1, 1], [2, 2]]))
+        )
+        self.assertTrue(torch.equal(eager_after_capture, captured))
+        self.assertEqual(stack_mock.call_count, 3)
 
     def test_metadata_default_slot_mapping_2d_can_be_overridden(self):
         metadata = self.mla_setup["metadata"](
