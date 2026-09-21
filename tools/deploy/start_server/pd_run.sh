@@ -49,6 +49,8 @@ ADDITIONAL_CONFIG=""
 HCCL_BUFFSIZE=0
 HCCL_OP_EXPANSION_MODE=""
 NUM_SPECULATIVE_TOKENS=1
+REJECTION_SAMPLE_METHOD=""
+DRAFT_SAMPLE_METHOD=""
 KV_TRANSFER_CONFIG_OVERRIDE=""
 
 # Help information
@@ -94,6 +96,8 @@ print_help() {
     echo "  --additional-args                vLLM framework: Additional VLLM arguments"
     echo "  --hccl-op-expansion-mode         vLLM framework: HCCL_OP_EXPANSION_MODE"
     echo "  --hccl-buffsize                  vLLM framework: HCCL_BUFFSIZE"
+    echo "  --rejection-sample-method        MTP rejection method: standard, block, synthetic (default: vLLM default)"
+    echo "  --draft-sample-method            MTP draft method: greedy, probabilistic (default: vLLM default)"
     echo "  --num-speculative-tokens         vLLM framework: Speculative decoding parameter, number of speculative tokens per step (default: $NUM_SPECULATIVE_TOKENS)"
     exit 0
 }
@@ -221,6 +225,12 @@ parse_long_option() {
             ;;
         --hccl-op-expansion-mode)
             HCCL_OP_EXPANSION_MODE="$2"
+            ;;
+        --rejection-sample-method)
+            REJECTION_SAMPLE_METHOD="$2"
+            ;;
+        --draft-sample-method)
+            DRAFT_SAMPLE_METHOD="$2"
             ;;
         --num-speculative-tokens)
             NUM_SPECULATIVE_TOKENS="$2"
@@ -397,6 +407,13 @@ common_operations() {
   if [ "$NUM_SPECULATIVE_TOKENS" -ne 0 ]; then
     mtp_args="--enable-mtp"
   fi
+  local sampling_args=()
+  if [ -n "$REJECTION_SAMPLE_METHOD" ]; then
+    sampling_args+=(--rejection-sample-method "$REJECTION_SAMPLE_METHOD")
+  fi
+  if [ -n "$DRAFT_SAMPLE_METHOD" ]; then
+    sampling_args+=(--draft-sample-method "$DRAFT_SAMPLE_METHOD")
+  fi
   local inventory_devices_args=""
   if [ "$USE_INVENTORY_DEVICES" = "1" ]; then
     inventory_devices_args="--use-inventory-devices"
@@ -418,6 +435,7 @@ common_operations() {
     --gpu-util "$GPU_UTIL" \
     --additional-config "$ADDITIONAL_CONFIG" \
     $mtp_args \
+    "${sampling_args[@]}" \
     $inventory_devices_args \
     --num-speculative-tokens "$NUM_SPECULATIVE_TOKENS" \
     --extra-args "$EXTRA_ARGS"
