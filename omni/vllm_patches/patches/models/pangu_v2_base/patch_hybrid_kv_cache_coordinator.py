@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Repeat the common hybrid APC hit length for every KV-cache group.
+"""Per-group real hit blocks with a uniform min hit-length scalar.
 
-``find_longest_cache_hit_per_group`` repeats that common length for the
-scheduler connector path.
-
-TODO: remove once vLLM tracks a per-group hit length in the fixed-point loop
-(upstream #50344; v0.27.2+).
+The scheduler connector path feeds ``max(per_group_hits)`` into
+``allocate_slots`` as a single scalar. That scalar must be the common (min)
+length so the SWA/Mome groups do not over-skip their window/state blocks.
+The blocks, however, must keep each group's true hit (DSA deep, SWA/Mome
+window/state) so the deep D-side APC hit is not re-pulled from P.
 """
 
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
@@ -21,14 +21,23 @@ def find_longest_cache_hit_per_group(
     block_hashes,
     max_cache_hit_length: int,
 ):
-    """Return the common hybrid hit as a per-group tuple for the scheduler."""
+    """Return per-group real blocks with a uniform min length scalar.
+
+    ``find_longest_cache_hit`` truncates the full-attention group's blocks to
+    the converged common length, discarding the deep D-side APC hit. Use the
+    per-group lookup instead to keep those blocks (they carry a hash, so the
+    connector skips them), while still reporting the min length so the
+    scheduler allocates a safe scalar (external = total - min fills the
+    lagging groups).
+    """
     # adapt start
-    # Stock looks up each group independently; the scheduler then uses
-    # max(per_group_hits). Repeat the common length instead.
-    blocks, hit_length = self.find_longest_cache_hit(
-        block_hashes, max_cache_hit_length
+    # Keep each group's true hit blocks; only the scalar is clamped to min.
+    blocks, hit_lengths = (
+        HybridAPCConnectorHitPatch._upstream_find_longest_cache_hit_per_group(
+            self, block_hashes, max_cache_hit_length
+        )
     )
-    return blocks, (hit_length,) * len(blocks)
+    return blocks, (min(hit_lengths),) * len(blocks)
     # adapt end
 
 
@@ -37,3 +46,7 @@ class HybridAPCConnectorHitPatch(VLLMPatch):
     _attr_names_to_apply = ["find_longest_cache_hit_per_group"]
 
     find_longest_cache_hit_per_group = find_longest_cache_hit_per_group
+
+    @classmethod
+    def apply(cls):
+        cls.apply_bypass_conflict("find_longest_cache_hit_per_group")
