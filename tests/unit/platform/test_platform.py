@@ -1,5 +1,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -7,13 +9,9 @@ import torch
 import pytest
 
 from omni_npu.platform import NPUPlatform
-from tests.unit.platform.utils import create_vllm_config
 
 
 class TestNPUPlatform:
-    def setup_method(self):
-        self.vllm_cfg = create_vllm_config()
-
     def test_platform_attributes(self):
         """Test platform class attributes.
         
@@ -382,89 +380,80 @@ class TestNPUPlatform:
 
         assert platform.is_sleep_mode_available() is True
 
-    def _make_hybrid_align_config(
-        self,
-        *,
-        use_mla=True,
-        index_topk=2048,
-        index_head_dim=128,
-        head_size=576,
-        block_size=16,
-        dtype=torch.bfloat16,
-        mamba_page_size_padded=100,
-    ):
-        vllm_cfg = create_vllm_config(block_size=block_size)
-        vllm_cfg.model_config.use_mla = use_mla
-        vllm_cfg.model_config.dtype = dtype
-        vllm_cfg.model_config.get_head_size = MagicMock(return_value=head_size)
-        vllm_cfg.model_config.hf_config = SimpleNamespace(
-            index_topk=index_topk,
-            index_head_dim=index_head_dim,
-        )
-        vllm_cfg.cache_config.mamba_page_size_padded = mamba_page_size_padded
-        return vllm_cfg
-
-    @pytest.mark.parametrize("index_topk", [0, None])
-    def test_align_hybrid_block_size_skips_when_not_dsa(self, monkeypatch, index_topk):
-        monkeypatch.setattr(
-            "vllm.platforms.interface.Platform._align_hybrid_block_size",
-            classmethod(lambda cls, cfg, backend: None),
-        )
-        vllm_cfg = self._make_hybrid_align_config(use_mla=False)
-        NPUPlatform._align_hybrid_block_size(vllm_cfg, object)
-        assert vllm_cfg.cache_config.mamba_page_size_padded == 100
-
-        vllm_cfg = self._make_hybrid_align_config(index_topk=index_topk)
-        NPUPlatform._align_hybrid_block_size(vllm_cfg, object)
-        assert vllm_cfg.cache_config.mamba_page_size_padded == 100
-
-    def test_align_hybrid_block_size_skips_when_mamba_page_unset(self, monkeypatch):
-        monkeypatch.setattr(
-            "vllm.platforms.interface.Platform._align_hybrid_block_size",
-            classmethod(lambda cls, cfg, backend: None),
-        )
-        vllm_cfg = self._make_hybrid_align_config(mamba_page_size_padded=None)
-        NPUPlatform._align_hybrid_block_size(vllm_cfg, object)
-        assert vllm_cfg.cache_config.mamba_page_size_padded is None
-
-    def test_align_hybrid_block_size_pads_mamba_to_dsa_page(self, monkeypatch):
-        monkeypatch.setattr(
-            "vllm.platforms.interface.Platform._align_hybrid_block_size",
-            classmethod(lambda cls, cfg, backend: None),
-        )
-        vllm_cfg = self._make_hybrid_align_config(mamba_page_size_padded=100)
-        NPUPlatform._align_hybrid_block_size(vllm_cfg, object)
-        # 16 * (576 + 128) * 2 bytes (bf16)
-        assert vllm_cfg.cache_config.mamba_page_size_padded == 16 * (576 + 128) * 2
-
-    def test_align_hybrid_block_size_keeps_larger_existing_padding(self, monkeypatch):
-        monkeypatch.setattr(
-            "vllm.platforms.interface.Platform._align_hybrid_block_size",
-            classmethod(lambda cls, cfg, backend: None),
-        )
-        vllm_cfg = self._make_hybrid_align_config(
-            mamba_page_size_padded=10**9,
-        )
-        NPUPlatform._align_hybrid_block_size(vllm_cfg, object)
-        assert vllm_cfg.cache_config.mamba_page_size_padded == 10**9
-
-    @pytest.mark.parametrize(
-        ("cache_dtype", "expected_page"),
-        [
-            ("fp8_ds_mla", 2 * 16 * (656 + 128 + 4)),
-            ("hif8_ds_mla", 2 * 16 * (656 + 128 + 4)),
-            ("int8_ds_mla", 2 * 16 * (656 + 128 + 2)),
-            ("li_int8_ds_mla", 16 * (576 * 2 + 128 + 2)),
-        ],
+@pytest.fixture
+def mome_config(monkeypatch):
+    monkeypatch.setattr(
+        "omni_npu.model_config.config_loader.loader.model_extra_config.operator_opt_config.use_noncontiguous_kv",
+        True,
     )
-    def test_align_hybrid_block_size_pads_quantized_dsa_layouts(
-        self, monkeypatch, cache_dtype, expected_page
-    ):
-        monkeypatch.setattr(
-            "vllm.platforms.interface.Platform._align_hybrid_block_size",
-            classmethod(lambda cls, cfg, backend: None),
-        )
-        vllm_cfg = self._make_hybrid_align_config(mamba_page_size_padded=100)
-        vllm_cfg.cache_config.cache_dtype = cache_dtype
-        NPUPlatform._align_hybrid_block_size(vllm_cfg, object)
-        assert vllm_cfg.cache_config.mamba_page_size_padded == expected_page
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(use_mome=True)),
+        cache_config=SimpleNamespace(
+            block_size=128, mamba_block_size=128, mamba_page_size_padded=None,
+        ),
+    )
+
+
+@pytest.mark.parametrize("num_spec_tokens,cache_dtype,block_size,padding,expected", [
+    # MTP3: each quantized DSA layout determines the largest page.
+    pytest.param(3, "fp8_ds_mla", 128, None, 2 * 128 * (656 + 128 + 4), id="mtp3-fp8"),
+    pytest.param(3, "hif8_ds_mla", 128, None, 2 * 128 * (656 + 128 + 4), id="mtp3-hif8"),
+    pytest.param(3, "int8_ds_mla", 128, None, 2 * 128 * (656 + 128 + 2), id="mtp3-int8"),
+    pytest.param(3, "li_int8_ds_mla", 128, None, 128 * (576 * 2 + 128 + 2), id="mtp3-li-int8"),
+    # MTP7: nine BF16 states make MoME largest at block size 128.
+    pytest.param(7, "auto", 128, None, 9 * 2 * (1536 + 512 + 64 * 128), id="mtp7-mome-largest"),
+    pytest.param(7, "auto", 256, None, 256 * (576 + 128) * 2, id="mtp7-dsa-largest"),
+    pytest.param(7, "auto", 128, 164096, 9 * 2 * (1536 + 512 + 64 * 128), id="mtp7-raise-small-padding"),
+    pytest.param(7, "auto", 128, 294912, 294912, id="mtp7-keep-large-padding"),
+])
+def test_pangu_page_uses_registered_specs(
+    monkeypatch, mome_config, num_spec_tokens, cache_dtype, block_size, padding, expected,
+):
+    """Unify physical pages without enlarging logical blocks or shrinking padding."""
+    from omni_npu.vllm_patches.patches.models.pangu_v2_base.patch_kv_cache_interface import (
+        DSAAttentionSpec, MomeSpec, ShareKVSlidingWindowSpec,
+    )
+
+    # Pangu doubles the DSA storage block for FP8/HIF8/INT8 layouts.
+    dsa_block_size = 2 * block_size if cache_dtype in (
+        "fp8_ds_mla", "hif8_ds_mla", "int8_ds_mla",
+    ) else block_size
+    specs = [
+        DSAAttentionSpec(block_size=dsa_block_size, num_kv_heads=1, head_size=704,
+                         dtype=torch.bfloat16, cache_dtype_str=cache_dtype),
+        MomeSpec(block_size=block_size, shapes=((1536,), (512,), (64 * 128,)),
+                 dtypes=(torch.bfloat16,) * 3, kernel_size=3, num_spec_tokens=num_spec_tokens),
+        ShareKVSlidingWindowSpec(block_size=block_size, num_kv_heads=1, head_size=576,
+                                 dtype=torch.bfloat16, sliding_window=512),
+    ]
+    layers = {
+        str(i): SimpleNamespace(get_kv_cache_spec=lambda cfg, spec=spec: spec)
+        for i, spec in enumerate(specs)
+    }
+    monkeypatch.setattr("vllm.config.get_layers_from_vllm_config", lambda *args: layers)
+    cache = mome_config.cache_config
+    cache.block_size = cache.mamba_block_size = block_size
+    cache.mamba_page_size_padded = padding
+    with patch("vllm.platforms.interface.Platform._align_hybrid_block_size") as upstream:
+        NPUPlatform._align_hybrid_block_size(mome_config, object)
+    upstream.assert_not_called()
+    assert cache.block_size == cache.mamba_block_size == block_size
+    assert cache.mamba_page_size_padded == expected
+    assert all(layer.page_size_padded == expected for layer in layers.values())
+
+
+@pytest.mark.parametrize("noncontiguous,mamba_block_size,error", [
+    pytest.param(False, 128, "noncontiguous", id="contiguous-cache"),
+    pytest.param(True, 256, "matching", id="unequal-blocks"),
+])
+def test_pangu_page_rejects_incompatible_layout(
+    monkeypatch, mome_config, noncontiguous, mamba_block_size, error,
+):
+    """Reject layouts that cannot share padded physical pages safely."""
+    monkeypatch.setattr(
+        "omni_npu.model_config.config_loader.loader.model_extra_config.operator_opt_config.use_noncontiguous_kv",
+        noncontiguous,
+    )
+    mome_config.cache_config.mamba_block_size = mamba_block_size
+    with pytest.raises(ValueError, match=error):
+        NPUPlatform._align_hybrid_block_size(mome_config, object)

@@ -479,6 +479,7 @@ def _eagle_dummy_contract():
             dp_parallel_lmhead=True, local_parallel_lmhead=False,
         ),
         attn_layer_names=["layer0"], num_speculative_tokens=2, n_predict=1,
+        prefill_single_step=False,
         supports_mm_inputs=False, method="mtp", vllm_config=object(),
         input_ids=torch.arange(4), inputs_embeds=torch.zeros(4, 2),
         hidden_states=torch.zeros(4, 2), model=model,
@@ -536,15 +537,18 @@ def test_eagle_dummy_api_preserves_metadata_and_kv_padding(
         proposer.build_per_group_and_layer_attn_metadata.assert_not_called()
 
 
-@pytest.mark.parametrize("n_predict", [1, 2])
+@pytest.mark.parametrize("n_predict,prefill_single_step", [(1, False), (2, False), (1, True)])
 @pytest.mark.parametrize("capturing", [False, True])
 @pytest.mark.parametrize("profile", [False, True])
-def test_eagle_dummy_keeps_mtp_logits_collective_order(n_predict, capturing, profile):
+def test_eagle_dummy_keeps_mtp_logits_collective_order(
+    n_predict, prefill_single_step, capturing, profile,
+):
     method, proposer, _, events = _eagle_dummy_contract()
     proposer.n_predict = n_predict
+    proposer.prefill_single_step = prefill_single_step
     proposer.num_speculative_tokens = 3
     method(proposer, num_tokens=2, is_graph_capturing=capturing, is_profile=profile)
-    steps = min(3, n_predict) if capturing else 3
+    steps = 1 if prefill_single_step else (min(3, n_predict) if capturing else 3)
     assert events == (["forward"] if profile else ["forward", "logits"]) * steps
     if n_predict > 1:
         assert [call.kwargs["spec_step_idx"] for call in proposer.model.call_args_list] == list(range(steps))
