@@ -14,6 +14,7 @@ from typing import ClassVar, Optional, Tuple, TYPE_CHECKING
 
 import torch
 
+from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -593,17 +594,27 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         return metadata
 
     def _lazy_slot_mapping_2d(self, metadata):
+        # Static-kernel compilation runs the model once before graph capture.
+        # Rebuild when the capture state changes so capture records conversion
+        # from the live slot_mapping input, while still sharing it across layers.
+        slot_mapping_2d = None
+        cached_during_capture = None
+
         def get_slot_mapping_2d():
-            if metadata.slot_mapping_2d is None:
+            nonlocal slot_mapping_2d, cached_during_capture
+
+            capturing = get_forward_context().capturing
+            if slot_mapping_2d is None or cached_during_capture != capturing:
                 block_size = self.kv_cache_spec.block_size
-                metadata.slot_mapping_2d = torch.stack(
+                slot_mapping_2d = torch.stack(
                     [
                         metadata.slot_mapping // block_size,
                         metadata.slot_mapping % block_size,
                     ],
                     dim=-1,
                 )
-            return metadata.slot_mapping_2d
+                cached_during_capture = capturing
+            return slot_mapping_2d
 
         return get_slot_mapping_2d
 
