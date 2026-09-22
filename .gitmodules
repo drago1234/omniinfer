@@ -10,7 +10,3 @@
 	path = components/omni-cache
 	url = https://gitee.com/omniai/omni-cache.git
 	tag = openPangu2.0-Infer-v1.2.0.B010
-[submodule "components/omni-models"]
-	path = components/omni-models
-	url = https://gitee.com/omniai/omni-models.git
-	tag = openPangu2.0-Infer-v1.2.0.B010
