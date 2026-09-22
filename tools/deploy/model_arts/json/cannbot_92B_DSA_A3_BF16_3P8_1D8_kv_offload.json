@@ -18,7 +18,7 @@
           "role": "COMMON",
           "image": {
             "source": "SWR_PRO",
-            "swr_path": "swr-aifm-exp-mt7nab.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_develop-vllm-202609120014:0.0.1",
+            "swr_path": "swr-aifm-exp-mt7nab.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_master-vllm-202609220014:0.0.1",
             "id": "8257e506-397e-11f1-8eb5-0255ac1001b4"
           },
           "count": 1,
@@ -82,7 +82,7 @@
           "role": "COMMON",
           "image": {
             "source": "SWR_PRO",
-            "swr_path": "swr-aifm-exp-mt7nab.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_develop-vllm-202609120014:0.0.1",
+            "swr_path": "swr-aifm-exp-mt7nab.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_master-vllm-202609220014:0.0.1",
             "id": "8257e506-397e-11f1-8eb5-0255ac1001b4"
           },
           "count": 1,
@@ -146,7 +146,7 @@
           "role": "COMMON",
           "image": {
             "source": "SWR_PRO",
-            "swr_path": "swr-aifm-exp-mt7nab.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_develop-vllm-202609120014:0.0.1",
+            "swr_path": "swr-aifm-exp-mt7nab.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_master-vllm-202609220014:0.0.1",
             "id": "8257e506-397e-11f1-8eb5-0255ac1001b4"
           },
           "count": 1,
@@ -210,7 +210,7 @@
           "role": "COMMON",
           "image": {
             "source": "SWR_PRO",
-            "swr_path": "swr-aifm-exp-mt7nab.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_develop-vllm-202609120014:0.0.1",
+            "swr_path": "swr-aifm-exp-mt7nab.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_master-vllm-202609220014:0.0.1",
             "id": "8257e506-397e-11f1-8eb5-0255ac1001b4"
           },
           "count": 1,
@@ -236,7 +236,7 @@
             "HCCL_CONNECT_TIMEOUT": "1800",
             "HCCL_EXEC_TIMEOUT": "1800",
             "HCCL_OP_RETRY_ENABLE": "L0:0,L1:0,L2:0",
-            "HCCL_OP_EXPANSION_MODE": "AIV",
+            "HCCL_OP_EXPANSION_MODE": "AI_CPU",
             "ASCEND_GLOBAL_LOG_LEVEL": "3",
             "VLLM_PLUGINS": "omni-npu,omni_npu_patches,omni_custom_models",
             "OMNI_HYBRID_ATTN_GROUP_SIZE": "17",
@@ -244,25 +244,31 @@
             "OMNI_VLLM_PATCHES": "ALL",
             "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
             "VLLM_MQ_MAX_CHUNK_BYTES_MB": "100",
-            "OMNI_CUSTOM_MODEL_CONFIG_PATH": "low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_p_open.json",
+            "OMNI_CUSTOM_MODEL_CONFIG_PATH": "low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_d_open.json",
             "TORCH_COMPILE_DISABLE": "1",
-            "gpu_util": "0.92",
+            "gpu_util": "0.85",
             "OMNI_LLMDATADIST_LINK_RECYCLE_DELAY": "3600",
-            "TASK_QUEUE_ENABLE": "2",
+            "TASK_QUEUE_ENABLE": "1",
             "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
             "LOG_PATH_PROXY": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/ma_deploy/cannbot_92B_3P8_1D8/proxy_logs/d0",
             "LOG_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/ma_deploy/cannbot_92B_3P8_1D8/logs/d0",
-            "HCCL_BUFFSIZE": "100",
+            "HCCL_BUFFSIZE": "1200",
             "OMNI_SKIP_DECODE_TOKENIZE": "1",
             "OMNI_REUSE_PREFILLED_TOKENS": "1",
             "OMNI_PANGU_TOOL_CALL_ENDS_THINKING": "1",
             "ENABLE_KV_EVENT": "true",
-            "kv_offload": "true",
+            "kv_offload": "false",
             "hugepage_enabled": "false",
             "enable_kv_offload_write": "false",
             "OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE": "true",
-            "cpu_bytes_to_use": "858993459200",
-            "PROFILE_DIR": "/home/ma-user/"
+            "cpu_bytes_to_use": "53687091200",
+            "PROFILE_DIR": "/home/ma-user/",
+            "ASCEND_SLOG_PRINT_TO_STDOUT": "0",
+            "ASCEND_GLOBAL_EVENT_ENABLE": "0",
+            "ENABLE_DP_LB": "false",
+            "VLLM_DATA_PARALLEL_EXTERNAL_LB": "false",
+            "VLLM_DISABLE_COMPILE_CACHE": "1",
+            "VLLM_CACHE_ROOT": "./graph_cache"
           },
           "termination_grace": {
             "termination_grace_period_seconds": 30
