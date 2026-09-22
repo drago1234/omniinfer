@@ -211,8 +211,6 @@ class NPUPlatform(Platform):
             # Pad page sizes to the maximum across all KV caches.
             if not model_extra_config.operator_opt_config.use_noncontiguous_kv:
                 raise ValueError("Pangu hybrid KV requires noncontiguous kv cache.")
-            if cache_config.mamba_block_size != cache_config.block_size:
-                raise ValueError("Pangu hybrid KV requires matching attention/MoME block sizes.")
             layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
             specs = [(layer, layer.get_kv_cache_spec(vllm_config)) for layer in layers.values()]
             page_size = max(spec.page_size_bytes for _, spec in specs)

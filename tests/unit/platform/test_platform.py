@@ -387,13 +387,21 @@ def mome_config(monkeypatch):
         True,
     )
     return SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(use_mome=True)),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(use_mome=True), max_model_len=131072,
+        ),
         cache_config=SimpleNamespace(
             block_size=128, mamba_block_size=128, mamba_page_size_padded=None,
+            enable_prefix_caching=True,
         ),
     )
 
 
+@pytest.mark.parametrize("enable_prefix_caching,mamba_block_multiplier", [
+    pytest.param(True, 1, id="apc"),
+    pytest.param(True, 2, id="apc-different-blocks"),
+    pytest.param(False, None, id="no-apc"),
+])
 @pytest.mark.parametrize("num_spec_tokens,cache_dtype,block_size,padding,expected", [
     # MTP3: each quantized DSA layout determines the largest page.
     pytest.param(3, "fp8_ds_mla", 128, None, 2 * 128 * (656 + 128 + 4), id="mtp3-fp8"),
@@ -408,6 +416,7 @@ def mome_config(monkeypatch):
 ])
 def test_pangu_page_uses_registered_specs(
     monkeypatch, mome_config, num_spec_tokens, cache_dtype, block_size, padding, expected,
+    enable_prefix_caching, mamba_block_multiplier,
 ):
     """Unify physical pages without enlarging logical blocks or shrinking padding."""
     from omni_npu.vllm_patches.patches.models.pangu_v2_base.patch_kv_cache_interface import (
@@ -418,10 +427,16 @@ def test_pangu_page_uses_registered_specs(
     dsa_block_size = 2 * block_size if cache_dtype in (
         "fp8_ds_mla", "hif8_ds_mla", "int8_ds_mla",
     ) else block_size
+    # Without APC, vLLM uses one logical MoME block per request.
+    mamba_block_size = (
+        block_size * mamba_block_multiplier
+        if enable_prefix_caching else mome_config.model_config.max_model_len
+    )
     specs = [
         DSAAttentionSpec(block_size=dsa_block_size, num_kv_heads=1, head_size=704,
                          dtype=torch.bfloat16, cache_dtype_str=cache_dtype),
-        MomeSpec(block_size=block_size, shapes=((1536,), (512,), (64 * 128,)),
+        MomeSpec(block_size=mamba_block_size,
+                 mamba_cache_mode="all" if enable_prefix_caching else "none", shapes=((1536,), (512,), (64 * 128,)),
                  dtypes=(torch.bfloat16,) * 3, kernel_size=3, num_spec_tokens=num_spec_tokens),
         ShareKVSlidingWindowSpec(block_size=block_size, num_kv_heads=1, head_size=576,
                                  dtype=torch.bfloat16, sliding_window=512),
@@ -432,28 +447,24 @@ def test_pangu_page_uses_registered_specs(
     }
     monkeypatch.setattr("vllm.config.get_layers_from_vllm_config", lambda *args: layers)
     cache = mome_config.cache_config
-    cache.block_size = cache.mamba_block_size = block_size
+    cache.enable_prefix_caching = enable_prefix_caching
+    cache.block_size = block_size
+    cache.mamba_block_size = mamba_block_size
     cache.mamba_page_size_padded = padding
     with patch("vllm.platforms.interface.Platform._align_hybrid_block_size") as upstream:
         NPUPlatform._align_hybrid_block_size(mome_config, object)
     upstream.assert_not_called()
-    assert cache.block_size == cache.mamba_block_size == block_size
+    assert cache.block_size == block_size
+    assert cache.mamba_block_size == mamba_block_size
     assert cache.mamba_page_size_padded == expected
     assert all(layer.page_size_padded == expected for layer in layers.values())
 
 
-@pytest.mark.parametrize("noncontiguous,mamba_block_size,error", [
-    pytest.param(False, 128, "noncontiguous", id="contiguous-cache"),
-    pytest.param(True, 256, "matching", id="unequal-blocks"),
-])
-def test_pangu_page_rejects_incompatible_layout(
-    monkeypatch, mome_config, noncontiguous, mamba_block_size, error,
-):
+def test_pangu_page_rejects_contiguous_layout(monkeypatch, mome_config):
     """Reject layouts that cannot share padded physical pages safely."""
     monkeypatch.setattr(
         "omni_npu.model_config.config_loader.loader.model_extra_config.operator_opt_config.use_noncontiguous_kv",
-        noncontiguous,
+        False,
     )
-    mome_config.cache_config.mamba_block_size = mamba_block_size
-    with pytest.raises(ValueError, match=error):
+    with pytest.raises(ValueError, match="noncontiguous"):
         NPUPlatform._align_hybrid_block_size(mome_config, object)
