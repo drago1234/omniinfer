@@ -206,6 +206,7 @@ def _install_chat_stubs(monkeypatch):
     # (vllm/inputs/engine.py: TokensInput(type="token", prompt_token_ids,
     # cache_salt)).
     inputs_mod.EngineInput = dict
+    inputs_mod.PromptType = object
 
     def _tokens_input(prompt_token_ids, *, prompt=None, cache_salt=None):
         return {
@@ -382,7 +383,8 @@ def test_input_ids_fallback_calls_original_for_multimodal(monkeypatch):
     async def fake_original(*args, **kwargs):
         return ["fallback"], [{"prompt_token_ids": [1]}]
 
-    monkeypatch.setattr(mod, "_original_preprocess_chat", fake_original)
+    monkeypatch.setattr(mod.OnlineRendererPrefilledTokenAdapter,
+                        "preprocess_chat", fake_original)
 
     request = mod.ChatCompletionRequest()
     request.input_ids = [10]
