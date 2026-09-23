@@ -12,7 +12,12 @@ import torch
 import torch.nn as nn
 import pytest
 
-if importlib.util.find_spec("omni_models") is None:
+# Broken editable installs may leave a bare `omni_models` namespace; find_spec on
+# nested modules then raises ModuleNotFoundError instead of returning None.
+try:
+    if importlib.util.find_spec("omni_models.models.pangu.openpangu") is None:
+        raise ModuleNotFoundError("omni_models.models.pangu.openpangu")
+except ModuleNotFoundError:
     pytest.skip(
         "optional omni_models package is not installed",
         allow_module_level=True,
