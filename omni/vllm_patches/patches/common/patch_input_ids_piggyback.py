@@ -63,9 +63,6 @@ from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
 
 from omni_npu import envs
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-from omni_npu.vllm_patches.patches.common.patch_prefilled_token_skip_tokenize import (
-    OnlineRendererPrefilledTokenAdapter,
-)
 
 logger = init_logger(__name__)
 
@@ -165,7 +162,6 @@ class InputIdsPiggybackPatch(VLLMPatch):
 
         is_fast_path_candidate = (
                 caller_ids is not None
-                and not (getattr(request, "kv_transfer_params", None) or {}).get("prefilled_token")
                 and parse_chat_messages is not None
                 and resolve_chat_template_content_format is not None
                 and isinstance(request, ChatCompletionRequest)
@@ -295,8 +291,9 @@ class InputIdsPiggybackPatch(VLLMPatch):
 
                 return conversation, [engine_input]
 
-        # Keep multimodal metadata and consume PD-relayed tokens on this path.
-        return await OnlineRendererPrefilledTokenAdapter.preprocess_chat(
+        # Fallback: delegate to the original OnlineRenderer.preprocess_chat
+        # (which itself may be wrapped by other patches in the relay chain).
+        return await _original_preprocess_chat(
             self, request, messages, default_template,
             default_template_content_format, default_template_kwargs,
             tool_dicts=tool_dicts, parser=parser,
