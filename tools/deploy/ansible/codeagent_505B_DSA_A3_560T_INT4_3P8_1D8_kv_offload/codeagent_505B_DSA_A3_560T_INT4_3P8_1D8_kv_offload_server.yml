@@ -141,9 +141,9 @@
         {% endif %}
 
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-        GPU_UTIL=0.9
+        GPU_UTIL=0.85
       args:
-        - --max-model-len 202752
+        - --max-model-len 524288
         - --served-model-name {{ model | quote }}
         - '--additional-config ''{"enable_low_latency": true}'''
         - --gpu-util "${GPU_UTIL}"
@@ -164,8 +164,8 @@
         export HCCL_OP_RETRY_ENABLE="L0:0,L1:0,L2:0"
         export HCCL_OP_EXPANSION_MODE="AI_CPU"
         export ASCEND_GLOBAL_LOG_LEVEL=3
-        # export OMNI_REUSE_PREFILLED_TOKENS=1
-        # export OMNI_SKIP_DECODE_TOKENIZE=1
+        export OMNI_REUSE_PREFILLED_TOKENS=1
+        export OMNI_SKIP_DECODE_TOKENIZE=1
         export VLLM_MQ_MAX_CHUNK_BYTES_MB=100
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_HYBRID_ATTN_GROUP_SIZE=18
@@ -205,9 +205,9 @@
         # export TORCH_COMPILE_DISABLE=1
         export VLLM_DISABLE_COMPILE_CACHE=1
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-        GPU_UTIL=0.9
+        GPU_UTIL=0.85
       args:
-        - --max-model-len 202752
+        - --max-model-len 524288
         - --served-model-name {{ model | quote }}
         - --tp 1
         - >-
