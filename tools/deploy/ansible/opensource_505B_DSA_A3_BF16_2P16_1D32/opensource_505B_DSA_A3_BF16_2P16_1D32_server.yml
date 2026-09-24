@@ -23,7 +23,7 @@
     enable_prefix_caching: true
 
     run_docker_profile:
-      shm_size: 1600g
+      shm_size: 1800g
       envs:
         - PYTHONHASHSEED=1234
       extra_mounts:
@@ -76,9 +76,12 @@
         export OMNI_VLLM_PATCHES="ALL"
         export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
         export RAY_CGRAPH_get_timeout=7200
+        export OMNI_PIGGYBACK_INPUT_IDS=1
+        export OMNI_SKIP_DECODE_TOKENIZE=0
         EXTRA_ARGS="--no-disable-hybrid-kv-cache-manager --max-num-batched-tokens 4096"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-expert-parallel --max-num-seqs 4"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prompt-tokens-details --enable-chunked-prefill"
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
         EXTRA_ARGS="${EXTRA_ARGS} --dtype bfloat16 --enforce-eager"
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-lopt --lopt-pool-size 16 --lopt-chunk-size 4096"
@@ -92,7 +95,7 @@
         export OMNI_CUSTOM_MODEL_CONFIG_PATH="low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_p_claw_noapc.json"
         {% endif %}
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-        GPU_UTIL=0.95
+        GPU_UTIL=0.92
       args:
         - --max-model-len 524288
         - --served-model-name pangu_ultra_moe
@@ -129,6 +132,8 @@
         export VLLM_CACHE_ROOT='./graph_cache'
         export TASK_QUEUE_ENABLE=1
         export LOCAL_WORLD_SIZE=16
+        export OMNI_PIGGYBACK_INPUT_IDS=1
+        export OMNI_SKIP_DECODE_TOKENIZE=0
         EXTRA_ARGS="--no-disable-hybrid-kv-cache-manager --enable-expert-parallel"
         EXTRA_ARGS="${EXTRA_ARGS} --max-num-seqs 6"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prompt-tokens-details --enable-chunked-prefill"
@@ -173,7 +178,10 @@
       prepare_commands: |-
         export PYTHONHASHSEED=1234
         export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+        rm -f "${LOG_PATH}/{{ inventory_hostname }}/nginx_error.log" \
+              "${LOG_PATH}/{{ inventory_hostname }}/nginx_access.log"
       args:
+        - --omni-proxy-model-path {{ model_path | quote }}
         - --log-file ${LOG_PATH}/{{ inventory_hostname }}/nginx_error.log
         - --log-level info
         - --access-log-file ${LOG_PATH}/{{ inventory_hostname }}/nginx_access.log
@@ -181,7 +189,7 @@
         - --start-core-index 16
         - --subrequest-output-buffer-size 10M
         - --omni-proxy-pd-policy sequential
-        - --omni-proxy-max-batch-num-token 100000
+        - --omni-proxy-max-batch-num-token 4096
         - --omni-proxy-prefill-max-num-seqs 4
         - --omni-proxy-decode-max-num-seqs 3
 
