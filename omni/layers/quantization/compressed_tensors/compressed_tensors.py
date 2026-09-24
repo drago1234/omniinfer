@@ -163,9 +163,11 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
         weight_quant: QuantizationArgs
     ) -> int:
         if isinstance(weight_quant.num_bits, dict):
-            for module, module_num_bits in weight_quant.num_bits.items():
+            # Prefer a full layer path over generic rules such as mlp.experts.
+            # Do not mutate the quantization args shared by different layers.
+            for module in sorted(weight_quant.num_bits, key=len, reverse=True):
                 if module in layer_name:
-                    return module_num_bits
+                    return weight_quant.num_bits[module]
             raise ValueError(
                 f"weight name mismatch, please check weights num_bits in config.json and model weight name. "
                 f"layer_name={layer_name}"
@@ -261,7 +263,7 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
         input_quant = self.target_scheme_map[matched_target].get(
             "input_activations"
         )
-        weight_num_bits = self._get_weight_num_bits("mlp.experts", weight_quant)
+        weight_num_bits = self._get_weight_num_bits(layer_name, weight_quant)
         if self._is_dynamic_token_w8a8(weight_quant, input_quant, weight_num_bits):
             return NPUCompressedTensorsW8A8Int8MoEMethod(
                 weight_quant, input_quant, layer)
