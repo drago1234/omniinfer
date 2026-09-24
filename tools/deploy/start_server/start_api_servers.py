@@ -110,8 +110,13 @@ def start_single_node_api_servers(
     use_inventory_devices=False,
     rejection_sample_method=None,
     draft_sample_method=None,
+    fail_on_port_conflict=False,
 ):
-    """Start multiple VLLM API servers with specified configurations."""
+    """Start API servers; opt into fixed ports with fail_on_port_conflict.
+
+    By default, preserve port scanning for existing callers (including RL).
+    Strict mode requires every base_api_port + rank to be available.
+    """
 
     # Hard code dp=1, cuz current we want one api server one DP
     dp_per_server = 1
@@ -146,13 +151,6 @@ def start_single_node_api_servers(
             log.close()
             print(f"Closed log file for server {i}")
 
-    # # Check if base api port is available. Raise error if it's unavailable.
-    # if not is_port_available(base_api_port):
-    #     raise RuntimeError(
-    #         f"Port {base_api_port} is not available. "
-    #         "Use --base_api_port to specify a different port, or terminate the process using this port."
-    #     )
-
     for rank in range(num_servers):
         # Set environment variables for each server
         env = os.environ.copy()
@@ -179,10 +177,19 @@ def start_single_node_api_servers(
 
         # Find an available port
         try:
-            port = find_available_port(api_port_start, max_attempts=max_port_attempts)
+            if fail_on_port_conflict:
+                port = api_port_start
+                if not is_port_available(port):
+                    raise RuntimeError(
+                        f"API server {rank}: port {port} is unavailable; port shifting is disabled."
+                    )
+            else:
+                port = find_available_port(api_port_start, max_attempts=max_port_attempts)
         except RuntimeError as e:
             print(f"Error: {e}")
             cleanup_processes()
+            if fail_on_port_conflict:
+                raise
             sys.exit(1)
 
         servers_api_ports[f"server_{rank}"] = port
@@ -300,6 +307,11 @@ if __name__ == "__main__":
     parser.add_argument("--served-model-name", type=str, required=True, help="Name of the served model")
     parser.add_argument("--max-model-len", default=16384, type=int, help="max number of tokens")
     parser.add_argument("--max-port-attempts", type=int, default=20, help="Max attempts to find an available port")
+    parser.add_argument(
+        "--fail-on-port-conflict",
+        action="store_true",
+        help="Fail on occupied API ports instead of shifting",
+    )
     parser.add_argument("--kv-transfer-config", type=str, default="", help="kv transfer config for VLLM")
     parser.add_argument(
         "--extra-args", 
@@ -362,7 +374,8 @@ if __name__ == "__main__":
         rejection_sample_method=args.rejection_sample_method,
         draft_sample_method=args.draft_sample_method,
         no_enable_chunked_prefill=args.no_enable_chunked_prefill,
-        use_inventory_devices=args.use_inventory_devices
+        use_inventory_devices=args.use_inventory_devices,
+        fail_on_port_conflict=args.fail_on_port_conflict
     )
 
     # Register SIGINT handler for Ctrl+C

@@ -247,6 +247,7 @@ def test_start_single_node_api_servers_signature_contract():
         "use_inventory_devices",
         "rejection_sample_method",
         "draft_sample_method",
+        "fail_on_port_conflict",
     ]
 
     assert params["server_offset"].default == 0
@@ -268,6 +269,7 @@ def test_start_single_node_api_servers_signature_contract():
     assert params["use_inventory_devices"].default is False
     assert params["rejection_sample_method"].default is None
     assert params["draft_sample_method"].default is None
+    assert params["fail_on_port_conflict"].default is False
 
 
 # ==============================================================================
@@ -852,6 +854,9 @@ def test_pd_launchers_preserve_source_environment_contract(launcher_name):
     assert "USE_INVENTORY_DEVICES=0" in contents
     assert "--use-inventory-devices)" in contents
     assert 'inventory_devices_args="--use-inventory-devices"' in contents
+    assert 'port_policy_args="--fail-on-port-conflict"' in contents
+    assert 'FAIL_ON_PORT_CONFLICT=1' in contents
+    assert 'FAIL_ON_PORT_CONFLICT=1' in contents
 
     assert 'PP=1' in contents
     assert '--pp)' in contents
@@ -874,3 +879,42 @@ def test_ansible_pd_templates_forward_inventory_devices(template_name):
 
     assert "--ascend-rt-visible-devices {{ ascend_rt_visible_devices | quote }}" in contents
     assert "--use-inventory-devices 1" in contents
+    assert "--fail-on-port-conflict" in contents
+
+
+def test_strict_port_conflict_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr(mod, "is_port_available", lambda port: False)
+    popen_called = []
+
+    def mock_popen(*args, **kwargs):
+        popen_called.append(True)
+        pytest.fail("must not start a server")
+
+    monkeypatch.setattr(mod.subprocess, "Popen", mock_popen)
+    with pytest.raises(RuntimeError, match="port 9000 is unavailable"):
+        mod.start_single_node_api_servers(
+            1, "/fake/model", 9000, "127.0.0.1", 8000, 1, 0.9, "model",
+            log_dir=str(tmp_path), fail_on_port_conflict=1,
+        )
+    assert not popen_called, "Popen should not have been called"
+
+
+def test_default_port_policy_keeps_scanning(monkeypatch, tmp_path):
+    launched = []
+    processes = []
+    monkeypatch.setattr(mod, "find_available_port",
+                        lambda base_port, max_attempts=10, host="0.0.0.0": 9001)
+    monkeypatch.setattr(mod.subprocess, "Popen",
+                        lambda cmd, **kwargs: (launched.append(cmd), _DummyProc())[1])
+    # Avoid testing weakref finalizer behavior in this command-construction test.
+    monkeypatch.setattr(mod.weakref, "finalize", lambda *args: None, raising=False)
+    try:
+        processes, _, ports = mod.start_single_node_api_servers(
+            1, "/fake/model", 9000, "127.0.0.1", 8000, 1, 0.9, "model",
+            log_dir=str(tmp_path), fail_on_port_conflict=0,
+        )
+        assert launched[0][launched[0].index("--port") + 1] == "9001"
+        assert ports == {"server_0": 9001}
+    finally:
+        for _, log in processes:
+            log.close()
