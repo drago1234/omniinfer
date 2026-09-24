@@ -901,6 +901,7 @@ def test_strict_port_conflict_raises(monkeypatch, tmp_path):
 
 def test_default_port_policy_keeps_scanning(monkeypatch, tmp_path):
     launched = []
+    processes = []
     monkeypatch.setattr(mod, "find_available_port",
                         lambda base_port, max_attempts=10, host="0.0.0.0": 9001)
     monkeypatch.setattr(mod.subprocess, "Popen",
@@ -915,5 +916,5 @@ def test_default_port_policy_keeps_scanning(monkeypatch, tmp_path):
         assert launched[0][launched[0].index("--port") + 1] == "9001"
         assert ports == {"server_0": 9001}
     finally:
-        for _, log in locals().get("processes", []):
+        for _, log in processes:
             log.close()
