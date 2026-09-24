@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 ---
-- name: Run PanguV2 505B INT8 2P1D Prefill, Decode, Proxy, and KV pool services.
+- name: Run PanguV2 505B INT8 Prefill, Decode, Proxy, and KV pool services.
   # Dedicated KV pool scenario; inventory includes the M master.
   hosts: all
   any_errors_fatal: true
@@ -21,7 +21,7 @@
 
   vars:
     model: pangu-v2-505b
-    model_path: "/mnt/sfs_turbo/bucket-910c-6055/s00623235/models/505b/505b_w4a8"
+    model_path: "/mnt/sfs_turbo_new/bucket-910c-6055/rk/ckpt/505B_B005_INT8_open/"
     enable_prefix_caching: true
 
     # Selecting this dedicated playbook enables the M service and P-side pool.
@@ -95,13 +95,12 @@
         ENDPOINT_PORT=$((API_PORT + 100))
         KV_EVENTS_CONFIG='{"enable_kv_cache_events":true,"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:'${ENDPOINT_PORT}'"}'
         EXTRA_ARGS="--kv-events-config ${KV_EVENTS_CONFIG}"
-        EXTRA_ARGS="${EXTRA_ARGS} --no-disable-hybrid-kv-cache-manager --max-num-batched-tokens 49152"
+        EXTRA_ARGS="${EXTRA_ARGS} --no-disable-hybrid-kv-cache-manager --max-num-batched-tokens 24576"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-expert-parallel --max-num-seqs 4"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prompt-tokens-details --enable-chunked-prefill"
         EXTRA_ARGS="${EXTRA_ARGS} --dtype bfloat16 --enforce-eager"
         EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu"
-        EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
         # EXTRA_ARGS="${EXTRA_ARGS} --enable-lopt --lopt-pool-size 16 --lopt-chunk-size 4096"
         REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
@@ -114,9 +113,11 @@
         {% endif %}
         export TORCH_COMPILE_DISABLE=1
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-        # w4a8 weights (~16 GiB/card at TP16): 0.9 leaves ample KV for
-        # max-model-len 524288 (mirrors the espace reference playbook).
-        GPU_UTIL=0.9
+        # 0.93/512K-class budgets OOM at runtime (torch-level overhang from
+        # pool-transfer buffers/APC ate the activation reserve twice). Final:
+        # 0.88 + 24576 chunk + 262144 len — ~3 GiB extra physical slack while
+        # KV budget ~9.4 GiB still covers rate-1 load (4 seqs x ~0.85 GiB).
+        GPU_UTIL=0.88
         {% if enable_kv_pool | bool %}
         if [ -f "{{ ansible_env.SCRIPTS_PATH }}/kv_pool_runtime.sh" ]; then
           . "{{ ansible_env.SCRIPTS_PATH }}/kv_pool_runtime.sh"
@@ -125,7 +126,7 @@
       args:
         - >-
           {% if enable_kv_pool | bool %}--kv-transfer-config "${KV_TRANSFER_CONFIG}"{% endif %}
-        - --max-model-len 524288
+        - --max-model-len 262144
         - --served-model-name {{ model | quote }}
         - '--additional-config ''{"enable_low_latency": true}'''
         - --gpu-util "${GPU_UTIL}"
@@ -193,7 +194,7 @@
       args:
         - >-
           {% if enable_kv_pool | bool %}--kv-transfer-config "${KV_TRANSFER_CONFIG}"{% endif %}
-        - --max-model-len 524288
+        - --max-model-len 262144
         - --served-model-name {{ model | quote }}
         - --tp 1
         - >-
@@ -220,9 +221,10 @@
         - --start-core-index 16
         - --subrequest-output-buffer-size 10M
         - --omni-proxy-pd-policy sequential
-        - --omni-proxy-max-batch-num-token 49152
+        - --omni-proxy-max-batch-num-token 24576
         - --omni-proxy-prefill-max-num-seqs 4
         - --omni-proxy-decode-max-num-seqs 3
+        - --omni-proxy-tokenizer-wide-affinity on
         - --omni-proxy-model-path {{ model_path | quote }}
 
   tasks:
