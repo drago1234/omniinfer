@@ -16,7 +16,6 @@ export ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/latest}
 export PYTHONHASHSEED=${PYTHONHASHSEED:-1234}
 export AUTO_USE_UC_MEMORY=${AUTO_USE_UC_MEMORY:-1}
 export CODE_PATH=${CODE_PATH:-/workspace/omniinfer}
-export CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-0}
 export LOG_PATH=${LOG_PATH:-"/home/ma-user/scripts/prefill/log"}
 LOG_PATH=${LOG_PATH}/${POD_IP}
 rm -rf ${LOG_PATH}
@@ -98,7 +97,6 @@ export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True
 
 export ROLE=${ROLE:-prefill}
 export SERVER_OFFSET=${SERVER_OFFSET:-0}
-export SHLVL=${SHLVL:-1}
 
 export SOCKET_IFNAME=${SOCKET_IFNAME:-eth0}
 export TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE:-2}
@@ -111,21 +109,21 @@ export VLLM_ENABLE_MC2=${VLLM_ENABLE_MC2:-1}
 export VLLM_LLMDATADIST_ZMQ_PORT=${VLLM_LLMDATADIST_ZMQ_PORT:-5568}
 export VLLM_USE_V1=${VLLM_USE_V1:-1}
 export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-fork}
-export HYBRID_ATTN_GROUP_SIZE=${HYBRID_ATTN_GROUP_SIZE:-16}
-
+export HYBRID_ATTN_GROUP_SIZE=${HYBRID_ATTN_GROUP_SIZE:-18}
+export ENABLE_OVERWRITE_REQ_IDS=${ENABLE_OVERWRITE_REQ_IDS:-1}
 export VLLM_DP_RANK=${VLLM_DP_RANK:-0}
 export VLLM_DP_MASTER_IP=${HOST_IP}
 export VLLM_DP_MASTER_PORT=${MASTER_PORT}
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/lib64
-export HCCL_OP_RETRY_ENABLE=${HCCL_OP_RETRY_ENABLE:-"L0:0, L1:0, L2:0"}
+export HCCL_OP_RETRY_ENABLE=${HCCL_OP_RETRY_ENABLE:-"L0:0,L1:0,L2:0"}
 export HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT:-32000}
-export OMNI_NPU_VLLM_PATCHES=${OMNI_NPU_VLLM_PATCHES:-"ALL"}
-export VLLM_PLUGINS=${VLLM_PLUGINS:-"omni-npu,omni_npu_patches,omni_pangu_models,omni_custom_models"}
+export OMNI_VLLM_PATCHES_DIR=${OMNI_VLLM_PATCHES_DIR:-"low_latency"}
+export OMNI_VLLM_PATCHES=${OMNI_VLLM_PATCHES:-"ALL"}
+export VLLM_PLUGINS=${VLLM_PLUGINS:-"omni-npu,omni_npu_patches,omni_custom_models"}
 npu=${npu:-16}
 export NUM_DIE_PER_MACH=${npu}
 export PREFILL_POD_NUM=${PREFILL_INSTANCE_NUM:-1}
 export DECODE_POD_NUM=${DECODE_INSTANCE_NUM:-1}
-long_prefill_token_threshold=${long_prefill_token_threshold:-0}
 if [[ -n "${KV_EVENTS_CONFIG}" ]]; then
     export KV_EVENTS_CONFIG
 fi
@@ -273,7 +271,7 @@ if [[ "${ENABLE_OMNI_CACHE:-0}" == "1" ]]; then
     export ROLE=prefill
     export VLLM_PLUGINS="omni-npu,omni_custom_models,omni_pangu_models,omni_npu_patches"
 
-    export KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:=$(( OMNI_CACHE_LAYER_BYTES * HYBRID_ATTN_GROUP_SIZE ))}"
+    export KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:=$(( OMNI_CACHE_LAYER_BYTES * OMNI_HYBRID_ATTN_GROUP_SIZE ))}"
     EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-memory-bytes ${KV_CACHE_MEMORY_BYTES}"
 
     SETUP_HUGETLBFS_SH="/workspace/omniinfer/components/omni-cache/tools/setup/setup_hugetlbfs_2MB.sh"
@@ -331,6 +329,7 @@ if [ ${PREFILL_POD_NUM_PER_INSTANCE} -gt 1 ]; then
     echo "PREFILL_POD_NUM_PER_INSTANCE is ${PREFILL_POD_NUM_PER_INSTANCE}" >> ${LOG_PATH}/server.log 2>&1
     IFS=',;' read -ra arr <<< "$P_NODE_LIST"
     export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+    export RAY_CGRAPH_get_timeout=${RAY_CGRAPH_get_timeout:-7200}
     for index in "${!arr[@]}"; do
         if [[ "${arr[$index]}" == "$cur_pod_ip" ]]; then
             echo "cur pod index is ${index}" >> ${LOG_PATH}/server.log 2>&1

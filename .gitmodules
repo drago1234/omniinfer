@@ -1,16 +1,8 @@
-[submodule "components/omni-eplb"]
-	path = components/omni-eplb
-	url = https://gitee.com/omniai/omni-eplb.git
-	branch = master
 [submodule "components/omni-proxy"]
-	path = components/omni-proxy
-	url = https://gitee.com/omniai/omni-proxy.git
-	branch = master
-[submodule "components/omni-cache"]
-	path = components/omni-cache
-	url = https://gitee.com/omniai/omni-cache.git
-	branch = master
-[submodule "components/Pangu-FusionComm"]
-	path = components/Pangu-FusionComm
-	url = https://gitee.com/omniai/Pangu-FusionComm.git
-	branch = develop
+        path = components/omni-proxy
+        url = https://gitee.com/omniai/omni-proxy.git
+        branch = develop
+[submodule "components/omni-models"]
+        path = components/omni-models
+        url = https://gitee.com/omniai/omni-models.git
+        branch = develop
