@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 import unittest
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
-import os
 import weakref
 
 import torch
@@ -367,7 +367,42 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
         b.ena_kvsp = False
         b.first_layer_idx = -1
         b.force_first_chunk_context = False
+        b.device = torch.device("cpu")
+        b.reorder_batch_threshold = 1
+        b.model_config = b.vllm_config.model_config
         return b
+
+    def _fill_common_for_build(self, cm):
+        """Fields build() reads before the NPU post-processing under test."""
+        cm.num_reqs = 0
+        cm.num_actual_tokens = 0
+        cm.max_query_len = getattr(cm, "max_query_len", 1)
+        cm.max_seq_len = getattr(cm, "max_seq_len", 1)
+        if not hasattr(cm, "block_table_tensor"):
+            cm.block_table_tensor = torch.zeros(1, 1, dtype=torch.int32)
+        if not hasattr(cm, "slot_mapping"):
+            cm.slot_mapping = torch.zeros(1, dtype=torch.long)
+        if not hasattr(cm, "query_start_loc"):
+            cm.query_start_loc = torch.zeros(1, dtype=torch.int32)
+        if not hasattr(cm, "query_start_loc_cpu"):
+            cm.query_start_loc_cpu = torch.zeros(1, dtype=torch.int32)
+        if not hasattr(cm, "seq_lens"):
+            cm.seq_lens = torch.zeros(0, dtype=torch.long)
+        if not hasattr(cm, "dcp_local_seq_lens"):
+            cm.dcp_local_seq_lens = None
+
+    @contextmanager
+    def _metadata_from(self, b, fake_meta, cm):
+        b.device = torch.device("cpu")
+        b.reorder_batch_threshold = getattr(b, "reorder_batch_threshold", 1)
+        if not hasattr(b, "model_config"):
+            b.model_config = b.vllm_config.model_config
+        self._fill_common_for_build(cm)
+        with patch(
+            "omni_npu.attention.backends.dsa.split_decodes_and_prefills",
+            return_value=(0, 0, 0, 0),
+        ), patch.object(b, "metadata_cls", return_value=fake_meta, create=True):
+            yield
 
     def test_generate_activate_mask_sets_prefix_true(self):
         b = self._new_builder_minimal()
@@ -407,8 +442,7 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
 
         fake_meta = _Meta()
 
-        with patch.object(mla_mod.MLACommonMetadataBuilder, "build", return_value=fake_meta), \
-             patch.dict(os.environ, {"ENABLE_OMNI_CACHE": "1"}, clear=False): 
+        with self._metadata_from(b, fake_meta, fake_meta):
             out = b.build(common_prefix_len=0, common_attn_metadata=fake_meta, fast_build=False)
 
         self.assertIs(out, fake_meta)
@@ -474,6 +508,13 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
                 self.query_start_loc_cpu = torch.tensor([0, 4], dtype=torch.int32)
 
         fake_meta = _Meta()
+        # Keep common separate: _metadata_from zeros num_actual_tokens on the
+        # common object, and paged_cache requires slot_mapping length to match
+        # query_start_loc[-1] via metadata.num_actual_tokens.
+        common = SimpleNamespace(
+            seq_lens=fake_meta.seq_lens,
+            query_start_loc_cpu=fake_meta.query_start_loc_cpu,
+        )
         fake_sp = object()
         me = SimpleNamespace(
             parall_config=SimpleNamespace(ena_context_parallel=True),
@@ -482,14 +523,12 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
         sp_cls = MagicMock()
         sp_cls.init_cp = init_cp_m
 
-        with patch.object(
-            mla_mod.MLACommonMetadataBuilder, "build", return_value=fake_meta
-        ), \
+        with self._metadata_from(b, fake_meta, common), \
              patch.object(mla_mod, "model_extra_config", me), \
              patch.object(mla_mod, "get_tp_group", return_value=MagicMock()), \
              patch.object(mla_mod, "SPManager", sp_cls):
             out = b.build(
-                common_prefix_len=0, common_attn_metadata=fake_meta, fast_build=False
+                common_prefix_len=0, common_attn_metadata=common, fast_build=False
             )
 
         self.assertIs(out.prefill.sp_manager, fake_sp)
@@ -546,12 +585,10 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
         sp_manager.init_cp.return_value = object()
         extra_config = SimpleNamespace(parall_config=SimpleNamespace(ena_seq_parallel=True, ena_context_parallel=True))
 
-        with (
-            patch.object(mla_mod.MLACommonMetadataBuilder, "build", return_value=metadata),
-            patch.object(mla_mod, "model_extra_config", extra_config),
-            patch.object(mla_mod, "SPManager", sp_manager),
-            patch.object(mla_mod, "paged_cache", return_value=cache_fn) as mock_paged_cache,
-        ):
+        with self._metadata_from(b, metadata, common_metadata), \
+             patch.object(mla_mod, "model_extra_config", extra_config), \
+             patch.object(mla_mod, "SPManager", sp_manager), \
+             patch.object(mla_mod, "paged_cache", return_value=cache_fn) as mock_paged_cache:
             output = b.build(0, common_metadata, False)
 
         self.assertIs(output.prefill.cache_fn, cache_fn)
@@ -592,11 +629,7 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
             [True] * 12 + [False] * 4,
             dtype=torch.bool,
         )
-        with patch.object(
-            mla_mod.MLACommonMetadataBuilder,
-            "build",
-            return_value=fake_meta,
-        ) as mock_super_build, \
+        with self._metadata_from(b, fake_meta, fake_common_attn_metadata), \
             patch.object(
                 b,
                 "_generate_activate_mask",
@@ -610,7 +643,6 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
             )       
 
         self.assertIs(out, fake_meta)
-        mock_super_build.assert_called_once()
         mock_gen_mask.assert_called_once_with(12)
 
         self.assertIs(fake_meta.decode.mc2_mask, fake_mask)
@@ -649,11 +681,7 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
             seq_lens=torch.tensor([], dtype=torch.long)
         )
 
-        with patch.object(
-            mla_mod.MLACommonMetadataBuilder,
-            "build",
-            return_value=fake_meta,
-        ), patch.object(
+        with self._metadata_from(b, fake_meta, fake_common_attn_metadata), patch.object(
             b,
             "_generate_activate_mask",
         ) as mock_gen_mask:
@@ -700,11 +728,7 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
             [True] * 12 + [False] * 4,
             dtype=torch.bool,
         )
-        with patch.object(
-            mla_mod.MLACommonMetadataBuilder,
-            "build",
-            return_value=fake_meta,
-        ), patch.object(
+        with self._metadata_from(b, fake_meta, fake_common_attn_metadata), patch.object(
             b,
             "_generate_activate_mask",
             return_value=fake_mask,
@@ -745,11 +769,7 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
             seq_lens=torch.tensor([], dtype=torch.long)
         )
 
-        with patch.object(
-            mla_mod.MLACommonMetadataBuilder,
-            "build",
-            return_value=fake_meta,
-        ), patch.object(
+        with self._metadata_from(b, fake_meta, fake_common_attn_metadata), patch.object(
             b,
             "_generate_activate_mask",
         ) as mock_gen_mask:
@@ -844,9 +864,7 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
         fake_meta = _Meta()
         fake_common = SimpleNamespace(seq_lens=torch.tensor([], dtype=torch.long))
 
-        with patch.object(
-            mla_mod.MLACommonMetadataBuilder, "build", return_value=fake_meta
-        ):
+        with self._metadata_from(b, fake_meta, fake_common):
             out = b.build(
                 common_prefix_len=0,
                 common_attn_metadata=fake_common,

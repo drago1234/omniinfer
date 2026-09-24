@@ -21,6 +21,7 @@ from vllm.distributed import get_tp_group
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionLayer, AttentionType, CommonAttentionMetadata
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
@@ -31,6 +32,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonPrefillMetadata,
     QueryLenSupport,
 )
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.backend import (
     AttentionBackend,  # type: ignore
     SparseMLAAttentionImpl,
@@ -43,6 +45,7 @@ from omni_npu.attention.backends.utils import (
     _maybe_padded_raw_tensor_to_strided_caches,
     paged_cache,
     register_attention_backend,
+    split_decodes_and_prefills,
     SPManager,
     KVSPMaganer,
 )
@@ -266,8 +269,255 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> NPUDSAMetadata:
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        max_query_len = common_attn_metadata.max_query_len
+        max_seq_len = common_attn_metadata.max_seq_len
 
-        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        device = self.device
+        block_table_tensor = common_attn_metadata.block_table_tensor
+        slot_mapping = common_attn_metadata.slot_mapping
+
+        query_start_loc = common_attn_metadata.query_start_loc
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        seq_lens = common_attn_metadata.seq_lens
+        dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
+
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+                require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
+            )
+        )
+
+        assert num_decodes + num_prefills == num_reqs
+        assert num_decode_tokens + num_prefill_tokens == num_tokens
+
+        prefill_metadata = None
+        if num_prefills > 0:
+            reqs_start = num_decodes
+
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            assert seq_lens_cpu is not None
+            prefill_query_lens_cpu = (
+                query_start_loc_cpu[reqs_start + 1:num_reqs + 1]
+                - query_start_loc_cpu[reqs_start:num_reqs]
+            )
+            context_lens_cpu = (
+                seq_lens_cpu[reqs_start:num_reqs] - prefill_query_lens_cpu
+            )
+            max_context_len_cpu = context_lens_cpu.max().item()
+            num_prefills_with_context_cpu = (context_lens_cpu > 0).sum().item()
+            prefill_query_start_loc = (
+                query_start_loc[reqs_start:] - query_start_loc[reqs_start]
+            )
+            prefill_query_start_loc_cpu = (
+                query_start_loc_cpu[reqs_start:] - query_start_loc_cpu[reqs_start]
+            )
+
+            chunked_context_metadata = None
+            if max_context_len_cpu > 0:
+                max_context_chunk = (
+                    self.chunked_prefill_workspace_size // num_prefills_with_context_cpu
+                )
+                max_context_chunk = round_down(max_context_chunk, self.page_size)
+                assert max_context_chunk > 0
+                num_chunks = cdiv(max_context_len_cpu, max_context_chunk)
+
+                chunk_starts = torch.empty(
+                    num_chunks, num_prefills, dtype=torch.int32, pin_memory=True
+                ).copy_(
+                    torch.arange(num_chunks, dtype=torch.int32)
+                    .multiply_(max_context_chunk)
+                    .unsqueeze(1)
+                )
+                chunk_ends = torch.min(
+                    context_lens_cpu.unsqueeze(0), chunk_starts + max_context_chunk
+                )
+                chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
+
+                cu_seq_lens_cpu = torch.zeros(
+                    num_chunks, num_prefills + 1, dtype=torch.int32, pin_memory=True
+                )
+                torch.cumsum(
+                    chunk_seq_lens, dim=1, out=cu_seq_lens_cpu[:, 1:], dtype=torch.int32
+                )
+                chunk_total_token = cu_seq_lens_cpu[:, -1]
+
+                max_token_num_over_chunk = chunk_total_token.max().item()
+                token_to_seq_tensor_cpu = torch.zeros(
+                    [num_chunks, max_token_num_over_chunk],
+                    dtype=torch.int32,
+                    pin_memory=True,
+                )
+                range_idx = torch.arange(num_prefills, dtype=torch.int32)
+                for i in range(num_chunks):
+                    chunk_token_to_seq_tensor = torch.repeat_interleave(
+                        range_idx, chunk_seq_lens[i]
+                    )
+                    chunk_len = chunk_token_to_seq_tensor.shape[0]
+                    token_to_seq_tensor_cpu[i, :chunk_len] = chunk_token_to_seq_tensor
+
+                if self.dcp_world_size > 1:
+                    local_context_lens_allranks = get_dcp_local_seq_lens(
+                        context_lens_cpu,
+                        self.dcp_world_size,
+                        None,
+                        self.dcp_local_block_size,
+                    )
+                    padded_local_context_lens_cpu: torch.Tensor = (
+                        cdiv(
+                            context_lens_cpu,
+                            self.dcp_virtual_block_size,
+                        )
+                        * self.dcp_local_block_size
+                    )
+                    assert max_context_chunk % self.dcp_world_size == 0
+                    padded_local_max_context_chunk_across_ranks = (
+                        cdiv(
+                            max_context_chunk,
+                            self.dcp_virtual_block_size,
+                        )
+                        * self.dcp_local_block_size
+                    )
+                    local_chunk_starts = torch.empty(
+                        num_chunks, num_prefills, dtype=torch.int32, pin_memory=True
+                    ).copy_(
+                        torch.arange(num_chunks, dtype=torch.int32)
+                        .multiply_(padded_local_max_context_chunk_across_ranks)
+                        .unsqueeze(1)
+                    )
+                    local_chunk_ends = torch.min(
+                        padded_local_context_lens_cpu.unsqueeze(0),
+                        local_chunk_starts
+                        + padded_local_max_context_chunk_across_ranks,
+                    )
+                    padded_local_chunk_seq_lens = (
+                        local_chunk_ends - local_chunk_starts
+                    ).clamp(min=0)
+
+                    padded_local_cu_chunk_seq_lens_cpu = torch.zeros(
+                        num_chunks, num_prefills + 1, dtype=torch.int32, pin_memory=True
+                    )
+                    torch.cumsum(
+                        padded_local_chunk_seq_lens,
+                        dim=1,
+                        out=padded_local_cu_chunk_seq_lens_cpu[:, 1:],
+                        dtype=torch.int32,
+                    )
+                    max_padded_local_tokens_over_chunk = (
+                        padded_local_cu_chunk_seq_lens_cpu[:, -1].max().item()
+                    )
+                    padded_local_token_to_seq_tensor_cpu = torch.zeros(
+                        [num_chunks, max_padded_local_tokens_over_chunk],
+                        dtype=torch.int32,
+                    )
+                    for i in range(num_chunks):
+                        chunk_token_to_seq_tensor = torch.repeat_interleave(
+                            range_idx, padded_local_chunk_seq_lens[i]
+                        )
+                        chunk_len = chunk_token_to_seq_tensor.shape[0]
+                        padded_local_token_to_seq_tensor_cpu[i, :chunk_len] = (
+                            chunk_token_to_seq_tensor
+                        )
+
+                prefill_tokens_with_context = None
+                if num_prefills_with_context_cpu > 0:
+                    prefill_tokens_with_context = prefill_query_start_loc_cpu[
+                        num_prefills_with_context_cpu
+                    ].item()
+                _ChunkedMetadata = MLACommonPrefillMetadata.ChunkedContextMetadata
+                if self.dcp_world_size > 1:
+                    chunked_context_metadata = _ChunkedMetadata(
+                        cu_seq_lens=cu_seq_lens_cpu.to(device, non_blocking=True),
+                        starts=local_chunk_starts.to(device, non_blocking=True),
+                        seq_tot=padded_local_chunk_seq_lens.sum(dim=1).tolist(),
+                        max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
+                        seq_lens=chunk_seq_lens,
+                        token_to_seq=token_to_seq_tensor_cpu.to(
+                            device, non_blocking=True
+                        ),
+                        chunk_total_token=chunk_total_token.tolist(),
+                        workspace=self.chunked_prefill_workspace,
+                        padded_local_chunk_seq_lens=padded_local_chunk_seq_lens.tolist(),
+                        local_context_lens_allranks=local_context_lens_allranks.tolist(),
+                        padded_local_cu_seq_lens=padded_local_cu_chunk_seq_lens_cpu.to(
+                            device, non_blocking=True
+                        ),
+                        padded_local_token_to_seq=padded_local_token_to_seq_tensor_cpu.to(
+                            device, non_blocking=True
+                        ),
+                        cu_seq_lens_lst=cu_seq_lens_cpu.tolist(),
+                        chunk_size=padded_local_max_context_chunk_across_ranks,
+                        prefill_tokens_with_context=prefill_tokens_with_context,
+                    )
+                else:
+                    chunked_context_metadata = _ChunkedMetadata(
+                        cu_seq_lens=cu_seq_lens_cpu.to(device, non_blocking=True),
+                        starts=chunk_starts.to(device, non_blocking=True),
+                        seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
+                        max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
+                        seq_lens=chunk_seq_lens,
+                        token_to_seq=token_to_seq_tensor_cpu.to(
+                            device, non_blocking=True
+                        ),
+                        chunk_total_token=chunk_total_token,
+                        workspace=self.chunked_prefill_workspace,
+                        prefill_tokens_with_context=prefill_tokens_with_context,
+                    )
+
+                assert (
+                    max(chunked_context_metadata.max_seq_lens)
+                    <= self.chunked_prefill_workspace_size
+                )
+
+            prefill_metadata = self.prefill_metadata_cls(
+                block_table=block_table_tensor[reqs_start:, ...],
+                query_start_loc=prefill_query_start_loc,
+                max_query_len=max_query_len,
+                chunked_context=chunked_context_metadata,
+                output_dtype=self.model_config.dtype,
+                q_data_type=self.q_data_type,
+                prefill_backend=self._prefill_backend,
+            )
+            self._prefill_backend.prepare_metadata(prefill_metadata)
+
+        decode_metadata = None
+        if num_decodes > 0:
+            dcp_tot_seq_lens_device = None
+            if self.dcp_world_size > 1:
+                dcp_tot_seq_lens_device = seq_lens[:num_decodes]
+                seq_lens = dcp_local_seq_lens
+                num_partitions = self.dcp_world_size * self.cp_kv_cache_interleave_size
+                max_seq_len = (
+                    (max_seq_len + num_partitions - 1) // num_partitions
+                ) * self.cp_kv_cache_interleave_size
+
+            decode_metadata = self._build_decode(
+                block_table_tensor=block_table_tensor[:num_decodes, ...],
+                seq_lens_device=seq_lens[:num_decodes],
+                max_seq_len=max_seq_len,
+                query_start_loc_cpu=query_start_loc_cpu[: num_decodes + 1],
+                query_start_loc_device=query_start_loc[: num_decodes + 1],
+                num_decode_tokens=num_decode_tokens,
+                dcp_tot_seq_lens_device=dcp_tot_seq_lens_device,
+            )
+
+        metadata = self.metadata_cls(
+            num_reqs=common_attn_metadata.num_reqs,
+            max_query_len=common_attn_metadata.max_query_len,
+            max_seq_len=max_seq_len,
+            num_actual_tokens=num_tokens,
+            query_start_loc=query_start_loc,
+            slot_mapping=slot_mapping,
+            head_dim=self.model_config.get_head_size(),
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_prefills=num_prefills,
+            prefill=prefill_metadata,
+            decode=decode_metadata,
+        )
         if metadata.decode is not None and self.vllm_config.kv_transfer_config is not None:
             # for pd-mixed, TP is used, no need to use mc2_mask
             if self.vllm_config.kv_transfer_config.kv_role == "kv_consumer":

@@ -31,7 +31,6 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     AttentionCGSupport,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
 from omni_npu.compilation.utils import (
     capture_graph_task,
@@ -40,7 +39,10 @@ from omni_npu.compilation.utils import (
     OP_FIA_SINK,
 )
 
-from omni_npu.attention.backends.utils import register_attention_backend
+from omni_npu.attention.backends.utils import (
+    register_attention_backend,
+    split_decodes_and_prefills,
+)
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.plugin_decorators import attn_decorator
 from omni_npu.attention.backends.utils import CrossLayerSharedOp
