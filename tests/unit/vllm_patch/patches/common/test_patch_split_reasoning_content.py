@@ -391,5 +391,88 @@ def test_stream_generator_rewrites_named_tool_choice_stop():
     assert _payload(chunks[1])["choices"][0]["finish_reason"] == "tool_calls"
 
 
+@pytest.mark.parametrize("input_ascii", [False, True])
+@pytest.mark.parametrize(
+    "delta, expected_deltas",
+    [
+        ({"content": "杭州天气☀️"}, [{"content": "杭州天气☀️"}]),
+        (
+            {"tool_calls": [{"index": 0, "function": {
+                "name": "查询天气", "arguments": '{"城市":"杭州"}',
+            }}]},
+            [{"tool_calls": [{"index": 0, "function": {
+                "name": "查询天气", "arguments": '{"城市":"杭州"}',
+            }}]}],
+        ),
+        (
+            {"reasoning": "思考中🧠", "content": "杭州天气☀️"},
+            [{"reasoning": "思考中🧠"}, {"content": "杭州天气☀️"}],
+        ),
+        (
+            {"role": "assistant", "content": "", "reasoning": "思考中🧠"},
+            [{"role": "assistant", "reasoning": "思考中🧠"}],
+        ),
+        (
+            {"content": "", "reasoning_content": "思考中🧠"},
+            [{"reasoning_content": "思考中🧠"}],
+        ),
+    ],
+    ids=["content", "tools", "mixed", "empty-content", "reasoning-content"],
+)
+def test_sse_unicode_split_paths(input_ascii, delta, expected_deltas):
+    event = {"id": "unicode-test", "choices": [{"index": 0, "delta": delta}]}
+    raw = "data: " + json.dumps(event, ensure_ascii=input_ascii) + "\n\n"
+    outputs = split._maybe_split_sse_line(raw)
+    assert outputs is not None
+    actual_deltas = [_payload(line)["choices"][0]["delta"] for line in outputs]
+    assert actual_deltas == expected_deltas
+    for line in outputs:
+        assert line.startswith("data: ") and line.endswith("\n\n")
+        assert r"\u" not in line
+        assert any(ord(char) > 127 for char in line)
+        assert _payload(line)["id"] == "unicode-test"
+
+
+@pytest.mark.parametrize("input_ascii", [False, True])
+def test_sse_unicode_named_finish_rewrite(input_ascii):
+    event = {"choices": [{
+        "delta": {"content": "查询完成✅"}, "finish_reason": "stop",
+    }]}
+    raw = "data: " + json.dumps(event, ensure_ascii=input_ascii) + "\n\n"
+    output, saw_tools = split._rewrite_named_finish_reason_sse(
+        raw, saw_tool_calls=True,
+    )
+    assert saw_tools is True
+    assert "查询完成✅" in output
+    assert r"\u" not in output
+    expected = json.loads(json.dumps(event))
+    expected["choices"][0]["finish_reason"] = "tool_calls"
+    assert _payload(output) == expected
+
+
+def test_sse_unicode_tool_fragments_preserve_json_escapes():
+    # Tool arguments are JSON strings; literal backslashes must survive both layers.
+    arguments = json.dumps(
+        {"城市": "杭州", "文本": '第一行\n"引用"', "路径": r"C:\目录\u4e2d"},
+        ensure_ascii=False,
+    )
+    cut = arguments.index("杭州") + 1
+    fragments = [arguments[:cut], arguments[cut:]]
+    restored = []
+    for fragment in fragments:
+        event = {"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "function": {"arguments": fragment},
+        }]}}]}
+        raw = "data: " + json.dumps(event) + "\n\n"
+        outputs = split._maybe_split_sse_line(raw)
+        assert len(outputs) == 1
+        assert _payload(outputs[0]) == event
+        assert "杭" in outputs[0] or "州" in outputs[0]
+        call = _payload(outputs[0])["choices"][0]["delta"]["tool_calls"][0]
+        restored.append(call["function"]["arguments"])
+    assert "".join(restored) == arguments
+    assert json.loads("".join(restored)) == json.loads(arguments)
+
+
 if __name__ == "__main__":
     run_standalone_tests(globals())

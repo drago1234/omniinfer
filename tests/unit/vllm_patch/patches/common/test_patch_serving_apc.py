@@ -606,5 +606,49 @@ def test_patch_names_still_shadow_the_upstream_registrations():
         assert expected in names, f"{expected} no longer registered"
 
 
+@pytest.mark.parametrize("input_ascii", [False, True])
+@pytest.mark.parametrize("enable_details", [False, True])
+def test_sse_unicode_usage_normalization(input_ascii, enable_details):
+    event = {
+        "choices": [{"delta": {
+            "reasoning": "思考中🧠", "content": "杭州天气☀️",
+            "tool_calls": [{"index": 0, "function": {
+                "name": "查询天气", "arguments": '{"城市":"杭州"}',
+            }}],
+        }}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+    }
+    raw = "data: " + json.dumps(event, ensure_ascii=input_ascii) + "\n\n"
+    output = apc._normalize_usage_chunk(raw, 3, enable_details)
+    assert output.startswith("data: ") and output.endswith("\n\n")
+    assert r"\u" not in output
+    assert "思考中🧠" in output and "杭州天气☀️" in output
+    expected = json.loads(json.dumps(event))
+    expected["usage"]["prompt_tokens_details"] = (
+        {"cached_tokens": 3, "cached_rate": 0.3} if enable_details else None
+    )
+    assert json.loads(output[len("data: "):]) == expected
+
+
+@pytest.mark.parametrize("input_ascii", [False, True])
+def test_sse_unicode_named_finish_rewrite(input_ascii):
+    event = {"choices": [{"delta": {"tool_calls": [{
+        "index": 0, "function": {
+            "name": "查询天气", "arguments": '{"城市":"杭州"}',
+        },
+    }]}, "finish_reason": "stop"}]}
+    request = types.SimpleNamespace(tool_choice=types.SimpleNamespace(
+        function=types.SimpleNamespace(name="查询天气"),
+    ))
+    raw = "data: " + json.dumps(event, ensure_ascii=input_ascii) + "\n\n"
+    output = apc._rewrite_named_stream_finish_chunk(raw, request)
+    assert output.startswith("data: ") and output.endswith("\n\n")
+    assert r"\u" not in output
+    assert "查询天气" in output and "杭州" in output
+    expected = json.loads(json.dumps(event))
+    expected["choices"][0]["finish_reason"] = "tool_calls"
+    assert json.loads(output[len("data: "):]) == expected
+
+
 if __name__ == "__main__":
     run_standalone_tests(globals())
