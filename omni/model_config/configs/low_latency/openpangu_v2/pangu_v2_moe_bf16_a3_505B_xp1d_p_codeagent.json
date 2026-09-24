@@ -2,13 +2,14 @@
     "model_parallel_config": {
         "ena_seq_parallel": true,
         "ena_context_parallel": true,
-        "ena_swa_attn_seq_parallel": false,
+        "ena_swa_attn_seq_parallel": true,
         "sharded_o_proj": false,
-        "enable_flashcomm2": true,
+        "enable_flashcomm2": false,
         "layer_parallel_config": {}
     },
     "operator_optimization_config": {
         "moe_comm_strategy": "allgather_reducescatter",
+        "mome_sp_allgather_multi_stream": true,
         "moe_tbo_threshold": 14336,
         "enable_mome_sp": true,
         "use_aicpu_fa_tiling": true,
