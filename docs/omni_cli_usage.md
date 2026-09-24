@@ -235,7 +235,7 @@ omni_cli 会在命令执行路径创建配置文件，并依赖该配置文件�
 
 2. omni_cli start
 
-   功能：依据模板配置和配置推断，在已配置容器中，将推理服务拉起，包括ranktable生成、global proxy拉起。(ranktable生成是临时方案，动态扩缩容会去掉ranktable机制)。
+   功能：依据指定配置文件在已有容器中拉起推理服务。普通模式会生成 ranktable；只有配置文件同时包含非空的 C、P、D 分组时才会自动拉起 global proxy。`--run-dev` 和 `--proxy-only` 的行为见下方单角色部署说明。
 
    参数说明：
 
@@ -245,7 +245,7 @@ omni_cli 会在命令执行路径创建配置文件，并依赖该配置文件�
    >
    > --config_path:  使用指定omni_cli配置文件拉起服务，默认为 $pwd/server_profiles.yml
    >
-   > --run-dev: 开发者快速拉起，跳过ranktable生成和global proxy拉起。需确保已经进行normal拉起，完成ranktable生成和global proxy拉起。
+   > --run-dev: 开发者快速拉起，跳过 ranktable 生成和 global proxy 自动拉起。使用前需确保服务依赖的 ranktable 等文件已经准备完成；如需 Proxy，可再使用 `--proxy-only` 单独拉起。
    >    
    > --proxy-only: 仅拉起global proxy。
 
@@ -255,6 +255,65 @@ omni_cli 会在命令执行路径创建配置文件，并依赖该配置文件�
    omni_cli start --config_path server_profiles.yml
    ```
 
+#### 使用 P-only / D-only YAML
+
+单角色部署用于 OmniCache 场景；容器中的 connector 和 OX 需包含 dynamic OX（!2441）改动。P/D 可以分别启动，无需在本次 YAML 中配置另一侧节点。
+
+##### 1. 配置模板格式
+
+`tools/omni_cli/template/` 新增以下参考模板：
+
+| 模板 | 分组与主机 | 含义 |
+|---|---|---|
+| `cli_glm5_moe_w4a8c16_a2_p_only_p0.yaml` | `all.children.P.hosts` 下为 p0–p3；可选 `C.hosts.c0` | 一组四机 Prefill，p0 为 master；C 默认与 p0 同节点、同容器 |
+| `cli_glm5_moe_w4a8c16_a2_d_only_d0.yaml` | 仅 `all.children.D.hosts`，包含 d0–d3 | 一组四机 Decode，d0 为 master；不需要 P/C 分组 |
+
+模板中的 `127.0.0.x`、镜像、SSH 密钥、模型/日志路径、网卡和端口都需要按实际环境修改。每个主机保留完整的 `env`、`args`、容器及 SSH 配置。`ansible_host` 是当前节点地址，`host_ip` 和 `env.HOST_IP` 指向本组 master；P 侧 `LOCAL_HOST_IP` 是当前节点地址，`P_NODE_PORT_LIST` 是本组四台机器的 IP 列表（逗号分隔，不带端口）。`master_node` 填写 YAML 中的 master 主机名。
+
+文件名中的 p0/d0 表示实例；主机名 p0–p3/d0–d3 表示该实例内的四台机器。部署第二个 P 实例时，复制 P 模板并修改节点及相关配置即可。模板参数仅供参考，不可原样用于实际部署。
+
+##### 2. 使用 `--config_path` 指定操作范围
+
+`--config_path FILE` 让命令读取指定 YAML，只处理其中配置的主机；省略时使用当前目录的 `server_profiles.yml`。它不是节点发现功能，不会自动读取其他 YAML 或补全另一角色。`--deploy_path` 作为旧参数继续兼容。
+
+`start`、`stop`、`run_docker`、`sync_code`、`install_code`、`inspect`、`cfg`、`ls`、`add_node`、`rm_node` 均支持该参数。以下以 P-only 为例，D-only 使用同样流程替换配置路径：
+
+```bash
+# 创建容器；同名容器会被删除并重建
+omni_cli run_docker --config_path /path/to/p_only.yml
+
+# 可选：同步并安装代码。/path/to/code 下需有 omniinfer/ 子目录
+omni_cli sync_code --code_path /path/to/code --config_path /path/to/p_only.yml
+omni_cli install_code --config_path /path/to/p_only.yml
+
+# 启动 P/D，跳过配置自动检查和修正；ranktable 等依赖须已准备好
+omni_cli start --skip-verify-config --run-dev --config_path /path/to/p_only.yml
+
+# 停止该配置的 P/D 进程，保留容器
+omni_cli stop --config_path /path/to/p_only.yml
+```
+
+需要生成 ranktable 时，启动命令去掉 `--run-dev`。`--skip-verify-config` 只跳过配置检查与自动修正，不控制 Proxy；`stop` 不接受这两个参数，也不会停止 Proxy。
+
+##### 3. `--proxy-only` 与 Proxy 启动关系
+
+以下说明适用于实际启动模式（未使用 `--cloud-mode`）：
+
+| 启动方式 | P/D 服务 | Proxy | ranktable |
+|---|---|---|---|
+| `start`（普通模式） | 启动 YAML 中的 P/D | 仅当同一 YAML 同时有非空 C、P、D 时自动启动 | 生成 |
+| `start --run-dev` | 启动 YAML 中的 P/D | 不启动 | 不生成 |
+| `start --proxy-only` | 不启动 | 只启动 C 中配置的 Proxy | 不生成 |
+| `start --run-dev --proxy-only` | 不启动 | 同上一行，`--proxy-only` 优先 | 不生成 |
+
+P-only 即使保留 C，普通 `start` 也不会自动启动 Proxy。需要时单独执行：
+
+```bash
+omni_cli start --proxy-only --config_path /path/to/p_only.yml
+```
+
+该 YAML 需要包含 C 和 P。没有 D 时，CLI 使用不可用的 Decode 占位 endpoint，仅用于验证 Prefill 链路，不能完成完整 P/D 推理；需要完整推理时，Proxy 使用的 YAML 必须包含实际 P/D endpoint。不同 YAML 的 endpoint 不会自动合并。重复对同一 C 容器执行 Proxy-only 会重启并替换其 nginx 配置。
+
 3. omni_cli stop
 
    功能：在已配置容器中，将服务停止。注：不会停止配置容器之外的服务
@@ -262,11 +321,13 @@ omni_cli 会在命令执行路径创建配置文件，并依赖该配置文件�
    参数说明:
 
    > --help: 帮助信息
+   >
+   > --config_path: 指定配置文件；只停止该文件中 P/D 主机对应容器内的 Python、vLLM、Ray 和 OX 进程，不停止 Proxy
 
    使用示例：
 
    ```bash
-   omni_cli stop
+   omni_cli stop --config_path server_profiles.yml
    ```
 
 ### 开发工具
@@ -313,14 +374,14 @@ omni_cli 会在命令执行路径创建配置文件，并依赖该配置文件�
 
    > --help: 帮助信息
    >
-   > --deploy_path：配置文件路径，默认为 $pwd/server_profiles.yml
+   > --config_path：配置文件路径，默认为 $pwd/server_profiles.yml；旧参数 `--deploy_path` 继续兼容
    >
    > --dry_run：测试模式，只显示将要执行的操作而不实际执行
 
     使用示例：
 
    ```bash
-   omni_cli install_code
+   omni_cli install_code --config_path /path/to/server_profiles.yml
    ```
 
 4. omni_cli sync_code --code_path
@@ -333,14 +394,16 @@ omni_cli 会在命令执行路径创建配置文件，并依赖该配置文件�
    >
    > --code_path：要同步的代码路径（必需）。
    >
-   > --deploy_path：配置文件路径，默认为 $pwd/server_profiles.yml
+   > --config_path：配置文件路径，默认为 $pwd/server_profiles.yml；旧参数 `--deploy_path` 继续兼容
    >
    > --dry_run：测试模式，只显示将要执行的操作而不实际执行
 
     使用示例：
 
    ```bash
-   omni_cli sync_code --code_path /path/to/my/code   # 路径会被补全为 /path/to/my/code/omniinfer
+   omni_cli sync_code \
+     --config_path /path/to/server_profiles.yml \
+     --code_path /path/to/my/code   # 路径会被补全为 /path/to/my/code/omniinfer
    ```
 
 ## 开发计划

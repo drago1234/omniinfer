@@ -5,7 +5,10 @@ import tempfile
 import os
 import shlex
 
-def register_values(inventory):
+DUMMY_DECODE_API_SERVER = "127.0.0.1:1@1"
+
+
+def register_values(inventory, allow_dummy_decode=False):
     # calculate PREFILL_API_SERVER_LIST
     prefill_api_server_list = []
     
@@ -24,7 +27,8 @@ def register_values(inventory):
     # calculate DECODE_API_SERVER_LIST
     decode_api_server_list = []
     
-    for host, vars in inventory['all']['children']['D']['hosts'].items():
+    decode_hosts = inventory['all']['children'].get('D', {}).get('hosts', {})
+    for host, vars in decode_hosts.items():
         ip = vars.get('ansible_host', '')
         api_port_val = vars.get('env', {}).get('API_PORT', '')
 
@@ -43,6 +47,9 @@ def register_values(inventory):
             entry = f"{ip}:{api_port_val}@{num}"
             if entry not in decode_api_server_list:
                 decode_api_server_list.append(entry)
+
+    if allow_dummy_decode and not decode_hosts:
+        decode_api_server_list.append(DUMMY_DECODE_API_SERVER)
 
     decode_api_server_list_result = ','.join(decode_api_server_list)
 
@@ -108,7 +115,7 @@ def process_results(results, inventory, inv_file, cloud_mode=False):
         args: Dict[str, Any] = vars.get("args", {}) or {}
         prefill_max_num_seqs = args.get('extra-args', {}).get('max-num-seqs', prefill_max_num_seqs)
 
-    for _, vars in inventory['all']['children']['D']['hosts'].items():
+    for _, vars in inventory['all']['children'].get('D', {}).get('hosts', {}).items():
         args: Dict[str, Any] = vars.get("args", {}) or {}
         decode_max_num_seqs = args.get('extra-args', {}).get('max-num-seqs', decode_max_num_seqs)
 
@@ -205,11 +212,11 @@ def _double_quotes(s: str) -> str:
     return f'"{s}"'
 
 
-def omni_run_proxy(inventory, cloud_mode=False):
+def omni_run_proxy(inventory, cloud_mode=False, allow_dummy_decode=False):
     inv_file = Path(inventory).expanduser().resolve()
     inv = None
     with open(inv_file, "r", encoding="utf-8") as f:
         inv = yaml.safe_load(f)
     
-    result = register_values(inv)
+    result = register_values(inv, allow_dummy_decode=allow_dummy_decode)
     process_results(result, inv, inv_file, cloud_mode=cloud_mode)

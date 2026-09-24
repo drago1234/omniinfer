@@ -283,16 +283,6 @@ def _verify_and_fix_env_vars(
                         break
     need_overwrite_inv = len(conflicts) > 0
 
-    # calculate pod num, server ip list and server offset, kv rank
-    server_ip_list_temp = []
-    for host, hv in inventory['all']['children']['D']['hosts'].items():
-        ip = hv.get('ansible_host', None)
-        if ip:
-            server_ip_list_temp.append(f"{ip}")
-
-    # update num_dp_dict
-    server_ip_list = ','.join(server_ip_list_temp)
-
     ## update inventory
     need_overwrite_inv = False
     for host, hv in all_hosts:
@@ -335,11 +325,6 @@ def _verify_and_fix_env_vars(
                 else:
                     hv.get("env", {})["RANK_TABLE_FILE_PATH"] = f"$(ls {rank_table_save_path}/decode_config/local_*.json)"
             print(f"{INFO} host={host} RANK_TABLE_FILE_PATH set to {hv.get('env', {})['RANK_TABLE_FILE_PATH']}")
-        if "SERVER_IP_LIST" in hv.get("env", {}):
-            if hv.get("env", {}).get("SERVER_IP_LIST") != server_ip_list:
-                need_overwrite_inv = True
-                hv.get("env", {})["SERVER_IP_LIST"] = server_ip_list
-                print(f"{INFO} host={host} SERVER_IP_LIST set to {server_ip_list}")
         if "SERVER_OFFSET" in hv.get("env", {}):
             server_offset = pod_info.get("server_offset", {}).get(host, None)
             if server_offset is not None and hv.get("env", {}).get("SERVER_OFFSET") != server_offset:
@@ -465,7 +450,7 @@ def omni_cli_start(
     skip_verify_config: bool = False,
     dev: bool = False,
     proxy_only: bool = False,
-    cloud_mode: bool = False
+    cloud_mode: bool = False,
 ) -> None:
     """
     Read inventory YAML, generate a per-host bash script, and run it via:
@@ -476,25 +461,40 @@ def omni_cli_start(
         return
     else:
         print(f"{INFO} Use inventory at:", inventory_path)
-    if not dev:
-        omni_ranktable(inventory_path)
-
-    if proxy_only:
-        omni_cli.proxy.omni_run_proxy(inventory_path)
-        return
 
     inv_file = Path(inventory_path).expanduser().resolve()
-    with open(inventory_path, "r", encoding="utf-8") as f:
+    with open(inv_file, "r", encoding="utf-8") as f:
         inv = yaml.safe_load(f)
+    inventory_root = inv.get("all", inv)
+    role_groups = inventory_root.get("children") or {}
+    proxy_hosts = (
+        (role_groups.get("C") or {}).get("hosts")
+        or {}
+    )
+    prefill_hosts = (role_groups.get("P") or {}).get("hosts") or {}
+    decode_hosts = (role_groups.get("D") or {}).get("hosts") or {}
+    all_hosts = _walk_hosts(inventory_root)
+
+    if proxy_only:
+        if not proxy_hosts:
+            raise RuntimeError("No proxy hosts found in inventory.")
+        omni_cli.proxy.omni_run_proxy(
+            inventory_path,
+            cloud_mode=cloud_mode,
+            allow_dummy_decode=True,
+        )
+        return
+
+    if not dev:
+        omni_ranktable(inventory_path)
 
     cluster_info = ClusterInfo(inv)
     if not skip_verify_config:
         _verify_and_fix_env_vars(cluster_info, inv, inv_file)
 
-    if (not dev) or cloud_mode:
+    if ((not dev) or cloud_mode) and proxy_hosts and prefill_hosts and decode_hosts:
         omni_cli.proxy.omni_run_proxy(inventory_path, cloud_mode=cloud_mode)
 
-    all_hosts = _walk_hosts(inv.get("all", inv))
     if not role_filter:
         role_filter = ["prefill", "decode"]
     selected: List[Tuple[str, Dict[str, Any]]] = []
@@ -593,10 +593,11 @@ echo "{python_bin} {entry_py} {args_line} >> {log_path}/omni_cli.log 2>&1 &" >> 
         try:
             return_code = execute_command(cmd) # 0 for success
             if return_code == 0:
-                for host, vars in inv['all']['children']['C']['hosts'].items():
-                    print("\nServer is available at: http://" + vars.get('ansible_host', '') \
-                        + ":" + str(vars.get('env').get('API_PORT', '')))
-                    print("\n\n")
+                if prefill_hosts and decode_hosts:
+                    for host, vars in proxy_hosts.items():
+                        print("\nServer is available at: http://" + vars.get('ansible_host', '') \
+                            + ":" + str(vars.get('env').get('API_PORT', '')))
+                        print("\n\n")
             else:
                 print(f"{ERROR} ansible command failed with return code {return_code}")
         finally:
@@ -700,7 +701,7 @@ def get_host_groups(inv_data: dict) -> Dict[str, List[str]]:
 def sync_code(
     inventory_path,
     dry_run: bool = False,
-    code_path: str = None
+    code_path: str = None,
 ) -> None:
     """Sync code to all relevant hosts and containers with minimal output"""
     if not code_path:
@@ -1095,6 +1096,9 @@ def run_docker_containers(
         --device=/dev/devmm_svm \\
         --entrypoint=bash \\
         -v /tmp:/tmp \\
+        -v /data:/data \\
+        -v /home:/home \\
+        -v /sfs-asset-inference-ci:/sfs-asset-inference-ci \\
         -v /tmp/scripts_path:/tmp/scripts_path \\
         -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \\
         -v /usr/local/dcmi:/usr/local/dcmi \\
@@ -1241,7 +1245,7 @@ def main():
     # START command configuration
     start_parser = subparsers.add_parser("start", help="Start the omni services")
     start_parser.add_argument(
-        "--config_path",
+        "--config_path", "--deploy_path",
         nargs='?',
         default=None,
         help='Start in normal mode with config file'
@@ -1268,7 +1272,7 @@ def main():
     stop_parser=subparsers.add_parser("stop", help="Stop the omni service")
     # 添加 --config_path 参数
     stop_parser.add_argument(
-        "--config_path",
+        "--config_path", "--deploy_path",
         default=None,
         help="Path to the configuration file"
     )
@@ -1288,7 +1292,7 @@ def main():
     cfg_group.add_argument("--delete", action='store_true', help="Delete configuration keys (e.g., --key)")
     # 添加 --config_path 参数
     cfg_parser.add_argument(
-        "--config_path",
+        "--config_path", "--deploy_path",
         default=None,
         help="Path to the configuration file"
     )
@@ -1301,6 +1305,11 @@ def main():
     # INSPECT command configuration
     inspect_parser = subparsers.add_parser("inspect", help="Inspect Configuration")
     inspect_parser.add_argument('name', nargs=1, help='Node name (e.g., prefill_0)')
+    inspect_parser.add_argument(
+        "--config_path", "--deploy_path",
+        default=None,
+        help="Path to the configuration file",
+    )
 
     # UPGRADE command configuration
     subparsers.add_parser("upgrade", help="Upgrade packages")
@@ -1311,8 +1320,9 @@ def main():
     # LS command configuration
     ls_parser = subparsers.add_parser("ls", help="Print the node list")
     ls_parser.add_argument(
-        "--deploy_path",
-        default=str(default_deploy_path),
+        "--config_path", "--deploy_path",
+        dest="deploy_path",
+        default=None,
         help=f"Path to server_profiles.yml (default: {default_deploy_path})"
     )
     ls_parser.set_defaults(func=lambda args:print_node_list(
@@ -1321,8 +1331,9 @@ def main():
     # ADD_NODE command configuration
     addnode_parser = subparsers.add_parser("add_node", help="Add a node to server_profiles.yml")
     addnode_parser.add_argument(
-        "--deploy_path",
-        default=str(default_deploy_path),
+        "--config_path", "--deploy_path",
+        dest="deploy_path",
+        default=None,
         help=f"Path to server_profiles.yml (default: {default_deploy_path})"
     )
     addnode_parser.add_argument("--role", required=True, choices=['P', 'D', 'C'], help="Node role")
@@ -1344,8 +1355,9 @@ def main():
     rmnode_parser = subparsers.add_parser("rm_node", help="Remove a node from server_profiles.yml")
     rmnode_parser.add_argument("--role", required=True, choices=['P', 'D', 'C'], help="Node role")
     rmnode_parser.add_argument(
-        "--deploy_path",
-        default=str(default_deploy_path),
+        "--config_path", "--deploy_path",
+        dest="deploy_path",
+        default=None,
         help=f"Path to server_profiles.yml (default: {default_deploy_path})"
     )
     rmnode_parser.add_argument("--name", required=True, help="Node name to remove")
@@ -1354,7 +1366,7 @@ def main():
     # RUN_DOCKER command configuration
     run_docker_parser = subparsers.add_parser("run_docker", help="Run Docker containers based on inventory")
     run_docker_parser.add_argument(
-        "--config_path", "-i",
+        "--config_path", "--deploy_path", "-i",
         default=None,
         help=f"Path to server_profiles.yml (default: {default_deploy_path})"
     )
@@ -1364,14 +1376,15 @@ def main():
         help="Dry run mode - show what would be done without executing"
     )
     run_docker_parser.set_defaults(func=lambda args: run_docker_containers(
-        inventory_path=str(default_deploy_path),
-        dry_run=args.dry_run
+        inventory_path=args.config_path,
+        dry_run=args.dry_run,
     ))
     # SYNC_CODE command configuration
     sync_parser = subparsers.add_parser("sync_code", help="Developer mode: Synchronize the code")
     sync_parser.add_argument(
-        "--deploy_path",
-        default=str(default_deploy_path),
+        "--config_path", "--deploy_path",
+        dest="deploy_path",
+        default=None,
         help=f"Path to server_profiles.yml (default: {default_deploy_path})"
     )
     sync_parser.add_argument(
@@ -1380,18 +1393,18 @@ def main():
         help="Show what would be done without making any changes"
     )
     sync_parser.add_argument("--code_path", required=True, help="code_path")
-
     sync_parser.set_defaults(func=lambda args:sync_code(
         inventory_path=args.deploy_path,
         dry_run=args.dry_run,
-        code_path=args.code_path
+        code_path=args.code_path,
     ))
 
     # INSTALL_CODE command configuration
     install_parser = subparsers.add_parser("install_code", help="Developer mode: Install packages")
     install_parser.add_argument(
-        "--deploy_path",
-        default=str(default_deploy_path),
+        "--config_path", "--deploy_path",
+        dest="deploy_path",
+        default=None,
         help=f"Path to server_profiles.yml (default: {default_deploy_path})"
     )
     install_parser.add_argument(
@@ -1401,7 +1414,7 @@ def main():
     )
     install_parser.set_defaults(func=lambda args:install_code(
         inventory_path=args.deploy_path,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
     ))
 
     args = parser.parse_args()
@@ -1409,27 +1422,31 @@ def main():
         if args.command == 'run':
             args.func(args)
             return
-        if  hasattr(args, 'config_path') and args.config_path is not None:
-            default_deploy_path = args.config_path
-        else:
-            args.deploy_path = get_default_deploy_path(args.command)
-            default_deploy_path = args.deploy_path
+        config_path = getattr(args, 'config_path', None)
+        deploy_path = getattr(args, 'deploy_path', None)
+        default_deploy_path = config_path or deploy_path or get_default_deploy_path(args.command)
+        if hasattr(args, 'config_path'):
+            args.config_path = default_deploy_path
+        if hasattr(args, 'deploy_path'):
+            args.deploy_path = default_deploy_path
         args.func(args)
         return
     else:
-        if not hasattr(args, 'config_path') or (args.config_path is None and args.normal is None):
-            args.deploy_path = get_default_deploy_path(args.command)
-            default_deploy_path = args.deploy_path
-        else:
-            if args.config_path is None:
-                default_deploy_path = args.normal
-            if args.normal is None:
-                default_deploy_path = args.config_path
+        if hasattr(args, 'config_path'):
+            normal_path = getattr(args, 'normal', None)
+            if isinstance(normal_path, list):
+                normal_path = normal_path[0]
+            default_deploy_path = (
+                args.config_path
+                or normal_path
+                or get_default_deploy_path(args.command)
+            )
+            args.config_path = default_deploy_path
 
     if args.command == "start" and not any([args.normal, args.run_dev]):
         args.normal = True
     # set config_path for args.command
-    if args.config_path is None:
+    if hasattr(args, 'config_path') and args.config_path is None:
         args.config_path = default_deploy_path
 
     if args.command == "start":
@@ -1473,4 +1490,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

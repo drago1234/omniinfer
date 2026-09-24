@@ -29,6 +29,8 @@
     # Configure the storage path of the ranktable file.
     default_ranktable_save_path: "/tmp/ranktable_save_path"
     ranktable_save_path: "{{ (hostvars[inventory_hostname].env | default({})).get('RANKTABLE_SAVE_PATH', default_ranktable_save_path) }}"
+    ranktable_hosts: "{{ groups.get('P', []) + groups.get('D', []) }}"
+    ranktable_coordinator: "{{ ranktable_hosts | first | default('') }}"
 
     docker_exec_cmd: |
       docker exec \
@@ -60,6 +62,24 @@
       decode_ranktable_list=$(echo "$decode_ranktable_list" | awk '$1=$1' | tr ',' ' ')
       prefill_merge_ranktable_list="{{ PREFILL_MERGE_RANKTABLE_LIST }}"
       prefill_merge_ranktable_list=$(echo "$prefill_merge_ranktable_list" | awk '$1=$1' | tr ',' ' ')
+
+      # A decode-only deployment only needs its local/merged decode
+      # ranktables. There is no cross-role global ranktable to generate.
+      if [ -z "$(echo "${prefill_merge_ranktable_list}" | tr -d '[:space:];,')" ]; then
+        if [ "$DECODE_POD_NUM" -gt 1 ]; then
+          python /workspace/omniinfer/tools/scripts/pd_ranktable_tools.py \
+          --mode merge-local \
+          --local-ranktable-list ${decode_ranktable_list} \
+          --save-dir ${RANKTABLE_SAVE_PATH}/global/collect_files_d || exit $?
+        elif [ "$DECODE_POD_NUM" -eq 1 ]; then
+          # merge-local requires at least two files; keep the same output
+          # path for a single decode host by copying its generated table.
+          cp "${decode_ranktable_list}" \
+            "${RANKTABLE_SAVE_PATH}/global/collect_files_d/local_ranktable_merge.json" || exit $?
+        fi
+        exit 0
+      fi
+
       prefill_local_ranktable_merge=""
       IFS=';' read -ra parts <<< ${prefill_merge_ranktable_list}
 
@@ -104,6 +124,12 @@
           fi
         fi
       done
+
+      # A prefill-only deployment only needs its local/merged prefill
+      # ranktables. There is no cross-role global ranktable to generate.
+      if [ -z "$(echo "${decode_ranktable_list}" | tr -d '[:space:],')" ]; then
+        exit 0
+      fi
 
       api_server_files=$(ls collect_files_p/api/*.json | head -1)
 
@@ -168,7 +194,7 @@
 
     - name: Register all values.
       set_fact:
-        DECODE_POD_NUM: "{{ groups['D'] | length }}"
+        DECODE_POD_NUM: "{{ groups['D'] | default([]) | length }}"
         PREFILL_MERGE_RANKTABLE_LIST: >-
           {% set result=[] %}
           {% set element = namespace(entry="") %}
@@ -232,7 +258,7 @@
         content: "{{ generate_global_ranktable_cmd }}"
         dest: "$SCRIPTS_PATH/generate_global_ranktable.sh"
         mode: '0750'
-      when: "'P' in group_names and inventory_hostname == groups['P'][0]"
+      when: "ranktable_hosts | length > 0 and inventory_hostname == ranktable_coordinator"
       tags: ranktable
 
     - name: Create the path used to store the global ranktable file.
@@ -356,36 +382,35 @@
         - d_dynamic_files.matched > 0
       tags: ranktable
 
-    - name: The executor synchronizes the files to the first prefill instances.
+    - name: The executor synchronizes the files to the ranktable coordinator.
       synchronize:
         src: "{{ item }}"
         dest: "{{ ranktable_save_path }}/global"
       loop:
         - "{{ ranktable_save_path }}/collect_files_p"
         - "{{ ranktable_save_path }}/collect_files_d"
-      when: "'P' in group_names and inventory_hostname == groups['P'][0]"
+      when: "ranktable_hosts | length > 0 and inventory_hostname == ranktable_coordinator"
       tags: ranktable
 
-    - name: Generate the global ranktable file on the first prefill instances.
+    - name: Generate the global ranktable file on the ranktable coordinator.
       command: bash -c "{{ docker_generate_global_cmd }}"
       environment:
         DOCKER_NAME_P: "{{ ACTUAL_DOCKER_NAME_P }}"
         DECODE_POD_NUM: "{{ DECODE_POD_NUM }}"
-      when: "'P' in group_names and inventory_hostname == groups['P'][0]"
+      when: "ranktable_hosts | length > 0 and inventory_hostname == ranktable_coordinator"
       tags: ranktable
 
-    - name: Forward the global ranktable file of the first prefill instances to the executor.
+    - name: Forward the coordinator ranktable files to the executor.
       ansible.builtin.synchronize:
         mode: pull
         src: "{{ ranktable_save_path }}/global/"
         dest: "{{ ranktable_save_path }}/global/"
-      when: "'P' in group_names and inventory_hostname == groups['P'][0]"
+      when: "ranktable_hosts | length > 0 and inventory_hostname == ranktable_coordinator"
       tags: ranktable
 
     - name: The executor synchronizes the global ranktable file to all instances.
       synchronize:
         src: "{{ ranktable_save_path }}/global/"
         dest: "{{ ranktable_save_path }}/global/"
-      when: "inventory_hostname != groups['P'][0]"
+      when: "ranktable_hosts | length > 0 and inventory_hostname != ranktable_coordinator"
       tags: ranktable
-
