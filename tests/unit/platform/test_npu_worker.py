@@ -284,6 +284,85 @@ def test_needs_dp_local_rank_offset(overrides, expected):
     assert _needs_dp_local_rank_offset(parallel_config) is expected
 
 
+@pytest.mark.parametrize(
+    "world_ranks",
+    [None, [0, 1], [1, 3], [3, 1], [2, 3]],
+    ids=["none", "leading", "subset", "reordered", "non-zero-based"],
+)
+def test_init_device_forwards_world_ranks(monkeypatch, world_ranks):
+    """`world_ranks` must reach the distributed init helper unchanged.
+
+    omni-rl passes `world_ranks` on `init_worker`: a rollout replica's
+    communication world covers only a subset of the training world's ranks.
+    NPUWorker stores it in `__init__`, so testing the helper alone cannot tell
+    whether `init_device()` actually forwards it - dropping the argument
+    silently falls back to `init_distributed_environment()` on the default full
+    world. Capture the helper's arguments to pin the hand-off itself, including
+    the exact order of the ranks and `None` staying `None` (not `[]`).
+    """
+
+    class DistributedInitReached(Exception):
+        pass
+
+    captured = {}
+
+    def capture(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        raise DistributedInitReached
+
+    worker = SimpleNamespace(
+        device_config=SimpleNamespace(device=SimpleNamespace(type="npu")),
+        # "ray" keeps init_device out of the local-rank remapping branch, so
+        # the local_rank asserted below is the one that was passed in.
+        parallel_config=SimpleNamespace(distributed_executor_backend="ray"),
+        model_config=SimpleNamespace(dtype="float16"),
+        vllm_config="vllm-config-sentinel",
+        rank=1,
+        local_rank=1,
+        distributed_init_method="tcp://localhost:12345",
+        world_ranks=world_ranks,
+    )
+    platform = SimpleNamespace(
+        device_type="npu",
+        dist_backend="hccl",
+        logical_device_id_to_visible_device_id=lambda local_rank: local_rank,
+        check_if_supports_dtype=lambda dtype: None,
+    )
+    monkeypatch.setattr("omni_npu.worker.npu_worker.current_platform", platform)
+    monkeypatch.setattr("omni_npu.worker.npu_worker.torch.device", lambda spec: spec)
+    monkeypatch.setattr(
+        "omni_npu.worker.npu_worker.torch.npu.set_device", lambda device: None
+    )
+    monkeypatch.setattr(
+        "omni_npu.worker.npu_worker._patch_npu_triton_capabilities", lambda: None
+    )
+    monkeypatch.setattr(
+        "omni_npu.worker.npu_worker.init_worker_distributed_environment", capture
+    )
+
+    init_device = getattr(NPUWorker.init_device, "__wrapped__", NPUWorker.init_device)
+    with pytest.raises(DistributedInitReached):
+        init_device(worker)
+
+    assert captured["args"] == (
+        "vllm-config-sentinel",
+        1,
+        "tcp://localhost:12345",
+        1,
+        "hccl",
+    )
+    assert list(captured["kwargs"]) == ["world_ranks"]
+    forwarded = captured["kwargs"]["world_ranks"]
+    if world_ranks is None:
+        assert forwarded is None
+    else:
+        # Identity is not required, but the order is: the ranks index into the
+        # externally created world group.
+        assert forwarded == world_ranks
+        assert isinstance(forwarded, list)
+
+
 class TestNpuWorker:
 
     def setup_method(self):

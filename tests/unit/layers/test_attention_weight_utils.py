@@ -9,11 +9,13 @@ from torch import nn
 
 from omni_npu.v1.layers.attention import weight_utils as wu_mod
 from omni_npu.v1.layers.attention.weight_utils import (
+    get_npu_mla_logical_weight,
     install_q_b_split_loaders,
     load_sharded_param_weight,
     mark_split_q_up_params_loaded,
     release_q_b_proj_storage,
 )
+from omni_npu.v1.layers.linear import UnquantizedFlashCommLinearMethod
 
 
 pytestmark = pytest.mark.unit
@@ -31,6 +33,41 @@ class _AttentionWithSplitQ(nn.Module):
         self.q_b_proj = _Projection()
         self.q_b_nope_proj = _Projection()
         self.q_b_pe_proj = _Projection()
+
+
+def test_mla_logical_weight_normalizes_loader_and_compute_layouts():
+    logical = torch.arange(16 * 8, dtype=torch.float32).view(16, 8)
+    loader_layer = SimpleNamespace(
+        weight=logical,
+        quant_method=UnquantizedFlashCommLinearMethod(),
+    )
+    compute = logical.T.contiguous()
+    compute.is_weight_transposed = True
+    compute_layer = SimpleNamespace(
+        weight=compute,
+        quant_method=UnquantizedFlashCommLinearMethod(),
+    )
+
+    loader_result = get_npu_mla_logical_weight(loader_layer, torch.float32)
+    compute_result = get_npu_mla_logical_weight(compute_layer, torch.float32)
+
+    torch.testing.assert_close(loader_result, logical)
+    torch.testing.assert_close(compute_result, logical)
+
+
+def test_mla_logical_weight_returns_tensor_instead_of_parameter():
+    weight = nn.Parameter(torch.ones(2, 2), requires_grad=False)
+    layer = SimpleNamespace(
+        weight=weight,
+        quant_method=UnquantizedFlashCommLinearMethod(),
+    )
+
+    result = get_npu_mla_logical_weight(layer, weight.dtype)
+
+    assert isinstance(result, torch.Tensor)
+    assert not isinstance(result, nn.Parameter)
+    assert result is not weight
+    assert layer.weight is weight
 
 
 def test_marks_split_projection_params_when_source_was_loaded():

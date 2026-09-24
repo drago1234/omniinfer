@@ -899,6 +899,15 @@ class TestNPUDSAImplUpdateSinkKV(unittest.TestCase):
         self.assertEqual(impl.sink_len, sink_len, "sink_len should be set to the first dimension of sink_compressed_kv")
 
 
+class TestNPUDSAImplParseMQAQuery(unittest.TestCase):
+    def test_rejects_query_that_was_not_absorbed_by_outer_layer(self):
+        impl = SimpleNamespace(kv_lora_rank=8, qk_rope_head_dim=2)
+        raw_query = torch.zeros(1, 2, 6)
+
+        with self.assertRaisesRegex(RuntimeError, "requires q to be absorbed"):
+            mla_mod.NPUDSAImpl._parse_mqa_q(impl, raw_query)
+
+
 class TestNPUDSAImplApplySparseAttention(unittest.TestCase):
     def test_apply_sparse_attention(self):
         """Test _apply_sparse_attention with basic functionality including sink."""

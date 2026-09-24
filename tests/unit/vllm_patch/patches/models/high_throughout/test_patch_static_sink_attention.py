@@ -6,10 +6,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from omni_npu.v1.layers.attention.npu_mla import NPUMLAAttention
 from omni_npu.vllm_patches.patches.models.high_throughout.patch_static_sink_attention import (
     StaticSinkAttentionPatch,
     create_static_sink_attention_backendPatch,
 )
+
+
+def test_static_sink_mla_uses_npu_wrapper_subclass():
+    assert issubclass(
+        StaticSinkAttentionPatch.StaticSinkMLAAttention,
+        NPUMLAAttention,
+    )
 
 
 class _FakeBuilder:

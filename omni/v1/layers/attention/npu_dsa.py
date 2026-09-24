@@ -9,7 +9,6 @@ import torch
 import torch_npu
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
-from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_dcp_group,
@@ -28,19 +27,9 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 try:
-    from vllm.model_executor.layers.attention.static_sink_attention import StaticSinkMLAAttention
-except ImportError:
-    logger.warning("StaticSinkMLAAttention has not being defined, skipping...")
-
-try:
     from vllm.model_executor.layers.mome import AggregateConv
 except ImportError:
     logger.warning("AggregateConv has not being defined, skipping...")
-
-try:
-    from vllm.model_executor.layers.npumome import MomeAttention
-except ImportError:
-    logger.warning("MomeAttention has not being defined, skipping...")
 
 from omni_npu.attention import ops
 from omni_npu.attention.backends.dsa import NPUDSAMetadata
@@ -61,7 +50,10 @@ from omni_npu.layers.mhc.mhc_deferred import (
 from omni_npu.layers.utils import SIDE_STREAM_NAME, named_stream
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.plugin_decorators import attn_decorator
-from omni_npu.v1.layers.attention.npu_mla import MomeAttentionMixin
+from omni_npu.v1.layers.attention.npu_mla import (
+    MomeAttentionMixin,
+    NPUMLAAttention,
+)
 from omni_npu.v1.layers.attention.weight_utils import (
     install_q_b_split_loaders,
     release_q_b_proj_storage,
@@ -342,7 +334,6 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, torch.nn.Module):
         self.prefix = prefix
         self.layer_idx = extract_layer_index(prefix)
         self.quant_symbol = quant_config is not None
-        self._init_wuk_t_uv = False
         self.is_pd_disagg = vllm_config.kv_transfer_config is not None
 
         self.kv_nz = model_extra_config.operator_opt_config.kv_nz
@@ -557,12 +548,16 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, torch.nn.Module):
                 )
 
         if self.param_sink_number == 0:
-            self.attn = MLAAttention(
+            self.attn = NPUMLAAttention(
                 **self._inner_mla_attn_kwargs(cache_config, quant_config, prefix),
                 use_sparse=True,
                 indexer=self.indexer,
             )
         else:
+            from vllm.model_executor.layers.attention.static_sink_attention import (
+                StaticSinkMLAAttention,
+            )
+
             self.attn = StaticSinkMLAAttention(
                 **self._static_sink_attn_base_kwargs(
                     cache_config, quant_config, prefix
@@ -609,18 +604,6 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, torch.nn.Module):
             self.indexer.ki_stream = self.ki_stream
 
     def post_weight_load(self):
-        if self._init_wuk_t_uv and getattr(self.attn.impl, "W_UK_T", None) is not None:
-            is_weight_nz = getattr(self.kv_b_proj.weight, "is_weight_nz", False)
-            if is_weight_nz:
-                self.kv_b_proj.weight.data = torch_npu.npu_format_cast(self.kv_b_proj.weight.data, torch_npu.Format.ND)
-            self.attn.impl.process_weights_after_loading(self.kv_b_proj.weight.dtype)
-            if is_weight_nz:
-                self.kv_b_proj.weight.data = torch_npu.npu_format_cast(
-                    self.kv_b_proj.weight.data, torch_npu.Format.FRACTAL_NZ
-                )
-        else:
-            self._init_wuk_t_uv = True
-
         if self.param_sink_number > 0:
             param_sink_compressed_kv = self.kv_a_layernorm(self.param_sink_compressed_kv)
             self.attn.update_sink_kv(self.param_sink_k_pe, param_sink_compressed_kv)
@@ -676,7 +659,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, torch.nn.Module):
         return q_nope, q_pe  # TND
 
     def _q_nope_absorb(self, q_nope: torch.Tensor) -> torch.Tensor:
-        absorb = self.attn.impl.W_UK_T
+        absorb = self.attn.W_UK_T
         if absorb.size(-1) % 128 != 0 or absorb.size(-2) % 128 != 0:
             return (q_nope.transpose(0, 1) @ absorb).transpose(1, 0)
 
@@ -778,7 +761,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, torch.nn.Module):
 
         return torch_npu.npu_transpose_batchmatmul(
             **args,  # TND -> NTD
-            weight=self.attn.impl.W_UV,  # [N, L, V]
+            weight=self.attn.W_UV,  # [N, L, V]
             perm_y=(1, 0, 2),  # NTD -> TND
         ).reshape(out.size(0), -1)  # [T, NV]
 
@@ -795,7 +778,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, torch.nn.Module):
             token_x=x.view(bs, 1, -1),
             weight_dq=self.q_a_proj.weight,  # BF16, NZ
             weight_uq_qr=self.q_b_proj.weight,  # BF16, NZ
-            weight_uk=self.attn.impl.W_UK_T,  # BF16, ND
+            weight_uk=self.attn.W_UK_T,  # BF16, ND
             weight_dkv_kr=self.kv_a_proj_with_mqa.weight,  # BF16, NZ
             rmsnorm_gamma_cq=self.q_a_layernorm.weight,
             rmsnorm_gamma_ckv=self.kv_a_layernorm.weight,

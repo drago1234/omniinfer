@@ -5,6 +5,56 @@ import torch
 from torch import nn
 
 
+def get_npu_mla_logical_weight(
+    layer: nn.Module,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a FlashComm weight in MLA's logical ``[out, in]`` layout."""
+    from omni_npu.v1.layers.linear import (
+        FlashCommLinearMethodBase,
+        UnquantizedFlashCommLinearMethod,
+    )
+
+    quant_method = getattr(layer, "quant_method", None)
+    if not isinstance(quant_method, FlashCommLinearMethodBase):
+        raise TypeError("layer is not backed by a FlashComm linear method")
+    if not isinstance(quant_method, UnquantizedFlashCommLinearMethod):
+        raise NotImplementedError(
+            "MLA wrapper refresh only supports unquantized FlashComm "
+            f"weights, got {type(quant_method).__name__}"
+        )
+
+    weight = layer.weight
+    if weight.dim() != 2:
+        raise RuntimeError(
+            "invalid FlashComm MLA weight: "
+            f"shape={tuple(weight.shape)}, expected a 2D tensor"
+        )
+
+    logical_weight = weight
+    if getattr(weight, "is_weight_nz", False):
+        if weight.is_meta:
+            raise RuntimeError("cannot materialize an NPU NZ weight from meta")
+        import torch_npu
+
+        logical_weight = torch_npu.npu_format_cast(
+            logical_weight,
+            torch_npu.Format.ND,
+        )
+    if getattr(weight, "is_weight_transposed", False):
+        logical_weight = logical_weight.T
+    return logical_weight.detach().to(out_dtype)
+
+
+def refresh_mla_wrappers(model: nn.Module, dtype: torch.dtype) -> None:
+    """Refresh each MLA wrapper once without re-running linear PWAL."""
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+
+    for module in model.modules():
+        if isinstance(module, MLAAttention):
+            module.process_weights_after_loading(dtype)
+
+
 def _plain_layout(param: torch.Tensor) -> torch.Tensor:
     """Materialize the pre-PWAL (out, in) layout of a possibly NZ/transposed
     weight without disturbing the stored tensor (mirrors the veRL reload
@@ -238,11 +288,9 @@ def load_sharded_param_weight(
 
 
 def run_post_weight_load(model: nn.Module) -> None:
-    """Drive DSA/MLA second-phase weight processing (absorb / sink / conv merge)."""
+    """Drive NPU post-load processing such as sink and conv merging."""
     for _, module in model.named_modules():
         if module is model:
             continue
         if hasattr(module, "post_weight_load"):
             module.post_weight_load()
-        if hasattr(module, "absorb_kv_b_weights"):
-            module.absorb_kv_b_weights()

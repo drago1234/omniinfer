@@ -122,12 +122,18 @@ class NPUWorker(Worker):
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
             # available memory
+            # world_ranks is an omni-rl extension carried on init_worker: a
+            # rollout replica's communication world covers only a subset of
+            # the training world's ranks. Dropping it here silently builds
+            # the model-parallel groups on the default full world, so
+            # collectives wait on ranks that belong to another replica.
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
                 self.distributed_init_method,
                 self.local_rank,
                 current_platform.dist_backend,
+                world_ranks=self.world_ranks,
             )
 
             # Initialize the model best practice configs.
