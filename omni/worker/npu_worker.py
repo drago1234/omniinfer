@@ -256,18 +256,21 @@ class NPUWorker(Worker):
         peak_activation = after_profile.torch_peak - before_profile.torch_peak
 
         total = after_profile.total_memory
+        kv_offload_reserved = _kv_offload_reserved_bytes(self.vllm_config)
         available = int(
             total * self.cache_config.gpu_memory_utilization
             - weights_memory
             - peak_activation
             - non_torch_increase
+            - kv_offload_reserved
         )
 
         logger.info(
             f"Available KV cache memory: {GiB(available):.2f} GiB "
             f"(total={GiB(total):.2f}, util={self.cache_config.gpu_memory_utilization}, "
             f"weights={GiB(weights_memory):.2f}, peak_torch_activation_during_profile_run={GiB(peak_activation):.2f}, "
-            f"non_torch_memory_increase_during_profile_run={GiB(non_torch_increase):.2f})"
+            f"non_torch_memory_increase_during_profile_run={GiB(non_torch_increase):.2f}, "
+            f"kv_offload_reserved={GiB(kv_offload_reserved):.2f})"
         )
         return max(available, 0)
 
@@ -606,6 +609,25 @@ def _needs_dp_local_rank_offset(parallel_config) -> bool:
         # so local_rank is shard-local and must not be offset by the DP rank.
         return False
     return True
+
+
+def _kv_offload_reserved_bytes(vllm_config: VllmConfig) -> int:
+    """Device bytes the NPU KV offload takes after the KV cache is allocated.
+
+    Only the sharded load holds any (see sharded_load_reserved_bytes); 0 when
+    NPUOffloadingConnector is not configured, alone or inside MultiConnector.
+    """
+    kv = vllm_config.kv_transfer_config
+    if kv is None:
+        return 0
+    extra = kv.kv_connector_extra_config or {}
+    names = {kv.kv_connector}
+    names.update(c.get("kv_connector") for c in extra.get("connectors", ()) if isinstance(c, dict))
+    if "NPUOffloadingConnector" not in names:
+        return 0
+    from omni_npu.v1.kv_offload.cpu.npu_worker import sharded_load_reserved_bytes
+
+    return sharded_load_reserved_bytes(vllm_config.parallel_config.tensor_parallel_size)
 
 
 def _patch_npu_triton_capabilities() -> None:

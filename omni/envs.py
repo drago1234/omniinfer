@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     OMNI_DP_ROUND_ROBIN: bool
     OMNI_PD_BENCH_ALIGNED_DECODE_THRESHOLD: int
     OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE: bool
+    OMNI_KV_OFFLOAD_SHARDED_LOAD: bool
 
 
 def _as_bool(raw: str) -> bool:
@@ -575,6 +576,15 @@ env_variables: Dict[str, Callable[[], Any]] = {
 
     "OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE":
     lambda: get_env_with_fallback("OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE", None, False, _as_bool),
+
+    # Sharded DDR->NPU load for replicated KV layouts: each TP rank copies
+    # 1/tp of the blocks and the TP group all-gathers the rest. Off by
+    # default; when a deployment that turns it on does not qualify, every rank
+    # falls back to the plain load and startup logs
+    # "kv_offload sharded load: OFF (<reason>)". Must be the same on every rank.
+    # Consumers: v1/kv_offload/cpu/npu_worker.py:_make_sharded_load.
+    "OMNI_KV_OFFLOAD_SHARDED_LOAD":
+    lambda: get_env_with_fallback("OMNI_KV_OFFLOAD_SHARDED_LOAD", None, False, _as_bool),
 
     # =========================================================================
     # Benchmark gates (not for production serving)

@@ -8,6 +8,7 @@ import torch
 from omni_npu.profiler.wrapper import _to_bool
 from omni_npu.worker.npu_worker import (
     NPUWorker,
+    _kv_offload_reserved_bytes,
     _needs_dp_local_rank_offset,
     _patch_npu_triton_capabilities,
 )
@@ -642,6 +643,26 @@ class TestNpuWorker:
         result = worker.determine_available_memory()
         # available = 2000 * 0.9 - 300 - (500-400) - (250-100) = 1800 - 300 - 100 - 150 = 1250
         assert result == 1250
+
+    def test_determine_available_memory_keeps_kv_offload_out_of_kv_cache(self, monkeypatch):
+        """What the KV offload holds after the KV cache is allocated comes out of
+        the KV cache budget, not out of the (1 - util) margin."""
+        worker = self._create_worker(monkeypatch)
+        worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=None, gpu_memory_utilization=0.9)
+        worker.model_runner.profile_run = MagicMock()
+        worker.model_runner.model_memory_usage = 300
+        worker.init_snapshot = SimpleNamespace(non_torch_memory=100)
+
+        def measure(self):
+            self.torch_peak, self.torch_memory, self.free_memory = 400, 600, 1000
+            self.total_memory, self.cuda_memory, self.non_torch_memory = 2000, 1000, 100
+            self.timestamp = 0.0
+
+        monkeypatch.setattr(MemorySnapshot, "measure", measure)
+        with patch("omni_npu.worker.npu_worker._kv_offload_reserved_bytes", return_value=200):
+            # 2000 * 0.9 - 300 - 0 - 0 - 200
+            assert worker.determine_available_memory() == 1300
+
 
     def test_determine_available_memory_reset_peak_exception(self, monkeypatch):
         """Test determine_available_memory with reset_peak_memory_stats exception handling.
@@ -1879,3 +1900,29 @@ class TestInitWorldGroup:
         # (it should remain at its default value)
         assert not hasattr(mock_group_coordinator, 'use_local_synchronization') or \
                mock_group_coordinator.use_local_synchronization != True
+
+
+def _kv_config(kv_connector, connectors=None):
+    extra = {} if connectors is None else {"connectors": [{"kv_connector": c} for c in connectors]}
+    return SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_connector=kv_connector, kv_connector_extra_config=extra),
+        parallel_config=SimpleNamespace(tensor_parallel_size=16),
+    )
+
+
+@pytest.mark.parametrize(
+    "config,reserved",
+    [
+        (SimpleNamespace(kv_transfer_config=None), 0),
+        (_kv_config("LLMDataDistConnector"), 0),
+        (_kv_config("NPUOffloadingConnector"), 7),
+        (_kv_config("MultiConnector", ["LLMDataDistConnector", "NPUOffloadingConnector"]), 7),
+    ],
+)
+def test_kv_offload_reserved_bytes(config, reserved):
+    with patch(
+        "omni_npu.v1.kv_offload.cpu.npu_worker.sharded_load_reserved_bytes", return_value=7
+    ) as fn:
+        assert _kv_offload_reserved_bytes(config) == reserved
+    if reserved:
+        fn.assert_called_once_with(16)
