@@ -30,11 +30,16 @@ def connected_sender(sender_config):
     """
     返回一个已模拟连接状态的 Sender 实例。
     - 不调用真实的 connect()，避免真实 ZMQ 依赖。
-    - 手动设置 _connected=True 并注入 AsyncMock 的 socket。
+    - 手动设置 _connected=True 并注入 socket。注意 zmq.asyncio.Socket 只在
+      recv/send/poll 上是协程，getsockopt 仍是同步调用（返回 int），因此 socket
+      用 Mock 而不是 AsyncMock：getsockopt 默认返回 POLLOUT（队列可写），
+      send_multipart 用 AsyncMock。
     """
     sender = NetworkTransportFactory.create(sender_config)
     sender._connected = True
-    sender.socket = AsyncMock()  # 模拟 socket，所有方法均为 AsyncMock
+    sender.socket = Mock()
+    sender.socket.getsockopt = Mock(return_value=zmq.POLLOUT)
+    sender.socket.send_multipart = AsyncMock(return_value=None)
     sender.context = None  # 不需要 context，因为 send 中未使用
     return sender
 
@@ -62,20 +67,18 @@ class TestZmqAsyncPubSender:
     async def test_send_success(self, connected_sender):
         """
         场景：正常发送成功
-        预期：返回 True，且 send_multipart 被正确调用一次（参数正确，flags=zmq.NOBLOCK）
+        预期：返回 True，且 send_multipart 被正确调用一次（队列是否可写由 POLLOUT
+            预判，不再依赖 zmq.Again，因此不带 flags=zmq.NOBLOCK）
         """
         hash_key = "test_key"
         payload = b"test_payload"
 
-        # Mock send_multipart normally return (no exception)
-        connected_sender.socket.send_multipart = AsyncMock(return_value=None)
-
         result = await connected_sender.send(hash_key, payload)
 
         assert result is True
+        connected_sender.socket.getsockopt.assert_called_with(zmq.EVENTS)
         connected_sender.socket.send_multipart.assert_awaited_once_with(
             [hash_key.encode("utf-8"), payload],
-            flags=zmq.NOBLOCK,
         )
 
     @pytest.mark.asyncio
@@ -102,14 +105,14 @@ class TestZmqAsyncPubSender:
     @pytest.mark.asyncio
     async def test_send_queue_full(self, connected_sender):
         """
-        场景：发送队列满，抛出 zmq.Again
-        预期：返回 False，记录 debug 日志（包含 DROP 和 QUEUE_FULL），不记录 warning
+        场景：发送队列满（POLLOUT 未置位，即 SNDHWM 已满）
+        预期：在锁外预判即返回 False，记录 info 日志（含 DROP 和 QUEUE_FULL），不发送
         """
         hash_key = "key"
         payload = b"data"
 
-        # Let send_multipart throw zmq.Again
-        connected_sender.socket.send_multipart = AsyncMock(side_effect=zmq.Again())
+        # POLLOUT 未置位 => 队列满
+        connected_sender.socket.getsockopt = Mock(return_value=0)
 
         with patch("omni_npu.connector.mm_feature_transfer.mm_feature_connector.network_connector.logger") as mock_logger:
             result = await connected_sender.send(hash_key, payload)
@@ -119,6 +122,80 @@ class TestZmqAsyncPubSender:
                 hash_key,
                 len(payload),
             )
+            connected_sender.socket.send_multipart.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_queue_full_after_lock(self, connected_sender):
+        """
+        场景：锁外预判可写，但在拿到发送锁后队列已被填满（锁内复核不可写）
+        预期：返回 False，记录 info 日志（含 DROP 和 QUEUE_FULL），不发送并释放锁
+        """
+        hash_key = "key"
+        payload = b"data"
+
+        # 第一次（锁外预判）可写，第二次（锁内复核）不可写
+        connected_sender.socket.getsockopt = Mock(side_effect=[zmq.POLLOUT, 0])
+
+        with patch("omni_npu.connector.mm_feature_transfer.mm_feature_connector.network_connector.logger") as mock_logger:
+            result = await connected_sender.send(hash_key, payload)
+            assert result is False
+            mock_logger.info.assert_called_once_with(
+                "ZmqAsyncSubSender[DROP] key=%s, size=%s, reason=QUEUE_FULL",
+                hash_key,
+                len(payload),
+            )
+            connected_sender.socket.send_multipart.assert_not_awaited()
+            # 丢弃路径也必须释放发送锁，否则后续发送会一直 LOCK_TIMEOUT
+            assert connected_sender._send_lock.locked() is False
+
+    @pytest.mark.asyncio
+    async def test_send_lock_timeout(self, connected_sender):
+        """
+        场景：发送锁被占用超过 _send_lock_timeout（同一 socket 的并发发送需串行化）
+        预期：非阻塞重试直到超过截止点后返回 False，记录 info 日志（含 DROP 和
+            LOCK_TIMEOUT），不发送；重试间隔用 _send_lock_retry_interval
+        """
+        hash_key = "key"
+        payload = b"data"
+
+        connected_sender._send_lock_timeout = 0.02
+        assert connected_sender._send_lock.acquire(blocking=False) is True
+
+        retries = []
+
+        async def fake_sleep(delay):
+            retries.append(delay)
+
+        with patch("omni_npu.connector.mm_feature_transfer.mm_feature_connector.network_connector.logger") as mock_logger:
+            with patch("omni_npu.connector.mm_feature_transfer.mm_feature_connector.network_connector.asyncio.sleep", fake_sleep):
+                result = await connected_sender.send(hash_key, payload)
+            assert result is False
+            mock_logger.info.assert_called_once_with(
+                "ZmqAsyncSubSender[DROP] key=%s, size=%s, reason=LOCK_TIMEOUT",
+                hash_key,
+                len(payload),
+            )
+            connected_sender.socket.send_multipart.assert_not_awaited()
+
+        # 是"重试到超时"，不是只试一次；且间隔取自常量而非写死
+        assert len(retries) > 1
+        assert set(retries) == {connected_sender._send_lock_retry_interval}
+
+    def test_send_lock_is_usable_across_event_loops(self, connected_sender):
+        """
+        场景：base.py 兜底路径为每次 save 新起线程 + 新 loop，同一 socket 会被不同
+            event loop 调用（修复记录 2.4）
+        预期：锁是 threading 原语，跨 loop 可用；若退回 asyncio.Lock，第二次调用会抛
+            RuntimeError: ... is bound to a different event loop（实测曾 41,206 次报错
+            / 20,612 个线程异常，期间 P 一条 mm 特征都发不出去）
+        """
+        assert not isinstance(connected_sender._send_lock, asyncio.Lock)
+
+        assert asyncio.run(connected_sender.send("key", b"data")) is True
+        assert asyncio.run(connected_sender.send("key", b"data")) is True
+
+        assert connected_sender.socket.send_multipart.await_count == 2
+        assert connected_sender._send_lock.locked() is False
 
     @pytest.mark.asyncio
     async def test_send_zmq_error(self, connected_sender):
@@ -143,6 +220,8 @@ class TestZmqAsyncPubSender:
                 error.errno,
             )
             mock_logger.warning.assert_called_once_with("ZMQ send error: %s", error)
+            # 发送失败同样必须释放发送锁
+            assert connected_sender._send_lock.locked() is False
 
 
 class TestZmqAsyncSubReceiver:
@@ -219,6 +298,40 @@ class TestZmqAsyncSubReceiver:
             mock_logger.warning.assert_called_once_with(f"Receive error: {error}")
             bound_receiver.poller.poll.assert_awaited_once()
             bound_receiver.socket.recv_multipart.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_receive_non_zmq_error(self, bound_receiver):
+        """
+        场景：recv_multipart 抛非 ZMQ 异常（帧边界被破坏后解包得到的 ValueError 等）
+        预期：被 receive 兜住并告警返回 None，不再冒泡到 run_forever 让接收线程退出
+        """
+        bound_receiver.poller.poll = AsyncMock(return_value=[(bound_receiver.socket, zmq.POLLIN)])
+        bound_receiver.socket.recv_multipart = AsyncMock(side_effect=ValueError("bad frames"))
+
+        with patch("omni_npu.connector.mm_feature_transfer.mm_feature_connector.network_connector.logger") as mock_logger:
+            result = await bound_receiver.receive()
+            assert result is None
+            mock_logger.warning.assert_called_once_with("Receive error: bad frames")
+
+    @pytest.mark.asyncio
+    async def test_receive_unexpected_frame_count(self, bound_receiver):
+        """
+        场景：recv_multipart 返回的段数不是 2（帧边界曾因并发发送被破坏）
+        预期：记录 error 日志并丢弃整条消息，返回 None，不抛异常（接收线程继续存活）
+        """
+        frames = [b"key_bytes", b"payload_bytes", b"extra"]
+        bound_receiver.poller.poll = AsyncMock(return_value=[(bound_receiver.socket, zmq.POLLIN)])
+        bound_receiver.socket.recv_multipart = AsyncMock(return_value=frames)
+
+        with patch("omni_npu.connector.mm_feature_transfer.mm_feature_connector.network_connector.logger") as mock_logger:
+            result = await bound_receiver.receive()
+            assert result is None
+            mock_logger.error.assert_called_once_with(
+                "Unexpected MM feature frame count=%d (expect 2); dropped. "
+                "first_frames=%r",
+                len(frames),
+                [f[:24] for f in frames[:4]],
+            )
 
     def test_bind_success(self, receiver):
         """
@@ -459,6 +572,56 @@ class TestNetworkMMFeatureConnector:
                 assert call_args[0] == "MMFeatureConnector local save failed for key %s: %s"
                 assert call_args[1] == mm_hash
                 assert "Save failed" in str(call_args[2])
+
+    @pytest.mark.asyncio
+    async def test_run_forever_receive_error_keeps_running(self, connector, mock_transport):
+        """receive 抛异常：兜底捕获 + 退避 0.1s 后继续循环，接收线程不退出"""
+        failures = 3
+        receive_calls = 0
+
+        async def receive_side_effect():
+            nonlocal receive_calls
+            receive_calls += 1
+            if receive_calls <= failures:
+                raise RuntimeError(f"receive failed #{receive_calls}")
+            connector._running = False
+            return None
+
+        mock_transport.receive.side_effect = receive_side_effect
+
+        sleeps = []
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+
+        with patch("omni_npu.connector.mm_feature_transfer.mm_feature_connector.network_connector.logger") as mock_logger:
+            with patch("omni_npu.connector.mm_feature_transfer.mm_feature_connector.network_connector.asyncio.sleep", fake_sleep):
+                await connector.run_forever()
+
+        assert mock_logger.error.call_count == failures
+        for idx, call in enumerate(mock_logger.error.call_args_list, start=1):
+            assert call[0][0] == "MMFeatureConnector receive loop error: %s"
+            assert str(call[0][1]) == f"receive failed #{idx}"
+        assert sleeps == [NetworkMMFeatureConnector._RECV_ERROR_BACKOFF_SECONDS] * failures
+        # 异常没有中断循环：第 failures 次之后仍然继续调用 receive
+        assert receive_calls == failures + 1
+
+    @pytest.mark.asyncio
+    async def test_run_forever_cancelled_propagates(self, connector, mock_transport):
+        """场景：接收循环被取消（CancelledError）
+        预期：直接向上传播、不当普通异常吞掉（否则线程无法退出），且不做退避等待。
+            run_forever 只捕 Exception，而 CancelledError 属于 BaseException，本用例
+            守住这个前提：谁把捕获范围放大到 BaseException，这个用例就会红
+        """
+        mock_transport.receive.side_effect = asyncio.CancelledError()
+
+        with patch("omni_npu.connector.mm_feature_transfer.mm_feature_connector.network_connector.logger") as mock_logger:
+            with patch("omni_npu.connector.mm_feature_transfer.mm_feature_connector.network_connector.asyncio.sleep", AsyncMock()) as mock_sleep:
+                with pytest.raises(asyncio.CancelledError):
+                    await connector.run_forever()
+
+                mock_logger.error.assert_not_called()
+                mock_sleep.assert_not_awaited()
 
 
 class TestPayloadPackUnpack:

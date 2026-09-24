@@ -74,6 +74,9 @@ class ZmqAsyncPubSender(NetworkSender):
         self.context: zmq.asyncio.Context | None = None
         self.socket: zmq.asyncio.Socket | None = None
         self._connected = False
+        self._send_lock = threading.Lock()
+        self._send_lock_timeout = 2.0
+        self._send_lock_retry_interval = 0.001
 
     def connect(self) -> None:
         """Create the context and socket, then connect."""
@@ -102,19 +105,31 @@ class ZmqAsyncPubSender(NetworkSender):
             return False
 
         try:
-            await self.socket.send_multipart(
-                [hash_key.encode("utf-8"), payload],
-                flags=zmq.NOBLOCK,
-            )
+            if not self._writable():
+                logger.info(
+                    "ZmqAsyncSubSender[DROP] key=%s, size=%s, reason=QUEUE_FULL",
+                    hash_key, len(payload)
+                )
+                return False
+            if not await self._acquire_send_lock():
+                logger.info(
+                    "ZmqAsyncSubSender[DROP] key=%s, size=%s, reason=LOCK_TIMEOUT",
+                    hash_key, len(payload)
+                )
+                return False
+            try:
+                if not self._writable():
+                    logger.info(
+                        "ZmqAsyncSubSender[DROP] key=%s, size=%s, reason=QUEUE_FULL",
+                        hash_key, len(payload)
+                    )
+                    return False
+                await self.socket.send_multipart(
+                    [hash_key.encode("utf-8"), payload],
+                )
+            finally:
+                self._send_lock.release()
             return True
-
-        except zmq.Again:
-            # SNDHWM reached; drop the message.
-            logger.info(
-                "ZmqAsyncSubSender[DROP] key=%s, size=%s, reason=QUEUE_FULL", 
-                hash_key, len(payload)
-            )
-            return False
 
         except zmq.ZMQError as e:
             # Network errors, socket closed, etc.
@@ -124,6 +139,19 @@ class ZmqAsyncPubSender(NetworkSender):
             )
             logger.warning("ZMQ send error: %s", e)
             return False
+
+    def _writable(self) -> bool:
+        return bool(self.socket.getsockopt(zmq.EVENTS) & zmq.POLLOUT)
+
+    async def _acquire_send_lock(self) -> bool:
+        """Bounded wait for the send lock; returns False on timeout."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._send_lock_timeout
+        while not self._send_lock.acquire(blocking=False):
+            if loop.time() > deadline:
+                return False
+            await asyncio.sleep(self._send_lock_retry_interval)
+        return True
 
     def close(self) -> None:
         """Cleanly shut down the socket and context."""
@@ -201,11 +229,20 @@ class ZmqAsyncSubReceiver(NetworkReceiver):
 
         try:
             # Recv multipart: [hash_bytes, payload]
-            hash_bytes, payload = await self.socket.recv_multipart()
-            return hash_bytes.decode("utf-8"), payload
-        except zmq.ZMQError as e:
+            frames = await self.socket.recv_multipart()
+        except Exception as e:
             logger.warning(f"Receive error: {e}")
             return None
+
+        if len(frames) != 2:
+            logger.error(
+                "Unexpected MM feature frame count=%d (expect 2); dropped. "
+                "first_frames=%r",
+                len(frames), [f[:24] for f in frames[:4]],
+            )
+            return None
+
+        return frames[0].decode("utf-8"), frames[1]
 
     def close(self) -> None:
         """Cleanly shut down the socket and context."""
@@ -239,6 +276,8 @@ class NetworkTransportFactory:
 
 
 class NetworkMMFeatureConnector(BaseMMFeatureConnector):
+    _RECV_ERROR_BACKOFF_SECONDS = 0.1
+
     def __init__(self, config: ConnectorConfig, local_conn: BaseMMFeatureConnector) -> None:
         super().__init__(config)
         self.local_conn = local_conn
@@ -305,19 +344,23 @@ class NetworkMMFeatureConnector(BaseMMFeatureConnector):
                 logger.error("MMFeatureConnector local save failed for key %s: %s", hash_key, e)
 
         while self._running:
-            result = await self.transport.receive()
-            if result:
-                hash_key, payload = result
-                metadata, tensors, state = unpack_complex_payload(payload)
-                logger.debug("MMFeatureConnector received MM feature %s", hash_key)
+            try:
+                result = await self.transport.receive()
+                if result:
+                    hash_key, payload = result
+                    metadata, tensors, state = unpack_complex_payload(payload)
+                    logger.debug("MMFeatureConnector received MM feature %s", hash_key)
 
-                # Hand off to the storage handler.
-                # If handler.handle is CPU-heavy, consider using:
-                #   await asyncio.get_running_loop().run_in_executor(None, self.handler.handle, hash_key, payload)
-                # For now, we call it directly (assuming it's async or fast).
-                task = asyncio.create_task(self.local_conn.save(hash_key, metadata, tensors, state))
-                task.add_done_callback(done_callback)
-            # else: timeout, just loop again (yield control via await above)
+                    # Hand off to the storage handler.
+                    # If handler.handle is CPU-heavy, consider using:
+                    #   await asyncio.get_running_loop().run_in_executor(None, self.handler.handle, hash_key, payload)
+                    # For now, we call it directly (assuming it's async or fast).
+                    task = asyncio.create_task(self.local_conn.save(hash_key, metadata, tensors, state))
+                    task.add_done_callback(done_callback)
+                # else: timeout, just loop again (yield control via await above)
+            except Exception as e:
+                logger.error("MMFeatureConnector receive loop error: %s", e)
+                await asyncio.sleep(self._RECV_ERROR_BACKOFF_SECONDS)
 
         logger.info("NetworkMMFeatureConnector stopped listening")
  
