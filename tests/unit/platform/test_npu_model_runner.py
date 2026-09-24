@@ -19,7 +19,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from tests.unit.platform.utils import create_vllm_config
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 
 @contextmanager
@@ -1196,30 +1196,48 @@ class TestNPUModelRunner:
     def test_post_weight_load_calls_model_hook(self, monkeypatch):
         post_weight_load = MagicMock()
         model = SimpleNamespace(post_weight_load=post_weight_load)
+        refresh_mla_wrappers = MagicMock()
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.refresh_mla_wrappers",
+            refresh_mla_wrappers,
+        )
         monkeypatch.setattr(self.runner, "get_model", lambda: model)
         monkeypatch.setattr(self.runner, "get_drafter_model", lambda: None)
         capture_model = MagicMock()
         monkeypatch.setattr(self.runner, "capture_model", capture_model)
-        self.runner.model_config = SimpleNamespace(enable_sleep_mode=False,
-                                                   enforce_eager=False)
+        self.runner.model_config = SimpleNamespace(
+            enable_sleep_mode=False,
+            enforce_eager=False,
+            dtype=torch.bfloat16,
+        )
 
         self.runner.model_post_weight_load()
 
         post_weight_load.assert_called_once_with()
+        refresh_mla_wrappers.assert_called_once_with(model, torch.bfloat16)
 
     def test_post_weight_load_skips_capture_when_enforce_eager(self, monkeypatch):
         post_weight_load = MagicMock()
         model = SimpleNamespace(post_weight_load=post_weight_load)
+        refresh_mla_wrappers = MagicMock()
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.refresh_mla_wrappers",
+            refresh_mla_wrappers,
+        )
         monkeypatch.setattr(self.runner, "get_model", lambda: model)
         monkeypatch.setattr(self.runner, "get_drafter_model", lambda: None)
         capture_model = MagicMock()
         monkeypatch.setattr(self.runner, "capture_model", capture_model)
-        self.runner.model_config = SimpleNamespace(enable_sleep_mode=False,
-                                                   enforce_eager=True)
+        self.runner.model_config = SimpleNamespace(
+            enable_sleep_mode=False,
+            enforce_eager=True,
+            dtype=torch.bfloat16,
+        )
 
         self.runner.model_post_weight_load()
 
         post_weight_load.assert_called_once_with()
+        refresh_mla_wrappers.assert_called_once_with(model, torch.bfloat16)
         capture_model.assert_not_called()
 
     def test_post_weight_load_calls_drafter_hook_with_sleep_mode(self, monkeypatch):
@@ -1234,6 +1252,11 @@ class TestNPUModelRunner:
         drafter_post_weight_load = MagicMock()
         model = SimpleNamespace(post_weight_load=model_post_weight_load)
         drafter_model = SimpleNamespace(post_weight_load=drafter_post_weight_load)
+        refresh_mla_wrappers = MagicMock()
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.refresh_mla_wrappers",
+            refresh_mla_wrappers,
+        )
         monkeypatch.setattr(self.runner, "get_model", lambda: model)
         monkeypatch.setattr(self.runner, "get_drafter_model", lambda: drafter_model)
 
@@ -1249,8 +1272,11 @@ class TestNPUModelRunner:
                             set_cfg_context)
         capture_model = MagicMock()
         monkeypatch.setattr(self.runner, "capture_model", capture_model)
-        self.runner.model_config = SimpleNamespace(enable_sleep_mode=True,
-                                                   enforce_eager=False)
+        self.runner.model_config = SimpleNamespace(
+            enable_sleep_mode=True,
+            enforce_eager=False,
+            dtype=torch.bfloat16,
+        )
 
         self.runner.model_post_weight_load()
 
@@ -1259,19 +1285,32 @@ class TestNPUModelRunner:
         set_cfg_context.assert_called_once_with(self.runner.vllm_config)
         model_post_weight_load.assert_called_once_with()
         drafter_post_weight_load.assert_called_once_with()
+        assert refresh_mla_wrappers.call_args_list == [
+            call(model, torch.bfloat16),
+            call(drafter_model, torch.bfloat16),
+        ]
         capture_model.assert_not_called()
 
     def test_post_weight_load_skips_when_missing_hook(self, monkeypatch):
         model = SimpleNamespace()
+        refresh_mla_wrappers = MagicMock()
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.refresh_mla_wrappers",
+            refresh_mla_wrappers,
+        )
         monkeypatch.setattr(self.runner, "get_model", lambda: model)
         monkeypatch.setattr(self.runner, "get_drafter_model", lambda: None)
         capture_model = MagicMock()
         monkeypatch.setattr(self.runner, "capture_model", capture_model)
-        self.runner.model_config = SimpleNamespace(enable_sleep_mode=False,
-                                                   enforce_eager=True)
+        self.runner.model_config = SimpleNamespace(
+            enable_sleep_mode=False,
+            enforce_eager=True,
+            dtype=torch.bfloat16,
+        )
 
         self.runner.model_post_weight_load()
 
+        refresh_mla_wrappers.assert_called_once_with(model, torch.bfloat16)
         capture_model.assert_not_called()
 
     def test_execute_model_uses_switch(self, monkeypatch):

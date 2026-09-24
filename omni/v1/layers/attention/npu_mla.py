@@ -7,7 +7,6 @@ import torch
 import torch_npu
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
@@ -17,6 +16,11 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.attention import (
+    set_default_quant_scales,
+    should_load_quant_weights,
+)
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
@@ -32,16 +36,6 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from omni_npu.v1.distributed.parallel_state_ext import get_layer_parallel_group
 
 logger = init_logger(__name__)
-
-try:
-    from vllm.model_executor.layers.attention.static_sink_attention import StaticSinkMLAAttention
-except ImportError:
-    logger.warning("StaticSinkMLAAttention has not being defined, skipping...")
-
-try:
-    from vllm.model_executor.layers.npumome import MomeAttention
-except ImportError:
-    logger.warning("MomeAttention has not being defined, skipping...")
 
 try:
     from vllm.model_executor.layers.mome import AggregateConv
@@ -71,11 +65,13 @@ from omni_npu.layers.mhc.mhc_deferred import (
 from omni_npu.layers.utils import SIDE_STREAM_NAME, named_stream
 from omni_npu.plugin_decorators import attn_decorator
 from omni_npu.v1.layers.attention.weight_utils import (
+    get_npu_mla_logical_weight,
     install_q_b_split_loaders,
     release_q_b_proj_storage,
 )
 from omni_npu.v1.layers.linear import (
     ColumnParallelFlashCommLinear,
+    FlashCommLinearMethodBase,
     RowParallelFlashCommLinear,
 )
 from omni_npu.v1.layers.utils import (
@@ -97,6 +93,80 @@ npu_fused_infer_attention_sink_metadata: CrossLayerSharedOp | None = None
 npu_ai_infra_attention_pioneer_metadata: CrossLayerSharedOp | None = None
 
 
+def _uses_flashcomm(layer) -> bool:
+    return isinstance(
+        getattr(layer, "quant_method", None),
+        FlashCommLinearMethodBase,
+    )
+
+
+def _stable_replace(
+    owner: MLAAttention,
+    name: str,
+    current: torch.Tensor,
+) -> None:
+    """Install once, then refresh without changing the tensor address."""
+    current = current.contiguous()
+    previous = getattr(owner, name, None)
+    if previous is None:
+        setattr(owner, name, current)
+        return
+
+    previous_spec = (previous.shape, previous.dtype, previous.device)
+    current_spec = (current.shape, current.dtype, current.device)
+    if previous_spec != current_spec:
+        raise RuntimeError(
+            f"cannot refresh MLA {name} in place: "
+            f"old={previous_spec}, new={current_spec}"
+        )
+    with torch.no_grad():
+        previous.copy_(current)
+
+
+class NPUMLAAttention(MLAAttention):
+    """MLA wrapper that owns NPU-derived absorb weights."""
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        if not _uses_flashcomm(self.kv_b_proj):
+            super().process_weights_after_loading(act_dtype)
+            return
+
+        kv_b_proj_weight = get_npu_mla_logical_weight(
+            self.kv_b_proj,
+            act_dtype,
+        ).T
+        expected_shape = (
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+        )
+        if kv_b_proj_weight.shape != expected_shape:
+            raise RuntimeError(
+                "invalid FlashComm kv_b_proj weight for MLA: "
+                f"shape={tuple(kv_b_proj_weight.shape)}, "
+                f"expected={expected_shape}"
+            )
+
+        kv_b_proj_weight = kv_b_proj_weight.view(
+            self.kv_lora_rank,
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        )
+        w_uk, w_uv = kv_b_proj_weight.split(
+            [self.qk_nope_head_dim, self.v_head_dim],
+            dim=-1,
+        )
+        _stable_replace(self, "W_UK_T", w_uk.permute(1, 2, 0))
+        _stable_replace(self, "W_UV", w_uv.transpose(0, 1))
+
+        quant_method = (
+            self.quant_config.get_quant_method(self, prefix=self.layer_name)
+            if self.quant_config
+            else None
+        )
+        if not should_load_quant_weights(quant_method):
+            set_default_quant_scales(self, register_buffer=False)
+
+
 class MomeAttentionMixin:
     def _build_mome_conv(
         self,
@@ -110,6 +180,11 @@ class MomeAttentionMixin:
         Populates the mome state metadata and the single conv, which transposes
         the QA/KV/O convs into one stateful convolution for noncontiguous KV.
         """
+        # The base Pangu patch imports this module before the high-throughput
+        # patch registers vllm.model_executor.layers.npumome. Resolve the
+        # patched class at model-construction time, after all patches applied.
+        from vllm.model_executor.layers.npumome import MomeAttention
+
         self.mome_state_shapes = (
             (self.q_lora_rank,),
             (self.kv_lora_rank,),
@@ -222,40 +297,6 @@ class MomeAttentionMixin:
             kv = torch.cat([kv_c, k_pe], dim=-1)
         return kv
 
-    def absorb_kv_b_weights(self) -> None:
-        """Compute W_UK_T / W_UV from kv_b_proj when vLLM could not.
-
-        vLLM's MLAAttentionImpl.process_weights_after_loading derives them with
-        get_and_maybe_dequant_weights, which drives the linear with an identity
-        matrix - unsupported by the FlashComm linears - and the spec-decode
-        (MTP) load path does not run it at all. Deriving them from the raw
-        weight reproduces vLLM's own layout:
-            W_UK_T = W_UK.permute(1, 2, 0)  -> [N, P, Lkv]
-            W_UV   = W_UV.transpose(0, 1)   -> [N, Lkv, V]
-        No-op once they exist.
-        """
-        impl = getattr(self.attn, "impl", None)
-        if impl is None or getattr(impl, "W_UK_T", None) is not None:
-            return
-        # num_local_heads, not num_heads: kv_b_proj is column-sharded and the
-        # inner MLAAttention was constructed with the local count.
-        w = self.kv_b_proj.weight
-        expected = (
-            self.num_local_heads
-            * (self.qk_nope_head_dim + self.v_head_dim)
-            * self.kv_lora_rank
-        )
-        if w.dim() != 2 or w.numel() != expected:
-            return
-        w = w.t().contiguous().view(
-            self.kv_lora_rank,
-            self.num_local_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-        )
-        w_uk, w_uv = w.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        impl.W_UK_T = w_uk.permute(1, 2, 0).contiguous()
-        impl.W_UV = w_uv.transpose(0, 1).contiguous()
-
     def _apply_o_proj(self, out: torch.Tensor) -> torch.Tensor:
         """Project the attention output and reduce it across the o_proj shards.
 
@@ -349,7 +390,6 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
         self.quant_symbol = quant_config is not None
         self.prefix = prefix
         self.layer_idx = extract_layer_index(prefix)
-        self._init_wuk_t_uv = False
         self.is_pd_disagg = getattr(vllm_config, "kv_transfer_config", None) is not None
         scheduler_cfg = getattr(vllm_config, "scheduler_config", None)
         cache_cfg = getattr(vllm_config, "cache_config", None)
@@ -543,12 +583,16 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
                 )
 
         if self.param_sink_number == 0:
-            self.attn = MLAAttention(
+            self.attn = NPUMLAAttention(
                 **self._inner_mla_attn_kwargs(cache_config, quant_config, prefix),
                 use_sparse=False,
                 indexer=None,
             )
         else:
+            from vllm.model_executor.layers.attention.static_sink_attention import (
+                StaticSinkMLAAttention,
+            )
+
             self.attn = StaticSinkMLAAttention(
                 **self._static_sink_attn_base_kwargs(
                     cache_config, quant_config, prefix
@@ -655,17 +699,6 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
             )
 
     def post_weight_load(self):
-        if self._init_wuk_t_uv and getattr(self.attn.impl, "W_UK_T", None) is not None:
-            is_weight_nz = getattr(self.kv_b_proj.weight, "is_weight_nz", False)
-            if is_weight_nz:
-                self.kv_b_proj.weight.data = torch_npu.npu_format_cast(self.kv_b_proj.weight.data, torch_npu.Format.ND)
-            self.attn.impl.process_weights_after_loading(self.kv_b_proj.weight.dtype)
-            if is_weight_nz:
-                self.kv_b_proj.weight.data = torch_npu.npu_format_cast(
-                    self.kv_b_proj.weight.data, torch_npu.Format.FRACTAL_NZ
-                )
-        else:
-            self._init_wuk_t_uv = True
         if self.param_sink_number > 0:
             param_sink_compressed_kv = self.kv_a_layernorm(self.param_sink_compressed_kv)
             self.attn.update_sink_kv(self.param_sink_k_pe, param_sink_compressed_kv)
@@ -736,7 +769,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
             args = {"input": q_nope.transpose(0, 1)}
         return torch_npu.npu_transpose_batchmatmul(
             **args,  # TND -> NTD
-            weight=self.attn.impl.W_UK_T,  # [Q, L]
+            weight=self.attn.W_UK_T,  # [Q, L]
             perm_y=(1, 0, 2),  # NTD -> TND
         )
 
@@ -824,7 +857,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
         V = self.v_head_dim
         return torch_npu.npu_transpose_batchmatmul(
             out.view(N, -1, L),  # NTD
-            self.attn.impl.W_UV,
+            self.attn.W_UV,
             perm_y=(1, 0, 2),
         ).reshape(-1, N * V)  # T,ND
 
@@ -1769,7 +1802,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
                 args = {"input": q_nope.transpose(0, 1)}
             q_nope = torch_npu.npu_transpose_batchmatmul(
                 **args,
-                weight=self.attn.impl.W_UK_T,
+                weight=self.attn.W_UK_T,
                 perm_y=(1, 0, 2),
             )
 

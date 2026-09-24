@@ -674,23 +674,6 @@ class NPUDSAImpl(SparseMLAAttentionImpl[NPUDSAMetadata]):
         self.sink_k_nope = sink_compressed_kv.unsqueeze(1).contiguous()
         self.sink_kv = torch.cat([sink_compressed_kv.unsqueeze(1), sink_k_pe.unsqueeze(1)], dim=-1).contiguous()
 
-    def _absorb_prolog(
-        self,
-        q: torch.Tensor,
-    ):
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        # Convert from (B, N, P) to (N, B, P)
-        q_nope = q_nope.transpose(0, 1)
-        N, B, P = q_nope.shape
-        _, _, L = self.W_UK_T.shape
-        ql_nope = q_nope.new_empty((N, B, L))
-
-        # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-        torch.bmm(q_nope, self.W_UK_T, out=ql_nope)
-        # Convert from (N, B, L) to (B, N, L)
-        ql_nope = ql_nope.transpose(0, 1)
-        return ql_nope, q_pe
-
     def _apply_sparse_attention(
         self,
         q_nope: torch.Tensor,
@@ -745,7 +728,9 @@ class NPUDSAImpl(SparseMLAAttentionImpl[NPUDSAMetadata]):
         if q.shape[-1] == self.kv_lora_rank + self.qk_rope_head_dim:
             return q.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
-        return self._absorb_prolog(q)
+        raise RuntimeError(
+            "NPUDSAImpl requires q to be absorbed by the NPU outer layer"
+        )
 
     def forward_mqa(
         self,
@@ -800,9 +785,3 @@ class NPUDSAImpl(SparseMLAAttentionImpl[NPUDSAMetadata]):
         actual_seq_lens_key = torch.concat((decode_seq_lens, prefill_seq_lens)).to(torch.int32)
         actual_seq_lens_query = attn_metadata.query_start_loc.to(torch.int32)[1:]
         return (block_table, actual_seq_lens_key, actual_seq_lens_query)
-
-    def process_weights_after_loading(self, act_dtype: torch.dtype):
-        super().process_weights_after_loading(act_dtype)
-
-        self.W_UV = self.W_UV.contiguous() # 避免 post_attn_absorb 前的连续化
-        self.W_UK_T = self.W_UK_T.contiguous() # 避免 mlaprolog 前的连续化

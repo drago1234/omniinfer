@@ -7,7 +7,6 @@ from torch import nn
 import torch_npu
 
 from vllm.model_executor.layers.attention.attention import Attention
-from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.config import CacheConfig, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -38,6 +37,7 @@ from vllm.model_executor.layers.attention.static_sink_attention import (
 from vllm.model_executor.custom_op import CustomOp
 
 from omni_npu.model_config.config_loader.loader import model_extra_config
+from omni_npu.v1.layers.attention.npu_mla import NPUMLAAttention
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
@@ -201,7 +201,7 @@ class StaticSinkAttentionPatch(VLLMPatch):
 
             load_sharded_param_weight(self, param, loaded_weight)
 
-    class StaticSinkMLAAttention(MLAAttention):
+    class StaticSinkMLAAttention(NPUMLAAttention):
         """MLAAttention with static sink tokens for NPU."""
 
         def __init__(

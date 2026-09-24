@@ -85,6 +85,7 @@ from omni_npu.plugin_decorators import (
     reinitialize_input_batch_decorator,
 )
 from omni_npu.v1.layers.vocab_parallel_embedding import NPUParallelLMHead
+from omni_npu.v1.layers.attention.weight_utils import refresh_mla_wrappers
 from omni_npu.v1.utils import switch_torch_device
 from omni_npu.worker.npu_input_batch import NPUInputBatch
 from omni_npu.worker.npu_mem_pool import NpuMemAllocator
@@ -600,6 +601,10 @@ class NPUModelRunner(GPUModelRunner):
         if callable(post_weight_load):
             post_weight_load()
 
+    def _model_refresh_mla_weights(self, model: nn.Module | None) -> None:
+        if model is not None:
+            refresh_mla_wrappers(model, self.model_config.dtype)
+
     def model_post_weight_load(self) -> None:
         if self.model_config.enable_sleep_mode:
             allocator = NpuMemAllocator.get_instance()
@@ -607,6 +612,8 @@ class NPUModelRunner(GPUModelRunner):
         else:
             context = nullcontext()
         with context, set_current_vllm_config(self.vllm_config):
+            self._model_refresh_mla_weights(self.get_model())
+            self._model_refresh_mla_weights(self.get_drafter_model())
             self._model_post_weight_load(self.get_model())
             self._model_post_weight_load(self.get_drafter_model())
     

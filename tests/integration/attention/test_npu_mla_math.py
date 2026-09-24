@@ -416,7 +416,7 @@ def _project_q(module: NPUDeepseekMLAAttention, hidden_states: torch.Tensor) -> 
     return module.q_b_proj(q_norm)[0]
 
 
-def _reset_mla_impl_weights(module: NPUDeepseekMLAAttention) -> None:
+def _reset_mla_wrapper_weights(module: NPUDeepseekMLAAttention) -> None:
     # vLLM MLA implementation expects:
     # - W_UK_T: [N, P, L] used for q_nope -> q_latent (decode)
     # - W_UV:   [N, L, V] used for latent output -> value head dim
@@ -426,8 +426,8 @@ def _reset_mla_impl_weights(module: NPUDeepseekMLAAttention) -> None:
         KV_LORA_RANK, NUM_HEADS, QK_NOPE_HEAD_DIM + V_HEAD_DIM
     )
     w_uk, w_uv = kv_weight.split([QK_NOPE_HEAD_DIM, V_HEAD_DIM], dim=-1)
-    module.attn.impl.W_UK_T = w_uk.permute(1, 2, 0).contiguous()
-    module.attn.impl.W_UV = w_uv.transpose(0, 1).contiguous()
+    module.attn.W_UK_T = w_uk.permute(1, 2, 0).contiguous()
+    module.attn.W_UV = w_uv.transpose(0, 1).contiguous()
 
 
 def _build_module(
@@ -541,7 +541,7 @@ def _build_module(
             torch.nn.init.normal_(param, mean=0.0, std=0.02)
 
     _transpose_flashcomm_weights(module)
-    _reset_mla_impl_weights(module)
+    _reset_mla_wrapper_weights(module)
     module.eval()
 
     # Add module to the forward context's no_compile_layers for npu_mla_forward
@@ -641,7 +641,9 @@ def _reference_decode(
     q_nope, q_pe = q.split([QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM], dim=-1)
     q_nope = q_nope.squeeze(2)
     q_pe = _apply_rope(q_pe.squeeze(2), cos, sin)
-    q_nope = torch.einsum("bhd,hdv->bhv", q_nope.float(), module.attn.impl.W_UK_T.float())
+    q_nope = torch.einsum(
+        "bhd,hdv->bhv", q_nope.float(), module.attn.W_UK_T.float()
+    )
 
     kv_a, k_pe = kv.split([KV_LORA_RANK, QK_ROPE_HEAD_DIM], dim=-1)
     kv_a = module.kv_a_layernorm(kv_a)
@@ -679,7 +681,9 @@ def _reference_decode(
         outputs.append(out)
 
     attn_out = torch.stack(outputs, dim=0)
-    out_proj = torch.einsum("bhd,hdv->bhv", attn_out.float(), module.attn.impl.W_UV.float())
+    out_proj = torch.einsum(
+        "bhd,hdv->bhv", attn_out.float(), module.attn.W_UV.float()
+    )
     out_proj = out_proj.reshape(hidden_states.shape[0], -1).to(hidden_states.dtype)
     return module.o_proj(out_proj)[0]
 

@@ -697,13 +697,13 @@ def _mock_mla_attention(
         ):
             super().__init__()
             impl = SimpleNamespace()
-            impl.W_UK_T = torch.zeros(
+            self.W_UK_T = torch.zeros(
                 num_heads,
                 qk_nope_head_dim,
                 kv_lora_rank,
                 **cfg_bf16,
             )
-            impl.W_UV = torch.zeros(
+            self.W_UV = torch.zeros(
                 num_heads,
                 kv_lora_rank,
                 v_head_dim,
@@ -740,8 +740,13 @@ def _mock_mla_attention(
             self.sink_populated = True
 
     with (
-        patch(f"{DSA_MODULE}.MLAAttention", MockMLAAttention, create=True),
-        patch(f"{DSA_MODULE}.StaticSinkMLAAttention", MockMLAAttention, create=True),
+        patch(f"{DSA_MODULE}.NPUMLAAttention", MockMLAAttention),
+        patch(
+            "vllm.model_executor.layers.attention.static_sink_attention."
+            "StaticSinkMLAAttention",
+            MockMLAAttention,
+            create=True,
+        ),
     ):
         yield
 
@@ -919,15 +924,16 @@ def _mock_mome():
 
     import omni_npu.v1.layers.attention.npu_dsa as dsa_mod
     import omni_npu.v1.layers.attention.npu_mla as mla_mod
-    dsa_mod.AggregateConv = MockAggregateConv
-    dsa_mod.MomeAttention = MockMomeAttention
-    mla_mod.AggregateConv = MockAggregateConv
-    mla_mod.MomeAttention = MockMomeAttention
-    yield
-    dsa_mod.AggregateConv = None
-    dsa_mod.MomeAttention = None
-    mla_mod.AggregateConv = None
-    mla_mod.MomeAttention = None
+    mome_module = SimpleNamespace(MomeAttention=MockMomeAttention)
+    with patch.dict(
+        sys.modules,
+        {"vllm.model_executor.layers.npumome": mome_module},
+    ):
+        dsa_mod.AggregateConv = MockAggregateConv
+        mla_mod.AggregateConv = MockAggregateConv
+        yield
+        dsa_mod.AggregateConv = None
+        mla_mod.AggregateConv = None
 
 
 # =========================
@@ -1946,9 +1952,7 @@ def test_post_attn_absorb_a5_uses_transposed_input(monkeypatch):
 
     fake = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
     fake.on_ascend950 = True
-    fake.attn = SimpleNamespace(
-        impl=SimpleNamespace(W_UV=torch.zeros(2, 4, 5))
-    )
+    fake.attn = SimpleNamespace(W_UV=torch.zeros(2, 4, 5))
     captured = {}
 
     def fake_bmm(**kwargs):
