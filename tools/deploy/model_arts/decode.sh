@@ -29,7 +29,6 @@ export PYTHONHASHSEED=${PYTHONHASHSEED:-1234}
 
 export AUTO_USE_UC_MEMORY=${AUTO_USE_UC_MEMORY:-1}
 export CODE_PATH=${CODE_PATH:-/workspace/omniinfer}
-export CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-0}
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if ! all_ip_list=$(python3 "$SCRIPTS_DIR/get_node_ip_list.py"); then
@@ -99,7 +98,6 @@ export MASTER_PORT=${MASTER_PORT:-8000}
 export OMNI_USE_DSV3=${OMNI_USE_DSV3:-1}
 export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}
 export ROLE=${ROLE:-decode}
-export SHLVL=${SHLVL:-1}
 export SOCKET_IFNAME=${SOCKET_IFNAME:-enp23s0f3}
 export TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE:-1}
 export TNG_HOST_COPY=${TNG_HOST_COPY:-1}
@@ -113,27 +111,21 @@ export VLLM_USE_V1=${VLLM_USE_V1:-1}
 export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-fork}
 
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/lib64
-export HCCL_OP_RETRY_ENABLE=${HCCL_OP_RETRY_ENABLE:-"L0:0, L1:0, L2:0"}
-export OMNI_NPU_VLLM_PATCHES=${OMNI_NPU_VLLM_PATCHES:-"ALL"}
-export VLLM_PLUGINS=${VLLM_PLUGINS:-"omni-npu,omni_npu_patches,omni_pangu_models,omni_custom_models"}
+export HCCL_OP_RETRY_ENABLE=${HCCL_OP_RETRY_ENABLE:-"L0:0,L1:0,L2:0"}
+export OMNI_VLLM_PATCHES_DIR=${OMNI_VLLM_PATCHES_DIR:-"low_latency"}
+export OMNI_VLLM_PATCHES=${OMNI_VLLM_PATCHES:-"ALL"}
+export VLLM_PLUGINS=${VLLM_PLUGINS:-"omni-npu,omni_npu_patches,omni_custom_models"}
 
-export HYBRID_ATTN_GROUP_SIZE=${HYBRID_ATTN_GROUP_SIZE:-16}
-
-npu=${npu:-16}
-export NUM_DIE_PER_MACH=${npu}
-
+export HYBRID_ATTN_GROUP_SIZE=${HYBRID_ATTN_GROUP_SIZE:-18}
+export NUM_DIE_PER_MACH=${npu:-16}
 export HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT:-32000}
-export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-fork}
-export DISABLE_GATHER_SELECTION=${DISABLE_GATHER_SELECTION:-0}
-
-server_model_name="$MODEL_NAME"
 
 export PREFILL_POD_NUM=${PREFILL_INSTANCE_NUM:-1}
 export DECODE_POD_NUM=${DECODE_INSTANCE_NUM:-1}
-dtype=${dtype:-bfloat16}
 
 tp=${tp:-1}
 export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
+export ENABLE_OVERWRITE_REQ_IDS=${ENABLE_OVERWRITE_REQ_IDS:-1}
 
 hccl_port_wait_time_out=${hccl_port_wait_time_out:-200}
 
@@ -201,7 +193,7 @@ IFS=';' read -ra arr <<< "$P_NODE_LIST"
 kv_transfer_config="${kv_transfer_config//__KV_RANK__/${#arr[@]}}"
 
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
-export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-1800}
+export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-1200}
 
 main() {
     if [ ! -e "/usr/local/Ascend/latest" ]; then
