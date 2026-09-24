@@ -34,10 +34,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonPrefillMetadata,
     QueryLenSupport,
 )
-from vllm.v1.attention.backends.utils import (
-    get_dcp_local_seq_lens,
-    split_decodes_and_prefills,
-)
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -45,6 +42,7 @@ from omni_npu.connector.utils import TP_Convertor
 from omni_npu.attention.backends.utils import (
     SPManager,
     register_attention_backend,
+    split_decodes_and_prefills,
     _maybe_padded_raw_tensor_to_strided_caches,
 )
 from omni_npu.model_config.config_loader.loader import model_extra_config

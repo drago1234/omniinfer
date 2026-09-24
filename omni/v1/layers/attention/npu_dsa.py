@@ -1709,24 +1709,26 @@ def npu_dsa_forward(
         if not self.attn.sink_populated and kv_cache is not None:
             self.attn.populate_sink_kv(kv_cache[0], kv_cache[1])
 
-    if has_prefill and has_decode:
+    if has_decode:
         sp_enabled = self.ena_sp
         if sp_enabled:
             topk_indices_buffer = get_tp_group().all_gather(topk_indices_buffer, dim=0)
         with sp_disabled(self, hs) as (x, y, out):
-            y[p_slice], topk_indices_buffer[p_slice] = self._forward_prefill(
-                x[p_slice],
-                cos[p_slice],
-                sin[p_slice],
-                prefill,
-                kv_cache,
-                topk_indices_buffer[p_slice],
-                pd_mixed_flag=True,
-            )
-            # short prefill in decode or pure decode
-            pd_mixed_flag = (
-                2 if attn_metadata.num_decode_tokens > attn_metadata.num_decodes else 1
-            )
+            pd_mixed_flag = 0
+            if has_prefill:
+                y[p_slice], topk_indices_buffer[p_slice] = self._forward_prefill(
+                    x[p_slice],
+                    cos[p_slice],
+                    sin[p_slice],
+                    prefill,
+                    kv_cache,
+                    topk_indices_buffer[p_slice],
+                    pd_mixed_flag=True,
+                )
+                pd_mixed_flag = (
+                    2 if attn_metadata.num_decode_tokens > attn_metadata.num_decodes
+                    else 1
+                )
             y[d_slice], topk_indices_buffer[d_slice] = self._forward_decode(
                 x[d_slice],
                 cos[d_slice],
@@ -1737,8 +1739,10 @@ def npu_dsa_forward(
                 pd_mixed_flag,
             )
         if sp_enabled:
-            topk_indices_buffer = topk_indices_buffer.split(hs.size(0))[get_tp_group().rank_in_group]
-    elif has_prefill:
+            topk_indices_buffer = topk_indices_buffer.split(hs.size(0))[
+                get_tp_group().rank_in_group
+            ]
+    else:
         out = lazy_zero_like(hs)
         if self.ena_cp:
             out[:], topk_indices_buffer = self._forward_prefill_cp(
@@ -1766,16 +1770,6 @@ def npu_dsa_forward(
                 prefill,
                 kv_cache,
                 topk_indices_buffer[p_slice],
-            )
-    else:
-        with sp_disabled(self, hs) as (x, y, out):
-            y[d_slice], topk_indices_buffer[d_slice] = self._forward_decode(
-                x[d_slice],
-                cos[d_slice],
-                sin[d_slice],
-                decode,
-                kv_cache,
-                topk_indices_buffer[d_slice],
             )
     return out.tensor(), topk_indices_buffer
 

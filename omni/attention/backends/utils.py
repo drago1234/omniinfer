@@ -9,10 +9,14 @@ from typing import Callable, Hashable
 
 import numpy as np
 import torch
+from vllm.config import get_current_vllm_config
 from vllm.distributed import GroupCoordinator, get_tp_group
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.utils import (
+    split_decodes_and_prefills as _vllm_split_decodes_and_prefills,
+)
 
 from omni_npu import envs
 from omni_npu.layers.utils import named_stream
@@ -20,6 +24,32 @@ from omni_npu.model_config.config_loader.loader import model_extra_config
 
 logger = init_logger(__name__)
 NPU_ATTENTION_BACKEND = {}
+
+
+def split_decodes_and_prefills(
+    common_attn_metadata,
+    decode_threshold: int = 1,
+    require_uniform: bool = False,
+    treat_short_extends_as_decodes: bool | None = None,
+):
+    """P sets the flag False so chunked-prefill tails stay prefill.
+
+    D and non-PD keep vLLM's default: short query is decode.
+    """
+    if treat_short_extends_as_decodes is None:
+        treat_short_extends_as_decodes = True
+        try:
+            ktc = get_current_vllm_config().kv_transfer_config
+        except Exception:
+            ktc = None
+        if ktc is not None and ktc.kv_role == "kv_producer":
+            treat_short_extends_as_decodes = False
+    return _vllm_split_decodes_and_prefills(
+        common_attn_metadata,
+        decode_threshold=decode_threshold,
+        require_uniform=require_uniform,
+        treat_short_extends_as_decodes=treat_short_extends_as_decodes,
+    )
 
 # NOTE: Cache for entry points to avoid repeated lookups
 _PLUGIN_BACKEND_CACHE = None  # type: dict[str, type] | None

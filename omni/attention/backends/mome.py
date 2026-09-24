@@ -13,10 +13,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
-from vllm.v1.attention.backends.utils import (
-    PAD_SLOT_ID,
-    split_decodes_and_prefills,
-)
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from omni_npu import envs
@@ -25,6 +22,7 @@ from omni_npu.attention.backends.utils import (
     _maybe_padded_raw_tensor_to_strided_caches,
     register_attention_backend,
     scheme_conv_sp,
+    split_decodes_and_prefills,
 )
 from omni_npu.model_config.config_loader.loader import model_extra_config
 
@@ -441,7 +439,8 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
         # Split decodes and prefills
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
-            common_attn_metadata, decode_threshold=self.reorder_batch_threshold
+            common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold,
         )
 
         num_computed_tokens = common_attn_metadata.compute_num_computed_tokens()

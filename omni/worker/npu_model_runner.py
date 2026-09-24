@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import time
+from collections.abc import Iterable
 from contextlib import nullcontext
 from copy import deepcopy
-from typing import TYPE_CHECKING, Optional, Union, Any, TypeAlias
+from typing import TYPE_CHECKING, Optional, Union, Any, TypeAlias, cast
 
 import torch
 import numpy as np
@@ -28,6 +30,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context, get_forward_context
 from vllm.logger import logger
+from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -606,6 +609,67 @@ class NPUModelRunner(GPUModelRunner):
         with context, set_current_vllm_config(self.vllm_config):
             self._model_post_weight_load(self.get_model())
             self._model_post_weight_load(self.get_drafter_model())
+    
+    def reload_weights(
+        self,
+        weights_iterator: Iterable[tuple[str, torch.Tensor]] | None = None,
+        weights_path: str | None = None,
+        is_checkpoint_format: bool = True,
+    ) -> None:
+        """Reload checkpoint weights in place.
+
+        Skip vLLM layerwise meta restore. Omni loaders already undo/redo
+        NZ and transpose on the live parameters (same path as first load).
+        """
+        if not is_checkpoint_format:
+            super().reload_weights(
+                weights_iterator=weights_iterator,
+                weights_path=weights_path,
+                is_checkpoint_format=is_checkpoint_format,
+            )
+            return
+
+        model = self.get_model()
+        weights_to_load = {name for name, _ in model.named_parameters()}
+        counter_before_reloading = time.perf_counter()
+
+        if weights_iterator is None:
+            model_loader = get_model_loader(self.load_config)
+            if not hasattr(model_loader, "get_all_weights"):
+                raise NotImplementedError(
+                    f"Model reloading with `{self.load_config.load_format}` format"
+                )
+            if weights_path is not None:
+                self.model_config.model = weights_path
+            weights_iterator = model_loader.get_all_weights(self.model_config, model)
+            weights_iterator = cast(
+                Iterable[tuple[str, torch.Tensor]], weights_iterator
+            )
+
+        logger.info_once("Reloading weights inplace without layerwise meta restore...")
+        loaded_weights = model.load_weights(weights_iterator)
+        # The hooked load_weights suppresses post_weight_load during the call,
+        # so we must trigger it manually once more after reloading.
+        if getattr(model, "_omni_npu_load_weights_hooked", False) and callable(
+            getattr(model, "post_weight_load", None)
+        ):
+            self.model_post_weight_load()
+
+        diff_seconds = time.perf_counter() - counter_before_reloading
+        logger.info_once(
+            "Reloading and processing weights took %.2f seconds",
+            diff_seconds,
+        )
+        if self.model_config.quantization is None and loaded_weights is not None:
+            weights_not_loaded = weights_to_load - loaded_weights
+            if weights_not_loaded:
+                logger.warning(
+                    "Following weights were not loaded from checkpoint: %s",
+                    weights_not_loaded,
+                )
+
+        self.reset_encoder_cache()
+        self.reset_mm_cache()
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, load_dummy_weights: bool = False) -> None:

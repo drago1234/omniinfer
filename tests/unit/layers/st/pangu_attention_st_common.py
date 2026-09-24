@@ -477,6 +477,9 @@ def build_metadata(layer, vllm_config, reqs, num_blocks: int,
         # bound directly (mla_attention.py build asserts it for prefills);
         # the deprecated _seq_lens_cpu fallback no longer satisfies it.
         seq_lens_cpu_upper_bound=seq_lens,
+        # kv_producer sets treat_short_extends_as_decodes=False, and vLLM then
+        # requires this CPU mask. These harness requests are still prefilling.
+        is_prefilling=torch.ones(num_reqs, dtype=torch.bool),
     )
     common._seq_lens_cpu = seq_lens
     common._num_computed_tokens_cpu = num_computed_cpu
