@@ -26,6 +26,9 @@ from omni_npu.v1.parsers._pangu_parser_engine_config import (
     PanguTerminals,
     pangu_parser_engine_config,
 )
+from omni_npu.v1.parsers._pangu_streaming_parser_engine import (
+    PanguStreamingParserEngine,
+)
 from omni_npu.v1.parsers._pangu_tool_array_event_expander import (
     PanguToolArrayEventExpander,
 )
@@ -59,6 +62,9 @@ class PanguParserEngine(ParserEngine):
             ),
         )
         super().__init__(tokenizer, tools, **kwargs)
+        self._engine = PanguStreamingParserEngine(
+            self.parser_engine_config, tokenizer, vocab=self.vocab
+        )
 
         self._event_expander = PanguToolArrayEventExpander(self.terminals)
 
