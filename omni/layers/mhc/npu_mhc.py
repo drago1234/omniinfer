@@ -9,6 +9,7 @@ from transformers import PretrainedConfig
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.logger import init_logger
 
+from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.v1.utils import on_ascend950
 
 logger = init_logger(__name__)
@@ -18,6 +19,17 @@ except ImportError as e:
     logger.warning(f"Failed to import omni_training_custom_ops: {e}")
 except Exception as e:
     logger.warning(f"Error occurred while importing omni_training_custom_ops: {e}")
+
+
+def pack_phi_3bf16(phi_fp32: torch.Tensor) -> torch.Tensor:
+    """Pack FP32 phi as [high, mid, low] BF16. Reconstruct: high + 2**-8*mid + 2**-16*low."""
+    mid_scale, low_scale = 2**-8, 2**-16
+    high = phi_fp32.to(torch.bfloat16)
+    residual = phi_fp32 - high.float()
+    mid = (residual / mid_scale).to(torch.bfloat16)
+    residual = residual - mid_scale * mid.float()
+    low = (residual / low_scale).to(torch.bfloat16)
+    return torch.stack((high, mid, low), dim=0)
 
 
 class NPUmHC(torch.nn.Module):
@@ -76,6 +88,11 @@ class NPUmHC(torch.nn.Module):
             else self.branch_beta_pre
         )
         self.branch_beta_post_res = self.branch_beta[self.num_stream:] if hasattr(self, "branch_beta") else None
+        if (
+            not self.pre_only
+            and model_extra_config.operator_opt_config.use_mega_mhc_fusion_op
+        ):
+            self.phi_weight_3bf16 = pack_phi_3bf16(self.phi_weight)
 
     def _mhc_pre_naive(self, hidden_states: torch.Tensor):
         shape, dtype = hidden_states.size(), hidden_states.dtype

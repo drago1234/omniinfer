@@ -1953,6 +1953,7 @@ class OpenPanguV2DecoderLayer(nn.Module):
             if self.mlp_is_moe:
                 self.mlp.experts.mhc_module = self.mlp_mhc_module
         self.use_mhc_fusion_op = model_extra_config.operator_opt_config.use_mhc_fusion_op
+        self.use_mega_mhc_fusion_op = model_extra_config.operator_opt_config.use_mega_mhc_fusion_op
 
     def set_side_stream(self, side_stream: torch.npu.Stream, fetch_stream: torch.npu.Stream = None) -> None:
         """Set the shared side/fetch streams for overlapping computations."""
@@ -2065,7 +2066,31 @@ class OpenPanguV2DecoderLayer(nn.Module):
         main_stream = torch.npu.current_stream() if use_side_stream else None
         new_sk_event: torch.npu.Event | None = None
 
-        if self.use_mhc and self.use_mhc_fusion_op and hidden_states.shape[0] <= 256:
+        if self.use_mhc and self.use_mega_mhc_fusion_op and not is_model_tail:
+            hidden_states, h_post, h_res, residual = torch.ops.custom.npu_ai_infra_mega_mhc(
+                hidden_states,
+                residual.view(-1, self.mhc_num_stream, self.hidden_size),
+                h_post,
+                h_res,
+                pre_mhc_module.phi_weight_3bf16,
+                pre_mhc_module.branch_alpha,
+                pre_mhc_module.branch_beta,
+                pre_norm_module.weight_fp32,
+                post_norm_module.weight_fp32,
+                block_norm_module.weight_fp32 if block_norm_module is not None else None,
+                norm_eps=pre_mhc_module.norm_eps,
+                mhc_pre_norm_eps=pre_mhc_module.hc_eps,
+                hc_eps=pre_mhc_module.hc_eps,
+                compute_mode=2,
+            )
+            h_res = pre_mhc_module.mhc_sinkhorn(h_res)
+            if return_h_in_f32:
+                hidden_states = {
+                    "hidden_states_bf16": hidden_states,
+                    "hidden_states_fp32": hidden_states.float(),
+                }
+
+        elif self.use_mhc and self.use_mhc_fusion_op and hidden_states.shape[0] <= 256:
             # Wait for previous side-stream sinkhorn before fusion op consumes h_res.
             if use_side_stream and sk_event is not None:
                 sk_event.wait(main_stream)

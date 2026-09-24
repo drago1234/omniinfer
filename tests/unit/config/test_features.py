@@ -25,6 +25,7 @@ def _make_config(graph_mode="eager_mode", moe_multi_stream_tune=False):
             li_prolog_multi_stream=True,
             enable_mhc_multistream=True,
             use_mhc_fusion_op=True,
+            use_mega_mhc_fusion_op=True,
             split_q_up_in_multistream=True,
             enable_super_kernel=True,
             enable_sk_scope=True,
@@ -60,6 +61,7 @@ def test_eager_mode_disables_other_optimizations():
     assert cfg.operator_opt_config.li_prolog_multi_stream is False
     assert cfg.operator_opt_config.enable_mhc_multistream is False
     assert cfg.operator_opt_config.use_mhc_fusion_op is False
+    assert cfg.operator_opt_config.use_mega_mhc_fusion_op is True
     assert cfg.operator_opt_config.split_q_up_in_multistream is False
 
 
@@ -72,6 +74,7 @@ def test_non_eager_mode_does_not_touch_config():
     assert cfg.operator_opt_config.enable_multi_stream is True
     assert cfg.operator_opt_config.enable_mhc_multistream is True
     assert cfg.operator_opt_config.use_mhc_fusion_op is True
+    assert cfg.operator_opt_config.use_mega_mhc_fusion_op is True
     assert cfg.operator_opt_config.split_q_up_in_multistream is True
     assert cfg.operator_opt_config.li_prolog_multi_stream is True
 
