@@ -13,6 +13,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <omni_health.h>
+#include <omni_reload.h>
 #include <inttypes.h>
 
 ngx_module_t ngx_http_omni_proxy_module;
@@ -2274,6 +2275,7 @@ static void *ngx_http_omni_create_loc_conf(ngx_conf_t *cf)
     conf->decode_pod_size = NGX_CONF_UNSET_UINT;
     conf->health_status_enabled = NGX_CONF_UNSET;
     conf->stream_ops = (ngx_prefill_stream_op_e) NGX_CONF_UNSET_UINT;
+    conf->reload_auth_enabled = NGX_CONF_UNSET;
 
     return conf;
 }
@@ -2330,6 +2332,9 @@ static char *ngx_http_omni_merge_loc_conf(ngx_conf_t *cf, void *parent, void *ch
             conf->stream_ops = prev->stream_ops;
         }
     }
+
+    ngx_conf_merge_value(conf->reload_auth_enabled, prev->reload_auth_enabled, 0);
+    ngx_conf_merge_str_value(conf->reload_token, prev->reload_token, "");
 
     return NGX_CONF_OK;
 }
@@ -2653,6 +2658,12 @@ static ngx_int_t omni_proxy_post_config(ngx_conf_t *cf)
         return NGX_ERROR;
     }
     *h = ngx_http_omni_proxy_health_status_handler;
+
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_CONTENT_PHASE].handlers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+    *h = ngx_http_omni_proxy_reload_handler;
 
     ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0, "omni proxy post config finished");
     return NGX_OK;
@@ -3521,6 +3532,20 @@ static ngx_command_t omni_proxy_commands[] = {
      ngx_conf_set_omni_stream_ops,
      NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_omni_loc_conf_t, stream_ops),
+     NULL},
+
+    {ngx_string("omni_proxy_reload_auth"),
+     NGX_HTTP_LOC_CONF | NGX_CONF_FLAG,
+     ngx_conf_set_flag_slot,
+     NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_omni_loc_conf_t, reload_auth_enabled),
+     NULL},
+
+    {ngx_string("omni_proxy_reload_token"),
+     NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+     ngx_conf_set_str_slot,
+     NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_omni_loc_conf_t, reload_token),
      NULL},
 
     ngx_null_command};

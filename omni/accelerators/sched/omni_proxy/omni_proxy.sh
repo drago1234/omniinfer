@@ -24,6 +24,8 @@ prefill_pod_size="1"
 decode_pod_size="1"
 stream_ops="off"
 omni_proxy_max_tokens_weight=""
+reload_auth="off"
+reload_token=""
 
 dry_run=false
 stop=false
@@ -55,6 +57,8 @@ print_help() {
     echo "  --omni-proxy-prefill-starvation-timeout <N> prefill_starvation_timeout (default: 400)"
     echo "  --prefill-pod-size <N>          Number of machines per prefill instance (default: 1)"
     echo "  --decode-pod-size <N>           Number of machines per decode instance (default: 1)"
+    echo "  --reload-auth <on|off>          Enable token authentication for /api/reload (default: off)"
+    echo "  --reload-token <TOKEN>          Bearer token for /api/reload authentication"
     echo "  --dry-run                       Only generate nginx config, do not start nginx"
     echo "  --stop                          Stop nginx"
     echo "  --reload                        Reload nginx config without restarting"
@@ -170,6 +174,14 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             omni_proxy_schedule_algo="$2"
+            shift 2
+            ;;
+        --reload-auth)
+            reload_auth="$2"
+            shift 2
+            ;;
+        --reload-token)
+            reload_token="$2"
             shift 2
             ;;
         --dry-run)
@@ -417,6 +429,14 @@ EOF
 EOF
     fi
 
+    local reload_directives=""
+    if [[ "$reload_auth" == "on" && -n "$reload_token" ]]; then
+        reload_directives="omni_proxy_reload_auth on;
+            omni_proxy_reload_token ${reload_token};"
+    else
+        reload_directives="omni_proxy_reload_auth off;"
+    fi
+
     cat >> "$nginx_conf_file" <<EOF
             chunked_transfer_encoding off;
             proxy_buffering off;
@@ -432,7 +452,7 @@ EOF
 
         location = /health {
             omni_proxy_broadcast on;
-            default_type application/json; 
+            default_type application/json;
         }
 
         location = /metrics {
@@ -442,13 +462,13 @@ EOF
 
         location = /omni_proxy/health {
             omni_proxy_health_status on;
-            default_type application/json; 
+            default_type application/json;
         }
 
         location = /internal/metrics {
             rewrite ^ /omni_proxy/metrics last;
         }
-        
+
         location ~ ^/prefill_sub(?<orig>/.*)\$ {
             internal;
             proxy_pass http://prefill_endpoints\$orig\$is_args\$args;
@@ -460,11 +480,23 @@ EOF
             proxy_http_version 1.1;
             proxy_set_header Connection Keep-Alive;
         }
-        
+
         location = /omni_proxy_broadcast_sub {
             internal;
             proxy_pass http://\$arg_target;
             subrequest_output_buffer_size 10M;
+        }
+
+        location = /api/reload {
+            ${reload_directives}
+            default_type application/json;
+        }
+
+        location ~ ^/restart/([^/]+)/$ {
+            proxy_pass http://\$1:10423/restart/;
+            proxy_connect_timeout 10s;
+            proxy_read_timeout 300s;
+            proxy_send_timeout 10s;
         }
     }
 }

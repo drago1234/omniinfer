@@ -18,6 +18,7 @@ ngx_module_srcs="$ngx_addon_dir/ngx_http_omni_proxy_module.c \
                  $ngx_addon_dir/omni_apc.c \
                  $ngx_addon_dir/omni_health.c \
                  $ngx_addon_dir/omni_metrics.c \
+                 $ngx_addon_dir/omni_reload.c \
                  $ngx_addon_dir/omni_zmq_handler.c" 
 
 # Include directories for the module

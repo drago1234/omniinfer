@@ -41,6 +41,8 @@ typedef struct
     ngx_uint_t prefill_pod_size;
     ngx_uint_t decode_pod_size;
     ngx_prefill_stream_op_e stream_ops;
+    ngx_flag_t reload_auth_enabled;
+    ngx_str_t  reload_token;
 } ngx_http_omni_loc_conf_t;
 
 typedef struct omni_req_context_s
