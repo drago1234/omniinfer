@@ -80,6 +80,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --dtype bfloat16 --enforce-eager"
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-auto-tool-choice --tool-call-parser pangu"
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
       args:
         - --max-model-len 524288
         - --served-model-name {{ model | quote }}
@@ -124,6 +125,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --compilation-config ${COMPILATION_CONFIG}"
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-auto-tool-choice --tool-call-parser pangu"
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
       args:
         - --max-model-len 524288
         - --served-model-name {{ model | quote }}

@@ -98,6 +98,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --enable-chunked-prefill --dtype bfloat16"
         EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla --enforce-eager"
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu"
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
 
         {% if enable_prefix_caching | bool %}
         EXTRA_ARGS="${EXTRA_ARGS} --mamba-block-size 128 --enable-prefix-caching"
@@ -162,6 +163,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --distributed-executor-backend mp --dtype bfloat16"
         EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu"
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
 
         # EXTRA_ARGS="${EXTRA_ARGS} --enforce-eager"
         EXTRA_ARGS="${EXTRA_ARGS} --compilation-config {\"mode\": 3, \"cudagraph_mode\":\"FULL\", \"cudagraph_capture_sizes\":[48], \"backend\":\"\", \"compile_sizes\":[48]}"

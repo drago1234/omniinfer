@@ -74,6 +74,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --no-enable-prefix-caching --no-enable-chunked-prefill"
         EXTRA_ARGS="${EXTRA_ARGS} --dtype bfloat16 --enforce-eager"
         EXTRA_ARGS="${EXTRA_ARGS} --distributed-executor-backend mp"
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
       args:
         - --max-model-len 16384
         - --served-model-name pangu_ultra_moe
@@ -118,6 +119,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --dtype bfloat16"
         COMPILATION_CONFIG='{"mode": 3, "cudagraph_mode":"FULL_DECODE_ONLY", "cudagraph_capture_sizes":[96], "backend":"", "compile_sizes":[96]}'
         EXTRA_ARGS="${EXTRA_ARGS} --compilation-config ${COMPILATION_CONFIG}"
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
       args:
         - --max-model-len 16384
         - --tp 1
