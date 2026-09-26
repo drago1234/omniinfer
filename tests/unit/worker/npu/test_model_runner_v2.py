@@ -499,6 +499,35 @@ def test_gumbel_sample_pure_greedy():
 
 @requires_npu_sampling
 @requires_npu
+def test_gumbel_sample_masked_request_does_not_access_request_state():
+    """A padded row has request index -1 and must not read or write its state."""
+    import torch
+
+    from omni_npu.worker.npu.sampler import gumbel_sample
+
+    vocab = 151552
+    logits = torch.zeros((2, vocab), dtype=torch.bfloat16, device="npu")
+    logits[0, 4] = 1
+    logits[1, 9] = 2
+    idx_mapping = torch.tensor([0, -1], dtype=torch.int32, device="npu")
+    temperature = torch.zeros(1, dtype=torch.float32, device="npu")
+    seeds = torch.zeros(1, dtype=torch.int64, device="npu")
+    pos = torch.zeros(2, dtype=torch.int32, device="npu")
+    processed = torch.full((1, vocab), -7, dtype=torch.float32, device="npu")
+
+    got = gumbel_sample(
+        logits, idx_mapping, temperature, seeds, pos,
+        apply_temperature=False, output_processed_logits=processed,
+    )
+    torch.npu.synchronize()
+
+    assert got.cpu().tolist() == [4, 9]
+    assert processed[0, 4].item() == 1
+    assert processed[0, 9].item() == 0
+
+
+@requires_npu_sampling
+@requires_npu
 def test_gumbel_sample_random_sampling():
     """纯 random：apply_temperature=True 且全 temp!=0，应正常采样（不再 raise）。
 
