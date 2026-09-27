@@ -55,6 +55,7 @@ from omni_npu.compilation.acl_graph import (
 from omni_npu.v1.utils import on_ascend950
 from omni_npu.profiler.wrapper import NpuProfilerWrapper
 import omni_npu.envs as omni_envs
+from omni_npu.diagnostics.metrics import stage_metrics
 
 logger = init_logger(__name__)
 
@@ -433,7 +434,9 @@ class NPUWorker(Worker):
             intermediate_tensors = IntermediateTensors(tensor_dict)
         else:
             intermediate_tensors = None
+        started = stage_metrics.mark_forward_start(self.model_runner)
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        stage_metrics.stamp_sync_forward(self.model_runner, output, started)
 
         if isinstance(
             output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
@@ -455,6 +458,11 @@ class NPUWorker(Worker):
                 self.profiler.stop()
                 self.profile_finished = True
         return res
+
+    def sample_tokens(self, grammar_output):
+        output = super().sample_tokens(grammar_output)
+        stage_metrics.stamp_async_forward(self.model_runner, output)
+        return output
 
     def sleep(self, level: int = 1) -> None:
         if self.is_full_async_rl:
