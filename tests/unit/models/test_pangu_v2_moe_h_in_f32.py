@@ -32,6 +32,9 @@ def _bare_layer(*, use_mhc, use_mhc_fusion_op):
     )
     layer.use_mhc = use_mhc
     layer.use_mhc_fusion_op = use_mhc_fusion_op
+    # Bare layers skip __init__, where this flag is assigned. These cases
+    # cover the old sandwich fusion path, so mega fusion stays off.
+    layer.use_mega_mhc_fusion_op = False
     layer.side_stream = None
     layer.hidden_size = 4
     layer.mhc_num_stream = 1

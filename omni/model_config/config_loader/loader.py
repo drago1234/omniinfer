@@ -193,7 +193,8 @@ class ModelOperatorOptConfig:
     else:
         moe_seq_split_length: int = 10**9 # 开启chunk moe的token数阈值，大于阈值会触发chunk moe, 默认不开启
     use_rope_fusion_op: bool = False # 是否使用npu_apply_rotary_pos_emb融合算子，默认不开启，CANN>=9.0.0可开启
-    use_mhc_fusion_op: bool = False # 是否使用mhc大融合算子，默认不开启
+    use_mhc_fusion_op: bool = False # 是否使用 mhc 大融合算子，仅小 shape 使用（当前 token 数小于等于 256 时使能），默认不开启
+    use_mega_mhc_fusion_op: bool = False # 是否使用 npu_ai_infra_mega_mhc（3BF16 phi），仅 P 侧开启，默认不开启
     use_mome_inplace_update: bool = False
     use_gpt_oss_sink_rescale: bool = False
     moe_comm_strategy: MoECommStrategyType = "dispatch_combine" # MoE通信策略，默认为dispatch_combine
