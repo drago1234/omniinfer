@@ -24,6 +24,7 @@ SERVER_OFFSET=0
 MASTER_IP="127.0.0.1"
 MASTER_PORT=8503
 BASE_API_PORT=9001
+FAIL_ON_PORT_CONFLICT=0
 # vLLM framework parameters
 GLOO_SOCKET_IFNAME="enp23s0f3"
 TP_SOCKET_IFNAME="enp23s0f3"
@@ -76,6 +77,7 @@ print_help() {
     echo "  --master-ip                      Multi-API Server: Master node IP for multi-node setup. For dual-node A3, set to head node IP (corresponds to vllm data-parallel-address) (default: $MASTER_IP)"
     echo "  --master-port                    Multi-API Server: Master node Gloo socket communication port (corresponds to vllm data-parallel-rpc-port) (default: $MASTER_PORT)"
     echo "  --base-api-port                  Multi-API Server: Base API port for multi API servers (default: $BASE_API_PORT)"
+    echo "  --fail-on-port-conflict          Reject occupied API ports instead of shifting (flag)"
     echo "  --gloo-socket-ifname             vLLM framework: DP communication parameter. Your network interface. Query with: ip -4 route list 0/0 | awk '{print $5}' | head -n 1 (default: $GLOO_SOCKET_IFNAME)"
     echo "  --tp-socket-ifname               vLLM framework: DP communication parameter. Your network interface. Query with: ip -4 route list 0/0 | awk '{print $5}' | head -n 1 (default: $TP_SOCKET_IFNAME)"
     echo "  --vllm-logging-level             vLLM framework: VLLM logging level. Default INFO, set to DEBUG for debugging (default: $VLLM_LOGGING_LEVEL)"
@@ -253,9 +255,14 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             print_help
             ;;
+        --fail-on-port-conflict)
+            FAIL_ON_PORT_CONFLICT=1
+            shift
+            continue
+            ;;
         --*)
-            parse_long_option "$1" "$2"  # Parse without shift
-            shift 2  # Shift in main loop
+            parse_long_option "$1" "$2"
+            shift 2
             ;;
         *)
             echo "Unknown option: $1" >&2
@@ -404,8 +411,12 @@ EXTRA_ARGS="$EXTRA_ARGS"
 
 common_operations() {
   local mtp_args=""
+  local port_policy_args=""
   if [ "$NUM_SPECULATIVE_TOKENS" -ne 0 ]; then
     mtp_args="--enable-mtp"
+  fi
+  if [ "$FAIL_ON_PORT_CONFLICT" -eq 1 ]; then
+    port_policy_args="--fail-on-port-conflict"
   fi
   local sampling_args=()
   if [ -n "$REJECTION_SAMPLE_METHOD" ]; then
@@ -427,6 +438,7 @@ common_operations() {
     --max-model-len "$MAX_MODEL_LEN" \
     --master-port "$MASTER_PORT" \
     --base-api-port "$BASE_API_PORT" \
+    $port_policy_args \
     --tp "$TP" \
     --pp "$PP" \
     --served-model-name "$SERVED_MODEL_NAME" \

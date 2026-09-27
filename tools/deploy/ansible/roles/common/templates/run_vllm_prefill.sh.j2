@@ -49,6 +49,7 @@ bash {{ profile.workdir }}/{{ profile.runner }} \
   --role "prefill" \
   --master-port ${MASTER_PORT} \
   --base-api-port ${API_PORT} \
+  --fail-on-port-conflict \
   --tp ${PREFILL_TENSOR_PARALLEL_SIZE} \
   --ascend-rt-visible-devices {{ ascend_rt_visible_devices | quote }} \
   --use-inventory-devices 1 \
