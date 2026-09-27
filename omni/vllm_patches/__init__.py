@@ -3,8 +3,8 @@
 # vllm_patches Reference: https://blog.vllm.ai/2025/11/20/vllm-plugin-system.html
 import importlib.util
 import logging
-import sys
 import os
+import sys
 from pathlib import Path
 
 from .patch_manager import PatchManager
@@ -168,3 +168,17 @@ def apply_patches():
     # targets wrap the final patched methods instead of earlier implementations.
     from omni_npu.vllm_patches.patches.common.patch_trace import ProfilerDynamicPatch
     ProfilerDynamicPatch()
+
+    # API-server process: copy proxy TTFT wall-clock headers onto
+    # Request.trace_headers even when OpenTelemetry tracing is off.
+    try:
+        from omni_npu import envs as _omni_envs
+
+        if _omni_envs.OMNI_ENABLE_TTFT_STAGE_METRICS:
+            from omni_npu.diagnostics.metrics.stage_hooks import (
+                install_serving_header_hook,
+            )
+
+            install_serving_header_hook()
+    except Exception:
+        logger.exception("failed to install TTFT serving header metrics hook")

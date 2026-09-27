@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     OMNI_HEALTH_HANG_SEC: int
     OMNI_METRICS_KV_TRANSFER_SELFTEST: bool
     OMNI_METRICS_WORKER_MEM_EVERY: int
+    OMNI_ENABLE_TTFT_STAGE_METRICS: bool
     OMNI_KV_DUMP_PATH: str
     OMNI_CUSTOM_MODEL_CONFIG_PATH: Optional[str]
     # Existing OMNI_ names
@@ -451,6 +452,14 @@ env_variables: Dict[str, Callable[[], Any]] = {
     "OMNI_METRICS_WORKER_MEM_EVERY":
     lambda: get_env_with_fallback(
         "OMNI_METRICS_WORKER_MEM_EVERY", None, 50, _as_int),
+
+    # Per-request scheduler/worker TTFT stage tracking. Completed records
+    # ride KVConnectorStats to the frontend. Default off: scheduler_cls wrap
+    # and [TTFT] logs stay out of the hot path until explicitly enabled.
+    # Consumer: diagnostics/metrics/stage_metrics.py:enabled.
+    "OMNI_ENABLE_TTFT_STAGE_METRICS":
+    lambda: get_env_with_fallback(
+        "OMNI_ENABLE_TTFT_STAGE_METRICS", None, False, _as_bool),
 
     # Enables KV-block hash dumping for cross-node consistency debugging.
     # Non-empty enables the maybe_dump_kv wrapper on NPUModelRunner.execute_model
