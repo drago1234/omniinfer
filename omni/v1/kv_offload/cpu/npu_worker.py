@@ -165,6 +165,7 @@ class Transfer:
     # Freed only when the stream passes end_event: the sharded load's row
     # indices are still being read after transfer_async returns.
     shard_keepalive: list | None = None
+    wait_event: torch.npu.Event | None = None
 
 
 @dataclass
@@ -943,8 +944,6 @@ def _sharded_hccl_options(group_name: str):
     all-gather (2 MiB at tp16, chunk 32), well under the 100 MiB the prefill
     pods set, and no measurement ever showed a reason to override it.
     """
-    import torch_npu
-
     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
     # AI_CPU: the prefill forward runs on AIV and the load's all-gather overlaps
     # it, so driving the group from AI_CPU leaves the vector cores to the model.

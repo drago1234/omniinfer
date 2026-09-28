@@ -1237,7 +1237,7 @@ def test_sharded_load_submits_on_the_caller_thread(monkeypatch):
     handler._sharded_executor = MagicMock()
     handler.enable_sharded_load = True
     assert handler.submit(5, "src", "dst") is True
-    handler.transfer_async.assert_called_once_with(5, "src", "dst", wait_stream=None)
+    handler.transfer_async.assert_called_once_with(5, "src", "dst", wait_event=None)
     handler._ensure_submit_thread.assert_not_called()
     assert handler._submit_queue.empty()
 
