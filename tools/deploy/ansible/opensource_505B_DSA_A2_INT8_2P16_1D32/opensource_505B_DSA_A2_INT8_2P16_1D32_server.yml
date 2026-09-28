@@ -93,6 +93,7 @@
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_VLLM_PATCHES_DIR="pangu_v2_hybrid, pangu_v2_moe"
         export OMNI_VLLM_PATCHES="ALL"
+        export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
 
         EXTRA_ARGS="--no-disable-hybrid-kv-cache-manager --max-num-batched-tokens 16384"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-expert-parallel --max-num-seqs 12"
@@ -149,6 +150,7 @@
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_VLLM_PATCHES_DIR="pangu_v2_hybrid, pangu_v2_moe"
         export OMNI_VLLM_PATCHES="ALL"
+        export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
 
         export ENABLE_DP_LB=false
         export VLLM_DATA_PARALLEL_EXTERNAL_LB=false
