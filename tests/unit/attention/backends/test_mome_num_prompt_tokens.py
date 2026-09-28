@@ -555,8 +555,8 @@ def make_draft_builder(*, num_spec=2, kernel_width=5):
     ``kernel_width`` is what ``__init__`` reads off
     ``hf_config.router_sliding_window`` (3 when unset) and ``fake_num_spec``
     collapses to ``max(num_spec, 1)`` there.  Both are hand-set here, so keep
-    ``kernel_width != fake_num_spec + 1`` or the two branches of the synthesis
-    below are indistinguishable.
+    ``kernel_width - 1 != fake_num_spec + 1`` or the synthesized step0 count
+    below is indistinguishable from ``build``'s own default.
     """
     b = make_builder(num_spec=num_spec, is_decode_node=True)
     b.kernel_width = kernel_width
@@ -567,12 +567,12 @@ class TestStep0NumAcceptedTokensSynthesis(unittest.TestCase):
     """``build_for_drafting`` derives the count when nobody hands it one.
 
     Step0 of the drafter has no sampling result to read an accepted count off:
-    the first step0 starts from the clean prefill tail, while a later step0
-    rebuilds its verification window from the prefix tail the previous MTP
-    iteration left behind.  The relative offset the fused Pangu conv needs is
-    different in the two cases, which is exactly the fake_num_spec+1 vs
-    kernel_width split -- and hard-coding either one is what cost acceptance
-    rate on MTP single-head multi-step.
+    its 8-token full-window forward always reads the committed tail with a
+    fixed relative offset.  The 6 single-token draft steps of the previous
+    iteration leave the conv_states row as [W-3 .. W+5] (3 committed-tail
+    tokens + 6 draft tokens), so the two history tokens of the first query
+    (position W) sit at state[1..2] -> offset = 1 -> the synthesized count is
+    always K - 1, independent of the previous schedule.
     """
 
     def setUp(self):
@@ -596,12 +596,11 @@ class TestStep0NumAcceptedTokensSynthesis(unittest.TestCase):
         self.builder.build_for_drafting(cm, **kwargs)
         return self.captured["num_accepted_tokens"]
 
-    def test_step0_derives_one_count_per_previous_schedule(self):
-        # computed is seq_lens - query_lens, i.e. 8 / 12 / 5 against prompt 8:
-        #   == -> clean prefill tail -> K = fake_num_spec + 1 = 3
-        #   >  -> window rebuilt from the prefix tail -> kernel_width = 5
-        #   <  -> left alone here; build() re-arms it for a decode node
-        self.assertEqual(self._call().tolist(), [3, 5, 3])
+    def test_step0_synthesizes_k_minus_1_regardless_of_previous_schedule(self):
+        # computed is seq_lens - query_lens, i.e. 8 / 12 / 5 against prompt 8.
+        # All three are full-window step0s whose row ends as [W-3 .. W+5], so
+        # the count is K - 1 = 4 for every one of them.
+        self.assertEqual(self._call().tolist(), [4, 4, 4])
 
     def test_derived_count_is_a_fresh_tensor(self):
         """``build()`` masks the count in place, so it must not alias anything.
@@ -663,10 +662,11 @@ class TestStep0EndToEnd(unittest.TestCase):
         )
 
         # computed 8 / 12 / 5 against prompt 8:
-        #   == -> K = fake_num_spec + 1 = 3
-        #   >  -> kernel_width = 5
-        #   <  -> build()'s decode-node pass re-arms it to fake_num_spec = 2
-        self.assertEqual(seen["num_accepted_tokens"].tolist(), [3, 5, 2])
+        #   all -> synthesized K - 1 = 4; build()'s prefill reset (computed <=
+        #   prompt -> fake_num_spec + 1) is skipped for the synthesized step0,
+        #   and its decode-node pass re-arms only the computed < prompt row
+        #   (5 < 8) back to fake_num_spec = 2
+        self.assertEqual(seen["num_accepted_tokens"].tolist(), [4, 4, 2])
 
 
 if __name__ == "__main__":

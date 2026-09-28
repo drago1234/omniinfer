@@ -425,6 +425,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         fast_build: bool = False,
         num_prompt_tokens: torch.Tensor | None = None,
         allow_runner_num_prompt_tokens: bool = True,
+        draft_step0: bool = False,
     ) -> NPUMomeAttentionMetadata:
         """
         Build Mome attention metadata from common attention metadata.
@@ -454,8 +455,15 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         elif num_prompt_tokens is not None:  # For graph capture, num_prompt_tokens is None
             num_accepted_tokens = num_accepted_tokens.clone()
             # if the previous schedule is prefill (computed <= prompt), we reset num_accepted_tokens = num_spec + 1
-            # so the MoME kernel reads the last few tokens from the cache
-            num_accepted_tokens.masked_fill_(num_computed_tokens <= num_prompt_tokens, self.fake_num_spec + 1)
+            # so the MoME kernel reads the last few tokens from the cache.
+            # NOTE: skip this reset for the synthesized draft step0.  Its 8-token
+            # full-window forward always reads the committed tail at state[1..2]
+            # (num_accepted_tokens = K - 1, see build_for_drafting); masking it
+            # back to num_spec + 1 on the first decode round (computed == prompt)
+            # would point the read at the stale draft tail of the previous
+            # iteration instead of the committed history.
+            if not draft_step0:
+                num_accepted_tokens.masked_fill_(num_computed_tokens <= num_prompt_tokens, self.fake_num_spec + 1)
 
         # if the current schedule is the recompute of the last prompt,
         # we reset num_accepted_tokens = fake_num_spec to let the kernel read the [-3:-1] tokens from the cache
@@ -636,24 +644,27 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         num_accepted_tokens: torch.Tensor | None = None,
         num_prompt_tokens: torch.Tensor | None = None,
     ) -> NPUMomeAttentionMetadata:
-        # For step0, the fused Pangu conv reads the previous MTP state using
-        # a relative offset.  The first step0 starts from the clean prefill
-        # tail; a later step0 rebuilds its 8-token verification window from
-        # the prefix tail left in the previous MTP iteration.  With K=3 this
-        # is state[0:2], encoded as num_accepted_tokens=K=3.
+        # The 8-token full-window step0 always reads the committed tail with a
+        # fixed relative offset.  Each MTP iteration runs 6 single-token draft
+        # steps after step0; their tail-aligned writes leave the conv_states
+        # row as [W-3 .. W+5] (the last 3 committed tokens + the 6 draft
+        # tokens of the iteration), so the two history tokens of the first
+        # query (position W) sit at state[1..2] -> offset = 1 ->
+        # num_accepted_tokens = K - 1.  This is independent of the previous
+        # verification accepted count.  (When num_computed_tokens == 0, i.e.
+        # the draft prefill, the kernel takes the zero-state path and ignores
+        # this value anyway.)
+        draft_step0_synthesized = False
         if (
             draft_index == 0
             and num_accepted_tokens is None
             and num_prompt_tokens is not None
         ):
+            draft_step0_synthesized = True
             num_computed_tokens = common_attn_metadata.compute_num_computed_tokens()
             num_accepted_tokens = torch.full_like(
                 num_computed_tokens,
-                self.fake_num_spec + 1,
-            )
-            num_accepted_tokens.masked_fill_(
-                num_computed_tokens > num_prompt_tokens,
-                self.kernel_width,
+                self.kernel_width - 1,
             )
         return self.build(
             common_prefix_len=0,
@@ -661,6 +672,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             num_accepted_tokens=num_accepted_tokens,
             fast_build=True,
             num_prompt_tokens=num_prompt_tokens,
+            draft_step0=draft_step0_synthesized,
         )
 
     def build_for_cudagraph_capture(self, common_attn_metadata: CommonAttentionMetadata):
