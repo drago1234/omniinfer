@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch_npu
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -46,6 +47,18 @@ from omni_npu.v1.kv_offload.cpu.sharded_load import (
 )
 
 logger = init_logger(__name__)
+
+
+def _current_npu_stream(device_index: int) -> torch.npu.Stream:
+    """Get the current NPU stream without constructing it with device=None."""
+    stream_data = torch_npu._C._npu_getCurrentStream(device_index)
+    return torch_npu.npu.Stream(
+        device=device_index,
+        stream_id=stream_data[0],
+        device_index=stream_data[1],
+        device_type=stream_data[2],
+    )
+
 
 # Matches vllm-ascend csrc/torch_binding.cpp::swap_blocks_batch.
 _DIRECTION_H2D = 0
@@ -151,6 +164,7 @@ class Transfer:
     # Freed only when the stream passes end_event: the sharded load's row
     # indices are still being read after transfer_async returns.
     shard_keepalive: list | None = None
+    wait_event: torch.npu.Event | None = None
 
 
 @dataclass
@@ -158,7 +172,7 @@ class QueuedJob:
     job_id: int
     src_spec: LoadStoreSpec
     dst_spec: LoadStoreSpec
-    wait_stream: object | None = None
+    wait_event: torch.npu.Event | None = None
 
 
 def _block_slice(
@@ -287,22 +301,18 @@ class NpuSingleDirectionOffloadingHandler:
 
     @contextmanager
     def _activate_transfer_stream(self, stream):
-        """Bind copies to *stream* without ``torch.npu.stream()``.
+        """Bind copies to *stream* without querying the current stream.
 
-        torch_npu ``StreamContext`` calls ``_get_device_index(None, True)``,
-        which can fall through to ``torch.cuda.current_device()`` and raise
-        ``Cannot re-initialize CUDA in forked subprocess`` in mp workers.
+        ``torch.npu.current_stream()`` builds ``Stream(device=None)``. That
+        enters ``torch.npu.device(None)`` and falls through to
+        ``torch.cuda.current_device()``, which raises
+        ``Cannot re-initialize CUDA in forked subprocess`` on this submit
+        thread. Workers are started with fork. The thread only issues
+        copies, so *stream* stays selected.
         """
         torch.npu.set_device(self._device_index)
-        try:
-            prev_stream = torch.npu.current_stream(self._device_index)
-        except TypeError:
-            prev_stream = torch.npu.current_stream()
         torch.npu.set_stream(stream)
-        try:
-            yield
-        finally:
-            torch.npu.set_stream(prev_stream)
+        yield
 
     @staticmethod
     def _transfer_time_s(transfer: Transfer) -> float:
@@ -559,19 +569,19 @@ class NpuSingleDirectionOffloadingHandler:
     def _queue_transfer(
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
-        wait_stream = None
+        wait_event = None
         if self.npu_to_cpu:
-            # Capture the compute stream here. transfer_async runs on the
-            # submit thread, where current_stream() is not the writer stream.
-            try:
-                wait_stream = torch.npu.current_stream()
-            except Exception:
-                wait_stream = None
+            # Record on the execute thread's current compute stream. Passing
+            # the event avoids constructing a Python Stream in the forked
+            # worker while preserving compute-before-D2H ordering.
+            compute_stream = _current_npu_stream(self._device_index)
+            wait_event = torch.npu.Event()
+            wait_event.record(compute_stream)
         job = QueuedJob(
             job_id=job_id,
             src_spec=src_spec,
             dst_spec=dst_spec,
-            wait_stream=wait_stream,
+            wait_event=wait_event,
         )
         if not self.enable_sharded_load:
             self._ensure_submit_thread()
@@ -582,7 +592,7 @@ class NpuSingleDirectionOffloadingHandler:
         if self.enable_sharded_load:
             # Stay on the submitting thread: the submit thread can run ahead of
             # the other ranks without bound and deadlock their all-gathers.
-            self.transfer_async(job_id, src_spec, dst_spec, wait_stream=wait_stream)
+            self.transfer_async(job_id, src_spec, dst_spec, wait_event=wait_event)
             return True
         self._submit_queue.put(job)
         return True
@@ -613,7 +623,7 @@ class NpuSingleDirectionOffloadingHandler:
                     job.job_id,
                     job.src_spec,
                     job.dst_spec,
-                    wait_stream=job.wait_stream,
+                    wait_event=job.wait_event,
                 )
             except Exception as exc:
                 if job is None:
@@ -634,7 +644,7 @@ class NpuSingleDirectionOffloadingHandler:
         job_id: int,
         src_spec: LoadStoreSpec,
         dst_spec: LoadStoreSpec,
-        wait_stream: object | None = None,
+        wait_event: torch.npu.Event | None = None,
     ) -> bool:
         if not isinstance(src_spec, BlockIDsLoadStoreSpec):
             raise TypeError(
@@ -686,12 +696,10 @@ class NpuSingleDirectionOffloadingHandler:
         stream = self._stream
         start_event, end_event = self._pop_timing_events()
 
-        wait_compute = int(self.npu_to_cpu)
-        if wait_compute:
-            compute_stream = wait_stream
-            if compute_stream is None:
-                compute_stream = torch.npu.current_stream()
-            stream.wait_stream(compute_stream)
+        if self.npu_to_cpu:
+            if wait_event is None:
+                raise RuntimeError("NPU-to-CPU transfer requires a compute event")
+            stream.wait_event(wait_event)
 
         batch_src: torch.Tensor | None = None
         batch_dst: torch.Tensor | None = None
@@ -769,6 +777,7 @@ class NpuSingleDirectionOffloadingHandler:
             batch_dst=batch_dst,
             batch_sizes=batch_sizes,
             shard_keepalive=shard_keepalive,
+            wait_event=wait_event,
         )
         with self._lock:
             self._transfer_events[job_id] = end_event
@@ -934,8 +943,6 @@ def _sharded_hccl_options(group_name: str):
     all-gather (2 MiB at tp16, chunk 32), well under the 100 MiB the prefill
     pods set, and no measurement ever showed a reason to override it.
     """
-    import torch_npu
-
     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
     # AI_CPU: the prefill forward runs on AIV and the load's all-gather overlaps
     # it, so driving the group from AI_CPU leaves the vector cores to the model.

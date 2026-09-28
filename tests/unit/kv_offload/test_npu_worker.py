@@ -467,12 +467,13 @@ def test_handler_transfer_get_finished_wait_shutdown():
     end_ev = MagicMock()
     end_ev.query.return_value = True
     end_ev.elapsed_time.return_value = 5.0  # milliseconds
+    wait_event = MagicMock(name="compute_done")
     with patch.object(torch.npu, "Event", return_value=end_ev), patch.object(
         torch.npu, "set_device"
     ), patch.object(torch.npu, "set_stream"), patch.object(
         torch.npu, "current_stream", return_value=MagicMock()
     ):
-        assert handler.transfer_async(7, src, dst) is True
+        assert handler.transfer_async(7, src, dst, wait_event=wait_event) is True
 
     assert 7 in handler._transfers_by_id
     results = handler.get_finished()
@@ -581,10 +582,11 @@ def test_handler_transfer_batch_path_and_rotation_skip():
     dst = ConcreteCPU.__new__(ConcreteCPU)
     dst.block_ids = np.asarray([0, 1, 2, 3], dtype=np.int64)
 
+    wait_event = MagicMock(name="compute_done")
     with patch.object(torch.npu, "set_device"), patch.object(
         torch.npu, "set_stream"
     ), patch.object(torch.npu, "current_stream", return_value=MagicMock()):
-        assert handler.transfer_async(1, src, dst) is True
+        assert handler.transfer_async(1, src, dst, wait_event=wait_event) is True
     assert swap_fn.called
     batched = swap_fn.call_args[0]
     assert int(batched[2].numel()) == 2
@@ -592,8 +594,8 @@ def test_handler_transfer_batch_path_and_rotation_skip():
     assert int(batched[2][1]) == 8
 
 
-def test_transfer_async_avoids_torch_npu_stream_context():
-    """Fork workers blow up if StreamContext queries device via torch.cuda."""
+def test_transfer_async_avoids_npu_stream_queries():
+    """The submit thread must not construct a Stream in a forked worker."""
     handler, _, _ = _make_handler(npu_to_cpu=True, factor=1)
     handler._device_index = 7
     ConcreteGPU, ConcreteCPU = _concrete_specs()
@@ -604,28 +606,82 @@ def test_transfer_async_avoids_torch_npu_stream_context():
     dst = ConcreteCPU.__new__(ConcreteCPU)
     dst.block_ids = np.asarray([0], dtype=np.int64)
 
-    prev_stream = MagicMock(name="prev")
-    wait_stream = MagicMock(name="compute")
+    wait_event = MagicMock(name="compute_done")
     end_ev = MagicMock()
     end_ev.query.return_value = True
 
     def _forbid_stream_ctx(*_args, **_kwargs):
         raise AssertionError("torch.npu.stream() must not be used")
 
+    def _forbid_current_stream(*_args, **_kwargs):
+        raise AssertionError("torch.npu.current_stream() must not be used")
+
     with patch.object(torch.npu, "Event", return_value=end_ev), patch.object(
         torch.npu, "stream", side_effect=_forbid_stream_ctx
     ), patch.object(torch.npu, "set_device") as set_device, patch.object(
         torch.npu, "set_stream"
     ) as set_stream, patch.object(
-        torch.npu, "current_stream", return_value=prev_stream
+        torch.npu, "current_stream", side_effect=_forbid_current_stream
     ):
-        assert handler.transfer_async(3, src, dst, wait_stream=wait_stream) is True
+        assert handler.transfer_async(3, src, dst, wait_event=wait_event) is True
 
     set_device.assert_called_with(7)
-    handler._stream.wait_stream.assert_called_once_with(wait_stream)
-    assert set_stream.call_count == 2
-    assert set_stream.call_args_list[0].args[0] is handler._stream
-    assert set_stream.call_args_list[1].args[0] is prev_stream
+    handler._stream.wait_event.assert_called_once_with(wait_event)
+    set_stream.assert_called_once_with(handler._stream)
+    assert handler._transfers_by_id[3].wait_event is wait_event
+
+
+def test_current_npu_stream_uses_explicit_device():
+    stream = MagicMock(name="compute_stream")
+    with patch.object(
+        worker_mod.torch_npu._C,
+        "_npu_getCurrentStream",
+        return_value=(17, 7, 20),
+    ) as get_raw_stream, patch.object(
+        worker_mod.torch_npu.npu, "Stream", return_value=stream
+    ) as stream_cls:
+        assert worker_mod._current_npu_stream(7) is stream
+
+    get_raw_stream.assert_called_once_with(7)
+    stream_cls.assert_called_once_with(
+        device=7, stream_id=17, device_index=7, device_type=20
+    )
+
+
+def test_store_submit_records_compute_event_without_stream_query():
+    handler, _, _ = _make_handler(npu_to_cpu=True, factor=1)
+    compute_stream = MagicMock(name="compute_stream")
+    compute_done = MagicMock(name="compute_done")
+
+    with patch.object(
+        worker_mod, "_current_npu_stream", return_value=compute_stream
+    ) as get_stream, patch.object(
+        torch.npu, "Event", return_value=compute_done
+    ), patch.object(
+        torch.npu,
+        "current_stream",
+        side_effect=AssertionError("current_stream must not be queried"),
+    ), patch.object(handler, "_ensure_submit_thread"):
+        assert handler.submit(11, MagicMock(), MagicMock()) is True
+
+    get_stream.assert_called_once_with(handler._device_index)
+    compute_done.record.assert_called_once_with(compute_stream)
+    queued = handler._submit_queue.get_nowait()
+    assert queued.wait_event is compute_done
+
+
+def test_store_transfer_requires_compute_event():
+    handler, _, _ = _make_handler(npu_to_cpu=True, factor=1)
+    ConcreteGPU, ConcreteCPU = _concrete_specs()
+    src = ConcreteGPU.__new__(ConcreteGPU)
+    src.block_ids = np.asarray([0], dtype=np.int64)
+    src.group_sizes = [1]
+    src.block_indices = [0]
+    dst = ConcreteCPU.__new__(ConcreteCPU)
+    dst.block_ids = np.asarray([0], dtype=np.int64)
+
+    with pytest.raises(RuntimeError, match="requires a compute event"):
+        handler.transfer_async(3, src, dst)
 
 
 def test_handler_transfer_rejects_bad_specs():
@@ -1181,7 +1237,7 @@ def test_sharded_load_submits_on_the_caller_thread(monkeypatch):
     handler._sharded_executor = MagicMock()
     handler.enable_sharded_load = True
     assert handler.submit(5, "src", "dst") is True
-    handler.transfer_async.assert_called_once_with(5, "src", "dst", wait_stream=None)
+    handler.transfer_async.assert_called_once_with(5, "src", "dst", wait_event=None)
     handler._ensure_submit_thread.assert_not_called()
     assert handler._submit_queue.empty()
 
