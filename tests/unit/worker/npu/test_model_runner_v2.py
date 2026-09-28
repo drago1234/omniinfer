@@ -532,7 +532,7 @@ def test_gumbel_sample_random_sampling():
     """纯 random：apply_temperature=True 且全 temp!=0，应正常采样（不再 raise）。
 
     M4 P0 曾让此场景 fail-loud；P1 平移 vllm-ascend kernel 后，random 采样可用。
-    断言：合法 token id + 同 seed 确定性复现。
+    断言：合法 token id + 全局 NPU RNG 前进及状态恢复后的复现。
     """
     import torch
 
@@ -544,11 +544,13 @@ def test_gumbel_sample_random_sampling():
         num_tokens, vocab, [0.7] * num_tokens, device=dev
     )
 
+    rng_before = torch.npu.get_rng_state()
     r1 = gumbel_sample(
         logits.clone(), idx_mapping, temperature, seeds, pos,
         apply_temperature=True,
     )
     torch.npu.synchronize()
+    rng_after_first = torch.npu.get_rng_state()
     r2 = gumbel_sample(
         logits.clone(), idx_mapping, temperature, seeds, pos,
         apply_temperature=True,
@@ -557,8 +559,16 @@ def test_gumbel_sample_random_sampling():
 
     # 合法 token id
     assert (r1.cpu() >= 0).all() and (r1.cpu() < vocab).all()
-    # 同 seed 两次调用 bitwise 一致（G2 确定性）
-    assert torch.equal(r1.cpu(), r2.cpu())
+    assert (r2.cpu() >= 0).all() and (r2.cpu() < vocab).all()
+    # 请求 seed 相同也消耗全局随机流；恢复全局状态才复现同一随机序列。
+    assert not torch.equal(rng_before, rng_after_first)
+    assert not torch.equal(rng_after_first, torch.npu.get_rng_state())
+    torch.npu.set_rng_state(rng_before)
+    replay = gumbel_sample(
+        logits.clone(), idx_mapping, temperature, seeds, pos,
+        apply_temperature=True,
+    )
+    assert torch.equal(r1.cpu(), replay.cpu())
 
 
 @requires_npu_sampling

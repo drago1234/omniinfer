@@ -2,9 +2,9 @@
 # Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """NPU sampling ops for the V2 runner. Implementation: omni/worker/npu/sampler.py.
 
-gumbel_sample: upstream reaches tldevice.log1p, a returning-None stub on
-triton-ascend 3.2.2. apply_top_k_top_p: the upstream Qrita Triton kernel fails
-to compile there, so the PyTorch sort path is taken unconditionally.
+gumbel_sample and rejection_sample use NPU uniform_ with the global RNG;
+request seeds no longer select stateless per-request random streams.
+apply_top_k_top_p uses CANN's fused filter to avoid vocabulary-wide scatter.
 
 Only V2 consumers are replaced. The defining module
 vllm/v1/sample/ops/topk_topp_sampler.py is left alone because MRv1's

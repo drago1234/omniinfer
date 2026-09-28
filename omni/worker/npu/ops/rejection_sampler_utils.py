@@ -4,7 +4,9 @@
 
 This module keeps the native vLLM rejection_sampler_utils.py structure out of
 OmniInfer. Unmodified helpers/kernels are imported directly from upstream vLLM;
-only Triton-Ascend incompatible pieces are redefined here.
+only Triton-Ascend incompatible pieces are redefined here. Acceptance coins
+and resampling noise come from NPU uniform_ using the global generator;
+request seed/position arguments are retained only for API compatibility.
 """
 
 from __future__ import annotations
@@ -29,17 +31,6 @@ def _next_power_of_2(x: int) -> int:  # pragma: no cover
     if next_power_of_2 is not None:
         return next_power_of_2(x)
     return 1 << (x - 1).bit_length()
-
-
-@triton.jit
-def _npu_rand_uniform(seed, pos):  # pragma: no cover
-    # NPU: cast pos to int32 so Philox avoids the uint64 umulhi path, which
-    # triton-ascend cannot lower on Ascend vector cores. The 1-element block
-    # form also avoids scalar-rand lowering issues.
-    pos = pos.to(tl.int32)
-    rand_seed = tl.randint(seed, pos)
-    u = tl.max(tl.rand(rand_seed, tl.arange(0, 1)).to(tl.float32), axis=0)
-    return tl.maximum(u, 4.6566127342e-10)
 
 
 @triton.jit
@@ -134,8 +125,7 @@ def _rejection_kernel(  # pragma: no cover
     cu_num_logits_ptr,
     idx_mapping_ptr,
     temp_ptr,
-    seed_ptr,
-    pos_ptr,
+    uniform_coins_ptr,
     synthetic_conditional_rates_ptr,
     cumulative_log_p_ptr,
     local_residual_mass_ptr,
@@ -151,7 +141,6 @@ def _rejection_kernel(  # pragma: no cover
     start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     num_draft_tokens = end_idx - start_idx - 1
-    seed = tl.load(seed_ptr + req_state_idx)
     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
     is_greedy = temp == 0.0
 
@@ -162,8 +151,7 @@ def _rejection_kernel(  # pragma: no cover
     for i in range(num_draft_tokens):
         logit_idx = start_idx + i
         draft_sampled = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
-        pos = tl.load(pos_ptr + logit_idx)
-        u = _npu_rand_uniform(seed, pos)
+        u = tl.maximum(tl.load(uniform_coins_ptr + logit_idx), 4.6566127342e-10)
         use_block_path = False
         if USE_BLOCK_VERIFICATION:
             use_block_path = not is_greedy
@@ -295,8 +283,8 @@ def _resample_kernel(  # pragma: no cover
     expanded_idx_mapping_ptr,
     draft_sampled_ptr,
     temp_ptr,
-    seed_ptr,
-    pos_ptr,
+    uniform_noise_ptr,
+    uniform_noise_stride,
     cumulative_log_p_ptr,
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
@@ -391,8 +379,9 @@ def _resample_kernel(  # pragma: no cover
         resample_token_idx,
         expanded_idx_mapping_ptr,
         temp_ptr,
-        seed_ptr,
-        pos_ptr,
+        uniform_noise_ptr,
+        uniform_noise_stride,
+        req_idx,
         None,  # processed_logits_ptr
         0,  # processed_logits_stride
         None,  # processed_logits_col_ptr
@@ -613,6 +602,7 @@ def rejection_sample(  # pragma: no cover
     num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
     target_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
     draft_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
+    uniform_coins = target_logits.new_empty(num_logits, dtype=torch.float32).uniform_()
     _rejection_kernel[(num_reqs,)](
         sampled, sampled.stride(0), num_sampled,
         target_rejected_logsumexp, draft_rejected_logsumexp,
@@ -623,7 +613,7 @@ def rejection_sample(  # pragma: no cover
         draft_sampled, draft_logits, draft_logits_stride_0, draft_logits_stride_1,
         draft_local_max, draft_local_max.stride(0),
         draft_local_sumexp, draft_local_sumexp.stride(0),
-        cu_num_logits, idx_mapping, temperature, seed, pos,
+        cu_num_logits, idx_mapping, temperature, uniform_coins,
         synthetic_conditional_rates, cumulative_log_p,
         local_residual_mass, local_residual_mass.stride(0), vocab_num_blocks,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
@@ -646,6 +636,10 @@ def rejection_sample(  # pragma: no cover
         resample_num_blocks,
         dtype=torch.float32,
     )
+    # Only one rejected/bonus row per request needs a vocabulary-sized draw.
+    uniform_noise = target_logits.new_empty(
+        num_reqs, vocab_size, dtype=torch.float32
+    ).uniform_()
     _resample_kernel[(num_reqs, resample_num_blocks)](
         resampled_local_argmax,
         resampled_local_argmax.stride(0),
@@ -663,8 +657,8 @@ def rejection_sample(  # pragma: no cover
         expanded_idx_mapping,
         draft_sampled,
         temperature,
-        seed,
-        pos,
+        uniform_noise,
+        uniform_noise.stride(0),
         cumulative_log_p,
         vocab_size,
         BLOCK_SIZE=RESAMPLE_BLOCK_SIZE,

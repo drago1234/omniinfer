@@ -14,8 +14,9 @@ def _npu_gumbel_block_argmax(  # pragma: no cover
     token_idx,
     expanded_idx_mapping_ptr,
     temp_ptr,
-    seeds_ptr,
-    pos_ptr,
+    uniform_noise_ptr,
+    uniform_noise_stride,
+    uniform_noise_row,
     processed_logits_ptr,
     processed_logits_stride,
     processed_logits_col_ptr,
@@ -49,14 +50,10 @@ def _npu_gumbel_block_argmax(  # pragma: no cover
 
     logits = logits.to(tl.float32)
     if temp != 0.0:
-        seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
-        # NPU: cast pos to int32. Triton-Ascend cannot lower the uint64 path
-        # used by upstream Philox random generation on Ascend vector cores.
-        pos = tl.load(pos_ptr + token_idx).to(tl.int32)
-        gumbel_seed = tl.randint(seed, pos)
-        # NPU: use float32 tl.rand; Triton-Ascend does not support upstream's
-        # float64 random/Gumbel path. The epsilon form avoids log1p.
-        r = tl.rand(gumbel_seed, block).to(tl.float32)
+        # NPU uniform_ generates fresh noise on every graph replay. Keep only
+        # the Gumbel transform and reduction in Triton, avoiding vector Philox.
+        r = tl.load(uniform_noise_ptr + uniform_noise_row * uniform_noise_stride
+                    + block, mask=mask, other=0.5).to(tl.float32)
         gumbel_noise = -tl.log(-tl.log(r + 1e-20) + 1e-20)
         logits = tl.where(mask, logits + gumbel_noise, float("-inf"))
 
