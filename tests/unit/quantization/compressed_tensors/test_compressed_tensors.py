@@ -500,10 +500,33 @@ class TestNPUCompressedTensorsConfig:
                 "input_activations": _make_w8a8_quant(8, "token", True, True),
             }
         }
-        method = config.get_quant_method(DummyFusedMoE(), "moe")
+        method = config.get_quant_method(DummyFusedMoE(), "mlp.experts")
         assert isinstance(method, DummyNPUCompressedTensorsW4A8Int4MoEMethod)
         assert method.weight_quant.symmetric is False
         assert method.weight_quant.asymmetric_group == ["mlp.experts"]
+
+    def test_get_quant_method_moe_mixed_layer_bits(self, compressed_tensors_module):
+        config = _make_config_instance(compressed_tensors_module)
+        # Generic rules deliberately precede the more specific MTP rules.
+        bits = {
+            "mlp.experts": 4,
+            "model.layers.50.mlp.experts": 8,
+        }
+        weight_quant = _make_w8a8_quant(dict(bits), "channel", False, True)
+        config.target_scheme_map = {
+            "Linear": {
+                "weights": weight_quant,
+                "input_activations": _make_w8a8_quant(8, "token", True, True),
+            }
+        }
+        method = config.get_quant_method(DummyFusedMoE(), "mlp.experts")
+        assert isinstance(method, DummyNPUCompressedTensorsW4A8Int4MoEMethod)
+
+        method = config.get_quant_method(
+            DummyFusedMoE(), "model.layers.50.mlp.experts"
+        )
+        assert isinstance(method, DummyNPUCompressedTensorsW8A8Int8MoEMethod)
+        assert weight_quant.num_bits == bits
 
     def test_is_dynamic_token_w8a8_allows_asymmetric_weight(self, compressed_tensors_module):
         """w8a8 detection no longer requires weight_quant.symmetric; asymmetric weight quant is now accepted."""
