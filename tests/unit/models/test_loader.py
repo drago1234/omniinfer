@@ -633,10 +633,32 @@ class TestConfigLoaderUnit(unittest.TestCase):
             # Verify that update_task_config was called
             mock_update.assert_called_once()
             # Verify that _validate_config was called
-            mock_validate.assert_called_once()
+            mock_validate.assert_called_once_with(mock_vllm_config)
             # Verify that _print_model_config was called
             mock_print.assert_called_once()
             self.assertEqual(model_extra_config.dtype, torch.float16)
+
+    def test_validate_config_runs_precision_consistency_validation(self):
+        from omni_npu.model_config.config_loader.loader import (
+            _validate_config,
+            model_extra_config,
+        )
+
+        vllm_config = MagicMock()
+        with (
+            patch('omni_npu.model_config.config_loader.loader.apply_eager_mode_config') as mock_eager,
+            patch('omni_npu.model_config.config_loader.loader.apply_omni_cache') as mock_cache,
+            patch('omni_npu.model_config.config_loader.loader.apply_seq_parallel') as mock_seq,
+            patch(
+                'omni_npu.model_config.config_loader.loader._validate_precision_strong_consistency'
+            ) as mock_precision,
+        ):
+            _validate_config(vllm_config)
+
+        mock_eager.assert_called_once_with(model_extra_config)
+        mock_cache.assert_called_once_with(vllm_config.additional_config)
+        mock_seq.assert_called_once_with(model_extra_config)
+        mock_precision.assert_called_once_with(vllm_config)
 
     def test_model_operator_opt_config_enable_mtp_invariant(self):
         """Test ModelOperatorOptConfig enable_mtp_invariant default and custom value"""
@@ -648,6 +670,103 @@ class TestConfigLoaderUnit(unittest.TestCase):
         enabled_config = ModelOperatorOptConfig(enable_mtp_invariant=True)
         self.assertTrue(enabled_config.enable_mtp_invariant)
 
+    class _FakeCUDAGraphMode:
+        NONE = "NONE"
+        PIECEWISE = "PIECEWISE"
+        FULL = "FULL"
+
+    def _patch_cudagraph_mode_module(self):
+        fake_compilation_mod = MagicMock()
+        fake_compilation_mod.CUDAGraphMode = self._FakeCUDAGraphMode
+        return patch.dict(sys.modules, {'vllm.config.compilation': fake_compilation_mod})
+
+    def _run_precision_consistency_validation(
+        self, *, enabled=True, prefill=False, use_batch_invariant_op=True,
+        cudagraph_mode=None,
+    ):
+        from omni_npu.model_config.config_loader.loader import (
+            _validate_precision_strong_consistency,
+            model_extra_config,
+        )
+
+        operator_config = model_extra_config.operator_opt_config
+        original = (
+            operator_config.enable_precision_strong_consistency,
+            operator_config.use_batch_invariant_op,
+            model_extra_config.task_config.is_prefill_node,
+        )
+        operator_config.enable_precision_strong_consistency = enabled
+        operator_config.use_batch_invariant_op = use_batch_invariant_op
+        model_extra_config.task_config.is_prefill_node = prefill
+        fake_vllm_config = MagicMock()
+        fake_vllm_config.compilation_config.cudagraph_mode = (
+            self._FakeCUDAGraphMode.FULL if cudagraph_mode is None else cudagraph_mode
+        )
+        try:
+            with self._patch_cudagraph_mode_module():
+                _validate_precision_strong_consistency(fake_vllm_config)
+        finally:
+            (
+                operator_config.enable_precision_strong_consistency,
+                operator_config.use_batch_invariant_op,
+                model_extra_config.task_config.is_prefill_node,
+            ) = original
+
+    def test_precision_strong_consistency_disabled_skips_checks(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('HCCL_DETERMINISTIC', None)
+            os.environ.pop('PYTORCH_NPU_ALLOC_CONF', None)
+            self._run_precision_consistency_validation(
+                enabled=False, cudagraph_mode=self._FakeCUDAGraphMode.NONE)
+
+    def test_precision_strong_consistency_violations_raise(self):
+        cases = (
+            ({'HCCL_DETERMINISTIC': 'true',
+              'PYTORCH_NPU_ALLOC_CONF': 'expandable_segments:True'}, True,
+             self._FakeCUDAGraphMode.FULL, 'HCCL_DETERMINISTIC'),
+            ({'HCCL_DETERMINISTIC': 'STRICT', 'PYTORCH_NPU_ALLOC_CONF': 'garbage'}, True,
+             self._FakeCUDAGraphMode.FULL, 'PYTORCH_NPU_ALLOC_CONF'),
+            ({'HCCL_DETERMINISTIC': 'STRICT', 'PYTORCH_NPU_ALLOC_CONF': 'expandable_segments:True'}, False,
+             self._FakeCUDAGraphMode.FULL, 'use_batch_invariant_op'),
+            ({'HCCL_DETERMINISTIC': 'STRICT', 'PYTORCH_NPU_ALLOC_CONF': 'expandable_segments:True'}, True,
+             self._FakeCUDAGraphMode.PIECEWISE, 'cudagraph_mode'),
+        )
+        for environment, use_batch_invariant_op, cudagraph_mode, expected in cases:
+            with self.subTest(expected=expected), patch.dict(os.environ, environment, clear=True):
+                with self.assertRaises(ValueError) as context:
+                    self._run_precision_consistency_validation(
+                        use_batch_invariant_op=use_batch_invariant_op,
+                        cudagraph_mode=cudagraph_mode,
+                    )
+                self.assertIn(expected, str(context.exception))
+
+    def test_precision_strong_consistency_passes(self):
+        with patch.dict(os.environ, {
+            'HCCL_DETERMINISTIC': 'STRICT',
+            'PYTORCH_NPU_ALLOC_CONF': 'expandable_segments:True',
+        }, clear=True):
+            self._run_precision_consistency_validation()
+
+    def test_precision_strong_consistency_prefill_skips_cudagraph_check(self):
+        with patch.dict(os.environ, {
+            'HCCL_DETERMINISTIC': 'STRICT',
+            'PYTORCH_NPU_ALLOC_CONF': 'expandable_segments:True',
+        }, clear=True):
+            self._run_precision_consistency_validation(
+                prefill=True, cudagraph_mode=self._FakeCUDAGraphMode.NONE)
+
+    def test_precision_strong_consistency_log_level_warns(self):
+        mock_logger = MagicMock()
+        with patch.dict(os.environ, {
+            'OMNI_PRECISION_STRONG_CONSISTENCY_CHECK_LEVEL': 'log',
+        }, clear=True), patch(
+            'omni_npu.model_config.config_loader.loader.logger', mock_logger
+        ):
+            self._run_precision_consistency_validation(
+                use_batch_invariant_op=False,
+                cudagraph_mode=self._FakeCUDAGraphMode.PIECEWISE,
+            )
+        self.assertEqual(mock_logger.warning.call_count, 4)
 
     # ------------------------------------------------------------------
     # _get_best_practice_config: warning & error paths (lines 439, 443, 451)

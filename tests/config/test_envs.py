@@ -378,3 +378,36 @@ def test_pangu_v2_high_throughout_defaults_false():
     import omni_npu.envs as envs
 
     assert envs.OMNI_PANGU_V2_HIGH_THROUGHOUT is False
+
+
+def test_precision_strong_consistency_check_level_defaults_to_error():
+    import omni_npu.envs as envs
+
+    assert envs.OMNI_PRECISION_STRONG_CONSISTENCY_CHECK_LEVEL == "error"
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("error", "error"),
+    ("log", "log"),
+    ("LOG", "log"),
+    ("  Error  ", "error"),
+])
+def test_precision_strong_consistency_check_level_is_parsed(monkeypatch, raw, expected):
+    monkeypatch.setenv("OMNI_PRECISION_STRONG_CONSISTENCY_CHECK_LEVEL", raw)
+    import omni_npu.envs as envs
+
+    assert envs.OMNI_PRECISION_STRONG_CONSISTENCY_CHECK_LEVEL == expected
+
+
+def test_precision_strong_consistency_check_level_invalid_preserves_default(
+    monkeypatch, caplog
+):
+    import omni_npu.envs as envs
+
+    monkeypatch.setenv("OMNI_PRECISION_STRONG_CONSISTENCY_CHECK_LEVEL", "invalid")
+    with caplog.at_level(logging.WARNING, logger="omni_npu.envs"):
+        assert envs.OMNI_PRECISION_STRONG_CONSISTENCY_CHECK_LEVEL == "error"
+    assert any(
+        "OMNI_PRECISION_STRONG_CONSISTENCY_CHECK_LEVEL" in record.message
+        for record in caplog.records
+    )

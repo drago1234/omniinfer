@@ -278,8 +278,10 @@ class TestConfigLoaderIntegration(unittest.TestCase):
             decode_node_num=1
         )
         
-        # Validate config (with None additional_config)
-        _validate_config(None)
+        # Validate config with the vLLM config shape used by the loader.
+        vllm_config = unittest.mock.MagicMock()
+        vllm_config.additional_config = None
+        _validate_config(vllm_config)
         
         # Print config
         _print_model_config()
