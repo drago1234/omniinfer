@@ -118,7 +118,6 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/
 export HCCL_OP_RETRY_ENABLE=${HCCL_OP_RETRY_ENABLE:-"L0:0,L1:0,L2:0"}
 export HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT:-32000}
 export OMNI_VLLM_PATCHES_DIR=${OMNI_VLLM_PATCHES_DIR:-"low_latency"}
-export OMNI_VLLM_PATCHES=${OMNI_VLLM_PATCHES:-"ALL"}
 export VLLM_PLUGINS=${VLLM_PLUGINS:-"omni-npu,omni_npu_patches,omni_custom_models"}
 npu=${npu:-16}
 export NUM_DIE_PER_MACH=${npu}
@@ -271,7 +270,7 @@ if [[ "${ENABLE_OMNI_CACHE:-0}" == "1" ]]; then
     export ROLE=prefill
     export VLLM_PLUGINS="omni-npu,omni_custom_models,omni_pangu_models,omni_npu_patches"
 
-    export KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:=$(( OMNI_CACHE_LAYER_BYTES * OMNI_HYBRID_ATTN_GROUP_SIZE ))}"
+    export KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:=$(( OMNI_CACHE_LAYER_BYTES * HYBRID_ATTN_GROUP_SIZE ))}"
     EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-memory-bytes ${KV_CACHE_MEMORY_BYTES}"
 
     SETUP_HUGETLBFS_SH="/workspace/omniinfer/components/omni-cache/tools/setup/setup_hugetlbfs_2MB.sh"
