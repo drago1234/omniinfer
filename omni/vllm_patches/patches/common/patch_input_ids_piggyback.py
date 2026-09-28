@@ -21,10 +21,9 @@
 # Gating: OMNI_PIGGYBACK_INPUT_IDS (default "0"); set "1" to enable. The patch is a
 # no-op for any request that does not carry input_ids, so it is self-gating.
 #
-# Note on composition: patch_prefilled_token_skip_tokenize.py also wraps
-# `_preprocess_chat` (PD prefilled-token reuse, gated by OMNI_REUSE_PREFILLED_TOKENS).
-# That mechanism is orthogonal (kv_transfer_params), but both target the same method;
-# if both must be active, compose them via a relay patch (see patch_serving_apc.py).
+# Composition: this patch owns OnlineRenderer.preprocess_chat. Validation and fallback
+# calls OnlineRendererPrefilledTokenAdapter, which delegates to native rendering
+# before consuming PD relay fields. No second patch overwrites this entry point.
 
 import difflib
 from typing import Any, List, Optional
@@ -63,13 +62,11 @@ from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
 
 from omni_npu import envs
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
+from omni_npu.vllm_patches.patches.common.patch_prefilled_token_skip_tokenize import (
+    OnlineRendererPrefilledTokenAdapter,
+)
 
 logger = init_logger(__name__)
-
-# Capture the original method before any patch is applied.  In v0.25.1 the
-# relay chain (InputIdsPiggyback → PrefilledTokenSkip → upstream) lives on
-# OnlineRenderer.preprocess_chat() rather than OpenAIServingChat._preprocess_chat().
-_original_preprocess_chat = OnlineRenderer.preprocess_chat
 
 
 def _register_input_ids_field() -> bool:
@@ -195,8 +192,11 @@ class InputIdsPiggybackPatch(VLLMPatch):
             if mm_data is None:
 
                 if validate_enabled:
-                    # Run the full original path to get vLLM's token ids for comparison.
-                    _orig_conversation, orig_engine_inputs = await _original_preprocess_chat(
+                    # Keep the legacy relay chain when validating caller IDs.
+                    (
+                        _orig_conversation,
+                        orig_engine_inputs,
+                    ) = await OnlineRendererPrefilledTokenAdapter.preprocess_chat(
                         self,
                         request,
                         messages,
@@ -291,9 +291,8 @@ class InputIdsPiggybackPatch(VLLMPatch):
 
                 return conversation, [engine_input]
 
-        # Fallback: delegate to the original OnlineRenderer.preprocess_chat
-        # (which itself may be wrapped by other patches in the relay chain).
-        return await _original_preprocess_chat(
+        # Keep the legacy input-IDs -> prefilled-token -> renderer chain explicit.
+        return await OnlineRendererPrefilledTokenAdapter.preprocess_chat(
             self, request, messages, default_template,
             default_template_content_format, default_template_kwargs,
             tool_dicts=tool_dicts, parser=parser,

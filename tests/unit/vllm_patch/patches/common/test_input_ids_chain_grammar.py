@@ -206,6 +206,7 @@ def _install_chat_stubs(monkeypatch):
     # (vllm/inputs/engine.py: TokensInput(type="token", prompt_token_ids,
     # cache_salt)).
     inputs_mod.EngineInput = dict
+    inputs_mod.PromptType = object
 
     def _tokens_input(prompt_token_ids, *, prompt=None, cache_salt=None):
         return {
@@ -230,6 +231,7 @@ def _install_chat_stubs(monkeypatch):
             self.__dict__.update(kwargs)
 
     v1_engine.EngineCoreOutput = EngineCoreOutput
+    v1_engine.EngineCoreOutputs = EngineCoreOutput
 
     kv_cache_interface = _stub_module(monkeypatch, "vllm.v1.kv_cache_interface")
     kv_cache_interface.AttentionSpec = type("AttentionSpec", (), {})
@@ -270,6 +272,8 @@ def _install_chat_stubs(monkeypatch):
     scheduler_mod.Scheduler = type("Scheduler", (), {
         "_update_from_kv_xfer_finished": lambda self, kv_connector_output: None,
         "add_request": lambda self, request: None,
+        "update_from_output": lambda *args: {},
+        "_make_cached_request_data": lambda *args: None,
     })
 
     lora_request = _stub_module(monkeypatch, "vllm.lora.request")
@@ -284,6 +288,9 @@ def _install_chat_stubs(monkeypatch):
 
 def _load_input_ids_module(monkeypatch):
     _install_chat_stubs(monkeypatch)
+    monkeypatch.delitem(sys.modules,
+                       "omni_npu.vllm_patches.patches.common.patch_prefilled_token_skip_tokenize",
+                       raising=False)
     module_name = (
         "omni_npu.vllm_patches.patches.common.patch_input_ids_piggyback")
     sys.modules.pop(module_name, None)
@@ -307,15 +314,19 @@ def test_input_ids_helpers_read_declared_and_extra_ids(monkeypatch):
 
 
 @pytest.mark.unit
-def test_input_ids_fast_path_reuses_piggyback_ids(monkeypatch):
+@pytest.mark.parametrize("has_relay_metadata", [False, True])
+@pytest.mark.parametrize("reuse", [False, True])
+def test_input_ids_fast_path_reuses_piggyback_ids(monkeypatch, has_relay_metadata, reuse):
     mod = _load_input_ids_module(monkeypatch)
     monkeypatch.setenv("OMNI_PIGGYBACK_INPUT_IDS", "1")
+    monkeypatch.setenv("OMNI_REUSE_PREFILLED_TOKENS", str(int(reuse)))
     monkeypatch.delenv("OMNI_SKIP_DECODE_TOKENIZE", raising=False)
 
     request = mod.ChatCompletionRequest()
     request.input_ids = [10, 11]
     request.truncate_prompt_tokens = None
     request.cache_salt = "salt"
+    request.kv_transfer_params = {"prefilled_token": [7]} if has_relay_metadata else None
 
     serving = types.SimpleNamespace(
         renderer=types.SimpleNamespace(tokenizer=object()),
@@ -351,7 +362,8 @@ def test_input_ids_validation_mismatch_raises(monkeypatch):
     async def fake_original(*args, **kwargs):
         return ["orig"], [{"prompt_token_ids": [99]}]
 
-    monkeypatch.setattr(mod, "_original_preprocess_chat", fake_original)
+    monkeypatch.setattr(mod.OnlineRendererPrefilledTokenAdapter,
+                       "preprocess_chat", fake_original)
 
     request = mod.ChatCompletionRequest()
     request.input_ids = [10]
@@ -382,7 +394,8 @@ def test_input_ids_fallback_calls_original_for_multimodal(monkeypatch):
     async def fake_original(*args, **kwargs):
         return ["fallback"], [{"prompt_token_ids": [1]}]
 
-    monkeypatch.setattr(mod, "_original_preprocess_chat", fake_original)
+    monkeypatch.setattr(mod.OnlineRendererPrefilledTokenAdapter,
+                       "preprocess_chat", fake_original)
 
     request = mod.ChatCompletionRequest()
     request.input_ids = [10]
