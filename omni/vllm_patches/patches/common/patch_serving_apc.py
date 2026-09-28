@@ -237,7 +237,7 @@ def _normalize_usage_chunk(
                     "cached_tokens": usage_num_cached,
                     "cached_rate": cached_rate,
                 }
-        return f"data: {json.dumps(obj)}\n\n"
+        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
     except (json.JSONDecodeError, KeyError):
         return chunk
 
@@ -276,7 +276,7 @@ def _rewrite_named_stream_finish_chunk(chunk: str, request: Any) -> str:
         if isinstance(choice, dict) and choice.get("finish_reason") not in (None, "tool_calls"):
             choice["finish_reason"] = "tool_calls"
             changed = True
-    return f"data: {json.dumps(obj)}\n\n" if changed else chunk
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n" if changed else chunk
 
 
 # ---------------------------------------------------------------------------

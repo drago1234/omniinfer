@@ -163,7 +163,7 @@ def _rewrite_named_finish_reason_sse(
             choice["finish_reason"] = "tool_calls"
             changed = True
     if changed:
-        event = f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
+        event = f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
     return event, saw_tool_calls
 
 
@@ -228,7 +228,7 @@ def _maybe_split_sse_line(line: str, tokenizer=None) -> list[str] | None:
             delta.pop("reasoning_content", None)
         choice = {**choice0, "delta": delta}
         event = {**obj, "choices": [choice]}
-        return [f"data: {json.dumps(event, separators=(',', ':'))}\n\n"]
+        return [f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"]
 
     has_reasoning = bool(delta.get("reasoning")) or bool(
         delta.get("reasoning_content")
@@ -241,7 +241,7 @@ def _maybe_split_sse_line(line: str, tokenizer=None) -> list[str] | None:
         delta.pop("content", None)
         choice = {**choice0, "delta": delta}
         event = {**obj, "choices": [choice]}
-        return [f"data: {json.dumps(event, separators=(',', ':'))}\n\n"]
+        return [f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"]
 
     if not has_content_or_tools:
         return None
@@ -303,8 +303,8 @@ def _maybe_split_sse_line(line: str, tokenizer=None) -> list[str] | None:
     content_event = {**obj, "choices": [content_choice]}
     lines = []
     if has_reasoning:
-        lines.append(f"data: {json.dumps(reasoning_event, separators=(',', ':'))}\n\n")
-    lines.append(f"data: {json.dumps(content_event, separators=(',', ':'))}\n\n")
+        lines.append(f"data: {json.dumps(reasoning_event, ensure_ascii=False, separators=(',', ':'))}\n\n")
+    lines.append(f"data: {json.dumps(content_event, ensure_ascii=False, separators=(',', ':'))}\n\n")
     return lines
 
 
