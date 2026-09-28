@@ -29,6 +29,12 @@ THINK_START = 100
 THINK_END = 200
 TOOL_CALL_START = 300
 TOOL_CALL_END = 400
+# Pangu's two sequence terminators: <|message_end|>=148902 (turn boundary) and
+# <|pangu_text_end|>=148900 (document boundary). Both end decoding, so both are
+# banned while reasoning is open.
+SEQ_END_A = 500
+SEQ_END_B = 501
+SEQ_END_TIDS = (SEQ_END_A, SEQ_END_B)
 VOCAB_SIZE = 512
 
 
@@ -44,15 +50,19 @@ def _make_reasoning_cfg(
     tool_call_start_tid: int | None = TOOL_CALL_START,
     ban_end: bool = False,
     tool_call_end_tid: int | None = TOOL_CALL_END,
+    ban_seq_end: bool = False,
+    seq_end_tids: tuple[int, ...] = SEQ_END_TIDS,
 ) -> ReasoningConfig:
     rc = ReasoningConfig(
         ban_tool_start_in_thinking=ban,
         ban_tool_end_in_thinking=ban_end,
+        ban_sequence_end_in_thinking=ban_seq_end,
     )
     rc._reasoning_start_token_ids = [THINK_START] if think_start is None else think_start
     rc._reasoning_end_token_ids = [THINK_END] if think_end is None else think_end
     rc._tool_call_start_token_id = tool_call_start_tid
     rc._tool_call_end_token_id = tool_call_end_tid
+    rc._sequence_end_token_ids = tuple(seq_end_tids) if ban_seq_end else ()
     rc._enabled = True
     return rc
 
@@ -67,6 +77,8 @@ def _make_holder(
     ban: bool = True,
     ban_end: bool = False,
     tool_call_end_tid: int | None = TOOL_CALL_END,
+    ban_seq_end: bool = False,
+    seq_end_tids: tuple[int, ...] = SEQ_END_TIDS,
 ) -> ThinkingBanStateHolder:
     return ThinkingBanStateHolder(
         reasoning_config=_make_reasoning_cfg(
@@ -76,9 +88,12 @@ def _make_holder(
             tool_call_start_tid=tool_call_start_tid,
             ban_end=ban_end,
             tool_call_end_tid=tool_call_end_tid,
+            ban_seq_end=ban_seq_end,
+            seq_end_tids=seq_end_tids,
         ),
         tool_call_start_tid=tool_call_start_tid,
         tool_call_end_tid=tool_call_end_tid if ban_end else None,
+        sequence_end_tids=seq_end_tids if ban_seq_end else (),
         max_num_seqs=4,
         num_spec_tokens=num_spec_tokens,
         device=device or torch.device("cpu"),
@@ -186,6 +201,69 @@ class TestMaybeCreateHolder(unittest.TestCase):
         self.assertIsInstance(h, ThinkingBanStateHolder)
         self.assertIsNone(h.tool_call_start_tid)
         self.assertEqual(h.tool_call_end_tid, 888)
+
+    # --- independence: sequence-end only -----------------------------------
+
+    def test_seq_end_only_creates_holder(self) -> None:
+        # Only the sequence-end ban is on; both tool bans are off. The holder
+        # must still be created, with both tool tids None.
+        rc = _make_reasoning_cfg(
+            ban=False, ban_end=False,
+            ban_seq_end=True, seq_end_tids=(500, 501),
+        )
+        h = maybe_create_thinking_ban_state_holder(
+            rc, 2, 0, torch.device("cpu"), False
+        )
+        self.assertIsInstance(h, ThinkingBanStateHolder)
+        self.assertIsNone(h.tool_call_start_tid)
+        self.assertIsNone(h.tool_call_end_tid)
+        self.assertFalse(h.ban_tool_call_start)
+        self.assertFalse(h.ban_tool_call_end)
+        self.assertTrue(h.ban_sequence_end)
+        self.assertEqual(h.sequence_end_tids, (500, 501))
+
+    def test_seq_end_unresolved_returns_none(self) -> None:
+        # Sequence-end ban on but its ids unresolved, and both tool bans off
+        # → no side is active → None.
+        rc = _make_reasoning_cfg(
+            ban=False, ban_end=False,
+            ban_seq_end=True, seq_end_tids=(),
+        )
+        self.assertIsNone(
+            maybe_create_thinking_ban_state_holder(
+                rc, 2, 0, torch.device("cpu"), False
+            )
+        )
+
+    def test_seq_end_unresolved_others_on_keeps_others(self) -> None:
+        # Sequence-end ids missing, but the start ban is on and resolved. The
+        # holder survives for the start side; the sequence-end side is dropped.
+        rc = _make_reasoning_cfg(
+            ban=True, tool_call_start_tid=42,
+            ban_end=False,
+            ban_seq_end=True, seq_end_tids=(),
+        )
+        h = maybe_create_thinking_ban_state_holder(
+            rc, 2, 0, torch.device("cpu"), False
+        )
+        self.assertIsInstance(h, ThinkingBanStateHolder)
+        self.assertEqual(h.tool_call_start_tid, 42)
+        self.assertEqual(h.sequence_end_tids, ())
+
+    def test_all_three_bans_independent(self) -> None:
+        # All three on and resolved → each side carries its own id(s).
+        rc = _make_reasoning_cfg(
+            ban=True, tool_call_start_tid=42,
+            ban_end=True, tool_call_end_tid=43,
+            ban_seq_end=True, seq_end_tids=(500, 501),
+        )
+        h = maybe_create_thinking_ban_state_holder(
+            rc, 2, 0, torch.device("cpu"), False
+        )
+        self.assertIsInstance(h, ThinkingBanStateHolder)
+        self.assertEqual(h.tool_call_start_tid, 42)
+        self.assertEqual(h.tool_call_end_tid, 43)
+        self.assertEqual(h.sequence_end_tids, (500, 501))
 
 
 # -------------------------------------------------------- pure helpers / FSM
@@ -717,6 +795,138 @@ class TestApplyToLogitsToolCallEnd(unittest.TestCase):
             logits, predict_bonus_token=True, spec_token_ids=spec_tokens
         )
         self.assertEqual(logits[0, TOOL_CALL_END].item(), float("-inf"))
+
+
+# -------------------------------------------------- ban_sequence_end_in_thinking
+
+
+class TestApplyToLogitsSequenceEnd(unittest.TestCase):
+    """``ban_sequence_end_in_thinking`` bans Pangu's two sequence terminators
+    (``<|message_end|>`` / ``<|pangu_text_end|>``) while reasoning is open, so a
+    turn boundary cannot cut the stream off before ``</think>`` is written."""
+
+    def _add(self, h: ThinkingBanStateHolder, idx: int, prompt: list[int]) -> None:
+        h.sync_batch(
+            _batch_update(added=[(idx, ParamsWithArgs(), prompt, [])])
+        )
+
+    def test_in_think_bans_both_seq_ends(self) -> None:
+        h = _make_holder(ban=False, ban_end=False, ban_seq_end=True)
+        self._add(h, 0, [THINK_START, 1])  # IN_THINK
+        logits = torch.zeros(1, VOCAB_SIZE)
+        h.apply_to_logits(logits, predict_bonus_token=False, spec_token_ids=None)
+        self.assertEqual(logits[0, SEQ_END_A].item(), float("-inf"))
+        self.assertEqual(logits[0, SEQ_END_B].item(), float("-inf"))
+        # Other columns untouched.
+        self.assertEqual(logits[0, 0].item(), 0.0)
+        self.assertEqual(logits[0, THINK_END].item(), 0.0)
+
+    def test_post_think_does_not_ban_seq_end(self) -> None:
+        # Once </think> has been committed the ban must lift, otherwise the
+        # model could never end the turn at all.
+        h = _make_holder(ban=False, ban_end=False, ban_seq_end=True)
+        self._add(h, 0, [THINK_START, 1, THINK_END])  # POST_THINK
+        logits = torch.zeros(1, VOCAB_SIZE)
+        h.apply_to_logits(logits, predict_bonus_token=False, spec_token_ids=None)
+        self.assertEqual(logits[0, SEQ_END_A].item(), 0.0)
+        self.assertEqual(logits[0, SEQ_END_B].item(), 0.0)
+        # POST_THINK still bans re-emitting </think>.
+        self.assertEqual(logits[0, THINK_END].item(), float("-inf"))
+
+    def test_pre_think_does_not_ban_seq_end(self) -> None:
+        h = _make_holder(ban=False, ban_end=False, ban_seq_end=True)
+        self._add(h, 0, [1, 2])  # PRE_THINK
+        logits = torch.zeros(1, VOCAB_SIZE)
+        out = h.apply_to_logits(
+            logits, predict_bonus_token=False, spec_token_ids=None
+        )
+        self.assertTrue(torch.equal(out, torch.zeros(1, VOCAB_SIZE)))
+
+    def test_seq_end_ban_off_leaves_untouched(self) -> None:
+        h = _make_holder(ban=False, ban_end=False, ban_seq_end=False)
+        self._add(h, 0, [THINK_START, 1])  # IN_THINK
+        logits = torch.zeros(1, VOCAB_SIZE)
+        h.apply_to_logits(logits, predict_bonus_token=False, spec_token_ids=None)
+        self.assertEqual(logits[0, SEQ_END_A].item(), 0.0)
+        self.assertEqual(logits[0, SEQ_END_B].item(), 0.0)
+
+    def test_spec_target_rows_all_ban_seq_end(self) -> None:
+        # K=3, base IN_THINK, drafts [., </think>, x]. Row 2 walks to POST, but
+        # the ban is gated on the *committed* state: the draft </think> has not
+        # been accepted yet, so every row of this step stays banned.
+        h = _make_holder(num_spec_tokens=3, ban=False, ban_end=False,
+                         ban_seq_end=True)
+        self._add(h, 0, [THINK_START])
+        spec_tokens = [[42, THINK_END, 5]]
+        logits = torch.zeros(3, VOCAB_SIZE)
+        h.apply_to_logits(
+            logits, predict_bonus_token=False, spec_token_ids=spec_tokens
+        )
+        for row in range(3):
+            self.assertEqual(logits[row, SEQ_END_A].item(), float("-inf"))
+            self.assertEqual(logits[row, SEQ_END_B].item(), float("-inf"))
+
+    def test_spec_bonus_row_bans_seq_end(self) -> None:
+        h = _make_holder(num_spec_tokens=3, ban=False, ban_end=False,
+                         ban_seq_end=True)
+        self._add(h, 0, [THINK_START])
+        spec_tokens = [[42, 43, 44]]
+        logits = torch.zeros(1, VOCAB_SIZE)
+        h.apply_to_logits(
+            logits, predict_bonus_token=True, spec_token_ids=spec_tokens
+        )
+        self.assertEqual(logits[0, SEQ_END_A].item(), float("-inf"))
+        self.assertEqual(logits[0, SEQ_END_B].item(), float("-inf"))
+
+
+# ------------------------------------------------------------- apply_draft_ban
+
+
+class _FakeSamplingMeta:
+    """Minimal stand-in for ``SamplingMetadata`` — ``apply_draft_ban`` only
+    reads ``output_token_ids`` off it (and tolerates its absence)."""
+
+    def __init__(self, output_token_ids: list[list[int]] | None) -> None:
+        self.output_token_ids = output_token_ids
+
+
+class TestApplyDraftBan(unittest.TestCase):
+    """MTP **draft-proposer** side of the ban. The drafter must not propose a
+    sequence terminator either: the target would reject it, wasting a draft
+    slot, and a leaked acceptance would end the stream early."""
+
+    def _add(self, h: ThinkingBanStateHolder, idx: int, prompt: list[int]) -> None:
+        h.sync_batch(
+            _batch_update(added=[(idx, ParamsWithArgs(), prompt, [])])
+        )
+
+    def test_draft_ban_masks_seq_end_when_only_seq_end_on(self) -> None:
+        # Only the sequence-end ban is on → both tool tids are None. The draft
+        # path must still mask: the early-return guard has to account for the
+        # sequence-end side too.
+        h = _make_holder(ban=False, ban_end=False, ban_seq_end=True)
+        self.assertIsNone(h.tool_call_start_tid)
+        self.assertIsNone(h.tool_call_end_tid)
+        self._add(h, 0, [THINK_START, 1])  # IN_THINK
+        logits = torch.zeros(1, VOCAB_SIZE)
+        meta = _FakeSamplingMeta([[THINK_START, 1]])
+        h.apply_draft_ban(logits, meta)
+        self.assertEqual(logits[0, SEQ_END_A].item(), float("-inf"))
+        self.assertEqual(logits[0, SEQ_END_B].item(), float("-inf"))
+
+    def test_draft_ban_noop_when_no_ban_active(self) -> None:
+        # Holder exists (start ban on) but no sequence-end ids → the draft path
+        # returns the tensor unchanged for an IN_THINK request without tool
+        # markers configured.
+        h = _make_holder(ban=False, ban_end=False, ban_seq_end=False)
+        self.assertEqual(h.sequence_end_tids, ())
+        self._add(h, 0, [THINK_START, 1])  # IN_THINK
+        logits = torch.zeros(1, VOCAB_SIZE)
+        meta = _FakeSamplingMeta([[THINK_START, 1]])
+        out = h.apply_draft_ban(logits, meta)
+        self.assertIs(out, logits)
+        self.assertEqual(logits[0, SEQ_END_A].item(), 0.0)
+        self.assertEqual(logits[0, SEQ_END_B].item(), 0.0)
 
 
 if __name__ == "__main__":

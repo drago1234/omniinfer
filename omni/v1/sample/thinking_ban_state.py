@@ -56,21 +56,26 @@ def maybe_create_thinking_ban_state_holder(
     """Factory: returns a holder iff at least one ban is opted-in and its
     token id resolved.
 
-    ``ban_tool_start_in_thinking`` and ``ban_tool_end_in_thinking`` are
-    independent: the holder is created when *either* is on, and each side
-    is applied only when its own flag is on and its token id resolved. A side
-    whose tokenizer lookup failed (``None`` id) is silently disabled rather
-    than aborting the other side. Returns ``None`` only when neither ban is
+    The three bans are independent: the holder is created when *any* is on,
+    and each side is applied only when its own flag is on and its token ids
+    resolved. A side whose tokenizer lookup failed is silently disabled rather
+    than aborting the other sides. Returns ``None`` only when no ban is
     effectively active.
     """
     if reasoning_config is None:
         return None
     ban_start = getattr(reasoning_config, "ban_tool_start_in_thinking", False)
     ban_end = getattr(reasoning_config, "ban_tool_end_in_thinking", False)
-    if not (ban_start or ban_end):
+    ban_seq_end = getattr(
+        reasoning_config, "ban_sequence_end_in_thinking", False
+    )
+    if not (ban_start or ban_end or ban_seq_end):
         return None
     tid = getattr(reasoning_config, "tool_call_start_token_id", None)
     end_tid = getattr(reasoning_config, "tool_call_end_token_id", None)
+    seq_end_tids = tuple(
+        getattr(reasoning_config, "sequence_end_token_ids", ()) or ()
+    )
     if ban_start and tid is None:
         logger.warning(
             "ThinkingBanStateHolder: ban_tool_start_in_thinking=True but the "
@@ -85,12 +90,21 @@ def maybe_create_thinking_ban_state_holder(
             "initialize_token_ids ran; end ban disabled"
         )
         ban_end = False
-    if not (ban_start or ban_end):
+    if ban_seq_end and not seq_end_tids:
+        logger.warning(
+            "ThinkingBanStateHolder: ban_sequence_end_in_thinking=True but "
+            "the tokenizer had neither <|message_end|> nor "
+            "<|pangu_text_end|> when initialize_token_ids ran; "
+            "sequence-end ban disabled"
+        )
+        ban_seq_end = False
+    if not (ban_start or ban_end or ban_seq_end):
         return None
     return ThinkingBanStateHolder(
         reasoning_config=reasoning_config,
         tool_call_start_tid=tid,
         tool_call_end_tid=end_tid,
+        sequence_end_tids=seq_end_tids,
         max_num_seqs=max_num_seqs,
         num_spec_tokens=num_spec_tokens,
         device=device,
@@ -115,7 +129,9 @@ class ThinkingBanStateHolder:
 
     Apply rules:
 
-    * ``IN_THINK``   → ban ``<|tool_call_start|>`` (one column)
+    * ``IN_THINK``   → ban ``<|tool_call_start|>`` (one column), and the
+      sequence-end tokens (``<|message_end|>`` / ``<|pangu_text_end|>``) so a
+      turn boundary cannot cut the answer off before ``</think>`` is written
     * ``POST_THINK`` → ban the last token of ``</think>`` (one column)
     * ``PRE_THINK``  → no-op
     """
@@ -126,6 +142,7 @@ class ThinkingBanStateHolder:
         reasoning_config: "ReasoningConfig",
         tool_call_start_tid: int,
         tool_call_end_tid: int,
+        sequence_end_tids: tuple[int, ...] = (),
         max_num_seqs: int,
         num_spec_tokens: int,
         device: torch.device,
@@ -152,6 +169,14 @@ class ThinkingBanStateHolder:
             int(tool_call_end_tid)
             if (self.ban_tool_call_end and tool_call_end_tid is not None)
             else None
+        )
+        self.ban_sequence_end = getattr(
+            reasoning_config, "ban_sequence_end_in_thinking", False
+        )
+        self.sequence_end_tids: tuple[int, ...] = (
+            tuple(int(t) for t in sequence_end_tids)
+            if self.ban_sequence_end
+            else ()
         )
 
         rs = getattr(reasoning_config, "reasoning_start_token_ids", None)
@@ -187,12 +212,15 @@ class ThinkingBanStateHolder:
             "ThinkingBanStateHolder enabled=%s "
             "ban_tool_call_start=%s tool_call_start_tid=%s "
             "ban_tool_call_end=%s tool_call_end_tid=%s "
+            "ban_sequence_end=%s sequence_end_tids=%s "
             "think_start=%s think_end=%s num_spec_tokens=%d",
             self.is_enabled,
             self.ban_tool_call_start,
             self.tool_call_start_tid,
             self.ban_tool_call_end,
             self.tool_call_end_tid,
+            self.ban_sequence_end,
+            self.sequence_end_tids,
             self.think_start_token_ids,
             self.think_end_token_ids,
             self.num_spec_tokens,
@@ -470,14 +498,18 @@ class ThinkingBanStateHolder:
             for row, walked in rows:
                 if row >= logits.shape[0]:
                     break
-                # Committed IN_THINK → hard-ban tool markers on every row of
-                # this step (target + bonus), even if a draft ``</think>``
-                # would walk the speculative state to POST.
+                # Committed IN_THINK → hard-ban tool markers and the sequence
+                # end tokens on every row of this step (target + bonus), even
+                # if a draft ``</think>`` would walk the speculative state to
+                # POST. Banning the sequence end here is what keeps a turn
+                # boundary from ending the stream before ``</think>`` lands.
                 if base_state == IN_THINK:
                     if self.tool_call_start_tid is not None:
                         logits[row, self.tool_call_start_tid] = float("-inf")
                     if self.tool_call_end_tid is not None:
                         logits[row, self.tool_call_end_tid] = float("-inf")
+                    for tid in self.sequence_end_tids:
+                        logits[row, tid] = float("-inf")
                 if walked == POST_THINK and think_end_last is not None:
                     logits[row, think_end_last] = float("-inf")
 
@@ -488,19 +520,20 @@ class ThinkingBanStateHolder:
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
-        """Ban tool markers on MTP **draft-proposer** logits.
+        """Ban tool markers and sequence-end tokens on MTP **draft-proposer** logits.
 
         Draft sampling is typically 1 row per request (sequential MTP), or
         ``K`` request-major rows for parallel drafting. Unlike verify-time
         ``apply_to_logits``, this only enforces the committed ``IN_THINK``
-        tool-marker ban so the proposer does not emit tokens that target
-        rejection would discard.
+        ban so the proposer does not emit tokens that target rejection would
+        discard.
         """
         if not self.is_enabled or not self._state:
             return logits
         if (
             self.tool_call_start_tid is None
             and self.tool_call_end_tid is None
+            and not self.sequence_end_tids
         ):
             return logits
 
@@ -544,4 +577,6 @@ class ThinkingBanStateHolder:
                     logits[row, self.tool_call_start_tid] = float("-inf")
                 if self.tool_call_end_tid is not None:
                     logits[row, self.tool_call_end_tid] = float("-inf")
+                for tid in self.sequence_end_tids:
+                    logits[row, tid] = float("-inf")
         return logits
