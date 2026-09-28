@@ -110,6 +110,7 @@
         export OMNI_SKIP_DECODE_TOKENIZE=1
         # export TORCH_COMPILE_DISABLE=1
         export VLLM_MQ_MAX_CHUNK_BYTES_MB=100
+        export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_HYBRID_ATTN_GROUP_SIZE=18
         export OMNI_VLLM_PATCHES_DIR="pangu_v2_hybrid, pangu_v2_moe"
@@ -167,6 +168,7 @@
         export OMNI_REUSE_PREFILLED_TOKENS=1
         export OMNI_SKIP_DECODE_TOKENIZE=1
         export VLLM_MQ_MAX_CHUNK_BYTES_MB=100
+        export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_HYBRID_ATTN_GROUP_SIZE=18
         export OMNI_VLLM_PATCHES_DIR="pangu_v2_hybrid, pangu_v2_moe"
