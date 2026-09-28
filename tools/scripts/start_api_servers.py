@@ -388,6 +388,23 @@ def run_omni_cache_setup(env, runner=subprocess.run, script_dir=None):
 
     # Determine which setup script to run based on MEMMAP_PATH
     if memmap_path == "/dev/shm/omni_cache":
+        # setup_shm_1MB.sh does `rm -f` + `dd` of the whole file every time.
+        # For MAP_SIZE_BYTES=720G that costs minutes of memory bandwidth and
+        # buys nothing on a restart: kv_mem_pool opens the file with O_RDWR
+        # (no O_CREAT/O_TRUNC), the decode path zeros its mapping via
+        # shared_tensor.zero_() (kv_mem_pool.py:185), and the prefill path
+        # never assumed a zeroed file to begin with (kv_mem_pool.py:176).
+        # Set OMNI_CACHE_REUSE_SHM=1 to skip dd and reuse the existing file.
+        if (env.get("OMNI_CACHE_REUSE_SHM") == "1"
+                and os.path.exists(memmap_path)):
+            existing_size = os.path.getsize(memmap_path)
+            if map_size and existing_size >= int(map_size):
+                print(f"Reusing existing {memmap_path} "
+                      f"({existing_size} bytes >= {map_size}), "
+                      f"skipping setup_shm_1MB.sh")
+                return None
+            print(f"{memmap_path} exists but is {existing_size} bytes, "
+                  f"needed {map_size}; rebuilding")
         setup_script = os.path.join(script_dir, "setup_shm_1MB.sh")
         print(f"MEMMAP_PATH is {memmap_path}, running {setup_script}")
     else:
