@@ -16,6 +16,7 @@ import importlib.util
 import logging
 import sys
 import types
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,6 +71,19 @@ class _SamplingParams:
 
 class _PoolingParams:
     pass
+
+
+@dataclass
+class _RepetitionDetectionParams:
+    """Minimal stand-in for vllm.sampling_params.RepetitionDetectionParams.
+
+    Only used by the coexistence regression test; field order matches the real
+    dataclass (max_pattern_size, min_pattern_size, min_count).
+    """
+
+    max_pattern_size: int = 0
+    min_pattern_size: int = 0
+    min_count: int = 0
 
 
 @dataclass
@@ -212,6 +226,12 @@ def _load_patch():
     # that apply() would capture in production.
     patch_cls = mod.ThinkingLimitEngineArgsPatch
     patch_cls._upstream_create_engine_config = _EngineArgs.create_engine_config
+    # process_inputs now chains through _upstream_process_inputs (captured at
+    # apply time in production); seed the native stub so direct-call tests work
+    # without first calling apply().
+    mod.ThinkingLimitInputProcessorPatch._upstream_process_inputs = (
+        _InputProcessor.process_inputs
+    )
     return mod
 
 
@@ -591,6 +611,7 @@ def test_apply_actually_installs_the_attributes():
     # Model a previously-applied patch (LoPT / repetition-detection). Production
     # captures the active create_engine_config at apply time; verify the chain.
     upstream_create_engine_config = _EngineArgs.create_engine_config
+    upstream_process_inputs = _InputProcessor.process_inputs
     prior_calls = []
 
     def prior_create_engine_config(self, usage_context=None, headless=False):
@@ -620,14 +641,154 @@ def test_apply_actually_installs_the_attributes():
         assert out["params"].thinking_token_budget == 64
     finally:
         _EngineArgs.create_engine_config = upstream_create_engine_config
+        _InputProcessor.process_inputs = upstream_process_inputs
         if hasattr(_EngineArgs, "_omni_npu_applied_patches"):
             _EngineArgs._omni_npu_applied_patches.clear()
         if hasattr(_InputProcessor, "_omni_npu_applied_patches"):
             _InputProcessor._omni_npu_applied_patches.clear()
-        # Restore the class-level seed for later direct-call tests.
+        # Restore the class-level seeds for later direct-call tests.
         PATCH.ThinkingLimitEngineArgsPatch._upstream_create_engine_config = (
             _EngineArgs.create_engine_config
         )
+        PATCH.ThinkingLimitInputProcessorPatch._upstream_process_inputs = (
+            _InputProcessor.process_inputs
+        )
+
+
+@contextmanager
+def _monkeypatch():
+    """Minimal stdlib stand-in for pytest's ``monkeypatch`` fixture.
+
+    Exposes ``setattr(obj, name, value)`` with ``raising=False`` semantics: an
+    attribute that did not pre-exist is deleted on teardown, one that did is
+    restored to its prior value. Used so the regression test's class-attribute
+    mutations are auto-reversed even if an assertion fails mid-setup, and so it
+    runs identically under pytest and as a standalone script (the latter calls
+    ``test_*`` with no fixture arguments, which a real ``monkeypatch`` parameter
+    could not satisfy).
+    """
+    undo = []
+
+    def _setattr(obj, name, value):
+        had = hasattr(obj, name)
+        old = getattr(obj, name, None) if had else None
+        undo.append((obj, name, had, old))
+        setattr(obj, name, value)
+
+    mp = types.SimpleNamespace(setattr=_setattr)
+    try:
+        yield mp
+    finally:
+        for obj, name, had, old in reversed(undo):
+            if had:
+                setattr(obj, name, old)
+            else:
+                try:
+                    delattr(obj, name)
+                except AttributeError:
+                    pass
+
+
+def test_input_processor_patch_chains_with_repetition_detection():
+    """Regression for issue 92BVL_A3_patch_conflict: both patches wrap
+    ``InputProcessor.process_inputs``. The second one (thinking-limit) must use
+    ``apply_bypass_conflict`` and call the upstream wrapper so that
+    repetition-detection's injection still runs and native runs exactly once.
+    """
+    _reset()
+
+    native_process_inputs = _InputProcessor.process_inputs
+    native_calls = []
+
+    def _instrumented_native(self, request_id, prompt, params, **kwargs):
+        native_calls.append(request_id)
+        out = native_process_inputs(self, request_id, prompt, params, **kwargs)
+        # The shared stub only clones thinking_token_budget; carry the
+        # repetition_detection field through so both injections are observable
+        # on the params that reach the engine core.
+        if isinstance(params, _RepSamplingParams):
+            out["params"].repetition_detection = params.repetition_detection
+        return out
+
+    # A minimal stand-in for InputProcessorRepetitionDetectionPatch: first link,
+    # applied with the default apply(), marks the attr occupied, injects
+    # repetition_detection, then calls the (native) upstream.
+    rep_default = _RepetitionDetectionParams(10, 2, 3)
+
+    class _RepSamplingParams(_SamplingParams):
+        """A SamplingParams that also carries repetition_detection, so both
+        injections are visible on one object. Subclasses _SamplingParams so the
+        patch's isinstance(arg, SamplingParams) check still matches."""
+
+        def __init__(self, thinking_token_budget=None):
+            super().__init__(thinking_token_budget=thinking_token_budget)
+            self.repetition_detection = None
+
+    class _RepPatch(_VLLMPatch):
+        _target = _InputProcessor
+        _attr_names_to_apply = ["process_inputs"]
+
+        def process_inputs(self, *args, **kwargs):
+            params = _find_rep_params(args, kwargs)
+            if params is not None and params.repetition_detection is None:
+                params.repetition_detection = rep_default
+            return _InputProcessor._omni_npu_applied_upstream_process_inputs(
+                self, *args, **kwargs
+            )
+
+    def _find_rep_params(args, kwargs):
+        params = kwargs.get("params")
+        if params is None:
+            for arg in args:
+                if isinstance(arg, _RepSamplingParams):
+                    return arg
+            return None
+        return params if isinstance(params, _RepSamplingParams) else None
+
+    # Auto-managed setattr: every assignment below is undone on exit, and an
+    # attribute that did not pre-exist is deleted (mirrors pytest's
+    # monkeypatch.setattr raising=False). A stdlib contextmanager rather than
+    # the pytest fixture so the test also runs standalone (``py <this>.py``),
+    # which calls test_* with no fixture args.
+    with _monkeypatch() as mp:
+        mp.setattr(_InputProcessor, "process_inputs", _instrumented_native)
+        # Hand-wire the first link the way core.py does for a default-apply
+        # patch: capture native as the "upstream" the first link calls, then
+        # install it.
+        mp.setattr(
+            _InputProcessor,
+            "_omni_npu_applied_upstream_process_inputs",
+            _instrumented_native,
+        )
+        mp.setattr(_InputProcessor, "_omni_npu_applied_patches", {})
+        _InputProcessor._omni_npu_applied_patches["process_inputs"] = "_RepPatch"
+        mp.setattr(_InputProcessor, "process_inputs", _RepPatch.process_inputs)
+        # apply() overwrites the patch class's _upstream_process_inputs; track
+        # it too so it is restored to the _load_patch() seed (native) on exit.
+        mp.setattr(
+            PATCH.ThinkingLimitInputProcessorPatch,
+            "_upstream_process_inputs",
+            PATCH.ThinkingLimitInputProcessorPatch._upstream_process_inputs,
+        )
+
+        # Now apply the thinking-limit patch on top -- before the fix this
+        # raised "process_inputs already patched by _RepPatch" inside apply()
+        # and silently skipped. apply_bypass_conflict must chain instead.
+        PATCH.ThinkingLimitInputProcessorPatch.apply()
+
+        vllm_config = _VllmConfig(
+            reasoning_config=_ReasoningConfig(thinking_token_budget=128),
+            model_config=_ModelConfigStub(),
+        )
+        out = _InputProcessor(vllm_config).process_inputs(
+            "req-1", "hi", _RepSamplingParams(), supported_tasks=("generate",)
+        )
+        # thinking-limit injection ran.
+        assert out["params"].thinking_token_budget == 128
+        # repetition-detection injection also ran (not bypassed).
+        assert out["params"].repetition_detection == rep_default
+        # Native process_inputs ran exactly once (no double execution).
+        assert native_calls == ["req-1"]
 
 
 if __name__ == "__main__":
