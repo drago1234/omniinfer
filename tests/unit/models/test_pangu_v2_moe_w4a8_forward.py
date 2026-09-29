@@ -6,7 +6,7 @@ The flag-only tests in ``test_pangu_v2_moe_w4a8_flags.py`` do not run the
 production GMM / swiglu / finalize lines. These tests drive the three
 communication paths that contain the incremental W4A8 code:
 
-* ``_forward_allgather`` (W4A8 GMM2 / GMM-FR, and the W8A8 else branch)
+* ``_forward_allgather`` (W4A8 expert FFN, and the W8A8 GMM / GMM-FR else branch)
 * ``_dispatch_combine_single_batch``
 * ``_forward_all2allv``
 """
@@ -83,6 +83,7 @@ def _w4a8_experts(*, asymmetric=False):
         w2_weight=torch.zeros(NUM_EXPERTS, INTERMEDIATE, HIDDEN, dtype=torch.int8),
         w2_weight_bias=torch.zeros(NUM_EXPERTS, HIDDEN),
         w2_weight_int4_scale=torch.ones(NUM_EXPERTS, 1, HIDDEN, dtype=torch.int64),
+        _use_w4a8_enk=False,
     )
     if asymmetric:
         experts.w13_weight_offset = torch.ones(NUM_EXPERTS, 1, 2 * INTERMEDIATE)
@@ -98,7 +99,6 @@ def _make_moe(*, asymmetric=False, gmm_fr_threshold=0, w4a8=True):
     # _is_graph_mode is a read-only property over get_forward_context().
     moe._is_quant = True
     moe._is_w4a8 = w4a8
-    moe._is_w4a8_weight_asymmetric = asymmetric if w4a8 else False
     moe.experts = (
         _w4a8_experts(asymmetric=asymmetric) if w4a8 else _w8a8_experts()
     )
@@ -417,31 +417,42 @@ def test_forward_allgather_w4a8_asymmetric_passes_offset_and_token_scale():
     assert captured[1]["per_token_scale"][0].ndim == 2
 
 
-def test_forward_allgather_w4a8_gmm_fr_path():
-    """Small-batch W4A8 allgather uses grouped_matmul_finalize_routing for GMM2."""
-    moe = _make_moe(asymmetric=False, gmm_fr_threshold=1024)
+@pytest.mark.parametrize("asymmetric", [False, True])
+def test_forward_allgather_w4a8_skips_gmm_fr(asymmetric):
+    """W4A8 allgather stays on expert FFN even under the GMM-FR token threshold."""
+    moe = _make_moe(asymmetric=asymmetric, gmm_fr_threshold=1024)
+    captured = []
+    routing_kwargs = {}
     fr_mock = _fr_mock()
-    gmm_calls = []
-    out = _run_forward_allgather_fr(moe, gmm_calls, fr_mock)
 
-    assert out.shape == (TOKENS, HIDDEN)
-    assert len(gmm_calls) == 1
-    fr_mock.assert_called_once()
-    assert fr_mock.call_args.kwargs["offset"] is None
-    assert fr_mock.call_args.kwargs["scale"] is moe.experts.w2_weight_int4_scale
+    def capture_routing(*args, **kwargs):
+        routing_kwargs.update(kwargs)
+        return _init_routing_result()
 
-
-def test_forward_allgather_w4a8_gmm_fr_asymmetric_offset():
-    """GMM-FR W4A8 path forwards the w2 offset when weights are asymmetric."""
-    moe = _make_moe(asymmetric=True, gmm_fr_threshold=1024)
-    fr_mock = _fr_mock()
     with ExitStack() as stack:
         _patch_common_npu(stack)
-        _patch_init_routing(stack)
+        _patch_grouped_matmul(stack, captured)
+        stack.enter_context(
+            patch.object(
+                model_mod.torch_npu,
+                "npu_moe_init_routing_v2",
+                side_effect=capture_routing,
+            )
+        )
+        _patch_finalize_routing(stack)
         _patch_grouped_matmul_finalize_routing(stack, fr_mock)
-        moe._forward_allgather(moe._hidden, use_allreduce=True)
+        out = moe._forward_allgather(moe._hidden, use_allreduce=True)
 
-    assert fr_mock.call_args.kwargs["offset"] is moe.experts.w2_weight_offset
+    assert out.shape == (TOKENS, HIDDEN)
+    assert len(captured) == 2
+    assert routing_kwargs["row_idx_type"] == 0
+    fr_mock.assert_not_called()
+    if asymmetric:
+        assert captured[0]["offset"][0] is moe.experts.w13_weight_offset
+        assert captured[1]["offset"][0] is moe.experts.w2_weight_offset
+    else:
+        assert captured[0]["offset"] is None
+        assert captured[1]["offset"] is None
 
 
 def test_dispatch_combine_w4a8_symmetric_and_asymmetric():

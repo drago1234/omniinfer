@@ -407,6 +407,7 @@ def _w4a8_experts(*, asymmetric):
         w2_weight=torch.zeros(2, 2, dtype=torch.int8),
         w2_weight_bias=torch.zeros(2),
         w2_weight_int4_scale=torch.ones(2, 1, 2, dtype=torch.int64),
+        _use_w4a8_enk=False,
     )
     if asymmetric:
         experts.w13_weight_offset = torch.ones(2, 1, 4)
@@ -487,6 +488,66 @@ def test_quant_ffn_w4a8_asymmetric_forwards_offsets(monkeypatch):
         calls[0]["per_token_scale"][0], x_sc.unsqueeze(-1)
     )
     assert not custom.npu_ai_infra_grouped_matmul.called
+
+
+def test_quant_ffn_w4a8_enk_uses_custom_grouped_matmul(monkeypatch):
+    """EnK W4A8 uses npu_ai_infra_grouped_matmul and rejects an asymmetric offset."""
+    calls, custom = _patch_w4a8_ops(monkeypatch)
+
+    def fake_enk(*args, **kwargs):
+        calls.append(kwargs)
+        tokens = args[0][0]
+        return [torch.ones(tokens.size(0), 3, dtype=torch.bfloat16)]
+
+    custom.npu_ai_infra_grouped_matmul.side_effect = fake_enk
+    experts = _w4a8_experts(asymmetric=False)
+    experts._use_w4a8_enk = True
+    x_i8 = torch.zeros(3, 2, dtype=torch.int8)
+    x_sc = torch.ones(3, dtype=torch.float32)
+    hist = torch.tensor([1, 2], dtype=torch.int32)
+
+    out = pangu_utils.quant_ffn(experts, x_i8, x_sc, hist)
+
+    assert tuple(out.shape) == (3, 3)
+    assert len(calls) == 2
+    assert calls[0]["offset"] is None
+    assert calls[1]["offset"] is None
+    assert calls[0]["tuning_config"] == [0, 0, -1, 1]
+    assert calls[1]["tuning_config"] == [0, 0, -1, 1]
+    assert calls[0]["scale"][0] is experts.w13_weight_int4_scale
+    assert calls[1]["scale"][0] is experts.w2_weight_int4_scale
+    assert calls[0]["group_list"].dtype == torch.int64
+    torch.testing.assert_close(calls[0]["per_token_scale"][0], x_sc.unsqueeze(-1))
+    torch.testing.assert_close(calls[1]["per_token_scale"][0], torch.ones(3, 1))
+    assert custom.npu_ai_infra_grouped_matmul.call_count == 2
+
+    experts.w13_weight_offset = torch.ones(2, 1, 4)
+    with pytest.raises(AssertionError, match="asymmetric offset"):
+        pangu_utils.quant_ffn(experts, x_i8, x_sc, hist)
+
+
+def test_quant_ffn_w4a8_enk_keeps_rank2_token_scale(monkeypatch):
+    """An already rank-2 EnK token scale is forwarded without another unsqueeze."""
+    calls, custom = _patch_w4a8_ops(monkeypatch)
+
+    def fake_enk(*args, **kwargs):
+        calls.append(kwargs)
+        tokens = args[0][0]
+        return [torch.ones(tokens.size(0), 3, dtype=torch.bfloat16)]
+
+    custom.npu_ai_infra_grouped_matmul.side_effect = fake_enk
+    experts = _w4a8_experts(asymmetric=False)
+    experts._use_w4a8_enk = True
+    x_sc = torch.ones(3, 1, dtype=torch.float32)
+
+    pangu_utils.quant_ffn(
+        experts,
+        torch.zeros(3, 2, dtype=torch.int8),
+        x_sc,
+        torch.tensor([1, 2], dtype=torch.int32),
+    )
+
+    assert calls[0]["per_token_scale"][0] is x_sc
 
 
 def test_finalize_routing_forwards_drop_pad_mode(monkeypatch):
