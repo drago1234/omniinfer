@@ -48,6 +48,7 @@ from omni_npu.attention.backends.utils import (
     CrossLayerSharedOp,
     SPManager,
     cache_fit_shape,
+    conv_sp,
     get_batch_desc,
     lazy_zero_like,
     sp_disabled,
@@ -329,6 +330,65 @@ class MomeAttentionMixin:
                 out = out[self.o_proj.tp_rank].contiguous()
         return out
 
+    def _get_mome_prefill_sp_args(
+        self,
+        state_indice: int,
+    ) -> tuple | None:
+        """Return one MoME-SP convolution's arguments when available."""
+        if (
+            not getattr(self, "enable_mome_sp", False)
+            or not self.on_ascend950
+            or not self.noncontiguous_kv
+        ):
+            return None
+
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if attn_metadata is None:
+            return None
+        mome_metadata = attn_metadata[self.conv.prefix]
+        if mome_metadata.prefill is None or mome_metadata.conv_sp_meta is None:
+            return None
+
+        conv = [self.conv.qa_conv, self.conv.compresskv_conv, self.conv.o_conv]
+        init_idx, save_idx, metadata = mome_metadata.conv_sp_meta
+        # vLLM 0.25 binds MomeAttention.kv_cache as the (q, kv, o) state tuple.
+        cache = self.conv.kv_cache[state_indice]
+        return conv[state_indice].weight, cache, init_idx, save_idx, metadata
+
+    def _apply_mome_prefill_sp(
+        self,
+        x: torch.Tensor,
+        state_indice: int,
+        *,
+        inplace: bool,
+    ) -> bool:
+        """Run MoME while q/kv tokens remain in the local SP layout."""
+        mome_sp_args = self._get_mome_prefill_sp_args(state_indice)
+        if mome_sp_args is None:
+            return False
+        conv_sp(x, *mome_sp_args, inplace=inplace)
+        return True
+
+    def _apply_mome_out_prefill_sp(
+        self,
+        out: torch.Tensor,
+        sp_manager: SPManager,
+    ) -> torch.Tensor | None:
+        """Convert TP heads to SP tokens, then run full-channel o_conv_sp."""
+        if not getattr(self, "enable_o_conv_sp", False):
+            return None
+        mome_sp_args = self._get_mome_prefill_sp_args(2)
+        if mome_sp_args is None:
+            return None
+
+        # Attention trims global token padding. Restore equal destination
+        # blocks before TP->SP, then run convolution only on this rank's SP
+        # tokens. conv_sp handles causal boundaries and state synchronization.
+        sp_out = sp_manager.tp_to_sp(sp_manager.align_tokens(out))
+        conv_sp(sp_out, *mome_sp_args, inplace=True)
+        return sp_out
+
     def _project_and_split_q(
         self,
         q_lora: torch.Tensor,
@@ -411,6 +471,11 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
             or self.enable_prefix_caching
         )
         self.use_mome = getattr(config, "use_mome", False)
+        self.enable_mome_sp = getattr(
+            model_extra_config.operator_opt_config,
+            "enable_mome_sp",
+            False,
+        )
         self.noncontiguous_kv = model_extra_config.operator_opt_config.use_noncontiguous_kv
         self.enable_decode_multi_stream = model_extra_config.operator_opt_config.enable_multi_stream
         self.split_q_up_in_multistream = (
@@ -491,6 +556,22 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+        )
+
+        # Pangu-style MLA epilog: turn full-token/local-channel attention output
+        # into local-token/full-channel SP layout before full-channel o_conv.
+        # The o_conv state remains full-channel on both PD stages, so this layout
+        # conversion is also safe when KV transfer is enabled.
+        self.enable_o_conv_sp = (
+            self.use_mome
+            and self.enable_mome_sp
+            and self.ena_sp
+            and self.noncontiguous_kv
+            and self.on_ascend950
+            and self.kv_b_proj.tp_size > 1
+            and self.kv_b_proj.tp_size == get_tp_group().world_size
+            and self.kv_b_proj.tp_rank == get_tp_group().rank_in_group
+            and self.o_proj.tp_size == 1
         )
 
         if config.rope_parameters["rope_type"] != "default":
@@ -2019,9 +2100,16 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
         sink_k_nope, sink_k_pe, sink_v = None, None, None
 
         q = self.q_a_proj(x)[0]  # TD
+        mome_sp_q_applied = False
         if self.ena_sp and self.use_mome:
+            mome_sp_q_applied = self._apply_mome_prefill_sp(
+                q,
+                0,
+                inplace=True,
+            )
             q = sp_manager.ag_tokens(q)  # TD
-        q = self._maybe_mome_q(q, get_mome_args)  # TD
+        if not mome_sp_q_applied:
+            q = self._maybe_mome_q(q, get_mome_args)  # TD
         q = self.q_a_layernorm(q)  # TD
         if self.ena_sp and not self.use_mome:
             q = sp_manager.ag_tokens(q)  # TD
@@ -2037,9 +2125,17 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
         q_pe = self._apply_rope(q_pe, cos, sin)  # TND
 
         kv = self.kv_a_proj_with_mqa(x)[0]  # TD
+        mome_sp_kv_applied = False
+        if self.ena_sp and self.use_mome:
+            mome_sp_kv_applied = self._apply_mome_prefill_sp(
+                kv[:, :self.kv_lora_rank],
+                1,
+                inplace=True,
+            )
         if self.ena_sp:
             kv = sp_manager.ag_tokens(kv)  # TD
-        kv = self._maybe_mome_kv(kv, get_mome_args)  # TD
+        if not mome_sp_kv_applied:
+            kv = self._maybe_mome_kv(kv, get_mome_args)  # TD
         kv_a, k_pe = self._kv_norm_rope_cache(kv, cos, sin, attn_metadata, kv_cache)  # T1D
         kv_a, k_pe = kv_a.squeeze(1), k_pe.squeeze(1)  # TD
         kv_a, k_pe, kv_cumlens = self._prepend_chunked_prefill_context(
@@ -2088,7 +2184,11 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
             metadata_caller="prefill",
         ).view(-1, N * V)  # [T, ND]
 
-        out = self._maybe_mome_out(out, get_mome_args)  # fit o_proj.tp_size
+        mome_sp_out = self._apply_mome_out_prefill_sp(out, sp_manager)
+        if mome_sp_out is not None:
+            out = mome_sp_out
+        else:
+            out = self._maybe_mome_out(out, get_mome_args)  # fit o_proj.tp_size
         if sp_manager and self.o_proj.tp_size > 1:
             out = sp_manager.align_tokens(out)
         out = self._apply_o_proj(out)  # T,ND -> TD
