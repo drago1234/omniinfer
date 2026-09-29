@@ -171,11 +171,19 @@ class ThinkingLimitEngineArgsPatch(VLLMPatch):
 # ────────────────────────────────────────────────────────────
 # Patch 2: InputProcessor.process_inputs — server-side default budget
 # ────────────────────────────────────────────────────────────
-# Mirrors patch_repetition_detection_config.py's InputProcessor pattern: mutate
-# params in place *before* the native process_inputs so the injected value goes
-# through native _validate_params (which checks reasoning_config.enabled) and
-# into the native ThinkingBudgetStateHolder. No extra_args, no custom holder.
-_original_process_inputs = InputProcessor.process_inputs
+# ``InputProcessor.process_inputs`` is *not* ours alone: the repetition-detection
+# patch (patch_repetition_detection_config.py) already wraps it. So unlike
+# ``create_engine_config`` above we are the *second* link, not the first, and
+# must chain onto whatever wrapper is currently active via
+# ``apply_bypass_conflict`` rather than preempting with the default ``apply()``.
+# Applying with the default ``apply()`` raises
+# ``process_inputs already patched by InputProcessorRepetitionDetectionPatch``
+# and silently skips this patch -- see issue "92BVL_A3_patch_conflict".
+#
+# Chaining means calling ``_upstream_process_inputs`` (the prior wrapper), never
+# the raw native: calling native directly would bypass repetition-detection's
+# injection and silently drop that feature. The prior wrapper is itself
+# responsible for reaching native, so native runs exactly once.
 
 
 def _find_sampling_params(args: tuple, kwargs: dict) -> SamplingParams | None:
@@ -199,6 +207,13 @@ class ThinkingLimitInputProcessorPatch(VLLMPatch):
 
     _attr_names_to_apply = ["process_inputs"]
 
+    @classmethod
+    def apply(cls):
+        # Second link on process_inputs (repetition-detection is first): chain
+        # onto the active wrapper instead of preempting. _upstream_process_inputs
+        # is captured here, after every patch module has been imported.
+        cls.apply_bypass_conflict("process_inputs")
+
     def process_inputs(self, *args, **kwargs):
         params = _find_sampling_params(args, kwargs)
         if params is not None and params.thinking_token_budget is None:
@@ -209,4 +224,8 @@ class ThinkingLimitInputProcessorPatch(VLLMPatch):
             if server_budget is not None:
                 params.thinking_token_budget = server_budget
 
-        return _original_process_inputs(self, *args, **kwargs)
+        # Chain to the prior wrapper (repetition-detection, etc.), not the raw
+        # native, so every link's injection still runs and native runs once.
+        return ThinkingLimitInputProcessorPatch._upstream_process_inputs(
+            self, *args, **kwargs
+        )
