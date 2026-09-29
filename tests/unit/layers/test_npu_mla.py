@@ -1109,6 +1109,7 @@ def _mock_model_extra_config(
                 enable_precision_strong_consistency=False,
                 enable_multi_stream=False,
                 split_q_up_in_multistream=False,
+                enable_mome_sp=False,
             ),
         ),
     ):

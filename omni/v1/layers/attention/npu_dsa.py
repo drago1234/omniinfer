@@ -39,6 +39,7 @@ from omni_npu.attention.backends.utils import (
     KVSPMaganer,
     SPManager,
     cache_fit_shape,
+    conv_sp,
     get_batch_desc,
     lazy_zero_like,
     sp_disabled,
@@ -490,6 +491,11 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, torch.nn.Module):
             self.scaling = self.scaling * mscale * mscale
 
         self.use_mome = getattr(config, "use_mome", False)
+        self.enable_mome_sp = getattr(
+            model_extra_config.operator_opt_config,
+            "enable_mome_sp",
+            False,
+        )
         self.merge_q_kv_conv = model_extra_config.operator_opt_config.merge_q_kv_conv
         self.param_sink_number = getattr(config, "param_sink_number", 0)
         self.index_topk = config.index_topk
@@ -806,6 +812,23 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, torch.nn.Module):
             dequant_scale_q_norm = dequant_scale_q_norm.view(-1)
             q_norm = {"x_int8": q_norm, "pertoken_scale": dequant_scale_q_norm}
         return q_nope, q_pe, q_norm, k_nope, k_pe, dequant_scale_q_nope, dequant_scale_q_norm
+
+    def _apply_mome_out_prefill_sp(
+        self,
+        cp_out: torch.Tensor,
+        sp_manager: SPManager,
+    ) -> torch.Tensor | None:
+        mome_sp_args = self._get_mome_prefill_sp_args(2)
+        if mome_sp_args is None:
+            return None
+
+        sp_out = sp_manager.cp_to_sp(cp_out)
+        mome_sp_out = conv_sp(sp_out, *mome_sp_args, inplace=False)
+        if self.o_proj.requires_input_partition():
+            mome_sp_out = sp_manager.sp_to_tp(mome_sp_out)
+            mome_sp_out = self._apply_o_proj(mome_sp_out)
+            return sp_manager.slice_tokens(mome_sp_out)
+        return self._apply_o_proj(mome_sp_out)
 
     # ======================= attention =======================
 
@@ -1142,9 +1165,17 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, torch.nn.Module):
         q_lora = self.q_a_proj(sp_x)[0]  # TD, sp
 
         if self.use_mome:
-            q_lora = sp_manager.ag_tokens(q_lora)
-            q_lora = self._maybe_mome_q(q_lora, get_mome_args)  # TD
-            q_lora = sp_manager.cp_slice(q_lora)  # TD, cp
+            mome_sp_q_applied = self._apply_mome_prefill_sp(
+                q_lora,
+                0,
+                inplace=True,
+            )
+            if mome_sp_q_applied:
+                q_lora = sp_manager.sp_to_cp(q_lora)  # TD, sp -> cp
+            else:
+                q_lora = sp_manager.ag_tokens(q_lora)
+                q_lora = self._maybe_mome_q(q_lora, get_mome_args)  # TD
+                q_lora = sp_manager.cp_slice(q_lora)  # TD, cp
         else:
             q_lora = sp_manager.sp_to_cp(q_lora)  # TD, cp
 
@@ -1163,8 +1194,16 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, torch.nn.Module):
                 nope_cache = ag_nope_cache()
                 rope_cache = ag_rope_cache()
         else:
+            mome_sp_kv_applied = False
+            if self.use_mome:
+                mome_sp_kv_applied = self._apply_mome_prefill_sp(
+                    kv[:, :self.kv_lora_rank],
+                    1,
+                    inplace=True,
+                )
             kv = sp_manager.ag_tokens(kv)  # TD
-            kv = self._maybe_mome_kv(kv, get_mome_args)  # TD
+            if self.use_mome and not mome_sp_kv_applied:
+                kv = self._maybe_mome_kv(kv, get_mome_args)  # TD
             self._kv_norm_rope_cache(kv, cos, sin, attn_metadata, kv_cache)
 
         if not self.skip_topk:
@@ -1224,6 +1263,10 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, torch.nn.Module):
         cp_out = self._post_attn_absorb(cp_out)
 
         if self.use_mome:
+            mome_sp_out = self._apply_mome_out_prefill_sp(cp_out, sp_manager)
+            if mome_sp_out is not None:
+                return mome_sp_out
+
             cp_out = sp_manager.cp_to_sp(cp_out)  # sp
             cp_out = sp_manager.ag_tokens(cp_out)  # TD
             cp_out = self._maybe_mome_out(cp_out, get_mome_args)  # TD

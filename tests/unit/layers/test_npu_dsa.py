@@ -1046,6 +1046,7 @@ def _mock_model_extra_config(
                 use_rope_fusion_op=False,
                 enable_multi_stream=False,
                 split_q_up_in_multistream=False,
+                enable_mome_sp=False,
             ),
         ),
     ):

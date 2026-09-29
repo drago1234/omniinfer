@@ -9,6 +9,7 @@ from typing import Callable, Hashable
 
 import numpy as np
 import torch
+import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed import GroupCoordinator, get_tp_group
 from vllm.logger import init_logger
@@ -21,6 +22,7 @@ from vllm.v1.attention.backends.utils import (
 from omni_npu import envs
 from omni_npu.layers.utils import named_stream
 from omni_npu.model_config.config_loader.loader import model_extra_config
+from omni_npu.v1.utils import on_ascend950
 
 logger = init_logger(__name__)
 NPU_ATTENTION_BACKEND = {}
@@ -671,6 +673,27 @@ class SPManager:
         )
         return tp_x.view(-1, D)  # [nT, D]
 
+    def tp_to_sp(self, tp_x: torch.Tensor):  # reorg TP to SP
+        """Convert full-token/local-channel TP layout to SP layout.
+
+        This is the inverse of :meth:`sp_to_tp`:
+        ``[nT, D]`` on every TP rank becomes ``[T, nD]`` on every SP rank.
+        """
+        assert tp_x.dim() == 2  # [nT, D]
+        n = self.sp_size
+        assert tp_x.size(0) % n == 0, f"{tp_x.shape=} {n=}"
+        T, D = tp_x.size(0) // n, tp_x.size(1)
+        tp_x = tp_x.view(n, T, D).contiguous()  # destination SP rank first
+        sp_x = torch.empty_like(tp_x)
+        torch.distributed.all_to_all_single(
+            sp_x.view(n, -1),
+            tp_x.view(n, -1),
+            [1] * n,
+            [1] * n,
+            group=self.sp_comm,
+        )
+        return sp_x.transpose(0, 1).contiguous().view(T, n * D)
+
     # ===================== cp_slice =====================
     @lazy_init
     def _scheme_cp_slice(self, cumlens: np.ndarray):
@@ -1178,13 +1201,39 @@ def simple_conv(
     prefix: torch.Tensor,
     cumlens: torch.Tensor,
     inplace: bool = False,
+    max_query_len: int | None = None,
 ) -> torch.Tensor:
     args = [x, w, states, prefix, cumlens]
     assert [it.dim() for it in args] == [2, 2, 3, 1, 1]
-    assert states.size(1) == w.size(0)
     assert len({it.size(-1) for it in args[:3]}) == 1
     assert {it.dtype for it in args[3:]} == {torch.int32}
 
+    if on_ascend950():
+        # The A5 operator consumes the native MoME cache, whose minimum
+        # history is kernel_size - 1 (plus any speculative-token slots).
+        assert states.size(1) >= w.size(0) - 1
+        assert max_query_len is not None
+        assert 0 < max_query_len <= x.size(0)
+        conv_kwargs = {
+            "query_start_loc": cumlens,
+            "initial_state_mode": None,
+            "bias": None,
+            "num_computed_tokens": prefix,
+            "activation": "None",
+            "run_mode": 0,
+            "residual_connection": 1,
+            "max_query_len": max_query_len,
+            "conv_mode": "pangu",
+        }
+        op = (
+            torch_npu.npu_fused_causal_conv1d_v2
+            if inplace
+            else torch_npu.npu_fused_causal_conv1d
+        )
+        return op(x, w, states, **conv_kwargs)
+
+    # The A3 custom operator expects exactly kernel_size initial-state rows.
+    assert states.size(1) == w.size(0)
     return torch.ops.custom.npu_ai_infra_fused_causal_conv1d(
         x,
         w,
@@ -1202,6 +1251,14 @@ def save_states(
     index: torch.Tensor,
     states: torch.Tensor,
 ):
+    if on_ascend950():
+        torch_npu.npu_scatter_nd_update_(
+            cache,
+            index.to(torch.int64).view(-1, 1),
+            states,
+        )
+        return
+
     batch_size, state_len, dim = states.shape
     desc = f"_cache-{states.dtype}-{state_len}"
     if not hasattr(save_states, desc):
@@ -1250,7 +1307,15 @@ def scheme_conv_sp(
     kernel_size: int = 3,
     save_all: bool = True,
 ) -> tuple[tuple]:
-    assert state_len >= kernel_size
+    # The A5 prefill convolution only consumes the causal history (K - 1).
+    # ``state_len`` can be larger when MTP is enabled because the persistent
+    # cache also reserves speculative-token slots.  Passing those slots as
+    # ordinary history changes the prefill result; keep them only in the save
+    # path below so the native MTP decode cache layout remains intact.
+    # The A3 custom operator still requires K rows.
+    conv_state_len = kernel_size - 1 if on_ascend950() else kernel_size
+    assert state_len >= kernel_size - 1
+    assert conv_state_len <= state_len
     self_rank = sp_group.rank_in_group
     sp_size = sp_group.world_size
     sp_len = int(cdiv(cumlens[-1], sp_size))
@@ -1308,9 +1373,9 @@ def scheme_conv_sp(
     for req, start, end, rank, _ in partition(pad_lens, pad_cumlens, sp_len):
         if req < batch_size:
             prefix = start + int(computed[req] - cumlens[req])
-            ranks[rank].conv(refer(req, start, kernel_size), end - start, prefix)
+            ranks[rank].conv(refer(req, start, conv_state_len), end - start, prefix)
         else:
-            ranks[rank].conv(refer(0, 0, kernel_size), end - start, 0)
+            ranks[rank].conv(refer(0, 0, conv_state_len), end - start, 0)
 
     for req, _, end, block, is_tail in partition(lens, computed, block_size):
         if not (is_tail or save_all):
@@ -1353,6 +1418,7 @@ def scheme_conv_sp(
     send_split = [len(dst[self_rank]) for dst in a2a_map]
     recv_split = [len(src) for src in a2a_map[self_rank]]
     save_range = [slice(min(it), max(it) + 1) for it in blocks]
+    max_query_len = max(size for size, _ in convs)
 
     # Pin on CPU then async H2D. like.new_tensor(list) is a blocking H2D.
     # prefix/cumlens must be int32 for simple_conv.
@@ -1371,8 +1437,8 @@ def scheme_conv_sp(
         conv_cumlens = conv_cumlens.to(like.device, non_blocking=True)
 
     a2a_meta = (send_idx, send_split, recv_split)
-    conv_meta = (conv_prefix, conv_cumlens, reorg_idx)
-    batch_meta = (batch_size, state_len, kernel_size, sp_len, sp_group)
+    conv_meta = (conv_prefix, conv_cumlens, reorg_idx, max_query_len)
+    batch_meta = (batch_size, state_len, kernel_size, conv_state_len, sp_len, sp_group)
     return a2a_meta, conv_meta, batch_meta, save_range
 
 
@@ -1387,8 +1453,8 @@ def conv_sp(
 ):
     a2a_meta, conv_meta, batch_meta, _ = metadata
     send_idx, send_split, recv_split = a2a_meta
-    prefix, cumlens, reorg_idx = conv_meta
-    batch_size, state_len, kernel_size, sp_len, sp_group = batch_meta
+    prefix, cumlens, reorg_idx, max_query_len = conv_meta
+    batch_size, state_len, kernel_size, conv_state_len, sp_len, sp_group = batch_meta
     allgather_multi_stream = (
         model_extra_config.operator_opt_config.mome_sp_allgather_multi_stream
     )
@@ -1410,15 +1476,23 @@ def conv_sp(
     )
 
     workspace = workspace[reorg_idx]
-    load_part = prefix.size(0) * kernel_size
-    loads = workspace[:load_part].view(-1, kernel_size, dim)
+    load_part = prefix.size(0) * conv_state_len
+    loads = workspace[:load_part].view(-1, conv_state_len, dim)
     saves = workspace[load_part:].view(-1, state_len, dim)
     if allgather_multi_stream:
         current_stream = torch.npu.current_stream()
         sub_stream = named_stream("mome_sp_ag")
         sub_stream.wait_stream(current_stream)
 
-    y = simple_conv(x, w, loads, prefix, cumlens, inplace)
+    y = simple_conv(
+        x,
+        w,
+        loads,
+        prefix,
+        cumlens,
+        inplace,
+        max_query_len=max_query_len,
+    )
 
     if allgather_multi_stream:
         with torch.npu.stream(sub_stream):
