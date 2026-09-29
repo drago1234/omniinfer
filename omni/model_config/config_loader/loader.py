@@ -214,6 +214,7 @@ class ModelOperatorOptConfig:
     enable_mome_sp: bool = False # prefill only, support prefix cache
     mome_sp_allgather_multi_stream: bool = True # Whether MoME-SP cache-state AllGather runs on a side stream
     optimize_first_chunk: bool = False # Whether turn off PA (non-absorb mode) and use MoME SP for the first chunk
+    use_w4a8_enk_gmm: bool = False # W4A8 MoE EnK 优化，仅对称量化，默认关闭
 
     def __post_init__(self):
         # Check the dependencies of use_prefetch and prefetch_Mb

@@ -617,6 +617,20 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
         return True
 
 
+def _pack_w4a8_enk_nz(packed):
+    """Checkpoint (E, N/2, K) int8 -> EnK NZ (E, K, N/8) int32."""
+    low = packed.bitwise_left_shift(4).bitwise_right_shift(4)
+    high = packed.bitwise_right_shift(4)
+    e, n2, k = packed.shape
+    w_enk = packed.new_empty(e, n2 * 2, k)
+    w_enk[:, 0::2, :] = low
+    w_enk[:, 1::2, :] = high
+    w_ln = w_enk[:, :, ::2].to(torch.uint8) & 0xF
+    w_hn = (w_enk[:, :, 1::2].to(torch.uint8) & 0xF) << 4
+    w_nz = torch_npu.npu_format_cast((w_ln | w_hn).to(torch.int8), 29)
+    return w_nz.view(e, k, n2).view(torch.int32)
+
+
 class NPUCompressedTensorsW4A8Int4MoEMethod(NPUCompressedTensorsW8A8Int8MoEMethod):
     LAST_SEQ_LEN = None
     BEST_EXPERT_TOKENS = None
@@ -755,14 +769,27 @@ class NPUCompressedTensorsW4A8Int4MoEMethod(NPUCompressedTensorsW8A8Int8MoEMetho
                 offset = getattr(layer, f"{proj}_weight_offset")
                 offset.data = (-1 * scale * offset.data.float()).contiguous()
 
-        layer.w13_weight = torch.nn.Parameter(layer.w13_weight.transpose(1, 2).contiguous(), requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(layer.w2_weight.transpose(1, 2).contiguous(), requires_grad=False)
+        layer._use_w4a8_enk = (
+            not self.asymmetric_quant
+            and model_extra_config.operator_opt_config.use_w4a8_enk_gmm
+        )
+        if layer._use_w4a8_enk:
+            for proj in ("w13", "w2"):
+                packed = getattr(layer, f"{proj}_weight").data
+                setattr(
+                    layer,
+                    f"{proj}_weight",
+                    torch.nn.Parameter(_pack_w4a8_enk_nz(packed), requires_grad=False),
+                )
+        else:
+            layer.w13_weight = torch.nn.Parameter(layer.w13_weight.transpose(1, 2).contiguous(), requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(layer.w2_weight.transpose(1, 2).contiguous(), requires_grad=False)
 
-        layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight, 29)            
-        layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight, 29)
+            layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight, 29)
+            layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight, 29)
 
-        layer.w13_weight.data = layer.w13_weight.data.view(torch.int32).contiguous()
-        layer.w2_weight.data = layer.w2_weight.data.view(torch.int32).contiguous()
+            layer.w13_weight.data = layer.w13_weight.data.view(torch.int32).contiguous()
+            layer.w2_weight.data = layer.w2_weight.data.view(torch.int32).contiguous()
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
