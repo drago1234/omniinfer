@@ -21,7 +21,7 @@
 
   vars:
     model: pangu-v2-505b
-    model_path: "/mnt/sfs_turbo/bucket-910c-6055/rk/ckpt/505B_B005_INT4_open/"
+    model_path: "/model_path"
     enable_prefix_caching: true
 
     run_docker_profile:
