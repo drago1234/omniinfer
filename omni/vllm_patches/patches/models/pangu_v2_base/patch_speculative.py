@@ -62,7 +62,11 @@ class PanguV2MoeSpeculativeConfigPatch(VLLMPatch):
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
 
         # patch start: for openpangu_v2_mtp
-        is_openpangu_vl = hf_config.model_type in ("openpangu_v2_vl_moe", "openpangu_v2_omni_moe")
+        is_openpangu_vl = hf_config.model_type in (
+            "openpangu_v2_vl_moe",
+            "openpangu_v2_omni_moe",
+            "openpangu_v2_omni",
+        )
         patch_dirs = envs.OMNI_VLLM_PATCHES_DIR
         has_pangu_v2_moe_patch = "pangu_v2_moe" in {item.strip() for item in patch_dirs.split(",")}
         is_pangu_v2_moe_vl = is_openpangu_vl and has_pangu_v2_moe_patch
