@@ -31,6 +31,9 @@ from pathlib import Path
 LOG = logging.getLogger("mooncake-launcher")
 MIB = 1024**2
 VERSION = "0.3.13.post1"
+CANN_ENV_SCRIPT = Path("/usr/local/Ascend/ascend-toolkit/set_env.sh")
+MOONCAKE_ENV_SCRIPT = Path("/opt/mooncake-runtime/activate.sh")
+IMAGE_ENV_READY = "_OMNI_MOONCAKE_IMAGE_ENV_READY"
 
 
 def parse_args(argv=None):
@@ -86,6 +89,12 @@ def parse_args(argv=None):
     parser.add_argument(
         "--master-bin",
         help="Optional explicit Master executable; defaults to this Python environment",
+    )
+    parser.add_argument(
+        "--dependency-timeout",
+        type=int,
+        default=90,
+        help="Seconds allowed for each Master help/native import preflight command",
     )
     parser.add_argument("--startup-timeout", type=int, default=180)
     parser.add_argument("--shutdown-timeout", type=int, default=45)
@@ -163,7 +172,12 @@ def validate_args(args):
             )
         if args.action != "start":
             raise ValueError("--kv-lease-ttl-ms is supported only for start")
-    if min(args.startup_timeout, args.shutdown_timeout, args.max_restarts) <= 0:
+    if min(
+        args.dependency_timeout,
+        args.startup_timeout,
+        args.shutdown_timeout,
+        args.max_restarts,
+    ) <= 0:
         raise ValueError("Timeouts and max-restarts must be positive")
     if args.action == "start" and (args.node_rank is None or args.data_dir is None):
         raise ValueError("start requires --node-rank and --data-dir")
@@ -175,6 +189,55 @@ def validate_args(args):
         raise ValueError("--check-only is supported only for start")
     if args.data_dir is not None:
         args.data_dir = args.data_dir.resolve()
+
+
+def bootstrap_image_environment(args, argv):
+    """Re-exec with the bundled image environment before loading native code."""
+    if (
+        sys.platform != "linux"
+        or (not args.child and (args.dry_run or args.action == "client-config"))
+        or os.environ.get(IMAGE_ENV_READY) == "1"
+        or not MOONCAKE_ENV_SCRIPT.is_file()
+    ):
+        return
+    if not CANN_ENV_SCRIPT.is_file():
+        raise RuntimeError(
+            f"Found {MOONCAKE_ENV_SCRIPT}, but required CANN environment is missing: "
+            f"{CANN_ENV_SCRIPT}"
+        )
+    # LD_LIBRARY_PATH and PYTHONPATH must apply when Python starts. Updating
+    # os.environ after startup is not sufficient for this process's native imports.
+    # Keep user arguments out of shell source and preserve the launcher PID.
+    command = (
+        'set -e\n'
+        'source "$1"\n'
+        'source "$2"\n'
+        'export LD_LIBRARY_PATH="/usr/local/Ascend/driver/lib64:'
+        '/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver'
+        '${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"\n'
+        'export MC_FORCE_TCP=1\n'
+        f'export {IMAGE_ENV_READY}=1\n'
+        'cd -- "$3"\n'
+        'shift 3\n'
+        'exec "$@"\n'
+    )
+    LOG.info("Loading CANN and Mooncake image environment before native preflight")
+    os.execv(
+        "/bin/bash",
+        [
+            "/bin/bash",
+            "-c",
+            command,
+            "mooncake-environment",
+            str(CANN_ENV_SCRIPT),
+            str(MOONCAKE_ENV_SCRIPT),
+            os.getcwd(),
+            sys.executable,
+            "-u",
+            str(Path(__file__).resolve()),
+            *argv,
+        ],
+    )
 
 
 def endpoint(args):
@@ -197,6 +260,8 @@ def environment(args, host, *, provider=False):
         "MC_MAX_RPC_PORT": str(ports[1]),
         "MC_DISABLE_MMAP_ARENA": "1",
         "MC_MS_AUTO_DISC": "0",
+        # This launcher and its generated client configuration use CPU/TCP only.
+        "MC_FORCE_TCP": "1",
     }
 
 
@@ -368,7 +433,7 @@ def check_dependencies(args):
     help_result = subprocess.run(
         [*master_command(args), "--help"],
         check=False,
-        timeout=10,
+        timeout=args.dependency_timeout,
         capture_output=True,
         text=True,
     )
@@ -385,12 +450,20 @@ def check_dependencies(args):
     for flag in required_flags:
         if flag not in output:
             raise RuntimeError(f"Master lacks --{flag}; requires Mooncake {VERSION}")
-    subprocess.run(child_command(args, "dependency"), check=True, timeout=20)
+    subprocess.run(
+        child_command(args, "dependency"),
+        check=True,
+        timeout=args.dependency_timeout,
+    )
 
 
 def check_native_dependency():
     installed = []
-    for name in ("mooncake-transfer-engine-non-cuda", "mooncake-transfer-engine"):
+    for name in (
+        "mooncake-transfer-engine-non-cuda",
+        "mooncake-transfer-engine",
+        "mooncake-transfer-engine-npu",
+    ):
         try:
             installed.append((name, importlib.metadata.version(name)))
         except importlib.metadata.PackageNotFoundError:
@@ -404,7 +477,7 @@ def check_native_dependency():
 
     if not list(Path(mooncake.__file__).parent.rglob("libetcd_wrapper.so*")):
         raise RuntimeError(
-            "Mooncake lacks libetcd_wrapper.so; install the etcd-enabled non-CUDA build"
+            "Mooncake lacks libetcd_wrapper.so; use an etcd-enabled Mooncake build"
         )
     if not callable(MooncakeDistributedStore) or not hasattr(
         ReplicateConfig(), "replica_num"
@@ -736,11 +809,13 @@ def check_cluster(args):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
     try:
+        bootstrap_image_environment(args, argv)
         if args.child == "dependency":
             check_native_dependency()
         elif args.child == "provider":

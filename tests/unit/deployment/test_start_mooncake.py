@@ -4,6 +4,7 @@
 import importlib.util
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -13,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parents[3] / "tools" / "start_mooncake.py"
+SCRIPT = Path(__file__).resolve().parents[3] / "tools" / "scripts" / "start_mooncake.py"
 SPEC = importlib.util.spec_from_file_location("start_mooncake_test_target", SCRIPT)
 launcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(launcher)
@@ -145,6 +146,7 @@ def test_client_files_bind_to_rl_host_and_request_two_replicas(tmp_path, monkeyp
     assert "export MC_METADATA_CLUSTER_ID=training-ha" in text
     assert "export MC_MIN_RPC_PORT=16400" in text
     assert "export MC_MAX_RPC_PORT=16500" in text
+    assert "export MC_FORCE_TCP=1" in text
     assert "unset MC_STORE_USE_HUGEPAGE" in text
     assert "export OMNI_FEATURE_STORE_CONFIG='" in text
     monkeypatch.setenv("MC_STORE_USE_HUGEPAGE", "1")
@@ -176,6 +178,7 @@ def test_dry_run_does_not_create_files_or_start_native_processes(
     assert launcher.main(argv(action, **options) + ["--dry-run"]) == 0
     output = json.loads(capsys.readouterr().out)
     assert output
+    assert output["environment"]["MC_FORCE_TCP"] == "1"
     if action == "client-config":
         assert output["feature_store"]["mooncake"]["replica_num"] == (
             2 if mode == "ha" else 1
@@ -684,12 +687,18 @@ def test_real_process_group_shutdown_preserves_unrelated_process(tmp_path):
         assert owned.poll() is not None
         assert unrelated.poll() is None
         status = Path(f"/proc/{grandchild}/status")
+
+        def grandchild_exited():
+            try:
+                return "State:\tZ" in status.read_text()
+            except (FileNotFoundError, ProcessLookupError):
+                # Reaping may remove /proc entries during open() or read().
+                return True
+
         deadline = time.monotonic() + 2
-        while status.exists() and time.monotonic() < deadline:
-            if "State:\tZ" in status.read_text():
-                break
+        while not grandchild_exited() and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert not status.exists() or "State:\tZ" in status.read_text()
+        assert grandchild_exited()
     finally:
         for process in (owned, unrelated):
             if process.poll() is None:
@@ -817,8 +826,13 @@ def test_standalone_native_setup_matches_exported_endpoints(
     args = standalone_args(tmp_path)
     setups = []
     client = types.SimpleNamespace(setup=lambda **kwargs: setups.append(kwargs) or 0)
+
+    def create_client():
+        assert launcher.os.environ["MC_FORCE_TCP"] == "1"
+        return client
+
     module = types.ModuleType("mooncake.store")
-    module.MooncakeDistributedStore = lambda: client
+    module.MooncakeDistributedStore = create_client
     monkeypatch.setitem(sys.modules, "mooncake", types.ModuleType("mooncake"))
     monkeypatch.setitem(sys.modules, "mooncake.store", module)
     monkeypatch.setattr(launcher.os, "environ", {})
@@ -1052,3 +1066,345 @@ def test_read_lease_can_change_on_restart_without_resetting_etcd(tmp_path, fake_
         assert (args.data_dir / "deployment.json").read_bytes() == manifest
         assert data.read_bytes() == b"existing cluster data"
         assert "--default_kv_lease_ttl=60000" in launcher.build_plan(updated)["master"]
+
+
+@pytest.mark.parametrize("mode", ["ha", "standalone"])
+@pytest.mark.parametrize("provider", [False, True])
+def test_tcp_child_environment_overrides_parent_without_mutating_it(
+    tmp_path, monkeypatch, mode, provider
+):
+    args = start_args(tmp_path) if mode == "ha" else standalone_args(tmp_path)
+    host = args.hosts[args.node_rank]
+    monkeypatch.setenv("MC_FORCE_TCP", "0")
+    monkeypatch.setenv("PYTHONPATH", "/opt/mooncake-py311")
+    env = launcher.child_environment(args, host, provider=provider)
+    assert env["MC_FORCE_TCP"] == "1"
+    assert env["PYTHONPATH"] == "/opt/mooncake-py311"
+    assert os.environ["MC_FORCE_TCP"] == "0"
+
+
+@pytest.mark.parametrize("configured,expected", [(None, 90), (150, 150)])
+def test_dependency_timeout_applies_to_master_help_and_native_import(
+    tmp_path, monkeypatch, configured, expected
+):
+    args = start_args(
+        tmp_path,
+        **{"dependency-timeout": configured, "startup-timeout": 17},
+    )
+    assert args.dependency_timeout == expected
+    assert args.startup_timeout == 17
+    calls = []
+
+    def run(command, **options):
+        calls.append((command, options))
+        if "--help" in command:
+            flags = (
+                "enable_ha ha_backend_connstring enable_oplog enable_snapshot_restore"
+            )
+            return subprocess.CompletedProcess(command, 1, stdout=flags, stderr="")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
+    monkeypatch.setattr(launcher.shutil, "which", lambda binary: binary)
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+    launcher.check_dependencies(args)
+    assert len(calls) == 3
+    assert calls[0][0] == [args.etcd_bin, "--version"]
+    assert calls[0][1]["timeout"] == 10
+    assert "--help" in calls[1][0]
+    assert calls[1][1]["timeout"] == expected
+    child = launcher.parse_args(calls[2][0][3:])
+    assert child.child == "dependency"
+    assert calls[2][1]["timeout"] == expected
+    assert calls[2][1]["check"] is True
+
+
+@pytest.mark.parametrize("value", [0, -1, "1.5", "inf", "invalid"])
+def test_invalid_dependency_timeout_rejected_before_start(tmp_path, value):
+    with pytest.raises(SystemExit) as raised:
+        start_args(tmp_path, **{"dependency-timeout": value})
+    assert raised.value.code == 2
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.fixture
+def native_installation(tmp_path, monkeypatch):
+    installed = {"mooncake-transfer-engine-npu": launcher.VERSION}
+
+    def version(name):
+        if name not in installed:
+            raise launcher.importlib.metadata.PackageNotFoundError(name)
+        return installed[name]
+
+    package = types.ModuleType("mooncake")
+    package.__file__ = str(tmp_path / "mooncake" / "__init__.py")
+    wrapper = Path(package.__file__).parent / "lib" / "libetcd_wrapper.so"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.touch()
+    store = types.ModuleType("mooncake.store")
+    store.MooncakeDistributedStore = lambda: None
+    store.ReplicateConfig = lambda: types.SimpleNamespace(replica_num=1)
+    monkeypatch.setattr(launcher.importlib.metadata, "version", version)
+    monkeypatch.setitem(sys.modules, "mooncake", package)
+    monkeypatch.setitem(sys.modules, "mooncake.store", store)
+    return installed, store, wrapper
+
+
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        "mooncake-transfer-engine",
+        "mooncake-transfer-engine-non-cuda",
+        "mooncake-transfer-engine-npu",
+    ],
+)
+def test_native_dependency_accepts_each_supported_distribution(
+    native_installation, distribution
+):
+    installed, _, _ = native_installation
+    installed.clear()
+    installed[distribution] = launcher.VERSION
+    launcher.check_native_dependency()
+
+
+@pytest.mark.parametrize(
+    "distributions",
+    [
+        {},
+        {"mooncake-transfer-engine-npu": "0.3.12"},
+        {
+            "mooncake-transfer-engine-npu": launcher.VERSION,
+            "mooncake-transfer-engine-non-cuda": launcher.VERSION,
+        },
+        {
+            "mooncake-transfer-engine-npu": launcher.VERSION,
+            "mooncake-transfer-engine": launcher.VERSION,
+        },
+    ],
+)
+def test_native_dependency_rejects_missing_wrong_or_mixed_distributions(
+    native_installation, distributions
+):
+    installed, _, _ = native_installation
+    installed.clear()
+    installed.update(distributions)
+    with pytest.raises(RuntimeError, match="Expected exactly one Mooncake"):
+        launcher.check_native_dependency()
+
+
+def test_npu_dependency_still_requires_etcd_wrapper(native_installation):
+    _, _, wrapper = native_installation
+    wrapper.unlink()
+    with pytest.raises(RuntimeError, match="etcd-enabled Mooncake build"):
+        launcher.check_native_dependency()
+
+
+@pytest.mark.parametrize("missing", ["store", "replica_num"])
+def test_npu_dependency_still_requires_native_store_api(native_installation, missing):
+    _, store, _ = native_installation
+    if missing == "store":
+        store.MooncakeDistributedStore = None
+    else:
+        store.ReplicateConfig = lambda: types.SimpleNamespace()
+    with pytest.raises(RuntimeError, match="Store/ReplicateConfig API is unavailable"):
+        launcher.check_native_dependency()
+
+
+@pytest.fixture
+def image_bootstrap(tmp_path, monkeypatch):
+    root = tmp_path / "image with spaces"
+    root.mkdir()
+    modules = root / "python modules"
+    modules.mkdir()
+    (modules / "bootstrap_test_module.py").write_text("VALUE = 'activated'\n")
+    cann = root / "CANN set env.sh"
+    cann.write_text(
+        'export LD_LIBRARY_PATH="/test/cann lib'
+        '${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"\n'
+        "cd /\n"
+    )
+    mooncake = root / "Mooncake activate.sh"
+    mooncake.write_text(
+        'export LD_LIBRARY_PATH="/test/gcc lib'
+        '${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"\n'
+        f"export PYTHONPATH={shlex.quote(str(modules))}\n"
+        "export PATH=/test/no-python-on-path\n"
+    )
+    result = root / "executed.json"
+    recorder = root / "record environment.py"
+    recorder.write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "from bootstrap_test_module import VALUE\n"
+        f"Path({str(result)!r}).write_text(json.dumps({{\n"
+        "    'argv': sys.argv[1:], 'cwd': os.getcwd(),\n"
+        "    'ld_library_path': os.environ.get('LD_LIBRARY_PATH'),\n"
+        "    'force_tcp': os.environ.get('MC_FORCE_TCP'),\n"
+        f"    'ready': os.environ.get({launcher.IMAGE_ENV_READY!r}),\n"
+        "    'module': VALUE, 'executable': sys.executable,\n"
+        "}))\n"
+    )
+    captured = []
+    monkeypatch.setattr(launcher, "CANN_ENV_SCRIPT", cann)
+    monkeypatch.setattr(launcher, "MOONCAKE_ENV_SCRIPT", mooncake)
+    monkeypatch.setattr(launcher, "__file__", str(recorder))
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
+    monkeypatch.setattr(
+        launcher.os, "execv", lambda path, command: captured.append((path, command))
+    )
+    monkeypatch.delenv(launcher.IMAGE_ENV_READY, raising=False)
+    monkeypatch.setenv("MC_FORCE_TCP", "0")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/test/inherited lib")
+    return cann, mooncake, result, captured
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Runs the Linux Bash bootstrap")
+def test_image_bootstrap_executes_sources_before_python_and_preserves_arguments(
+    tmp_path, monkeypatch, image_bootstrap
+):
+    _, _, result, captured = image_bootstrap
+    caller = tmp_path / "caller with spaces"
+    caller.mkdir()
+    monkeypatch.chdir(caller)
+    unintended = tmp_path / "must-not-be-created"
+    raw = argv(
+        **{
+            "node-rank": 0,
+            "data-dir": "relative data directory",
+            "master-bin": f"$(touch {shlex.quote(str(unintended))}); echo expanded",
+            "etcd-bin": "*",
+            "model": "",
+        }
+    )
+    launcher.bootstrap_image_environment(launcher.parse_args(raw), raw)
+    assert len(captured) == 1
+    executable, command = captured[0]
+    assert executable == command[0] == "/bin/bash"
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads(result.read_text())
+    assert report["argv"] == raw
+    assert report["cwd"] == str(caller)
+    assert report["executable"] == sys.executable
+    assert report["module"] == "activated"
+    assert report["ready"] == report["force_tcp"] == "1"
+    assert report["ld_library_path"].split(":") == [
+        "/usr/local/Ascend/driver/lib64",
+        "/usr/local/Ascend/driver/lib64/common",
+        "/usr/local/Ascend/driver/lib64/driver",
+        "/test/gcc lib",
+        "/test/cann lib",
+        "/test/inherited lib",
+    ]
+    assert not unintended.exists()
+    assert os.environ["MC_FORCE_TCP"] == "0"
+    assert launcher.IMAGE_ENV_READY not in os.environ
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Runs the Linux Bash bootstrap")
+@pytest.mark.parametrize("failed_source", ["cann", "mooncake"])
+def test_image_bootstrap_source_failure_never_executes_python(
+    tmp_path, image_bootstrap, failed_source
+):
+    cann, mooncake, result, captured = image_bootstrap
+    failed = cann if failed_source == "cann" else mooncake
+    failed.write_text("return 23\n")
+    args = start_args(tmp_path)
+    launcher.bootstrap_image_environment(args, ["start"])
+    completed = subprocess.run(
+        captured[0][1], capture_output=True, text=True, timeout=10
+    )
+    assert completed.returncode == 23
+    assert not result.exists()
+
+
+@pytest.mark.parametrize("reason", ["non-linux", "dry-run", "client-config", "ready"])
+def test_image_bootstrap_skips_without_inspecting_image_dependencies(
+    tmp_path, monkeypatch, reason
+):
+    args = start_args(tmp_path)
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
+    monkeypatch.delenv(launcher.IMAGE_ENV_READY, raising=False)
+
+    def forbidden(*_args):
+        pytest.fail("Skipped bootstrap must not inspect or execute image dependencies")
+
+    unavailable = types.SimpleNamespace(is_file=forbidden)
+    monkeypatch.setattr(launcher, "CANN_ENV_SCRIPT", unavailable)
+    monkeypatch.setattr(launcher, "MOONCAKE_ENV_SCRIPT", unavailable)
+    monkeypatch.setattr(launcher.os, "execv", forbidden)
+    if reason == "non-linux":
+        monkeypatch.setattr(launcher.sys, "platform", "win32")
+    elif reason == "dry-run":
+        args.dry_run = True
+    elif reason == "client-config":
+        args = standalone_args(tmp_path, action="client-config")
+    else:
+        monkeypatch.setenv(launcher.IMAGE_ENV_READY, "1")
+    launcher.bootstrap_image_environment(args, [])
+
+
+def test_generic_installation_does_not_require_cann_activation(tmp_path, monkeypatch):
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
+    monkeypatch.delenv(launcher.IMAGE_ENV_READY, raising=False)
+    monkeypatch.setattr(launcher, "MOONCAKE_ENV_SCRIPT", tmp_path / "absent.sh")
+
+    def forbidden(*_args):
+        pytest.fail("Generic installation must not inspect CANN or re-exec")
+
+    monkeypatch.setattr(
+        launcher, "CANN_ENV_SCRIPT", types.SimpleNamespace(is_file=forbidden)
+    )
+    monkeypatch.setattr(launcher.os, "execv", forbidden)
+    launcher.bootstrap_image_environment(start_args(tmp_path), [])
+
+
+def test_incomplete_image_environment_fails_before_native_preflight(
+    tmp_path, monkeypatch, image_bootstrap
+):
+    cann, _, _, captured = image_bootstrap
+    cann.unlink()
+
+    def forbidden(*_args):
+        pytest.fail("Incomplete image environment must not start native preflight")
+
+    monkeypatch.setattr(launcher, "check_dependencies", forbidden)
+    monkeypatch.setattr(launcher, "check_ports", forbidden)
+    raw = argv(**{"node-rank": 0, "data-dir": tmp_path / "node"})
+    assert launcher.main(raw + ["--check-only"]) == 1
+    assert not captured
+    assert not (tmp_path / "node").exists()
+
+
+@pytest.mark.parametrize("action", ["start", "check"])
+@pytest.mark.parametrize("implicit_argv", [False, True])
+def test_main_bootstraps_with_original_arguments_before_native_work(
+    tmp_path, monkeypatch, action, implicit_argv
+):
+    if action == "start":
+        raw = argv(**{"node-rank": 0, "data-dir": tmp_path / "node"})
+        raw += ["--check-only"]
+    else:
+        raw = argv("check", **{"local-host": "10.20.1.8"})
+    calls = []
+
+    def bootstrap(args, actual_argv):
+        assert args.action == action
+        assert actual_argv == raw
+        calls.append("bootstrap")
+
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
+    monkeypatch.setattr(launcher, "bootstrap_image_environment", bootstrap)
+    monkeypatch.setattr(
+        launcher, "check_dependencies", lambda _: calls.append("dependencies")
+    )
+    monkeypatch.setattr(launcher, "check_ports", lambda _: calls.append("ports"))
+    monkeypatch.setattr(launcher, "check_cluster", lambda _: calls.append("cluster"))
+    if implicit_argv:
+        monkeypatch.setattr(launcher.sys, "argv", [str(SCRIPT), *raw])
+    assert launcher.main(None if implicit_argv else raw) == 0
+    assert calls == (
+        ["bootstrap", "dependencies", "ports"]
+        if action == "start"
+        else ["bootstrap", "cluster"]
+    )
