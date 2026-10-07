@@ -1395,6 +1395,7 @@ class DeepseekMLA(nn.Module):
                 
                 kv_dsa, key_rope_dsa, topk_indices_dsa, block_table_dsa = attn_metadata.omni_cache.process_avsg(topk_indices + 0,
                                                        k_nope,
+                                                       k_rope,
                                                        attn_metadata.decode.block_table,
                                                        attn_metadata.decode.seq_lens.to(torch.int32),
                                                        attn_metadata.omni_cache.cu_q_len,

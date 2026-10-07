@@ -1207,7 +1207,7 @@ class DecodeOmniCache(BaseOmniCache):
     def synchronize_d2h(self, key_states: torch.Tensor, value_states: torch.Tensor, slot_mapping: torch.Tensor, layer_idx: int, kv_event: torch.npu.Event) -> None:
         raise NotImplementedError
 
-    def process_avsg(self, topk_id, wait_tensor, block_table, kv_lens, cu_q_lens, layer_idx, skip_topk_offset_idx):
+    def process_avsg(self, topk_id, kv_cache, k_rope, block_table, kv_lens, cu_q_lens, layer_idx, skip_topk_offset_idx):
         # if skip_topk_offset_idx > 0:
         #     # Wait For Prefetch
         #     tng.scope.npu_wait_tensor(wait_tensor, self.reused_nums[layer_idx])
@@ -1217,7 +1217,7 @@ class DecodeOmniCache(BaseOmniCache):
         if(skip_topk_offset_idx <= 0):
             self._process_avsg_match(_topk_id, block_table, kv_lens, cu_q_lens, layer_idx)
 
-        kv_dsa, key_rope_dsa = self._process_avsg_copy(wait_tensor, cu_q_lens, layer_idx)
+        kv_dsa, key_rope_dsa = self._process_avsg_copy(kv_cache, k_rope, cu_q_lens, layer_idx)
 
         return kv_dsa, key_rope_dsa, self.topk_indices_dsa, self.block_table_dsa 
 
@@ -1231,12 +1231,11 @@ class DecodeOmniCache(BaseOmniCache):
                 self.reused_nums[layer_idx + 1]  *= 0 
                 self.reused_nums[layer_idx + 1]  += reused_nums
 
-    def _process_avsg_copy(self, wait_tensor, cu_q_lens, layer_idx):
+    def _process_avsg_copy(self, kv_cache, k_rope, cu_q_lens, layer_idx):
         selection_k_rope = self.selection_k_rope[layer_idx]
         selection_kv_cache_npu = self.selection_kv_cache[layer_idx]
-        full_kv_cache_npu = self.kv_caches[layer_idx][0].squeeze(-2)
-        full_k_rope_npu = self.kv_caches[layer_idx][1].squeeze(-2)
-        tng.scope.npu_wait_tensor(full_kv_cache_npu, wait_tensor)
+        full_kv_cache_npu = kv_cache.squeeze(-2)
+        full_k_rope_npu = k_rope.squeeze(-2)
 
         torch_npu.npu_avsg_copy(
             selection_k_rope, selection_kv_cache_npu, full_k_rope_npu,
