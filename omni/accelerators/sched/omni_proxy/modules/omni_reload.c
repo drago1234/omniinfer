@@ -247,8 +247,8 @@ ngx_http_omni_proxy_reload_handler(ngx_http_request_t *r)
 
     plcf = ngx_http_get_module_loc_conf(r, ngx_http_omni_proxy_module);
 
-    /* only enabled when reload_auth_enabled is explicitly set to 1 */
-    if (plcf->reload_auth_enabled != 1) {
+    /* only enabled when omni_proxy_reload_auth is explicitly configured */
+    if (plcf->reload_auth_enabled == NGX_CONF_UNSET) {
         return NGX_DECLINED;
     }
 

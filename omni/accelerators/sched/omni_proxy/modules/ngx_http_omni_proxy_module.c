@@ -2333,7 +2333,7 @@ static char *ngx_http_omni_merge_loc_conf(ngx_conf_t *cf, void *parent, void *ch
         }
     }
 
-    ngx_conf_merge_value(conf->reload_auth_enabled, prev->reload_auth_enabled, 0);
+    ngx_conf_merge_value(conf->reload_auth_enabled, prev->reload_auth_enabled, NGX_CONF_UNSET);
     ngx_conf_merge_str_value(conf->reload_token, prev->reload_token, "");
 
     return NGX_CONF_OK;
