@@ -1,8 +1,12 @@
 # Mooncake 普通与高可用部署
 
-OmniInfer 仓库提供 [`tools/start_mooncake.py`](../tools/start_mooncake.py)。下游选择部署模式，提供存储
+OmniInfer 仓库提供 [`tools/scripts/start_mooncake.py`](../tools/scripts/start_mooncake.py)。下游选择部署模式，提供存储
 主机 IP、集群名称和数据目录，脚本负责 etcd、Master 和常驻内存池的参数及生命周期。
-它不导入 torch、vLLM 或 NPU 运行时，可以作为容器前台入口或由作业调度器启动。
+启动器本身仅使用 Python 标准库，可作为容器前台入口或由作业调度器启动；它启动的
+provider 和检查子进程会导入 Mooncake。使用 NPU wheel 时，即使只存储 CPU 数据，
+Mooncake 原生库仍可能依赖 CANN 和宿主机 driver 库。
+对下文所述包含 Mooncake 激活脚本的镜像，直接运行 Python 入口即可；CANN、Mooncake
+及动态库路径由入口自动初始化，无需先手动 `source`，也无需额外的启动 `.sh` 文件。
 
 | 模式 | 存储主机 | 服务组成 | 客户端副本数 |
 | --- | --- | --- | --- |
@@ -20,42 +24,110 @@ HA 模式的三个 etcd member 负责仲裁，Master 开启 etcd 选主和 OpLog
 
 - 普通模式需要一台 Linux 存储主机；HA 模式需要三台**独立 Linux 主机**，地址互通。
   同机的三个地址不代表三个故障域。RL/推理客户端可以运行在存储主机或其他可达主机上。
-- 各节点使用同一版本的本仓库和 Python >= 3.11。
-- 镜像内准备 `etcd`，以及支持 etcd 的
-  `mooncake-transfer-engine-non-cuda==0.3.13.post1`；已有环境无需重复安装。
+- 各节点使用同一版本的本仓库和 Python >= 3.11。容器内仓库路径为 `/workspace/omniinfer`，
+  启动入口为该仓库下的 `tools/scripts/start_mooncake.py`。
+- 镜像内准备 `etcd`，以及支持 etcd 的 Mooncake `0.3.13.post1`。
+  启动器接受 `mooncake-transfer-engine-non-cuda`、`mooncake-transfer-engine-npu`
+  或 `mooncake-transfer-engine`，同一 Python 环境必须只安装其中一个发行包，且版本匹配。
+  已有依赖满足要求时直接复用，无需重新安装。
   已有部署验证过 etcd 3.7.1。默认 CUDA wheel/镜像可能不含 etcd 后端，不能只以 import 成功为准。
-  同一 Python 环境不要混装两种 Mooncake wheel。普通模式使用同一套依赖，也需要 etcd 后端。
+  所选 wheel 必须含 `libetcd_wrapper.so`、Store/ReplicateConfig API，Master 必须支持 HA 和
+  OpLog 参数。普通模式使用同一套依赖，也需要 etcd 后端。
 - 每节点至少预留 `--pool-mib` 指定的内存（默认 4096 MiB），另留本地缓冲和服务开销。
   etcd 的 `--data-dir` 使用本机持久盘；不同节点不能共享同一 etcd 数据目录。
 - 当前入口部署 CPU/TCP、内网无 TLS 的服务，适用于互信的训练网络；不向公网开放。
   已有 RDMA/KV 通道应使用不同端口和 namespace。
 
 脚本不下载依赖、不启动 SSH、不修改训练拓扑。将同一个入口交给现有容器/调度器，在各
-存储节点启动即可；HA 的三个节点需并行启动。容器使用 host 网络，将脚本和数据目录
-挂入容器，并给至少 60 秒停止宽限。容器或 systemd 应配置自动重启，以覆盖启动器自身退出
+存储节点启动即可；HA 的三个节点需并行启动。容器使用 host 网络，直接运行容器内的仓库代码，
+挂载持久化数据目录，并给至少 60 秒停止宽限。容器或 systemd 应配置自动重启，以覆盖启动器自身退出
 或整机重启；脚本内部负责子进程异常退出后的退避重启。
+
+### 复用已包含 NPU wheel 的镜像
+
+部分镜像将 Mooncake 放在 `/opt/mooncake-py311`，默认 Python 环境不能直接导入。
+Linux 下，`start_mooncake.py` 在 `start`（包括 `--check-only`）、`check` 和内部 native
+子进程的依赖检查之前，检测 `/opt/mooncake-runtime/activate.sh`。该文件存在时，入口通过
+Bash 加载镜像内已有的 CANN、Mooncake 环境，并补齐 driver 动态库路径。
+下面展示的是入口内部自动执行的步骤，部署者直接使用后面的 Python/Docker 命令即可：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /opt/mooncake-runtime/activate.sh
+export LD_LIBRARY_PATH="/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export MC_FORCE_TCP=1
+```
+
+初始化后，入口使用原解释器和原参数重新执行 Python，使 `LD_LIBRARY_PATH` 在加载原生库前
+生效。后续子进程继承该环境，不会重复初始化。
+
+若 Mooncake 激活脚本不存在，入口沿用调用者已经配置的通用环境；若该脚本存在但 CANN
+`set_env.sh` 缺失，则明确报错；任一环境脚本执行失败时立即退出，不继续启动服务。
+`--dry-run`、`client-config` 和 `--help` 不加载原生环境，也不能用来验证 CANN/driver 是否可用；
+本机依赖预检使用 `start --check-only`，启动后的读写验收使用 `check`。
+这些步骤只激活已有依赖，不安装或重新编译任何包。存储容器可使用 `runc`，不映射 NPU
+设备，仍需将宿主机 `/usr/local/Ascend/driver` 只读挂入容器以提供链接所需的库。
+本入口始终配置 CPU/TCP，这种容器不验证 NPU 或 RDMA 数据传输。
+
+下面在宿主机准备持久化数据目录，并启动容器。容器直接使用 `/workspace/omniinfer` 中的
+仓库代码。`IMAGE` 填写使用的 OmniInfer 镜像，IP 为示例值；所有命令使用本文默认端口，
+执行前应确认这些端口可用。
+
+```bash
+IMAGE='your-registry/your-omniinfer-image:tag'
+DATA_DIR=/srv/mooncake/rl-embeddings-dev/data
+mkdir -p "$DATA_DIR"
+
+docker run -d --name mooncake-standalone \
+  --runtime=runc --network=host --restart=unless-stopped --stop-timeout=75 \
+  --workdir /workspace/omniinfer \
+  --mount "type=bind,src=$DATA_DIR,dst=/var/lib/mooncake" \
+  --mount type=bind,src=/usr/local/Ascend/driver,dst=/usr/local/Ascend/driver,readonly \
+  --entrypoint python3 "$IMAGE" tools/scripts/start_mooncake.py start \
+  --mode standalone --hosts 10.0.0.11 --cluster-id rl-embeddings-dev \
+  --data-dir /var/lib/mooncake --pool-mib 4096 \
+  --master-bin /opt/mooncake-py311/mooncake/mooncake_master \
+  --dependency-timeout 90
+
+docker exec -w /workspace/omniinfer mooncake-standalone python3 tools/scripts/start_mooncake.py check \
+  --mode standalone --hosts 10.0.0.11 --cluster-id rl-embeddings-dev \
+  --local-host 10.0.0.11
+```
+
+上述 `check` 在存储主机验证读写；还应按下文在实际 RL/推理主机执行。`docker exec`
+启动的新 Python 进程也会由该入口完成环境初始化。HA 使用相同镜像和 Python 入口，
+在三台主机分别提供独立数据目录，按下文设置相同的三个
+`--hosts`、cluster-id 及各自的 `--node-rank`，并行启动。
+
+`--master-bin` 可选；示例直接指定该镜像已有的原生 Master，避免通过 Python CLI 入口加载。
+省略时使用当前 Python 环境的 `mooncake.cli`。直接执行原生 Master 仍需要正确的动态库路径，
+provider 和客户端仍需要可用的 Python wheel。
+自动初始化只覆盖该入口及其子进程。独立的 RL/推理应用仍需通过各自的镜像入口激活依赖；
+`client-config` 生成的环境文件只包含连接配置，不负责初始化这些应用的 CANN 环境。
+后续章节的 Python 命令均在容器内的 `/workspace/omniinfer` 仓库根目录执行。
+通过 `docker run` 启动时，将相同参数传给上面的 Python 入口。
 
 ## 普通部署：单节点启动与接入
 
-假设存储主机是 `10.0.0.11`，在该主机执行：
+假设存储主机是 `10.0.0.11`，在该主机的容器内执行：
 
 ```bash
-python tools/start_mooncake.py start \
+python3 tools/scripts/start_mooncake.py start \
   --mode standalone \
   --hosts 10.0.0.11 \
   --cluster-id rl-embeddings-dev \
-  --data-dir /data/mooncake/rl-embeddings-dev \
+  --data-dir /var/lib/mooncake \
   --pool-mib 4096
 ```
 
 普通模式的 `--hosts` 只接收一个地址，`--node-rank` 可省略，默认为 `0`。
 启动器在本机托管 etcd、单 Master 和常驻存储池，并处理子进程异常重启。
 
-在每台 RL/推理主机上生成本机配置并验收。`--local-host` 始终填写**当前客户端主机**的
+在每台 RL/推理主机的容器内生成本机配置并验收。`--local-host` 始终填写**当前客户端主机**的
 可达地址，下面假设是 `10.0.0.21`；`--model` 改为实际 served model 名称：
 
 ```bash
-python tools/start_mooncake.py client-config \
+python3 tools/scripts/start_mooncake.py client-config \
   --mode standalone \
   --hosts 10.0.0.11 \
   --cluster-id rl-embeddings-dev \
@@ -65,7 +137,7 @@ python tools/start_mooncake.py client-config \
 
 source /job/feature-store/feature-store.env
 
-python tools/start_mooncake.py check \
+python3 tools/scripts/start_mooncake.py check \
   --mode standalone \
   --hosts 10.0.0.11 \
   --cluster-id rl-embeddings-dev \
@@ -83,14 +155,14 @@ provider/主机重启后，RL 需要重新发布丢失的 embedding；进程自�
 
 ## 高可用部署：三个节点启动
 
-假设三个存储节点是 `10.0.0.11 / 10.0.0.12 / 10.0.0.13`，在第一台执行：
+假设三个存储节点是 `10.0.0.11 / 10.0.0.12 / 10.0.0.13`，在第一台的容器内执行：
 
 ```bash
-python tools/start_mooncake.py start \
+python3 tools/scripts/start_mooncake.py start \
   --hosts 10.0.0.11 10.0.0.12 10.0.0.13 \
   --cluster-id rl-embeddings-v1 \
   --node-rank 0 \
-  --data-dir /data/mooncake/rl-embeddings-v1 \
+  --data-dir /var/lib/mooncake \
   --pool-mib 4096
 ```
 
@@ -103,6 +175,10 @@ python tools/start_mooncake.py start \
 可先加 `--dry-run` 打印计划，不需要安装 native 依赖、不写文件也不启动服务；
 加 `--check-only` 检查本机依赖、Master 参数、etcd 库及端口占用后退出。
 该预检不能替代实际启动后的 etcd 后端和网络验收。
+
+`--dependency-timeout` 默认为 90 秒，分别限制 Master `--help` 参数检查和 native 依赖
+导入子进程；两项检查各自拥有完整超时，不共用一个总时限。NPU wheel 首次加载较慢时可按需
+增大该值。它不限制环境激活脚本的执行时间，不控制服务就绪等待，也不替代 `--startup-timeout`。
 
 ### 大对象读取租约
 
@@ -162,12 +238,12 @@ TCP 数据传输所需连接应按 Mooncake 和所在网络策略放通，不能
 
 ## 给 RL 和推理生成本机配置
 
-在每台 RL/推理主机上运行一次，`--local-host` 填**当前客户端主机**的可达地址。
+在每台 RL/推理主机的容器内运行一次，`--local-host` 填**当前客户端主机**的可达地址。
 `--model` 使用任务真实 served model 名称（RL 若使用模型绝对路径作为名称，照原值填写）。
 下面为默认 HA 模式示例；普通模式使用上文的 `--mode standalone` 和单个存储地址：
 
 ```bash
-python tools/start_mooncake.py client-config \
+python3 tools/scripts/start_mooncake.py client-config \
   --hosts 10.0.0.11 10.0.0.12 10.0.0.13 \
   --cluster-id rl-embeddings-v1 \
   --local-host 10.0.0.21 \
@@ -185,11 +261,19 @@ HA 模式请求 `replica_num=2`，普通模式请求 `replica_num=1`。
 Omni-NPU 仓库中的 `docs/feature_store.md`，RL/推理环境需安装包含该 feature store 功能的 Omni-NPU 版本。
 
 `feature-store.env` 同时设置 `MC_STORE_CLUSTER_ID`、`MC_METADATA_CLUSTER_ID`、
-`MC_TCP_BIND_ADDRESS`、客户端端口及 `OMNI_FEATURE_STORE_CONFIG`。
+`MC_TCP_BIND_ADDRESS`、`MC_FORCE_TCP=1`、客户端端口及 `OMNI_FEATURE_STORE_CONFIG`。
+此处的 `source feature-store.env` 用于给 RL/推理进程加载连接配置，仍需执行；入口的自动
+CANN/Mooncake 初始化不会修改调用者的 shell 或其他应用进程的环境。
 **须在导入 Mooncake、启动 Ray/API/worker 前加载**。已有 Ray 集群需在各节点启动时注入，
 不能只修改 head 或 API 进程的环境。各节点 JSON 路径可以一致，但内容/本地 bind 地址必须
 分别生成；不要把 head 的 IP 通过全局 runtime_env 广播。这里不设置 KV 通道的
 `MOONCAKE_CONFIG_PATH`。
+
+启动器也为 provider 和 `check` 子进程统一设置 `MC_FORCE_TCP=1`，确保 NPU wheel 的
+本部署走 CPU/TCP。该变量作用于整个进程中的所有 Mooncake engine，不限于这个 feature
+store；不要将它写成通用镜像的全局 `ENV`。同一进程若还使用 Mooncake NPU/RDMA 通道，
+应将 TCP feature-store 与该通道隔离到不同进程或部署，并分别配置环境，不能直接全局加载
+这里生成的 TCP 环境。
 
 HA 模式下，旧的外部 RL 配置渲染器若仅允许单端点字符串，需要先适配分号分隔的 etcd 地址再使用，
 不能为了通过旧校验删掉另外两个 endpoint。Omni-NPU feature store 客户端接受生成的多端点字符串。
@@ -205,10 +289,10 @@ with FeatureWriter.from_config() as writer:
 
 ## 启动验收
 
-在实际 RL/推理主机、对应 Python 环境里执行。下面为 HA 模式示例，普通模式命令见上文：
+在实际 RL/推理主机的容器内执行。下面为 HA 模式示例，普通模式命令见上文：
 
 ```bash
-python tools/start_mooncake.py check \
+python3 tools/scripts/start_mooncake.py check \
   --hosts 10.0.0.11 10.0.0.12 10.0.0.13 \
   --cluster-id rl-embeddings-v1 \
   --local-host 10.0.0.21
