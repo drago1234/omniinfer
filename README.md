@@ -41,6 +41,8 @@ Omni-Infer是一套专为昇腾硬件平台定制的强大推理加速工具集�
 
 PD分离快速部署示例请参考[指南](docs/omni_infer_quick_start.md)。如需将Omni_Infer集成到项目中，请参考[安装指南](docs/omni_infer_installation_guide.md)和[文档](docs/)获取详细的设置说明和API参考。
 
+Mooncake embedding 存储池的普通部署、高可用部署及 RL/推理客户端配置，请参考 [Mooncake 部署指南](docs/mooncake_deployment.md)。
+
 ## 贡献指南
 
 我们欢迎您为Omni_Infer贡献代码！请查看[贡献指南](./CONTRIBUTION.md)，并通过[Gitee Issues](https://gitee.com/omniai/omniinfer/issues/new?issue%5Bassignee_id%5D=0&issue%5Bmilestone_id%5D=0)提交拉取请求或问题。
