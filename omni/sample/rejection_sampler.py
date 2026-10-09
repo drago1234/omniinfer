@@ -1,6 +1,6 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 from dataclasses import replace
 from typing import Optional
 import torch
@@ -581,12 +581,10 @@ def sample_recovered_tokens_native(
             sample_probs = (
                 target_scale[:, None] * target_probs - draft_probs
             ).clamp_min(0)
-            ### patch start for block padded draft recovery
             # A padded boundary has no proposal: sample directly from P.
             sample_probs = torch.where(
                 draft_token_ids[:, None] < 0, target_probs, sample_probs
             )
-            ### patch end for block padded draft recovery
 
     num_draft_tokens = cu_num_draft_tokens.clone()
     num_draft_tokens[1:] -= cu_num_draft_tokens[:-1]
@@ -746,7 +744,6 @@ def compute_block_acceptance_torch(
         ids = draft_token_ids[start:end].long()[:, None]
 
         # 1. 每个位置只取实际 draft token 对应的 P/Q。
-        ### patch start for block padded draft prefix
         # Only the contiguous real prefix participates in verification.
         valid_prefix = (ids.squeeze(1) >= 0).to(torch.int32).cumprod(0).bool()
         safe_ids = ids.clamp_min(0)
@@ -755,7 +752,6 @@ def compute_block_acceptance_torch(
         # Neutral factors carry c through padding without log(0) - log(0).
         p = torch.where(valid_prefix, p, 1.0)
         q = torch.where(valid_prefix, q, 1.0)
-        ### patch end for block padded draft prefix
 
         # Greedy 行不参与概率验证，避免其所选 token 的 Q=0。
         if is_greedy is not None:
@@ -787,19 +783,15 @@ def compute_block_acceptance_torch(
         h[:-1] = torch.where(
             denominator == 0, 1.0, Z / safe_denominator
         )
-        ### patch start for block padded draft threshold
         # The last real candidate uses c, not a residual from a padded Q.
         h[:-1] = torch.where(valid_prefix[1:], h[:-1], c[:-1])
         h[-1] = c[-1]
-        ### patch end for block padded draft threshold
 
         # 4. 选择最长通过前缀。
         lengths = torch.arange(
             1, k + 1, dtype=torch.int32, device=device
         )
-        ### patch start for block padded draft acceptance
         passed = valid_prefix & (uniform_probs[start:end] <= h) & (h > 0)
-        ### patch end for block padded draft acceptance
         request_tau = torch.where(passed, lengths, 0).max()
 
         # 此 helper 不决定 greedy 请求的接受结果。

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-
+# Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import torch
 from vllm.triton_utils import tl, triton
@@ -37,16 +36,13 @@ def _compute_block_prefix_kernel(
 
     log_c = 0.0
     previous_c = 1.0
-    ### patch start for block padded draft prefix
     valid_prefix = True
-    ### patch end for block padded draft prefix
 
     # 循环在 NPU 内执行，不会逐步重新启动 kernel。
     for i in range(end - start):
         row = start + i
         token = tl.load(draft_ids_ptr + row).to(tl.int64)
 
-        ### patch start for block padded draft prefix
         valid_prefix = valid_prefix & (token >= 0)
         safe_token = tl.maximum(token, 0)
         p = tl.load(
@@ -60,7 +56,6 @@ def _compute_block_prefix_kernel(
             mask=valid_prefix,
             other=1.0,
         ).to(tl.float32)
-        ### patch end for block padded draft prefix
 
         # 与当前 Torch helper 保持一致。
         p = tl.where(greedy, 1.0, p)
@@ -152,9 +147,7 @@ def _finalize_block_acceptance_kernel(
     C_ptr,                  # [D]
     partial_z_ptr,          # [B, MAX_PREFIXES, NUM_TILES]
     uniform_ptr,            # [D]
-    ### patch start for block padded draft length
     draft_ids_ptr,          # [D], negative IDs end the real prefix
-    ### patch end for block padded draft length
     cu_num_draft_ptr,        # [B]
     greedy_ptr,             # [B]，可选
     tau_ptr,                # [B]
@@ -180,13 +173,11 @@ def _finalize_block_acceptance_kernel(
     positions = tl.arange(0, PADDED_K)
     rows = start + positions
     valid = positions < length
-    ### patch start for block padded draft length
     tokens = tl.load(draft_ids_ptr + rows, mask=valid, other=-1)
     real_length = tl.min(
         tl.where(valid & (tokens < 0), positions, length), axis=0
     )
     valid_prefix = positions < real_length
-    ### patch end for block padded draft length
 
     c = tl.load(
         C_ptr + rows,
@@ -244,15 +235,11 @@ def _finalize_block_acceptance_kernel(
     )
 
     # 最后一个实际候选的阈值为 c_K。
-    ### patch start for block padded draft threshold
     is_last = valid_prefix & (positions + 1 == real_length)
-    ### patch end for block padded draft threshold
     h = tl.where(is_last, c, h)
 
     # 3. 选最长通过前缀，不能用“遇到失败就停止”。
-    ### patch start for block padded draft acceptance
     passed = valid_prefix & (u <= h) & (h > 0.0)
-    ### patch end for block padded draft acceptance
 
     candidate_lengths = tl.where(
         passed, positions + 1, 0
@@ -377,10 +364,8 @@ def finalize_block_acceptance_triton(
     uniform_probs,
     cu_num_draft_tokens,
     is_greedy=None,
-    ### patch start for block padded draft length
     *,
     draft_token_ids,
-    ### patch end for block padded draft length
 ):
     assert c.is_contiguous()
     assert partial_z.is_contiguous()
@@ -388,10 +373,8 @@ def finalize_block_acceptance_triton(
     assert uniform_probs.dtype == torch.float32
     assert cu_num_draft_tokens.is_contiguous()
     assert uniform_probs.numel() == c.numel()
-    ### patch start for block padded draft length
     assert draft_token_ids.is_contiguous()
     assert draft_token_ids.numel() == c.numel()
-    ### patch end for block padded draft length
 
 
     if is_greedy is not None:
@@ -420,19 +403,15 @@ def finalize_block_acceptance_triton(
 
     if batch_size == 0:
         return tau, accepted
-    ### patch start for block empty draft batch
     if c.numel() == 0:
         tau.zero_()
         return tau, accepted
-    ### patch end for block empty draft batch
 
     _finalize_block_acceptance_kernel[(batch_size,)](
         c,
         partial_z,
         uniform_probs,
-        ### patch start for block padded draft length
         draft_token_ids,
-        ### patch end for block padded draft length
         cu_num_draft_tokens,
         is_greedy,
         tau,
@@ -479,9 +458,7 @@ def compute_block_acceptance_triton(
         uniform_probs,
         cu_num_draft_tokens,
         is_greedy,
-        ### patch start for block padded draft length
         draft_token_ids=draft_token_ids,
-        ### patch end for block padded draft length
     )
 
     return tau, accepted, target_scale

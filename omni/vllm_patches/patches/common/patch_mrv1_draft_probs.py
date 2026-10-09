@@ -1,7 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Provide MRV1 draft probabilities for standard and block verification."""
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 from dataclasses import replace
 from importlib.util import find_spec

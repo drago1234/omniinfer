@@ -1,10 +1,6 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""CPU interpretation of the real Triton kernels; no NPU compilation is required.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-Load private module instances so TRITON_INTERPRET and import substitutions never
-change the kernels used by other tests. These check semantics, not NPU codegen.
-"""
 import importlib.util
 import os
 import subprocess
