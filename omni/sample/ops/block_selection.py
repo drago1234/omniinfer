@@ -95,10 +95,14 @@ def select_block_tokens_triton(
     batch_size = cu_num_draft_tokens.numel()
     output_width = max_spec_len + 1
 
-    assert output_token_ids.shape == (batch_size, output_width)
-    assert tau.shape == (batch_size,)
-    assert bonus_token_ids.numel() == batch_size
-    assert recovered_token_ids.numel() == draft_token_ids.numel()
+    if output_token_ids.shape != (batch_size, output_width):
+        raise ValueError("output_token_ids must have shape (batch_size, max_spec_len + 1)")
+    if tau.shape != (batch_size,):
+        raise ValueError("tau must have shape (batch_size,)")
+    if bonus_token_ids.numel() != batch_size:
+        raise ValueError("bonus_token_ids must have one token per request")
+    if recovered_token_ids.numel() != draft_token_ids.numel():
+        raise ValueError("recovered_token_ids and draft_token_ids must have the same number of elements")
 
     for tensor in (
         output_token_ids,
@@ -108,11 +112,14 @@ def select_block_tokens_triton(
         recovered_token_ids,
         bonus_token_ids,
     ):
-        assert tensor.is_contiguous()
+        if not tensor.is_contiguous():
+            raise ValueError("All token selection tensors must be contiguous")
 
     if fill_this_time is not None:
-        assert fill_this_time.shape == (batch_size,)
-        assert fill_this_time.is_contiguous()
+        if fill_this_time.shape != (batch_size,):
+            raise ValueError("fill_this_time must have shape (batch_size,)")
+        if not fill_this_time.is_contiguous():
+            raise ValueError("fill_this_time must be contiguous")
 
     accepted_num = torch.empty(
         batch_size,

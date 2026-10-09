@@ -270,10 +270,13 @@ def compute_block_prefix_triton(
     is_greedy=None,
 ):
     # 一维输入按连续布局读取；P/Q 使用实际 stride。
-    assert draft_token_ids.is_contiguous()
-    assert cu_num_draft_tokens.is_contiguous()
+    if not draft_token_ids.is_contiguous():
+        raise ValueError("draft_token_ids must be contiguous")
+    if not cu_num_draft_tokens.is_contiguous():
+        raise ValueError("cu_num_draft_tokens must be contiguous")
     if is_greedy is not None:
-        assert is_greedy.is_contiguous()
+        if not is_greedy.is_contiguous():
+            raise ValueError("is_greedy must be contiguous")
 
     num_tokens = draft_token_ids.numel()
     batch_size = cu_num_draft_tokens.numel()
@@ -314,9 +317,12 @@ def compute_block_partial_z_triton(
     cu_num_draft_tokens,
     max_num_draft_tokens,
 ):
-    assert c.is_contiguous()
-    assert cu_num_draft_tokens.is_contiguous()
-    assert max_num_draft_tokens >= 0
+    if not c.is_contiguous():
+        raise ValueError("c must be contiguous")
+    if not cu_num_draft_tokens.is_contiguous():
+        raise ValueError("cu_num_draft_tokens must be contiguous")
+    if not (max_num_draft_tokens >= 0):
+        raise ValueError("max_num_draft_tokens must be non-negative")
 
     batch_size = cu_num_draft_tokens.numel()
     vocab_size = target_probs.shape[1]
@@ -366,21 +372,31 @@ def finalize_block_acceptance_triton(
     *,
     draft_token_ids,
 ):
-    assert c.is_contiguous()
-    assert partial_z.is_contiguous()
-    assert uniform_probs.is_contiguous()
-    assert uniform_probs.dtype == torch.float32
-    assert cu_num_draft_tokens.is_contiguous()
-    assert uniform_probs.numel() == c.numel()
-    assert draft_token_ids.is_contiguous()
-    assert draft_token_ids.numel() == c.numel()
+    if not c.is_contiguous():
+        raise ValueError("c must be contiguous")
+    if not partial_z.is_contiguous():
+        raise ValueError("partial_z must be contiguous")
+    if not uniform_probs.is_contiguous():
+        raise ValueError("uniform_probs must be contiguous")
+    if uniform_probs.dtype != torch.float32:
+        raise TypeError("uniform_probs must have dtype torch.float32")
+    if not cu_num_draft_tokens.is_contiguous():
+        raise ValueError("cu_num_draft_tokens must be contiguous")
+    if uniform_probs.numel() != c.numel():
+        raise ValueError("uniform_probs and c must have the same number of elements")
+    if not draft_token_ids.is_contiguous():
+        raise ValueError("draft_token_ids must be contiguous")
+    if draft_token_ids.numel() != c.numel():
+        raise ValueError("draft_token_ids and c must have the same number of elements")
 
 
     if is_greedy is not None:
-        assert is_greedy.is_contiguous()
+        if not is_greedy.is_contiguous():
+            raise ValueError("is_greedy must be contiguous")
 
     batch_size = cu_num_draft_tokens.numel()
-    assert partial_z.shape[0] == batch_size
+    if partial_z.shape[0] != batch_size:
+        raise ValueError("partial_z must have one row per request")
 
     max_prefixes = partial_z.shape[1]
     num_tiles = partial_z.shape[2]

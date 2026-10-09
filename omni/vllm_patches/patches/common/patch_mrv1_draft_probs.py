@@ -42,7 +42,10 @@ class MRv1ProbabilisticDraftProposerPatch(VLLMPatch):
         runner=None,
     ):
         self.vllm_config = vllm_config
-        assert vllm_config.speculative_config is not None
+        ### patch start for explicit speculative config validation
+        if vllm_config.speculative_config is None:
+            raise ValueError("speculative_config is required for the MRV1 draft proposer")
+        ### patch end for explicit speculative config validation
         self.speculative_config = vllm_config.speculative_config
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
