@@ -68,6 +68,21 @@
           docker cp '{{ ansible_env.CODE_PATH }}/Pangu-FusionComm'
           "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/components/";
           fi
+        proxy: >-
+          if [ -d '{{ ansible_env.CODE_PATH }}/omni-proxy' ]; then
+          docker exec "$DOCKER_NAME_C" mkdir -p
+          '{{ container_workspace }}/omniinfer/components' &&
+          docker exec "$DOCKER_NAME_C" rm -rf
+          '{{ container_workspace }}/omniinfer/components/omni-proxy' &&
+          docker cp '{{ ansible_env.CODE_PATH }}/omni-proxy'
+          "${DOCKER_NAME_C}:{{ container_workspace }}/omniinfer/components/";
+          fi
+       
+    pip_install_profile:
+      proxy: >-
+        docker exec -w
+        '{{ container_workspace }}/omniinfer/components/omni-proxy/omni_proxy'
+        "$DOCKER_NAME_C" bash build.sh --skip-extras
 
     run_server_prefill_profile:
       # 由 enable_kv_pool=true 控制（M 组部署 + install_kv_pool +
