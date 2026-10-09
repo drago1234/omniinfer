@@ -288,7 +288,7 @@ def test_cla_dsa_combines_global_and_local_outputs(case, monkeypatch):
 @pytest.mark.parametrize("mome,sp,gather", [(False, False, False), (True, False, True), (True, True, True)])
 def test_fc2_epilog_preserves_mome_and_token_padding(case, monkeypatch, mome, sp, gather):
     a = case.attention
-    a.use_mome, a.enable_mome_sp = mome, sp
+    a.use_mome = mome
     a.num_local_heads, a.num_heads = 1, 2
     a.o_conv = SimpleNamespace(input_size_per_partition=4)
     monkeypatch.setattr(a, "_apply_o_proj", lambda value: value)
@@ -302,7 +302,8 @@ def test_fc2_epilog_preserves_mome_and_token_padding(case, monkeypatch, mome, sp
 
     conv = Mock(side_effect=apply_mome)
     monkeypatch.setattr(a, "_apply_MOME", conv)
-    output = a._flashcomm2_epilog(torch.ones(3, 2), case.metadata, None, 2, 4, 0, 3, gather)
+    mome_metadata = SimpleNamespace(use_mome_sp=sp) if mome else None
+    output = a._flashcomm2_epilog(torch.ones(3, 2), case.metadata, mome_metadata, 2, 4, 0, 3, gather)
     if not mome:
         torch.testing.assert_close(output, torch.ones(3, 4))
         conv.assert_not_called()
@@ -364,7 +365,7 @@ def test_mixed_forward_restores_shared_metadata(case, monkeypatch):
 @pytest.mark.parametrize("mome,inplace", [(False, False), (True, False), (True, True)])
 def test_cp_kv_projection_preserves_optional_mome(case, monkeypatch, mome, inplace):
     a, metadata = case.attention, case.metadata
-    a.use_mome, a.use_mome_inplace_update, a.enable_mome_sp = mome, inplace, False
+    a.use_mome, a.use_mome_inplace_update = mome, inplace
     a.skip_topk, a.cache_config = True, SimpleNamespace(cache_dtype="auto")
     a.rope_interleave = False
     a.o_proj = SimpleNamespace(tp_size=1)
@@ -388,7 +389,9 @@ def test_cp_kv_projection_preserves_optional_mome(case, monkeypatch, mome, inpla
     monkeypatch.setattr(torch.ops.custom, "npu_ai_infra_kv_rmsnorm_rope_cache_v2", cache_update)
     monkeypatch.setattr(a, "_apply_DSA_attention_cp", lambda *args, **kwargs: torch.ones(3, 4))
     monkeypatch.setattr(a, "_apply_o_proj", lambda value: value)
-    output = a._forward_prefill_cp(hidden, torch.ones(3, 1), torch.ones(3, 1), metadata)
+    # MoME-SP off for this step: KV is gathered first, then MoME runs on the full tokens.
+    mome_metadata = SimpleNamespace(use_mome_sp=False)
+    output = a._forward_prefill_cp(hidden, torch.ones(3, 1), torch.ones(3, 1), metadata, mome_metadata)
     expected_kv = hidden[:, :4].clone()
     expected_kv[:, :3] += int(mome)
     torch.testing.assert_close(cache_update.call_args.kwargs["kv"], expected_kv)
