@@ -1422,8 +1422,10 @@ class NPUModelRunner(GPUModelRunner):
     ) -> None:
         super().initialize_kv_cache(kv_cache_config, is_profiling)
 
+        # patch start
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
+        # patch end
 
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
