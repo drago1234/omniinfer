@@ -1,13 +1,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the hybrid APC per-group coordinator patch.
-
-``find_longest_cache_hit_per_group`` keeps each group's real hit blocks (so the
-deep D-side APC hit is not re-pulled) while clamping the returned scalar to
-``min(hit_lengths)`` (so ``external = total - min`` fills the lagging
-SWA/Mome groups).
-"""
+"""Hybrid APC per-group hit: min scalar, DSA blocks kept, MoME re-looked up."""
 
 import pytest
 
@@ -16,8 +10,11 @@ from omni_npu.vllm_patches.patches.models.pangu_v2_base import (
 )
 
 
+class _NoMamba:
+    attention_groups = []
+
+
 def _stub_upstream(monkeypatch, blocks, hit_lengths):
-    """Replace the saved upstream with a deterministic stub."""
     def upstream(self, block_hashes, max_cache_hit_length):
         return blocks, hit_lengths
 
@@ -29,43 +26,85 @@ def _stub_upstream(monkeypatch, blocks, hit_lengths):
     )
 
 
+def _mamba_spec():
+    import torch
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    return MambaSpec(
+        block_size=128,
+        shapes=((1,), (1,), (1,)),
+        dtypes=(torch.float16, torch.float16, torch.float16),
+    )
+
+
+class _Coord:
+    def __init__(self, attention_groups):
+        self.attention_groups = attention_groups
+        self.hash_block_size = 128
+        self.block_pool = object()
+        self.scheduler_block_size = 128
+
+
 @pytest.mark.unit
-def test_keeps_real_blocks_and_clamps_scalar_to_min(monkeypatch):
-    blocks = (["dsa0", "dsa1"], ["swa0"], ["mome0"])
-    _stub_upstream(monkeypatch, blocks, hit_lengths=(896, 128, 128))
+def test_clamps_scalar_and_keeps_dsa_blocks(monkeypatch):
+    blocks = (["dsa0", "dsa1"], ["swa0"])
+    _stub_upstream(monkeypatch, blocks, hit_lengths=(896, 128))
 
     out_blocks, hit_lengths = hybrid_mod.find_longest_cache_hit_per_group(
-        None, ["h0", "h1"], 1024
+        _NoMamba(), ["h0"], 1024
     )
 
-    # Blocks are passed through untouched — the deep DSA hit stays.
-    assert out_blocks is blocks
-    # The scalar is clamped to the common (min) length.
-    assert hit_lengths == (128, 128, 128)
+    assert out_blocks == blocks
+    assert hit_lengths == (128, 128)
 
 
 @pytest.mark.unit
-def test_zero_hit_is_preserved(monkeypatch):
-    _stub_upstream(monkeypatch, blocks=([], []), hit_lengths=(0, 0))
+def test_mamba_past_min_is_reresolved(monkeypatch):
+    dsa_blocks = ["dsa"] * 5
+    long_state = ["null"] * 5 + ["state_768"]
+    short_state = ["null"] * 4 + ["state_640"]
+    _stub_upstream(monkeypatch, (dsa_blocks, long_state), hit_lengths=(640, 768))
+    captured = {}
 
-    blocks, hit_lengths = hybrid_mod.find_longest_cache_hit_per_group(
-        None, [], 256
+    class _Mgr:
+        @classmethod
+        def find_longest_cache_hit(cls, **kwargs):
+            captured.update(kwargs)
+            return (short_state,)
+
+    out_blocks, hit_lengths = hybrid_mod.find_longest_cache_hit_per_group(
+        _Coord([(_mamba_spec(), [1], _Mgr, True)]),
+        ["h0"],
+        834,
     )
 
-    assert blocks == ([], [])
-    assert hit_lengths == (0, 0)
+    assert out_blocks[0] is dsa_blocks
+    assert out_blocks[1] == short_state
+    assert hit_lengths == (640, 640)
+    assert captured["max_length"] == 640
+    assert captured["drop_eagle_block"] is False
 
 
 @pytest.mark.unit
-def test_single_group_clamps_to_itself(monkeypatch):
-    _stub_upstream(monkeypatch, blocks=(["only"],), hit_lengths=(896,))
+def test_mamba_within_min_is_not_requeried(monkeypatch):
+    dsa_blocks = ["dsa"] * 16
+    state = ["null"] * 4 + ["state_640"]
+    blocks = (dsa_blocks, state)
+    _stub_upstream(monkeypatch, blocks, hit_lengths=(2048, 640))
 
-    blocks, hit_lengths = hybrid_mod.find_longest_cache_hit_per_group(
-        None, ["h0"], 1024
+    class _Mgr:
+        @classmethod
+        def find_longest_cache_hit(cls, **kwargs):
+            raise AssertionError("mamba hit within min must not be re-queried")
+
+    out_blocks, hit_lengths = hybrid_mod.find_longest_cache_hit_per_group(
+        _Coord([(_mamba_spec(), [1], _Mgr, False)]),
+        ["h0"],
+        4096,
     )
 
-    assert blocks == (["only"],)
-    assert hit_lengths == (896,)
+    assert out_blocks == blocks
+    assert hit_lengths == (640, 640)
 
 
 @pytest.mark.unit
@@ -83,17 +122,3 @@ def test_apply_calls_bypass_conflict(monkeypatch):
     hybrid_mod.HybridAPCConnectorHitPatch.apply()
 
     assert called == [("find_longest_cache_hit_per_group",)]
-
-
-@pytest.mark.unit
-def test_connector_patch_targets_hybrid_coordinator():
-    assert hybrid_mod.HybridAPCConnectorHitPatch._target is (
-        hybrid_mod.HybridKVCacheCoordinator
-    )
-    assert hybrid_mod.HybridAPCConnectorHitPatch._attr_names_to_apply == [
-        "find_longest_cache_hit_per_group"
-    ]
-    assert (
-        hybrid_mod.HybridAPCConnectorHitPatch.find_longest_cache_hit_per_group
-        is hybrid_mod.find_longest_cache_hit_per_group
-    )

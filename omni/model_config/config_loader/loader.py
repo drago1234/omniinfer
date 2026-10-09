@@ -12,6 +12,7 @@ import torch_npu
 from vllm.logger import init_logger
 
 from omni_npu import envs
+from omni_npu.v1.utils import on_ascend950
 from omni_npu.configs import OmniAdditionalConfig
 
 from .features import (
@@ -89,6 +90,10 @@ def load_model_extra_config(model_config, vllm_config, scheduler_config):
     )
     _validate_config(vllm_config)
     _print_model_config()
+    
+    if model_extra_config.operator_opt_config.use_batch_invariant_op and not on_ascend950():
+        from omni_npu.vllm_patches.patches.common.patch_matmul import patch_matmul
+        patch_matmul()
 
 
 @dataclass
