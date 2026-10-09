@@ -1,0 +1,25 @@
+diff --git a/vllm/v1/structured_output/__init__.py b/vllm/v1/structured_output/__init__.py
+index 987d4fe674..889295765c 100644
+--- a/vllm/v1/structured_output/__init__.py
++++ b/vllm/v1/structured_output/__init__.py
+@@ -219,6 +219,20 @@ class StructuredOutputManager:
+                 # Reasoning just ended, so we shouldn't advanced til
+                 # next pass
+                 structured_req.reasoning_ended = True
++                # The step that ends reasoning may already carry content
++                # tokens after the think-end token (e.g. with MTP the
++                # verify batch is [think_end, first_content_token]).
++                # Accept them into the FSM right now; otherwise the FSM
++                # stays in its initial state and the next bitmask forces
++                # another grammar-initial token (duplicated '{' prefix).
++                # Use output_token_ids (not all_token_ids) so that a
++                # think-end token inside the prompt never feeds prompt
++                # tokens into the FSM.
++                boundary_tokens = self.reasoner.extract_content_ids(
++                    list(request.output_token_ids))
++                if boundary_tokens:
++                    structured_req.grammar.accept_tokens(
++                        request.request_id, boundary_tokens)
+ 
+             return False
+         else:

@@ -34,7 +34,8 @@ class SimpleValidator(RejectionSamplerV1):
     ) -> SamplerOutput:
         num_logprobs = sampling_metadata.max_num_logprobs
         if num_logprobs is not None:
-            raise ("Logprobs gathered is not supported in current version")
+            raise NotImplementedError(
+                "Logprobs gathered is not supported in current version")
         if self.minus_one is None:
             # prepare const on npu
             self.minus_one = -torch.ones(1, 1, device=input_ids.device, dtype=input_ids.dtype)
@@ -120,7 +121,8 @@ class SparseRejectionSamplerValidator(RejectionSamplerV1):
     ) -> SamplerOutput:
         num_logprobs = sampling_metadata.max_num_logprobs
         if num_logprobs is not None:
-            raise ("Logprobs gathered is not supported in current version")
+            raise NotImplementedError(
+                "Logprobs gathered is not supported in current version")
         if self.minus_one is None:
             # prepare const on npu
             self.minus_one = -torch.ones(1, 1, device=input_ids.device, dtype=input_ids.dtype)

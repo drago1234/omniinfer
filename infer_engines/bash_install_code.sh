@@ -89,4 +89,5 @@ git apply --whitespace=nowarn $PATCH_ROOT/preserve_reasoning_content_input_passt
 git apply --whitespace=nowarn $PATCH_ROOT/glm_parser_finish_streaming.patch
 git apply --whitespace=nowarn $PATCH_ROOT/support_reasoning_effort.patch
 git apply --whitespace=nowarn $PATCH_ROOT/guard_find_longest_cache_hit_stale_hash_chain.patch
+git apply --whitespace=nowarn $PATCH_ROOT/fix_guided_dup_prefix_on_think_end.patch
 verify_parser_patches
