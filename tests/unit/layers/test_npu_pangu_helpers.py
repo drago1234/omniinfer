@@ -469,7 +469,6 @@ class TestPanguMomeDisabled(unittest.TestCase):
         attention = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
         torch.nn.Module.__init__(attention)
         attention.use_mome = False
-        attention.enable_mome_sp = False
         attention.tp_size = 1
         attention.moe_comm_strategy = "allreduce"
         attention.num_heads = 1
@@ -2146,7 +2145,6 @@ def _bare_swa_attention(**attrs):
         use_gpt_oss_sink=False,
         param_sink_number=0,
         use_mome=False,
-        enable_mome_sp=False,
         use_mome_inplace_update=False,
         sharded_o_proj=False,
         is_cp_layer=False,
@@ -2517,7 +2515,7 @@ class TestPanguSWASeqParallel(unittest.TestCase):
     def test_forward_prefill_sp_mome_inplace_and_prefetch(self):
         """MoME SP + sharded o_proj prefetch still returns local-token output."""
         attention = _bare_swa_attention(
-            use_mome=True, enable_mome_sp=True,
+            use_mome=True,
             use_mome_inplace_update=True, sharded_o_proj=True,
         )
         local = 3
@@ -2542,7 +2540,7 @@ class TestPanguSWASeqParallel(unittest.TestCase):
             pangu_mod.torch.npu, "stream", return_value=nullcontext()
         ):
             out = attention._forward_prefill_sp(
-                hidden, torch.zeros(6, 4), torch.zeros(6, 4), meta, object()
+                hidden, torch.zeros(6, 4), torch.zeros(6, 4), meta, SimpleNamespace(use_mome_sp=True)
             )
         self.assertEqual(tuple(out.shape), (local, 8))
         attention.o_proj.prefetch.assert_called_once()

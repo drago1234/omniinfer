@@ -411,6 +411,16 @@ class CrossLayerSharedOp:
         return buffer
 
 
+def _h2d_nonblocking(arr: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Copy host metadata to ``device`` via pinned memory, without a stream sync."""
+    host = torch.from_numpy(np.ascontiguousarray(arr))
+    if device.type == "cpu":
+        return host.clone()
+    if host.numel() == 0:
+        return torch.empty(host.shape, dtype=host.dtype, device=device)
+    return host.pin_memory().to(device, non_blocking=True)
+
+
 class SPManager:
     """
     This module handles sequence parallelism (SP).
@@ -545,11 +555,13 @@ class SPManager:
         kv_lens_np = (computed_lens_np + (inter_end - req_start))[keep]
 
         device = block_table_ref.device
-        q_lens = torch.tensor(q_lens_np, dtype=torch.int32, device=device)
-        kv_lens = torch.tensor(kv_lens_np, dtype=torch.int32, device=device)
+        # Pageable H2D copies and bool-mask indexing each block on a stream sync.
+        q_lens = _h2d_nonblocking(q_lens_np.astype(np.int32, copy=False), device)
+        kv_lens = _h2d_nonblocking(kv_lens_np.astype(np.int32, copy=False), device)
         self.valid_token_count = int(q_lens_np.sum())
         q_cumlens = q_lens.cumsum(dim=0, dtype=torch.int32)
-        blk_table = block_table_ref[torch.as_tensor(keep, device=device)]
+        keep_idx = _h2d_nonblocking(np.flatnonzero(keep), device)
+        blk_table = block_table_ref.index_select(0, keep_idx)
         self.sp_attn_metadata = (q_cumlens, kv_lens, blk_table)
 
     def sp_attn_meta(self) -> tuple:  # FA once:

@@ -845,7 +845,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
             vllm_config.cache_config.enable_prefix_caching) and
             not model_extra_config.operator_opt_config.optimize_first_chunk
         )
-        self.enable_mome_sp = self.use_mome and model_extra_config.operator_opt_config.enable_mome_sp
 
         if self.is_cp_layer:
             max_num_reqs = vllm_config.scheduler_config.max_num_seqs
@@ -2682,6 +2681,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         attn_metadata: Optional[MLACommonMetadata] = None,
         mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
     ) -> torch.Tensor:
+        use_mome_sp = mome_metadata.use_mome_sp if self.use_mome else False
         sp_manager: SPManager = (
             attn_metadata.prefill.sp_manager
             if attn_metadata is not None
@@ -2699,7 +2699,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         q_lora = self.q_a_proj(sp_x)
 
         if self.use_mome:
-            if self.enable_mome_sp:
+            if use_mome_sp:
                 self._apply_MOME(q_lora, self.qa_conv, attn_metadata, mome_metadata, True, True)
                 q_lora = sp_manager.sp_to_cp(q_lora)
             else:
@@ -2755,7 +2755,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
 
         ### KV stream begins ###
         kv = self.kv_a_proj_with_mqa(sp_x)
-        if not self.enable_mome_sp:
+        if not use_mome_sp:
             kv = sp_manager.ag_tokens(kv)
             if self.use_mome:
                 if self.use_mome_inplace_update:
@@ -2821,7 +2821,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         )
 
         if self.use_mome:
-            if self.enable_mome_sp:
+            if use_mome_sp:
                 attn_output = sp_manager.cp_to_sp(attn_output)
                 self._apply_MOME(
                     attn_output,
@@ -2930,6 +2930,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
     ) -> torch.Tensor:
         """SWA prefill with contiguous token SP and replicated head weights."""
+        use_mome_sp = mome_metadata.use_mome_sp if self.use_mome else False
         assert not self.on_ascend950, "ena_swa_attn_seq_parallel is supported on A3 only"
         assert attn_metadata is not None and attn_metadata.prefill is not None
         sp_manager = attn_metadata.prefill.sp_manager
@@ -2945,7 +2946,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         # Q remains token-sharded and uses all replicated heads.
         q_lora = self.q_a_proj(hidden_states)
         if self.use_mome:
-            if self.enable_mome_sp:
+            if use_mome_sp:
                 self._apply_MOME(q_lora, self.qa_conv, attn_metadata, mome_metadata, True, True)
             else:
                 q_lora = sp_manager.ag_tokens(q_lora)
@@ -2965,7 +2966,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         # KV is projected locally, then gathered so every rank writes the same
         # full-token cache with the global slot mapping.
         kv = self.kv_a_proj_with_mqa(hidden_states)
-        gather_before_mome = self.use_mome and not self.enable_mome_sp
+        gather_before_mome = self.use_mome and not use_mome_sp
         if gather_before_mome:
             kv = sp_manager.ag_tokens(kv)
         if self.use_mome:
@@ -2976,7 +2977,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                     attn_metadata=attn_metadata,
                     mome_metadata=mome_metadata,
                     inplace=True,
-                    ena_sp=self.enable_mome_sp,
+                    ena_sp=use_mome_sp,
                 )
             else:
                 k_nope, k_pe = torch.split(
@@ -2989,7 +2990,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                     self.compresskv_conv,
                     attn_metadata=attn_metadata,
                     mome_metadata=mome_metadata,
-                    ena_sp=self.enable_mome_sp,
+                    ena_sp=use_mome_sp,
                 )
                 kv = torch.cat([k_nope, k_pe], dim=-1)
         if not gather_before_mome:
@@ -3028,7 +3029,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             attn_output = padded_output
 
         if self.use_mome:
-            if self.enable_mome_sp:
+            if use_mome_sp:
                 self._apply_MOME(
                     attn_output,
                     self.o_conv,
@@ -3089,7 +3090,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 attn_output = get_tp_group().all_gather(attn_output, dim=1)
             return self._apply_o_proj(attn_output)
 
-        if not self.enable_mome_sp:
+        if not mome_metadata.use_mome_sp:
             tp_group = get_tp_group()
             if attn_output.size(1) < self.o_conv.input_size_per_partition:
                 attn_output = tp_group.all_gather(attn_output, dim=1)
@@ -3139,6 +3140,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         and trim to num_actual_tokens to remove TP padding.
         cos / sin are already global and need no gathering.
         """
+        use_mome_sp = mome_metadata.use_mome_sp if self.use_mome else False
         enable_pa = self._use_swa_prefill_pa(attn_metadata)
 
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -3161,7 +3163,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         ### Q stream begins ###
         # Project, apply MoME and layer norm on local tokens, then gather all tokens
         q_lora = self.q_a_proj(hidden_states)
-        if not self.enable_mome_sp:
+        if not use_mome_sp:
             if need_all_gather:
                 q_lora = get_tp_group().all_gather(q_lora, dim=0)
             q_lora = q_lora[:num_prefill_tokens] # Trim TP padding to keep only actual prefill tokens
@@ -3213,7 +3215,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         ### KV stream begins ###
         # Project, apply MoME and layer norm on local tokens, then gather the smaller kv tensor
         kv = self.kv_a_proj_with_mqa(hidden_states)
-        if not self.enable_mome_sp:
+        if not use_mome_sp:
             if need_all_gather:
                 kv = get_tp_group().all_gather(kv, dim=0)
             kv = kv[:num_prefill_tokens] # Trim TP padding to keep only actual prefill tokens
