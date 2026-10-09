@@ -15,15 +15,17 @@ from vllm.v1.sample.rejection_sampler import (
     MAX_SPEC_LEN,
     PLACEHOLDER_TOKEN_ID,
     GREEDY_TEMPERATURE,
-    RejectionSampler,
-    generate_uniform_probs
+    RejectionSampler
 )
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.triton_utils import HAS_TRITON
 
 from omni_npu import envs
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.sample.ops.topk_topp_sampler import apply_top_k_top_p_npu
+from omni_npu.sample.ops.block_acceptance import compute_block_acceptance_triton
+from omni_npu.sample.ops.block_selection import select_block_tokens_triton
 from omni_npu.v1.utils import on_ascend950
 
 logger = init_logger(__name__)
@@ -32,12 +34,18 @@ NEW_GREEDY_TEMPERATURE = 1e-6 # convert greedy cases into random cases
 
 
 class NPURejectionSampler(RejectionSampler):
-    def __init__(self, sampler: Sampler):
+    def __init__(self, sampler: Sampler, speculative_config):
         super().__init__(sampler)
         # Share the main sampler's side stream. This step's sampling noise is
         # produced exactly ONCE in forward() below and consumed on the default
         # stream as contiguous copies, so the bonus and verify consumers no
         # longer interleave producers on this stream (IJTE2J).
+
+        rejection_sample_method = speculative_config.rejection_sample_method
+        if rejection_sample_method not in ("standard", "block"):
+            raise ValueError(f"Unsupported rejection sample method: {rejection_sample_method}")
+
+        self.rejection_sample_method = rejection_sample_method
         self.dsa_stream = sampler.dsa_stream
         self.use_npu_sample = not (
             model_extra_config.operator_opt_config.disable_npu_top_k_top_p_sample
@@ -218,6 +226,7 @@ class NPURejectionSampler(RejectionSampler):
                 bonus_token_ids,
                 sampling_metadata,
                 self.dsa_stream,
+                self.rejection_sample_method,
             )
 
         logprobs_tensors = None
@@ -237,6 +246,35 @@ class NPURejectionSampler(RejectionSampler):
         )
 
 
+def generate_uniform_probs(
+    num_tokens: int,
+    num_draft_tokens: list[int],
+    generators: dict[int, torch.Generator],
+    device: torch.device,
+    *,
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    uniform_probs = torch.rand(
+        (num_tokens,),
+        dtype=dtype,
+        device=device,
+    )
+
+    start_idx = 0
+    for req_idx, n in enumerate(num_draft_tokens):
+        if n == 0:
+            continue
+
+        end_idx = start_idx + n
+        generator = generators.get(req_idx)
+        if generator is not None:
+            uniform_probs[start_idx:end_idx].uniform_(generator=generator)
+
+        start_idx = end_idx
+
+    return uniform_probs
+
+
 def rejection_sample(
     draft_token_ids: torch.Tensor,  # shape: (num_tokens)
     num_draft_tokens: list[int],  # shape: (batch_size)
@@ -247,6 +285,7 @@ def rejection_sample(
     bonus_token_ids: torch.Tensor,  # shape: (batch_size, 1)
     sampling_metadata: SamplingMetadata,
     stream: torch.npu.Stream,
+    rejection_sample_method: str = "standard",
 ) -> torch.Tensor:
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
@@ -264,6 +303,15 @@ def rejection_sample(
     assert target_probs.shape == (num_tokens, vocab_size)
     cur_stream = torch.npu.current_stream()
     multi_stream = model_extra_config.operator_opt_config.sampler_multi_stream
+    uniform_dtype = (
+        torch.float32
+        if (
+            rejection_sample_method == "block"
+            and HAS_TRITON
+            and target_probs.device.type == "npu"
+        )
+        else torch.float64
+    )
 
     # Create output buffer.
     output_token_ids = torch.full(
@@ -300,6 +348,7 @@ def rejection_sample(
                 num_draft_tokens,
                 sampling_metadata.generators,
                 device,
+                dtype=uniform_dtype,
             )
         cur_stream.wait_stream(stream)
         # Consumed on the default stream below; keep its block from being
@@ -311,20 +360,8 @@ def rejection_sample(
             num_draft_tokens,
             sampling_metadata.generators,
             device,
+            dtype=uniform_dtype,
         )
-
-    # Sample recovered tokens for each position.
-    recovered_token_ids = sample_recovered_tokens(  # shape: (num_tokens)
-        max_spec_len,
-        num_draft_tokens,
-        cu_num_draft_tokens,
-        draft_token_ids,
-        draft_probs,
-        target_probs,
-        sampling_metadata,
-        device,
-        stream
-    )
 
     # Rejection sampling for random sampling requests.
     rejection_random_sample_native(
@@ -334,11 +371,15 @@ def rejection_sample(
         draft_probs,
         target_probs,
         bonus_token_ids,
-        recovered_token_ids,
+        num_draft_tokens,
+        sampling_metadata,
+        stream,
+        device,
         uniform_probs,
         is_greedy,
         max_spec_len,
         vocab_size,
+        rejection_sample_method,
         NO_DRAFT_PROBS=draft_probs is None,
     )
     return output_token_ids
@@ -460,6 +501,7 @@ def sample_recovered_tokens(
     sampling_metadata: SamplingMetadata,
     device: torch.device,
     stream: torch.npu.Stream,
+    target_scale=None,
 ) -> torch.Tensor:
     # NOTE(woosuk): Create only one distribution for each request.
     batch_size = len(num_draft_tokens)
@@ -507,6 +549,7 @@ def sample_recovered_tokens(
         vocab_size,
         vocab_size, # next_power_of_2(vocab_size) is useless in native
         NO_DRAFT_PROBS=draft_probs is None,
+        target_scale=target_scale,
     )
     return recovered_token_ids
 
@@ -521,6 +564,7 @@ def sample_recovered_tokens_native(
     vocab_size,
     PADDED_VOCAB_SIZE, # next_power_of_2(vocab_size) is useless in native
     NO_DRAFT_PROBS,
+    target_scale=None,
 ):
     num_tokens = target_probs.shape[0]
 
@@ -531,7 +575,18 @@ def sample_recovered_tokens_native(
         ) * sample_probs.shape[1]
         sample_probs.view(-1)[draft_token_ids.view(-1) + offset] -= 1
     else:
-        sample_probs = target_probs - draft_probs
+        if target_scale is None:
+            sample_probs = target_probs - draft_probs
+        else:
+            sample_probs = (
+                target_scale[:, None] * target_probs - draft_probs
+            ).clamp_min(0)
+            ### patch start for block padded draft recovery
+            # A padded boundary has no proposal: sample directly from P.
+            sample_probs = torch.where(
+                draft_token_ids[:, None] < 0, target_probs, sample_probs
+            )
+            ### patch end for block padded draft recovery
 
     num_draft_tokens = cu_num_draft_tokens.clone()
     num_draft_tokens[1:] -= cu_num_draft_tokens[:-1]
@@ -571,26 +626,85 @@ def rejection_random_sample_native(
     draft_probs,  # [num_tokens, vocab_size] or None
     target_probs,  # [num_tokens, vocab_size]
     bonus_token_ids,  # [batch_size]
-    recovered_token_ids,  # [num_tokens]
+    num_draft_tokens,
+    sampling_metadata,
+    stream,
+    device,
     uniform_probs,  # [num_tokens]
     is_greedy,  # [batch_size]
     max_spec_len,
     vocab_size,
+    rejection_sample_method,
     NO_DRAFT_PROBS,
 ):
     num_tokens = target_probs.shape[0]
+    target_scale = None
 
-    if draft_probs is None:
-        draft_prob = torch.ones(
-            num_tokens,
-            dtype=target_probs.dtype,
-            device=target_probs.device,
+    if rejection_sample_method == "standard":
+        if draft_probs is None:
+            draft_prob = torch.ones(
+                num_tokens,
+                dtype=target_probs.dtype,
+                device=device,
+            )
+        else:
+            draft_prob = draft_probs.gather(1, draft_token_ids.view(-1, 1)).view(-1)
+
+        target_prob = target_probs.gather(1, draft_token_ids.view(-1, 1)).view(-1)
+        accepted = target_prob / draft_prob >= uniform_probs
+
+    elif rejection_sample_method == "block":
+        if HAS_TRITON and target_probs.device.type == "npu":
+            tau, accepted, target_scale = compute_block_acceptance_triton(
+                draft_token_ids=draft_token_ids,
+                cu_num_draft_tokens=cu_num_draft_tokens,
+                draft_probs=draft_probs,
+                target_probs=target_probs,
+                uniform_probs=uniform_probs,
+                max_num_draft_tokens=max_spec_len,
+                is_greedy=is_greedy,
+            )
+        else:
+            tau, accepted, target_scale = compute_block_acceptance_torch(
+                draft_token_ids=draft_token_ids,
+                num_draft_tokens=num_draft_tokens,
+                draft_probs=draft_probs,
+                target_probs=target_probs,
+                uniform_probs=uniform_probs,
+                device=device,
+                is_greedy=is_greedy,
+            )
+
+    # Sample recovered tokens for each position.
+    recovered_token_ids = sample_recovered_tokens(  # shape: (num_tokens)
+        max_spec_len,
+        num_draft_tokens,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        draft_probs,
+        target_probs,
+        sampling_metadata,
+        device,
+        stream,
+        target_scale,
+    )
+
+    if (
+        rejection_sample_method == "block"
+        and HAS_TRITON
+        and target_probs.device.type == "npu"
+    ):
+        return select_block_tokens_triton(
+            output_token_ids=output_token_ids,
+            tau=tau,
+            cu_num_draft_tokens=cu_num_draft_tokens,
+            draft_token_ids=draft_token_ids,
+            recovered_token_ids=recovered_token_ids,
+            bonus_token_ids=bonus_token_ids,
+            fill_this_time=~is_greedy,
+            max_spec_len=max_spec_len,
+            placeholder_token_id=PLACEHOLDER_TOKEN_ID,
         )
-    else:
-        draft_prob = draft_probs.gather(1, draft_token_ids.view(-1, 1)).view(-1)
-
-    target_prob = target_probs.gather(1, draft_token_ids.view(-1, 1)).view(-1)
-    accepted = target_prob / draft_prob >= uniform_probs
 
     return select_tokens_by_accepted(
         output_token_ids,
@@ -602,6 +716,107 @@ def rejection_random_sample_native(
         ~is_greedy,
         max_spec_len,
     )
+
+
+def compute_block_acceptance_torch(
+    draft_token_ids,    # [D]
+    num_draft_tokens,   # list[int]，每个请求的 draft 数
+    draft_probs,       # [D, V]，Q
+    target_probs,      # [D, V]，P
+    uniform_probs,     # [D]，由调用方生成
+    device,
+    is_greedy=None,    # [B]，True 表示交给原 greedy 分支处理
+):
+    batch_size = len(num_draft_tokens)
+
+    tau = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    accepted = torch.zeros_like(draft_token_ids, dtype=torch.bool)
+    target_scale = torch.ones(
+        draft_token_ids.numel(), dtype=torch.float32, device=device
+    )
+
+    start = 0
+    for request, k in enumerate(num_draft_tokens):
+        if k == 0:
+            continue
+
+        end = start + k
+        P = target_probs[start:end].float()
+        Q = draft_probs[start:end].float()
+        ids = draft_token_ids[start:end].long()[:, None]
+
+        # 1. 每个位置只取实际 draft token 对应的 P/Q。
+        ### patch start for block padded draft prefix
+        # Only the contiguous real prefix participates in verification.
+        valid_prefix = (ids.squeeze(1) >= 0).to(torch.int32).cumprod(0).bool()
+        safe_ids = ids.clamp_min(0)
+        p = P.gather(1, safe_ids).squeeze(1)
+        q = Q.gather(1, safe_ids).squeeze(1)
+        # Neutral factors carry c through padding without log(0) - log(0).
+        p = torch.where(valid_prefix, p, 1.0)
+        q = torch.where(valid_prefix, q, 1.0)
+        ### patch end for block padded draft prefix
+
+        # Greedy 行不参与概率验证，避免其所选 token 的 Q=0。
+        if is_greedy is not None:
+            p = torch.where(is_greedy[request], 1.0, p)
+            q = torch.where(is_greedy[request], 1.0, q)
+
+        # 2. log c_i = min(0, log c_(i-1) + log P_i - log Q_i)。
+        log_ratio = p.log() - q.log()
+        log_c = torch.empty_like(p)
+        previous = P.new_zeros(())  # log(c_0) = log(1) = 0
+
+        for i in range(k):
+            previous = (previous + log_ratio[i]).clamp_max(0)
+            log_c[i] = previous
+
+        c = log_c.exp()
+
+        # 3. 前缀 i 的 Z，使用下一位置的整行 P/Q。
+        Z = (
+            c[:-1, None] * P[1:] - Q[1:]
+        ).clamp_min(0).sum(dim=-1)
+
+        denominator = Z + (1 - c[:-1])
+        safe_denominator = torch.where(
+            denominator == 0, 1.0, denominator
+        )
+
+        h = torch.empty_like(c)
+        h[:-1] = torch.where(
+            denominator == 0, 1.0, Z / safe_denominator
+        )
+        ### patch start for block padded draft threshold
+        # The last real candidate uses c, not a residual from a padded Q.
+        h[:-1] = torch.where(valid_prefix[1:], h[:-1], c[:-1])
+        h[-1] = c[-1]
+        ### patch end for block padded draft threshold
+
+        # 4. 选择最长通过前缀。
+        lengths = torch.arange(
+            1, k + 1, dtype=torch.int32, device=device
+        )
+        ### patch start for block padded draft acceptance
+        passed = valid_prefix & (uniform_probs[start:end] <= h) & (h > 0)
+        ### patch end for block padded draft acceptance
+        request_tau = torch.where(passed, lengths, 0).max()
+
+        # 此 helper 不决定 greedy 请求的接受结果。
+        if is_greedy is not None:
+            request_tau = torch.where(
+                is_greedy[request], 0, request_tau
+            )
+
+        tau[request] = request_tau
+        accepted[start:end] = lengths <= request_tau
+
+        # 5. 恢复位置 j 使用 c_(j-1)：[1, c_1, ..., c_(k-1)]。
+        target_scale[start + 1:end] = c[:-1]
+
+        start = end
+
+    return tau, accepted, target_scale
 
 
 def select_tokens_by_accepted(

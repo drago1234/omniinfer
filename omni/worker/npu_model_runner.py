@@ -139,7 +139,7 @@ class NPUModelRunner(GPUModelRunner):
         self.sampler = NPUSamplerV1()
 
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.rejection_sampler = NPURejectionSampler(self.sampler)
+            self.rejection_sampler = NPURejectionSampler(self.sampler, self.speculative_config)
 
         if vllm_config.additional_config is not None:
             from omni_npu.compilation.npugraph_ex_config import init_aclgraph_config
