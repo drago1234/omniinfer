@@ -100,6 +100,13 @@ class NpuGraphExAdaptor(CompilerInterface):
             "static_kernel_compile", False
         ) or npugraph_ex_config.get("super_kernel_optimize", False):
             config.static_kernel_compile = True
+            from omni_npu import envs as omni_envs
+            from omni_npu.compilation.static_kernel_compile import (
+                configure_static_kernel_compile_jobs,
+            )
+            configure_static_kernel_compile_jobs(
+                omni_envs.OMNI_STATIC_KERNEL_COMPILE_JOBS
+            )
             # Control whether to enable super kernel optimize
             if npugraph_ex_config.get("super_kernel_optimize", False):
                 config.super_kernel_optimize = True
