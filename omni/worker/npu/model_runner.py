@@ -84,6 +84,27 @@ class NPUModelRunnerV2(GPUModelRunner):
             )
         encoder_runner.inputs_embeds = inputs_embeds.repeat(1, num_streams)
 
+    def add_requests(self, scheduler_output):
+        super().add_requests(scheduler_output)
+        if self.sampler is not None:
+            if not hasattr(self.sampler, "thinking_budget"):
+                from omni_npu.worker.npu.thinking_budget import MRv2ThinkingBudget
+
+                self.sampler.thinking_budget = MRv2ThinkingBudget(
+                    self.vllm_config.reasoning_config, self.device
+                )
+            for data in scheduler_output.scheduled_new_reqs:
+                idx = self.req_states.req_id_to_index[data.req_id]
+                self.sampler.thinking_budget.add_request(idx, data)
+
+    def _remove_request(self, req_id):
+        idx = self.req_states.req_id_to_index.get(req_id)
+        removed = super()._remove_request(req_id)
+        budget = getattr(self.sampler, "thinking_budget", None)
+        if idx is not None and budget is not None:
+            budget.remove_request(idx)
+        return removed
+
     def capture_model(self) -> int:
         """Guard the aicpu-tiling assumption around the upstream capture.
 

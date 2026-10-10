@@ -71,6 +71,8 @@ def test_runner_installs_cuda_aliases_and_pins_override_surface(
     # 钉住覆写面：多出来说明有人加了覆写没说明原因，少了说明某个适配被删掉了。
     own = set(vars(type(runner))) - _CLASS_NOISE
     assert own == {
+        "add_requests",              # Track budget after sampler creation in load_model
+        "_remove_request",           # Clear state before request-slot reuse
         "__init__",                  # torch.cuda 别名，必须早于上游 __init__ 建 Stream
         "load_model",                # MRv2 mHC 多模态模型加载后对齐 encoder buffer 宽度
         "_align_mhc_mm_embedding_width",  # mHC 多流输出宽度适配（来自基线提交）
