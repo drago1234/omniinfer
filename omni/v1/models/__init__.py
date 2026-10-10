@@ -13,6 +13,9 @@ def register_models():
         "PanguUltraMoEForCausalLM",
         "omni_npu.v1.models.pangu.pangu_ultra_moe:PanguUltraMoEForCausalLM")
     ModelRegistry.register_model(
+        "PanguUltraMoEV3ForCausalLM",
+        "omni_npu.v1.models.pangu.pangu_ultra_moe:PanguUltraMoEV3ForCausalLM")
+    ModelRegistry.register_model(
         "OpenPanguMTPModel",
         "omni_npu.v1.models.pangu.pangu_ultra_moe_mtp:OpenPanguMTP")
     ModelRegistry.register_model(

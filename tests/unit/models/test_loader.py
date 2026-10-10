@@ -213,7 +213,7 @@ class TestConfigLoaderUnit(unittest.TestCase):
                 parallel = loader.ModelParallelConfig(**data["model_parallel_config"])
                 operator = loader.ModelOperatorOptConfig(**data["operator_optimization_config"])
                 self.assertEqual(operator.moe_comm_strategy, strategy)
-                self.assertTrue(operator.use_gpt_oss_sink_rescale)
+                self.assertFalse(operator.use_gpt_oss_sink_rescale)
                 self.assertEqual(parallel.ena_context_parallel, role == "p")
                 self.assertFalse(operator.enable_mome_sp)
 

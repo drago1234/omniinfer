@@ -46,6 +46,7 @@ How to use
      npu_pangu_swa_decode            -> _apply_SWA_attention_decode
      npu_pangu_dsa_decode            -> _apply_DSA_attention
                                         (decode path only)
+     npu_pangu_gpt_oss_fia           -> npu_ai_infra_flash_attention
      npu_pangu_indexer_cache_update  -> Indexer._update_indexer_cache
      npu_pangu_lightning_indexer     -> Indexer._apply_lightning_indexer
      npu_pangu_kv_cache_update       -> _npu_kvrmsnorm_rope_cache
@@ -192,6 +193,94 @@ def _indexer_cache_tuple(
     if kv_cache_2 is None:
         return (kv_cache_0, kv_cache_1)
     return (kv_cache_0, kv_cache_1, kv_cache_2)
+
+
+# ---------------------------------------------------------------------------
+# npu_pangu_gpt_oss_fia: opaque wrapper for native OSS-sink dense FIA
+# ---------------------------------------------------------------------------
+# The operator package does not provide a FakeTensor-safe meta kernel for
+# npu_ai_infra_flash_attention.  Without this boundary, FULL graph tracing
+# enters the device kernel with unallocated fake tensors.  Keep metadata
+# generation outside so its cross-layer sharing semantics remain unchanged.
+def npu_pangu_gpt_oss_fia(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    meta_data: torch.Tensor,
+    actual_seq_lengths: torch.Tensor,
+    actual_seq_lengths_kv: torch.Tensor,
+    sinks: torch.Tensor,
+    num_heads: int,
+    num_key_value_heads: int,
+    *,
+    atten_mask: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    query_rope: Optional[torch.Tensor] = None,
+    key_rope: Optional[torch.Tensor] = None,
+    softmax_scale: float = 1.0,
+    pre_tokens: int = (1 << 31) - 1,
+    next_tokens: int = (1 << 31) - 1,
+    input_layout: str = "TND",
+    sparse_mode: int = 0,
+    block_size: int = 0,
+) -> torch.Tensor:
+    return torch.ops.custom.npu_ai_infra_flash_attention(
+        query,
+        key,
+        value,
+        meta_data,
+        atten_mask=atten_mask,
+        actual_seq_lengths=actual_seq_lengths,
+        actual_seq_lengths_kv=actual_seq_lengths_kv,
+        block_table=block_table,
+        query_rope=query_rope,
+        key_rope=key_rope,
+        sinks=sinks,
+        num_heads=num_heads,
+        softmax_scale=softmax_scale,
+        pre_tokens=pre_tokens,
+        next_tokens=next_tokens,
+        input_layout=input_layout,
+        num_key_value_heads=num_key_value_heads,
+        sparse_mode=sparse_mode,
+        block_size=block_size,
+    )[0]
+
+
+def npu_pangu_gpt_oss_fia_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    meta_data: torch.Tensor,
+    actual_seq_lengths: torch.Tensor, actual_seq_lengths_kv: torch.Tensor,
+    sinks: torch.Tensor,
+    num_heads: int,
+    num_key_value_heads: int,
+    *,
+    atten_mask: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    query_rope: Optional[torch.Tensor] = None,
+    key_rope: Optional[torch.Tensor] = None,
+    softmax_scale: float = 1.0,
+    pre_tokens: int = (1 << 31) - 1, next_tokens: int = (1 << 31) - 1,
+    input_layout: str = "TND",
+    sparse_mode: int = 0,
+    block_size: int = 0,
+) -> torch.Tensor:
+    if input_layout == "TND_NTD":
+        shape = (num_heads, query.size(0), value.size(-1))
+    else:
+        shape = (*query.shape[:-1], value.size(-1))
+    return torch.empty(shape, device=query.device, dtype=query.dtype)
+
+
+direct_register_custom_op(
+    op_name="npu_pangu_gpt_oss_fia",
+    op_func=npu_pangu_gpt_oss_fia,
+    mutates_args=[],
+    fake_impl=npu_pangu_gpt_oss_fia_fake,
+    dispatch_key="PrivateUse1",
+)
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from vllm.logger import init_logger
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import ParallelConfig, VllmConfig, CacheConfig
 from vllm.distributed import (
@@ -54,6 +55,11 @@ from omni_npu.layers.mhc.mhc_rl import NPUmHCRL
 from omni_npu.plugin_decorators import post_model_forward_decorator
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+from omni_npu.v1.layers.attention.npu_cla import (
+    NPUDeepseekMLACLAAttention,
+    NPUDeepseekSparseCLAAttention,
+)
+from omni_npu.v1.layers.utils import get_cla_mapping
 from omni_npu.v1.layers.attention.weight_utils import (
     mark_split_q_up_params_loaded,
     run_post_weight_load,
@@ -69,6 +75,9 @@ from .utils import (
     _normalize_rope_parameters,
     check_ffn_act_fn,
 )
+
+
+logger = init_logger(__name__)
 
 
 class OpenPanguMLP(FusedMLP):
@@ -148,7 +157,13 @@ class OpenPanguMoE(nn.Module):
         else:
             self.shared_experts = None
 
-        if config.model_type in ("openpangu_v2", "openpangu_mtp", "openpangu_v2_vl_moe", "openpangu_v2_omni_moe"):
+        if config.model_type in (
+            "openpangu_v2",
+            "openpangu_v3",
+            "openpangu_mtp",
+            "openpangu_v2_vl_moe",
+            "openpangu_v2_omni_moe",
+        ):
             self.experts = NPUSharedFusedMoE(
                 shared_experts=self.shared_experts,
                 gate=self.gate,
@@ -275,7 +290,9 @@ class OpenPanguDecoderLayer(nn.Module):
         is_dsa = (getattr(config, "index_topk", 0) or 0) > 0 and (
             not hasattr(config, "dsa_layers") or layer_idx in config.dsa_layers
         )
-        if is_dsa:
+        if layer_idx in get_cla_mapping(config):
+            attn_cls = NPUDeepseekSparseCLAAttention if is_dsa else NPUDeepseekMLACLAAttention
+        elif is_dsa:
             attn_cls = NPUDeepseekSparseAttention
         else:
             attn_cls = NPUDeepseekMLAAttention
@@ -1052,6 +1069,13 @@ class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):
                         record_conv_name.append(merge_conv_name)
                         loaded_params.add(merge_conv_name)
 
+            if remapped_name not in params_dict:
+                # A CLA reuse layer builds no global KV projection, so the empty
+                # one the checkpoint ships has nowhere to land. Skip as the
+                # pangu_v2 loader does.
+                logger.warning(f"Skip loading {remapped_name}.")
+                continue
+
             param = params_dict[remapped_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
@@ -1152,3 +1176,22 @@ def get_spec_layer_idx_from_weight_name(
             if weight_name.startswith(f"model.layers.{layer_idx + i}."):
                 return layer_idx + i
     return None
+
+
+class PanguUltraMoEV3ForCausalLM(PanguUltraMoEForCausalLM):
+    """OpenPangu V3 on the shared ultra implementation.
+
+    V3 keeps no MoME state, so vLLM must not treat it as a hybrid model; only
+    those two hooks differ, exactly as OpenPanguV3ForCausalLM differs from
+    OpenPanguV2ForCausalLM on the low-latency side.
+    """
+
+    is_hybrid = False
+
+    @classmethod
+    def get_model_state_cls(cls):
+        # MRv2 checks this hook before is_hybrid, so override the MoME state
+        # selection as well.
+        from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+
+        return DefaultModelState

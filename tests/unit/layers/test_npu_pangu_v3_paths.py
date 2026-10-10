@@ -37,7 +37,10 @@ def case(monkeypatch):
     attention.attn = SimpleNamespace(
         layer_name="global", kv_cache=cache, impl=SimpleNamespace(SHARE_MASK_TRIL_SPARSE=torch.empty(0)),
     )
-    attention.attn_cla_swa = attention.attn
+    local_cache = (torch.randn_like(cache[0]), torch.randn_like(cache[1]))
+    attention.attn_cla_swa = SimpleNamespace(
+        layer_name="cla_swa", kv_cache=local_cache, impl=attention.attn.impl,
+    )
     phase = SimpleNamespace(
         query_cumlens=torch.tensor([3], dtype=torch.int32), seq_lens=torch.tensor([3], dtype=torch.int32),
         block_table=torch.zeros(1, 1, dtype=torch.int32), chunked_context=None, num_tokens=3,
@@ -51,6 +54,7 @@ def case(monkeypatch):
     )
     return SimpleNamespace(
         attention=attention, metadata=metadata, context=context, cache=cache,
+        local_cache=local_cache,
         q=torch.arange(18, dtype=torch.float32).reshape(3, 2, 3), pe=torch.ones(3, 2, 1),
     )
 
@@ -78,6 +82,8 @@ def test_cla_query_and_cache_preparation(case, monkeypatch):
     assert local_cache[0] is updated[2] and local_cache[1] is updated[3]
     assert current[0] is updated[0] and current[1] is updated[1]
     torch.testing.assert_close(update.call_args.args[0], hidden[:, :4])
+    assert update.call_args.args[3] is case.local_cache[0]
+    assert update.call_args.args[4] is case.local_cache[1]
     assert update.call_args.args[-1] == a.layer_name
 
 
@@ -128,7 +134,12 @@ def test_swa_pa_backends_capture_and_padding(case, monkeypatch, backend, capturi
     monkeypatch.setattr(torch.ops.custom, "npu_fused_infer_attention_sink", op)
     monkeypatch.setattr(torch.ops.custom, "npu_ai_infra_attention_pioneer", op)
     monkeypatch.setattr(mod.torch_npu, "_npu_attention_pioneer", op, raising=False)
-    monkeypatch.setattr(mod.torch_npu, "npu_fused_infer_attention_score_v2", op)
+    native_fia = Mock(return_value=(op.return_value[0], torch.empty(0), torch.empty(0), torch.empty(0)))
+    monkeypatch.setattr(torch.ops.custom, "npu_ai_infra_flash_attention", native_fia, raising=False)
+    opaque_fia = Mock(return_value=op.return_value[0])
+    monkeypatch.setattr(torch.ops.vllm, "npu_pangu_gpt_oss_fia", opaque_fia)
+    native_metadata = Mock(return_value=torch.empty(1024, dtype=torch.int32))
+    monkeypatch.setattr(mod, "npu_ai_infra_flash_attention_metadata", native_metadata)
     tiling = Mock(return_value=torch.empty(1, dtype=torch.int32))
     monkeypatch.setattr(mod, "npu_fused_infer_attention_sink_metadata", tiling)
     monkeypatch.setattr(mod, "npu_ai_infra_attention_pioneer_metadata", tiling)
@@ -143,17 +154,20 @@ def test_swa_pa_backends_capture_and_padding(case, monkeypatch, backend, capturi
             case.q, case.pe, case.cache, case.metadata.prefill, num_tokens=3, num_actual_tokens=count,
             attention_layer=a.attn, sliding_window=32, metadata_caller=caller, recompute_metadata=True,
         )
-    if capturing:
+    if capturing and backend != "gpt":
         torch.testing.assert_close(output, torch.zeros_like(case.q))
         op.assert_not_called()
         kwargs = capture.call_args.kwargs["op_kwargs"]
-        expected_op = {"sink": mod.OP_FIA_SINK, "pioneer": mod.OP_FIA_PIONEER, "gpt": mod.OP_FIA_V2}[backend]
+        expected_op = {"sink": mod.OP_FIA_SINK, "pioneer": mod.OP_FIA_PIONEER}[backend]
         assert capture.call_args.kwargs["op_desc"] == expected_op
     else:
         torch.testing.assert_close(output[:count], case.q[:count])
         torch.testing.assert_close(output[count:], torch.zeros_like(output[count:]))
         capture.assert_not_called()
-        kwargs = op.call_args.kwargs
+        if backend == "gpt":
+            kwargs = opaque_fia.call_args.kwargs
+        else:
+            kwargs = op.call_args.kwargs
     for key, value in (("key_sink", a.sink_k_nope), ("value_sink", a.sink_k_nope), ("key_rope_sink", a.sink_k_pe)):
         if sinks:
             assert kwargs[key] is value
@@ -161,6 +175,11 @@ def test_swa_pa_backends_capture_and_padding(case, monkeypatch, backend, capturi
             assert key not in kwargs
     assert kwargs["pre_tokens"] == 31
     assert kwargs["query"].shape[0] == count
+    if backend == "gpt":
+        torch.testing.assert_close(kwargs["sinks"], a.gpt_oss_sink)
+        assert kwargs["sinks"].data_ptr() == a.gpt_oss_sink.data_ptr()
+        assert kwargs["meta_data"] is native_metadata.return_value
+        assert native_metadata.call_args.args[-1] == "decode_mla"
     if aicpu:
         assert kwargs["metaData" if a.on_ascend950 else "meta_data"] is tiling.return_value
         args, recompute, actual_caller = tiling.call_args.args
@@ -188,7 +207,10 @@ def test_direct_prefill_preserves_token_sinks(case, monkeypatch, ascend950, aicp
     tiling = Mock(return_value=torch.empty(1))
     monkeypatch.setattr(mod, "npu_ai_infra_attention_pioneer_metadata", tiling)
     monkeypatch.setattr(mod, "npu_fused_infer_attention_sink_metadata", tiling)
-    output = a._apply_SWA_attention_prefill(case.q, case.pe, case.q, case.pe, native, case.metadata)
+    output = a._apply_SWA_attention_prefill(
+        case.q, case.pe, case.q, case.pe, native, case.metadata,
+        recompute_metadata=a.is_fa_metadata_producer,
+    )
     torch.testing.assert_close(output, native.flatten(1))
     assert ("key_sink" in op.call_args.kwargs) == bool(sinks)
     assert op.call_args.kwargs["pre_tokens"] == 31
@@ -197,8 +219,8 @@ def test_direct_prefill_preserves_token_sinks(case, monkeypatch, ascend950, aicp
 
 
 @pytest.mark.parametrize("error,message", [
-    ("layout", "Unsupported GPT-OSS sink output layout"), ("sink", "was not initialized"),
-    ("capture", "num_tokens is required"), ("rescale_capture", "num_tokens is required"),
+    ("layout", "Unsupported GPT-OSS sink output layout"),
+    ("rescale_capture", "num_tokens is required"),
     ("local", "Missing CLA local SWA attention metadata"), ("cp", "Missing CLA local SWA prefill metadata"),
     ("cp_metadata", "CLA CP requires prefill SWA metadata"),
     ("fc2", "Missing CLA local SWA prefill metadata"), ("fc2_mome", "does not support MoME"),
@@ -208,10 +230,8 @@ def test_v3_rejects_invalid_attention_inputs(case, error, message):
     case.context.capturing = True
     calls = {
         "layout": lambda: a._rescale_gpt_oss_sink_output(case.q, torch.ones(3, 2), a.gpt_oss_sink, "invalid"),
-        "sink": lambda: a._apply_gpt_oss_fia({"query": case.q}),
-        "capture": lambda: a._apply_gpt_oss_fia({"query": case.q}, output_shape=(2, 3, 3)),
         "rescale_capture": lambda: a._apply_gpt_oss_fia_rescale(
-            {"query": case.q}, a.gpt_oss_sink, (2, 3, 3), None, None, "decode",
+            {"query": case.q}, a.gpt_oss_sink, (2, 3, 3), None, "global", "decode", False,
         ),
         "local": lambda: a._forward_cla(case.q, case.pe, case.pe, metadata, None, None),
         "cp": lambda: a._forward_cla_prefill_cp(case.q, case.pe, case.pe, metadata, None),
@@ -221,8 +241,6 @@ def test_v3_rejects_invalid_attention_inputs(case, error, message):
         "fc2": lambda: a._forward_cla_prefill_FC2(case.q, case.pe, case.pe, metadata, None),
         "fc2_mome": lambda: a._forward_cla_prefill_FC2(case.q, case.pe, case.pe, metadata, metadata),
     }
-    if error == "sink":
-        a.gpt_oss_sink = None
     if error == "fc2_mome":
         a.use_mome = True
     call = calls.get(error)
