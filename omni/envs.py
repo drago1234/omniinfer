@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     OMNI_PROFILE_SKIP_REQUESTS: int
     # Patch / Attention
     OMNI_DISABLE_PLUGIN_BACKENDS: str
+    OMNI_STATIC_KERNEL_COMPILE_JOBS: int
     OMNI_HYBRID_ATTN_GROUP_SIZE: int
     OMNI_REPETITION_DETECTION_CONFIG: Optional[str]
     OMNI_REASONING_CONFIG: Optional[str]
@@ -293,6 +294,13 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # =========================================================================
     # Patch / Attention
     # =========================================================================
+
+    # Per-op_compiler job cap for npugraph_ex static kernel compilation.
+    # 0 (default): leave the backend unchanged. Positive: min(backend jobs, cap).
+    # Negative/invalid values are rejected. Not a cross-rank/container limit.
+    # Set before starting workers; consumed by compilation/npugraph_ex.py.
+    "OMNI_STATIC_KERNEL_COMPILE_JOBS":
+    lambda: int(os.getenv("OMNI_STATIC_KERNEL_COMPILE_JOBS", "0")),
 
     # Comma-separated blacklist of attention backend names that must NOT be
     # replaced by plugin implementations, even when a plugin is registered.
