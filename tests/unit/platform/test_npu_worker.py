@@ -18,6 +18,12 @@ from vllm.v1.outputs import ModelRunnerOutput
 from tests.unit.platform.utils import create_vllm_config, DeviceConfig
 
 
+@pytest.fixture(autouse=True)
+def _disable_worker_cpu_affinity(monkeypatch):
+    """Keep worker tests independent of the service CPU-affinity environment."""
+    monkeypatch.delenv("OMNI_WORKER_CPUSET_MAP", raising=False)
+
+
 @pytest.mark.parametrize(
     ("has_triton_package", "available_device", "expected"),
     [
@@ -166,6 +172,7 @@ def test_init_device_patches_triton_capabilities_after_setting_device(monkeypatc
         device_config=SimpleNamespace(device=SimpleNamespace(type="npu")),
         parallel_config=SimpleNamespace(distributed_executor_backend="ray"),
         local_rank=3,
+        rank=3,
         model_config=SimpleNamespace(dtype="float16"),
     )
     platform = SimpleNamespace(
@@ -192,6 +199,51 @@ def test_init_device_patches_triton_capabilities_after_setting_device(monkeypatc
         ("patch_triton_capabilities", None),
         ("check_dtype", "float16"),
     ]
+
+
+@pytest.mark.parametrize("setting", ["bad JSON", '{"0":"1"}', "auto"])
+def test_init_device_continues_when_cpu_affinity_fails(monkeypatch, setting):
+    from omni_npu.worker import cpu_affinity
+
+    class DeviceInitReached(Exception):
+        pass
+
+    monkeypatch.setenv("OMNI_WORKER_CPUSET_MAP", setting)
+    monkeypatch.setattr(cpu_affinity.os, "sched_getaffinity", lambda tid: {0, 1, 2, 3})
+    monkeypatch.setattr(cpu_affinity, "_read_numa_cpu_sets", lambda allowed: [allowed])
+    set_affinity = MagicMock(side_effect=PermissionError("affinity denied"))
+    monkeypatch.setattr(cpu_affinity.os, "sched_setaffinity", set_affinity)
+    platform = SimpleNamespace(
+        device_type="npu",
+        logical_device_id_to_visible_device_id=lambda rank: rank,
+    )
+    monkeypatch.setattr("omni_npu.worker.npu_worker.current_platform", platform)
+    monkeypatch.setattr("omni_npu.worker.npu_worker.torch.device", lambda spec: spec)
+    set_device = MagicMock(side_effect=DeviceInitReached)
+    monkeypatch.setattr("omni_npu.worker.npu_worker.torch.npu.set_device", set_device)
+    worker_logger = MagicMock()
+    monkeypatch.setattr("omni_npu.worker.npu_worker.logger", worker_logger)
+    worker = SimpleNamespace(
+        device_config=SimpleNamespace(device=SimpleNamespace(type="npu")),
+        parallel_config=SimpleNamespace(
+            distributed_executor_backend="ray", data_parallel_size=1,
+            tensor_parallel_size=2, pipeline_parallel_size=1, nnodes_within_dp=1,
+        ),
+        rank=0,
+        local_rank=0,
+    )
+
+    init_device = getattr(NPUWorker.init_device, "__wrapped__", NPUWorker.init_device)
+    with pytest.raises(DeviceInitReached):
+        init_device(worker)
+    set_device.assert_called_once_with("npu:0")
+    worker_logger.warning.assert_called_once_with(
+        "CPU affinity binding failed for worker rank %s; continuing worker startup", 0)
+    worker_logger.info.assert_not_called()
+    if setting == "bad JSON":
+        set_affinity.assert_not_called()
+    else:
+        set_affinity.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -232,6 +284,7 @@ def test_init_device_dp_offset_respects_assigned_devices(
         device_config=SimpleNamespace(device=SimpleNamespace(type="npu")),
         parallel_config=parallel_config,
         local_rank=0,
+        rank=1,
         model_config=SimpleNamespace(dtype="float16"),
     )
     platform = SimpleNamespace(

@@ -56,6 +56,7 @@ from omni_npu.v1.utils import on_ascend950
 from omni_npu.profiler.wrapper import NpuProfilerWrapper
 import omni_npu.envs as omni_envs
 from omni_npu.diagnostics.metrics import stage_metrics
+from omni_npu.worker.cpu_affinity import apply_worker_cpu_affinity
 
 logger = init_logger(__name__)
 
@@ -113,6 +114,13 @@ class NPUWorker(Worker):
 
             visible_device_index = current_platform.logical_device_id_to_visible_device_id(self.local_rank)
             self.device = torch.device(f"npu:{visible_device_index}")
+            if os.environ.get("OMNI_WORKER_CPUSET_MAP"):
+                placement = apply_worker_cpu_affinity(self.rank, parallel_config)
+                if placement is not None:
+                    logger.info("Early worker CPU placement: %s", placement)
+                else:
+                    logger.warning("CPU affinity binding failed for worker rank %s; continuing worker startup",
+                                   self.rank)
             torch.npu.set_device(self.device)
 
             _patch_npu_triton_capabilities()
