@@ -1256,3 +1256,13 @@ def test_conv_sp_allgather_stream_is_configurable(multi_stream):
 
     group.all_gather.assert_called_once()
     assert named_stream.call_count == int(multi_stream)
+
+
+@pytest.mark.unit
+def test_cp_block_table_gives_each_fragment_its_requests_pages_and_a_spare_column():
+    utils = importlib.import_module(MODULE)
+    table = torch.tensor([[1, 2], [3, 4]], **cfg_i32)
+    cp_table = utils.SPManager.cp_block_table(table)
+    assert cp_table.tolist() == [[1, 2, 2], [1, 2, 2], [3, 4, 4], [3, 4, 4]]
+    # No page column to repeat: only the rows double.
+    assert utils.SPManager.cp_block_table(table[:, :0]).shape == (4, 0)

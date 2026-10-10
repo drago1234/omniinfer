@@ -34,6 +34,13 @@ class HFConfig:
             "OpenPanguMTPModel",
         ),
         (
+            "openpangu_v3",
+            ["PanguUltraMoEV3ForCausalLM"],
+            "high_throughout",
+            "openpangu_mtp",
+            "OpenPanguMTPModel",
+        ),
+        (
             "openpangu_v2",
             ["OpenPanguV2ForCausalLM"],
             "",

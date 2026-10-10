@@ -184,11 +184,11 @@ class TestNPUAttentionBackendMLAUtilsFunc(unittest.TestCase):
             ),
         ):
             eager = callback()
-            eager_reused = callback()
+            eager_reused = callback(7)
             metadata.slot_mapping.copy_(torch.tensor([0, 17, 34]))
             forward_context.capturing = True
             captured = callback()
-            captured_reused = callback()
+            captured_reused = callback(layer_idx=31)
             forward_context.capturing = False
             eager_after_capture = callback()
             eager_after_capture_reused = callback()

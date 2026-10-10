@@ -399,6 +399,17 @@ class CrossLayerSharedOp:
             shape, dtype=dtype, device=device,
         )
 
+    def reserve(self, callers: tuple[Hashable, ...]) -> None:
+        """Add buffers for callers registered after construction.
+
+        A layer built later -- a CLA layer's local branch, say -- reserves its
+        own keys so it shares a buffer with its peers instead of falling back
+        to the unshared default.
+        """
+        for caller in callers:
+            if caller not in self._buffers:
+                self._buffers[caller] = torch.empty_like(self._default_buffer)
+
     def __call__(
         self,
         op_args: dict,
@@ -775,7 +786,13 @@ class SPManager:
         blk_base = seq_blks.cumsum(dim=0, dtype=torch.int32) - seq_blks
         table0 = torch.arange(tab, dtype=torch.int32, device=cumlens.device)
         blk_table = table0.view(1, -1) + blk_base.repeat_interleave(2, dim=0).view(-1, 1)
-        cp_block_table = blk_table_ref.repeat_interleave(2, dim=0)
+        cp_block_table = self.cp_block_table(blk_table_ref)
+        self.cp_attn_metadata = (q_cumlens, kv_lens, blk_table, cp_block_table)
+
+    @staticmethod
+    def cp_block_table(block_table: torch.Tensor) -> torch.Tensor:  # [B, *] -> [2B, *]
+        """One row per zigzag fragment: a request's two fragments share its pages."""
+        cp_block_table = block_table.repeat_interleave(2, dim=0)
         # Zigzag pad is < one page (frag_num-1 tokens, page typically 64/128).
         # Repeat the last block as a spare column so indexer DMA stays
         # in-range without kv_lens.max().item() host synchronization.
@@ -783,7 +800,7 @@ class SPManager:
             cp_block_table = torch.cat(
                 [cp_block_table, cp_block_table[:, -1:]], dim=1
             )
-        self.cp_attn_metadata = (q_cumlens, kv_lens, blk_table, cp_block_table)
+        return cp_block_table
 
     @depends_on(_scheme_cp_attn)
     def cp_attn_meta(self) -> tuple:  # FA once:
