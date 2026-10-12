@@ -26,7 +26,7 @@ from omni_npu.attention.backends.mome import NPUMomeAttentionMetadata
 from vllm.logger import init_logger
 
 from omni_npu.v1.utils import current_stream, on_ascend950
-from omni_npu.v1.layers.utils import yarn_get_mscale
+from omni_npu.v1.layers.utils import get_cla_mapping, yarn_get_mscale
 from omni_npu.v1.layers.linear import (
     ColumnParallelFlashCommLinear,
     RowParallelFlashCommLinear,
@@ -48,7 +48,6 @@ from omni_npu.layers.attention.npu_sparse_attentions import (
 from omni_npu.compilation.utils import (
     capture_graph_task,
     OP_FIA_SINK,
-    OP_FIA_V2,
     OP_FIA_PIONEER,
 )
 from omni_npu.plugin_decorators import attn_decorator
@@ -112,6 +111,7 @@ class CrossLayerSharedOp:
 
 npu_fused_infer_attention_sink_metadata: CrossLayerSharedOp | None = None
 npu_ai_infra_attention_pioneer_metadata: CrossLayerSharedOp | None = None
+npu_ai_infra_flash_attention_metadata: CrossLayerSharedOp | None = None
 
 
 def _get_slot_mapping_2d(attn_metadata, layer_idx=-1):
@@ -845,7 +845,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
             vllm_config.cache_config.enable_prefix_caching) and
             not model_extra_config.operator_opt_config.optimize_first_chunk
         )
-        self.enable_mome_sp = self.use_mome and model_extra_config.operator_opt_config.enable_mome_sp
 
         if self.is_cp_layer:
             max_num_reqs = vllm_config.scheduler_config.max_num_seqs
@@ -1225,15 +1224,53 @@ class NPUPanguSparseAttention(torch.nn.Module):
         kwargs.update({"actual_seq_qlen": query_cumlens, "actual_seq_kvlen": kv_lens, "meta_data": meta_data})
         return kwargs
 
+    def _add_gpt_oss_fia_metadata(
+        self,
+        kwargs: dict,
+        caller: str,
+        recompute: bool,
+    ) -> dict:
+        """Translate FIA v2 arguments and attach metadata for native OSS sink."""
+        query_cumlens = kwargs.pop("actual_seq_qlen").to(torch.int64)
+        kv_lens = kwargs.pop("actual_seq_kvlen").to(torch.int64)
+        num_heads = kwargs.pop("num_query_heads")
+        block_table = kwargs.get("block_table")
+        metadata_args = {
+            "num_heads_q": num_heads,
+            "num_heads_kv": kwargs["num_key_value_heads"],
+            "head_dim_qk": kwargs["query"].shape[-1],
+            "head_dim_v": kwargs["value"].shape[-1],
+            "actual_seq_lengths": query_cumlens,
+            "actual_seq_lengths_kv": kv_lens,
+            "batch_size": block_table.shape[0] if block_table is not None else query_cumlens.numel(),
+            "sparse_mode": kwargs["sparse_mode"],
+            "pre_tokens": kwargs["pre_tokens"],
+            "next_tokens": kwargs["next_tokens"],
+            "input_layout": "TND",
+            "input_layout_kv": "BnBsH" if block_table is not None else "TND",
+            "rope_head_dim": kwargs["query_rope"].shape[-1],
+            "block_size": kwargs["block_size"] if block_table is not None else 0,
+            "aic_core_num": self._fia_aic_core_num,
+            "aiv_core_num": self._fia_aiv_core_num,
+        }
+        meta_data = npu_ai_infra_flash_attention_metadata(metadata_args, recompute, caller)
+        kwargs.update({
+            "meta_data": meta_data,
+            "num_heads": num_heads,
+            "actual_seq_lengths": query_cumlens,
+            "actual_seq_lengths_kv": kv_lens,
+        })
+        return kwargs
+
     def _apply_gpt_oss_fia_rescale(
         self,
         kwargs: dict,
         learnable_sink: torch.Tensor,
         output_shape: tuple[int, ...] | None,
         num_tokens: int | None,
-        layer_name: str | None,
-        metadata_caller: str | None,
-        recompute_metadata: bool | None = None,
+        layer_name: str,
+        metadata_caller: str,
+        recompute_metadata: bool,
     ) -> torch.Tensor:
         kwargs = self._add_fia_metadata(kwargs, metadata_caller, recompute_metadata)
         kwargs["return_softmax_lse"] = True
@@ -1249,7 +1286,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 op_kwargs=kwargs,
                 out_tensors=[output, softmax_lse],
                 num_tokens=num_tokens,
-                layer_name=layer_name or self.attn.layer_name,
+                layer_name=layer_name,
             )
         else:
             output, softmax_lse = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)
@@ -1259,45 +1296,23 @@ class NPUPanguSparseAttention(torch.nn.Module):
         self,
         kwargs: dict,
         *,
+        layer_name: str,
+        metadata_caller: str,
+        recompute_metadata: bool,
         output_shape: tuple[int, ...] | None = None,
         num_tokens: int | None = None,
-        learnable_sink: torch.Tensor | None = None,
-        layer_name: str | None = None,
-        metadata_caller: str | None = None,
-        recompute_metadata: bool | None = None,
     ) -> torch.Tensor:
-        """Run dense GPT-OSS attention using native FIA v2 or FIA-sink rescaling."""
-        learnable_sink = self.gpt_oss_sink if learnable_sink is None else learnable_sink
-        if learnable_sink is None:
-            raise RuntimeError("GPT-OSS sink attention was not initialized.")
-
-        # KV-token sinks and GPT-OSS logit sinks are mutually exclusive and use
-        # different operator arguments.
-        for key in ("key_sink", "key_rope_sink", "value_sink", "meta_data", "sink_number"):
-            kwargs.pop(key, None)
+        """Run dense GPT-OSS attention using native OSS-sink FIA or rescaling."""
+        cla_swa_attn = getattr(self, "attn_cla_swa", None)
+        is_cla_swa = cla_swa_attn is not None and layer_name == cla_swa_attn.layer_name
+        learnable_sink = self.gpt_oss_sink_swa if is_cla_swa else self.gpt_oss_sink
         if self.use_gpt_oss_sink_rescale:
             return self._apply_gpt_oss_fia_rescale(
                 kwargs, learnable_sink, output_shape, num_tokens, layer_name, metadata_caller, recompute_metadata
             )
-        kwargs["learnable_sink"] = learnable_sink.view(self.num_local_heads)
-
-        forward_context = get_forward_context()
-        if forward_context.capturing and output_shape is not None:
-            if num_tokens is None:
-                raise ValueError("num_tokens is required when capturing GPT-OSS FIA.")
-            attn_output = torch.zeros(output_shape, device=kwargs["query"].device, dtype=kwargs["query"].dtype)
-            # FIA v2 returns an empty second output when LSE is not requested.
-            softmax_lse = torch.empty((0,), device=kwargs["query"].device, dtype=torch.float32)
-            capture_graph_task(
-                op_desc=OP_FIA_V2,
-                op_kwargs=kwargs,
-                out_tensors=[attn_output, softmax_lse],
-                num_tokens=num_tokens,
-                layer_name=layer_name or self.attn.layer_name,
-            )
-            return attn_output
-
-        return torch_npu.npu_fused_infer_attention_score_v2(**kwargs)[0]
+        kwargs = self._add_gpt_oss_fia_metadata(kwargs, metadata_caller, recompute_metadata)
+        kwargs["sinks"] = learnable_sink.view(self.num_local_heads)
+        return torch.ops.vllm.npu_pangu_gpt_oss_fia(**kwargs)
 
     def _run_gpt_oss_fia(
         self,
@@ -1305,20 +1320,18 @@ class NPUPanguSparseAttention(torch.nn.Module):
         *,
         num_tokens: int,
         num_actual_tokens: int,
-        learnable_sink: torch.Tensor | None = None,
-        layer_name: str | None = None,
-        metadata_caller: str | None = None,
-        recompute_metadata: bool | None = None,
+        layer_name: str,
+        metadata_caller: str,
+        recompute_metadata: bool,
     ) -> torch.Tensor:
         """Dispatch dense GPT-OSS attention for captured, full, or padded batches."""
         output_shape = (self.num_local_heads, num_tokens, self.kv_lora_rank)
         call_kwargs = {
-            "learnable_sink": learnable_sink,
             "layer_name": layer_name,
             "metadata_caller": metadata_caller,
             "recompute_metadata": recompute_metadata,
         }
-        if get_forward_context().capturing:
+        if get_forward_context().capturing and self.use_gpt_oss_sink_rescale:
             return self._apply_gpt_oss_fia(kwargs, output_shape=output_shape, num_tokens=num_tokens, **call_kwargs)
         if num_actual_tokens == num_tokens:
             return self._apply_gpt_oss_fia(kwargs, **call_kwargs)
@@ -1331,51 +1344,35 @@ class NPUPanguSparseAttention(torch.nn.Module):
         self,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: tuple[torch.Tensor, ...],
         topk_indices: torch.Tensor,
         query_cumlens: torch.Tensor,
         kv_lens: torch.Tensor,
         block_table: torch.Tensor,
     ) -> torch.Tensor:
-        if not self.use_gpt_oss_sink_rescale:
-            query = torch.cat([q_nope, q_pe], dim=-1)
-            return torch.ops.custom.npu_ai_infra_sparse_flash_attention(
-                query=query,
-                key=kv_cache[0].unsqueeze(2),
-                value=kv_cache[0].unsqueeze(2),
-                sparse_indices=topk_indices,
-                scale_value=self.scaling,
-                sparse_block_size=1,
-                block_table=block_table,
-                actual_seq_lengths_query=query_cumlens,
-                actual_seq_lengths_kv=kv_lens,
-                pre_tokens=(1 << 63) - 1,
-                next_tokens=(1 << 63) - 1,
-                attention_mode=2,
-                layout_query="TND",
-                layout_kv="PA_BSND",
-                sparse_mode=3,
-                sinks=self.gpt_oss_sink,
-            )[0]
         kwargs = {
             "query": q_nope,
             "key": kv_cache[0].unsqueeze(2),
-            "value": self.dummy_value_cache,
+            "value": kv_cache[0][..., :q_nope.shape[-1]].unsqueeze(2),
             "query_rope": q_pe,
             "sparse_indices": topk_indices,
             "scale_value": self.scaling,
             "sparse_block_size": 1,
             "block_table": block_table,
-            "actual_seq_lengths_query": query_cumlens.to(torch.int32),
-            "actual_seq_lengths_kv": kv_lens.to(torch.int32),
+            "actual_seq_lengths_query": query_cumlens,
+            "actual_seq_lengths_kv": kv_lens,
             "pre_tokens": (1 << 63) - 1,
             "next_tokens": (1 << 63) - 1,
             "attention_mode": 2,
             "layout_query": "TND",
             "layout_kv": "PA_BSND",
             "sparse_mode": 3,
-            "return_softmax_lse": True,
         }
+        if not self.use_gpt_oss_sink_rescale:
+            kwargs["sinks"] = self.gpt_oss_sink
+            return torch.ops.custom.npu_ai_infra_sparse_flash_attention(**kwargs)[0]
+
+        kwargs["return_softmax_lse"] = True
         output, softmax_max, softmax_sum = torch.ops.custom.npu_ai_infra_sparse_flash_attention_pioneer(**kwargs)
         softmax_lse = (softmax_max + torch.log(softmax_sum)).squeeze(0)
         return self._rescale_gpt_oss_sink_output(output, softmax_lse, self.gpt_oss_sink, "TND")
@@ -1543,11 +1540,13 @@ class NPUPanguSparseAttention(torch.nn.Module):
         self.o_conv.mome_cache_index = 2
 
     def _init_cross_layer_shared_ops(self):
-        global npu_fused_infer_attention_sink_metadata, npu_ai_infra_attention_pioneer_metadata
+        global npu_fused_infer_attention_sink_metadata
+        global npu_ai_infra_attention_pioneer_metadata
+        global npu_ai_infra_flash_attention_metadata
+        callers = ("decode", "decode_mla", "prefill_absorb", "prefill_absorb_mla", "prefill", "prefill_mla")
+        if getattr(self.hf_config, "cla_explicit_mapping", None):
+            callers += ("cla_decode", "cla_prefill_absorb", "cla_prefill", "cla_prefill_absorb_cp")
         if npu_fused_infer_attention_sink_metadata is None:
-            callers = ("decode", "decode_mla", "prefill_absorb", "prefill_absorb_mla", "prefill", "prefill_mla")
-            if getattr(self.hf_config, "cla_explicit_mapping", None):
-                callers += ("cla_decode", "cla_prefill_absorb", "cla_prefill", "cla_prefill_absorb_cp")
             npu_fused_infer_attention_sink_metadata = CrossLayerSharedOp(
                 op=torch.ops.custom._npu_fused_infer_attention_sink_metadata,
                 shape=(1024,),
@@ -1565,6 +1564,17 @@ class NPUPanguSparseAttention(torch.nn.Module):
                     "prefill_absorb", "prefill_absorb_mla",
                     "prefill", "prefill_mla",
                 ),
+            )
+        if (
+            getattr(self, "use_gpt_oss_sink", False)
+            and not getattr(self, "use_gpt_oss_sink_rescale", False)
+            and npu_ai_infra_flash_attention_metadata is None
+        ):
+            npu_ai_infra_flash_attention_metadata = CrossLayerSharedOp(
+                op=torch.ops.custom.npu_ai_infra_flash_attention_metadata,
+                shape=(1024,),
+                dtype=torch.int32,
+                callers=callers,
             )
 
     def _calculate_page_size_padded(
@@ -1952,7 +1962,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 sliding_window=self.cla_swa_gate_window,
                 metadata_caller=caller,
                 recompute_metadata=self.is_cla_fa_metadata_producer,
-                learnable_sink=self.gpt_oss_sink_swa if self.use_gpt_oss_sink else None,
                 use_pioneer=False,
             )
 
@@ -1966,7 +1975,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
             attn_metadata=attn_metadata_cla_swa,
             attention_layer=self.attn_cla_swa,
             sliding_window=self.cla_swa_gate_window,
-            learnable_sink=self.gpt_oss_sink_swa,
             metadata_caller="cla_prefill",
             recompute_metadata=self.is_cla_fa_metadata_producer,
         )
@@ -1984,7 +1992,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
         sliding_window: int,
         metadata_caller: str,
         recompute_metadata: bool,
-        learnable_sink: torch.Tensor | None = None,
         use_pioneer: bool = True,
         query_cumlens: torch.Tensor | list[int] | None = None,
         seq_lens: torch.Tensor | list[int] | None = None,
@@ -2021,7 +2028,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 kwargs,
                 num_tokens=num_tokens,
                 num_actual_tokens=num_actual_tokens,
-                learnable_sink=learnable_sink,
                 layer_name=attention_layer.layer_name,
                 metadata_caller=metadata_caller,
                 recompute_metadata=recompute_metadata,
@@ -2142,7 +2148,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
             sliding_window=self.cla_swa_gate_window,
             metadata_caller="cla_prefill_absorb_cp",
             recompute_metadata=self.is_cla_fa_metadata_producer,
-            learnable_sink=self.gpt_oss_sink_swa if self.use_gpt_oss_sink else None,
             use_pioneer=False,
             query_cumlens=query_cumlens,
             seq_lens=seq_lens,
@@ -2682,6 +2687,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         attn_metadata: Optional[MLACommonMetadata] = None,
         mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
     ) -> torch.Tensor:
+        use_mome_sp = mome_metadata.use_mome_sp if self.use_mome else False
         sp_manager: SPManager = (
             attn_metadata.prefill.sp_manager
             if attn_metadata is not None
@@ -2699,7 +2705,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         q_lora = self.q_a_proj(sp_x)
 
         if self.use_mome:
-            if self.enable_mome_sp:
+            if use_mome_sp:
                 self._apply_MOME(q_lora, self.qa_conv, attn_metadata, mome_metadata, True, True)
                 q_lora = sp_manager.sp_to_cp(q_lora)
             else:
@@ -2755,7 +2761,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
 
         ### KV stream begins ###
         kv = self.kv_a_proj_with_mqa(sp_x)
-        if not self.enable_mome_sp:
+        if not use_mome_sp:
             kv = sp_manager.ag_tokens(kv)
             if self.use_mome:
                 if self.use_mome_inplace_update:
@@ -2821,7 +2827,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         )
 
         if self.use_mome:
-            if self.enable_mome_sp:
+            if use_mome_sp:
                 attn_output = sp_manager.cp_to_sp(attn_output)
                 self._apply_MOME(
                     attn_output,
@@ -2910,6 +2916,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                     k_pe,
                     v_up,
                     attn_metadata=attn_metadata,
+                    recompute_metadata=self.is_fa_metadata_producer,
                 )
 
         if self.sharded_o_proj:
@@ -2930,6 +2937,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
     ) -> torch.Tensor:
         """SWA prefill with contiguous token SP and replicated head weights."""
+        use_mome_sp = mome_metadata.use_mome_sp if self.use_mome else False
         assert not self.on_ascend950, "ena_swa_attn_seq_parallel is supported on A3 only"
         assert attn_metadata is not None and attn_metadata.prefill is not None
         sp_manager = attn_metadata.prefill.sp_manager
@@ -2945,7 +2953,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         # Q remains token-sharded and uses all replicated heads.
         q_lora = self.q_a_proj(hidden_states)
         if self.use_mome:
-            if self.enable_mome_sp:
+            if use_mome_sp:
                 self._apply_MOME(q_lora, self.qa_conv, attn_metadata, mome_metadata, True, True)
             else:
                 q_lora = sp_manager.ag_tokens(q_lora)
@@ -2965,7 +2973,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         # KV is projected locally, then gathered so every rank writes the same
         # full-token cache with the global slot mapping.
         kv = self.kv_a_proj_with_mqa(hidden_states)
-        gather_before_mome = self.use_mome and not self.enable_mome_sp
+        gather_before_mome = self.use_mome and not use_mome_sp
         if gather_before_mome:
             kv = sp_manager.ag_tokens(kv)
         if self.use_mome:
@@ -2976,7 +2984,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                     attn_metadata=attn_metadata,
                     mome_metadata=mome_metadata,
                     inplace=True,
-                    ena_sp=self.enable_mome_sp,
+                    ena_sp=use_mome_sp,
                 )
             else:
                 k_nope, k_pe = torch.split(
@@ -2989,7 +2997,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                     self.compresskv_conv,
                     attn_metadata=attn_metadata,
                     mome_metadata=mome_metadata,
-                    ena_sp=self.enable_mome_sp,
+                    ena_sp=use_mome_sp,
                 )
                 kv = torch.cat([k_nope, k_pe], dim=-1)
         if not gather_before_mome:
@@ -3028,7 +3036,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             attn_output = padded_output
 
         if self.use_mome:
-            if self.enable_mome_sp:
+            if use_mome_sp:
                 self._apply_MOME(
                     attn_output,
                     self.o_conv,
@@ -3089,7 +3097,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 attn_output = get_tp_group().all_gather(attn_output, dim=1)
             return self._apply_o_proj(attn_output)
 
-        if not self.enable_mome_sp:
+        if not mome_metadata.use_mome_sp:
             tp_group = get_tp_group()
             if attn_output.size(1) < self.o_conv.input_size_per_partition:
                 attn_output = tp_group.all_gather(attn_output, dim=1)
@@ -3139,6 +3147,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         and trim to num_actual_tokens to remove TP padding.
         cos / sin are already global and need no gathering.
         """
+        use_mome_sp = mome_metadata.use_mome_sp if self.use_mome else False
         enable_pa = self._use_swa_prefill_pa(attn_metadata)
 
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -3161,7 +3170,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         ### Q stream begins ###
         # Project, apply MoME and layer norm on local tokens, then gather all tokens
         q_lora = self.q_a_proj(hidden_states)
-        if not self.enable_mome_sp:
+        if not use_mome_sp:
             if need_all_gather:
                 q_lora = get_tp_group().all_gather(q_lora, dim=0)
             q_lora = q_lora[:num_prefill_tokens] # Trim TP padding to keep only actual prefill tokens
@@ -3213,7 +3222,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         ### KV stream begins ###
         # Project, apply MoME and layer norm on local tokens, then gather the smaller kv tensor
         kv = self.kv_a_proj_with_mqa(hidden_states)
-        if not self.enable_mome_sp:
+        if not use_mome_sp:
             if need_all_gather:
                 kv = get_tp_group().all_gather(kv, dim=0)
             kv = kv[:num_prefill_tokens] # Trim TP padding to keep only actual prefill tokens
@@ -3279,6 +3288,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 k_pe,
                 v_up,
                 attn_metadata=attn_metadata,
+                recompute_metadata=self.is_fa_metadata_producer,
             )
 
         if self.sharded_o_proj:
@@ -3579,15 +3589,13 @@ class NPUPanguSparseAttention(torch.nn.Module):
         v: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata] = None,
         *,
+        recompute_metadata: bool,
         attention_layer: MLASWAAttention | None = None,
         sliding_window: int | None = None,
-        learnable_sink: torch.Tensor | None = None,
         metadata_caller: str = "prefill",
-        recompute_metadata: bool | None = None,
     ) -> torch.Tensor:
         attention_layer = self.attn if attention_layer is None else attention_layer
         sliding_window = self.sliding_window if sliding_window is None else sliding_window
-        recompute_metadata = self.is_fa_metadata_producer if recompute_metadata is None else recompute_metadata
         if metadata_caller == "prefill":
             metadata_caller += self._fa_meta_suffix
         if self.use_gpt_oss_sink:
@@ -3601,7 +3609,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
             }
             attn_output = self._apply_gpt_oss_fia(
                 kwargs,
-                learnable_sink=learnable_sink,
                 layer_name=attention_layer.layer_name,
                 metadata_caller=metadata_caller,
                 recompute_metadata=recompute_metadata,
@@ -4790,34 +4797,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
     @staticmethod
     def _get_cla_mapping(config: DeepseekV2Config | DeepseekV3Config) -> dict[int, int]:
         """Return the zero-based CLA ``reuse_layer -> source_layer`` mapping."""
-        raw_mapping = getattr(config, "cla_explicit_mapping", None)
-        if not raw_mapping:
-            return {}
-
-        items = raw_mapping.items() if isinstance(raw_mapping, dict) else raw_mapping
-        mapping: dict[int, int] = {}
-        num_hidden_layers = getattr(config, "num_hidden_layers", None)
-        for item in items:
-            if not isinstance(item, (tuple, list)) or len(item) != 2:
-                raise ValueError(
-                    "cla_explicit_mapping entries must be [reuse_layer, source_layer] "
-                    f"pairs, but got {item!r}."
-                )
-            reuse_layer, source_layer = int(item[0]), int(item[1])
-            if reuse_layer in mapping:
-                raise ValueError(f"Duplicate CLA reuse layer {reuse_layer} in cla_explicit_mapping.")
-            if source_layer >= reuse_layer:
-                raise ValueError(
-                    f"A CLA source layer must precede its reuse layer, but got reuse={reuse_layer}, "
-                    f"source={source_layer}."
-                )
-            if num_hidden_layers is not None and not (0 <= source_layer < reuse_layer < num_hidden_layers):
-                raise ValueError(
-                    "CLA layer indices must be in [0, num_hidden_layers), but got "
-                    f"reuse={reuse_layer}, source={source_layer}, num_hidden_layers={num_hidden_layers}."
-                )
-            mapping[reuse_layer] = source_layer
-        return mapping
+        return get_cla_mapping(config)
 
 
 def npu_pangu_forward(

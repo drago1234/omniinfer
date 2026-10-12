@@ -1221,3 +1221,97 @@ class TestOpenPanguModelBaseLoadWeights(unittest.TestCase):
 
         self.assertIs(result, loaded_params)
         mark_split.assert_called_once_with(model, loaded_params)
+
+
+class TestPanguUltraMoeV3Wiring(unittest.TestCase):
+    """The pieces OpenPangu V3 needs from the shared ultra implementation."""
+
+    @staticmethod
+    def _cla_cfg():
+        cfg = TestPanguUltraMoeDecoderLayer._base_cfg(
+            num_hidden_layers=4, use_mhc=False, index_topk=2048
+        )
+        cfg.cla_explicit_mapping = [[1, 0]]
+        return cfg
+
+    @patch.object(ultra_mod, "OpenPanguMLP")
+    @patch.object(ultra_mod, "RMSNorm")
+    @patch.object(ultra_mod, "NPUDeepseekSparseCLAAttention")
+    @patch.object(ultra_mod, "NPUDeepseekSparseAttention")
+    @patch.object(ultra_mod, "get_tp_group")
+    def test_a_cla_reuse_layer_gets_the_cla_attention(
+        self, mock_get_tp, mock_dsa, mock_cla, mock_norm, mock_mlp
+    ):
+        mock_get_tp.return_value = SimpleNamespace(device_group=None)
+        mock_dsa.return_value = nn.Identity()
+        mock_cla.return_value = nn.Identity()
+        mock_norm.side_effect = _rms_norm_identity
+        mock_mlp.return_value = nn.Identity()
+        cfg = self._cla_cfg()
+        vllm_cfg = TestPanguUltraMoeDecoderLayer._vllm_cfg(cfg)
+
+        # Layer 1 reuses layer 0's cache, so it takes the CLA class.
+        ultra_mod.OpenPanguDecoderLayer(
+            config=cfg, prefix="model.layers.1", vllm_config=vllm_cfg
+        )
+        mock_cla.assert_called_once()
+        mock_dsa.assert_not_called()
+
+        # The source layer is an ordinary DSA layer.
+        mock_cla.reset_mock()
+        ultra_mod.OpenPanguDecoderLayer(
+            config=cfg, prefix="model.layers.0", vllm_config=vllm_cfg
+        )
+        mock_dsa.assert_called_once()
+        mock_cla.assert_not_called()
+
+    @patch.object(ultra_mod, "NPUSharedFusedMoE", MagicMock())
+    @patch.object(ultra_mod, "OpenPanguMLP", MagicMock())
+    @patch.object(ultra_mod, "ReplicatedLinear", MagicMock(return_value=nn.Identity()))
+    @patch.object(
+        ultra_mod,
+        "get_ep_group",
+        return_value=SimpleNamespace(
+            device_group=SimpleNamespace(rank=lambda: 0, size=lambda: 2)
+        ),
+    )
+    @patch.object(ultra_mod, "get_tp_group", return_value=SimpleNamespace(rank_in_group=0))
+    @patch.object(ultra_mod, "get_tensor_model_parallel_world_size", return_value=1)
+    def test_v3_scales_routed_experts_inside_the_fused_moe(self, *_):
+        """A model left out of the list would lose the scaling: nothing else applies it."""
+        cfg = TestOpenPanguMoERouterGatingInFp32._make_config()
+        cfg.model_type = "openpangu_v3"
+        cfg.routed_scaling_factor = 2.5
+        ultra_mod.OpenPanguMoE(
+            cfg, TestOpenPanguMoERouterGatingInFp32._make_parallel_config(),
+            quant_config=None, prefix="moe",
+        )
+        assert ultra_mod.NPUSharedFusedMoE.call_args.kwargs["routed_scaling_factor"] == 2.5
+
+    def test_v3_causal_lm_keeps_no_mome_state(self):
+        from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+
+        assert ultra_mod.PanguUltraMoEForCausalLM.is_hybrid is True  # v2 keeps MoME state
+        assert ultra_mod.PanguUltraMoEV3ForCausalLM.is_hybrid is False
+        assert ultra_mod.PanguUltraMoEV3ForCausalLM.get_model_state_cls() is DefaultModelState
+
+    def test_an_unmatched_checkpoint_weight_is_skipped(self):
+        """A CLA reuse layer builds no global KV projection, so its weight has
+        nowhere to land and the loader must skip it instead of raising."""
+        model = ultra_mod.OpenPanguMoEModel.__new__(ultra_mod.OpenPanguMoEModel)
+        nn.Module.__init__(model)
+        model.config = SimpleNamespace(
+            n_routed_experts=1, tie_word_embeddings=False, num_hidden_layers=2,
+        )
+        model.num_redundant_experts = 0
+        model.named_parameters = lambda: iter(())  # nothing the loader could match
+        orphan = "model.layers.7.self_attn.kv_a_proj_with_mqa.weight"
+
+        with patch.object(ultra_mod, "fused_moe_make_expert_params_mapping", return_value=[]), \
+             patch.object(ultra_mod, "get_spec_layer_idx_from_weight_name", return_value=None), \
+             patch.object(ultra_mod, "mark_split_q_up_params_loaded"), \
+             patch.object(ultra_mod.logger, "warning") as warn:
+            loaded = model.load_weights([(orphan, torch.zeros(1))])
+
+        self.assertEqual(loaded, set())
+        self.assertIn(orphan, warn.call_args.args[0])

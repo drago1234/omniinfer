@@ -2,7 +2,7 @@
 
 Pangu V2 MoE 505B int8 + EP 离线精度测试所需的最小 patch 集合。
 
-目录划分：`common/` 为通用 patch；`models/pangu_v2_base/` 为共享补丁；`models/high_throughout/` 与 `models/low_latency/` 为性能路径补丁。
+目录划分：`common/` 为通用 patch；`models/pangu_v2_base/` 为共享补丁；`models/high_throughout/` 与 `models/low_latency/` 为性能路径补丁；`models/openpangu_vl_realtime_video/` 为 realtime-video 启动脚本显式加载的专用接入点。
 
 ## 目录结构
 
@@ -12,7 +12,8 @@ patches/
 ├── models/
 │   ├── pangu_v2_base/
 │   ├── high_throughout/
-│   └── low_latency/
+│   ├── low_latency/
+│   └── openpangu_vl_realtime_video/
 └── README.md
 ```
 
@@ -61,6 +62,7 @@ patches/
 |------|------|
 | `patch_sink_attention_spec.py` | 注入 `SinkMLAAttentionSpec` |
 | `patch_static_sink_attention.py` | StaticSink attention |
+| `patch_hybrid_kv_cache_coordinator.py` | hybrid APC：`find_longest_cache_hit_per_group` 把公共命中长度按 group 重复，给 LLMDataDist fill |
 | `patch_mome_hybrid.py` | Pangu V2 hybrid MoME attention |
 
 ## models/low_latency/
@@ -70,6 +72,16 @@ patches/
 | `patch_kv_offload_joint_lookup.py` | KV Offload 的 hybrid HBM+DDR 联立查询：仅 OffloadingConnector 时绕开 `schedule()` hybrid+connector 分支，按组 lookup 后把 local 收成 `min(h_g)`。无 Offload 时保持上游 `max(FA)` |
 
 设置 `OMNI_VLLM_PATCHES_DIR=low_latency` 仍会加载 `pangu_v2_base`。
+
+## models/openpangu_vl_realtime_video/
+
+| 文件 | 作用 |
+|------|------|
+| `patch_realtime_kv.py` | 接入 realtime session 的 computed block、块边界保护、完成快照和显式清理生命周期 |
+| `patch_realtime_npu.py` | 在 NPU model runner 已有输入准备流程中接入 KV copy、position 和 M-RoPE 恢复 |
+
+该目录不属于普通 OpenPangu-VL patch 集。仅 realtime-video 启动脚本应将它追加到
+`OMNI_VLLM_PATCHES_DIR`；未点名时模块不会被导入，Patch 也不会注册或应用。
 
 ## 加载方式
 

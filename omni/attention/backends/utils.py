@@ -399,6 +399,17 @@ class CrossLayerSharedOp:
             shape, dtype=dtype, device=device,
         )
 
+    def reserve(self, callers: tuple[Hashable, ...]) -> None:
+        """Add buffers for callers registered after construction.
+
+        A layer built later -- a CLA layer's local branch, say -- reserves its
+        own keys so it shares a buffer with its peers instead of falling back
+        to the unshared default.
+        """
+        for caller in callers:
+            if caller not in self._buffers:
+                self._buffers[caller] = torch.empty_like(self._default_buffer)
+
     def __call__(
         self,
         op_args: dict,
@@ -409,6 +420,16 @@ class CrossLayerSharedOp:
         if buffer is self._default_buffer or recompute:
             buffer.copy_(self._op(**op_args))
         return buffer
+
+
+def _h2d_nonblocking(arr: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Copy host metadata to ``device`` via pinned memory, without a stream sync."""
+    host = torch.from_numpy(np.ascontiguousarray(arr))
+    if device.type == "cpu":
+        return host.clone()
+    if host.numel() == 0:
+        return torch.empty(host.shape, dtype=host.dtype, device=device)
+    return host.pin_memory().to(device, non_blocking=True)
 
 
 class SPManager:
@@ -545,11 +566,13 @@ class SPManager:
         kv_lens_np = (computed_lens_np + (inter_end - req_start))[keep]
 
         device = block_table_ref.device
-        q_lens = torch.tensor(q_lens_np, dtype=torch.int32, device=device)
-        kv_lens = torch.tensor(kv_lens_np, dtype=torch.int32, device=device)
+        # Pageable H2D copies and bool-mask indexing each block on a stream sync.
+        q_lens = _h2d_nonblocking(q_lens_np.astype(np.int32, copy=False), device)
+        kv_lens = _h2d_nonblocking(kv_lens_np.astype(np.int32, copy=False), device)
         self.valid_token_count = int(q_lens_np.sum())
         q_cumlens = q_lens.cumsum(dim=0, dtype=torch.int32)
-        blk_table = block_table_ref[torch.as_tensor(keep, device=device)]
+        keep_idx = _h2d_nonblocking(np.flatnonzero(keep), device)
+        blk_table = block_table_ref.index_select(0, keep_idx)
         self.sp_attn_metadata = (q_cumlens, kv_lens, blk_table)
 
     def sp_attn_meta(self) -> tuple:  # FA once:
@@ -763,7 +786,13 @@ class SPManager:
         blk_base = seq_blks.cumsum(dim=0, dtype=torch.int32) - seq_blks
         table0 = torch.arange(tab, dtype=torch.int32, device=cumlens.device)
         blk_table = table0.view(1, -1) + blk_base.repeat_interleave(2, dim=0).view(-1, 1)
-        cp_block_table = blk_table_ref.repeat_interleave(2, dim=0)
+        cp_block_table = self.cp_block_table(blk_table_ref)
+        self.cp_attn_metadata = (q_cumlens, kv_lens, blk_table, cp_block_table)
+
+    @staticmethod
+    def cp_block_table(block_table: torch.Tensor) -> torch.Tensor:  # [B, *] -> [2B, *]
+        """One row per zigzag fragment: a request's two fragments share its pages."""
+        cp_block_table = block_table.repeat_interleave(2, dim=0)
         # Zigzag pad is < one page (frag_num-1 tokens, page typically 64/128).
         # Repeat the last block as a spare column so indexer DMA stays
         # in-range without kv_lens.max().item() host synchronization.
@@ -771,7 +800,7 @@ class SPManager:
             cp_block_table = torch.cat(
                 [cp_block_table, cp_block_table[:, -1:]], dim=1
             )
-        self.cp_attn_metadata = (q_cumlens, kv_lens, blk_table, cp_block_table)
+        return cp_block_table
 
     @depends_on(_scheme_cp_attn)
     def cp_attn_meta(self) -> tuple:  # FA once:

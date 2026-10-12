@@ -213,7 +213,7 @@ class TestConfigLoaderUnit(unittest.TestCase):
                 parallel = loader.ModelParallelConfig(**data["model_parallel_config"])
                 operator = loader.ModelOperatorOptConfig(**data["operator_optimization_config"])
                 self.assertEqual(operator.moe_comm_strategy, strategy)
-                self.assertTrue(operator.use_gpt_oss_sink_rescale)
+                self.assertFalse(operator.use_gpt_oss_sink_rescale)
                 self.assertEqual(parallel.ena_context_parallel, role == "p")
                 self.assertFalse(operator.enable_mome_sp)
 
@@ -610,6 +610,8 @@ class TestConfigLoaderUnit(unittest.TestCase):
         
         mock_scheduler_config = MagicMock()
         mock_scheduler_config.enable_chunked_prefill = False
+        mock_patch_matmul = MagicMock()
+        mock_patch_module = MagicMock(patch_matmul=mock_patch_matmul)
 
         # Mock external dependencies
         with (
@@ -626,6 +628,8 @@ class TestConfigLoaderUnit(unittest.TestCase):
             patch(
                 'omni_npu.model_config.config_loader.loader._print_model_config'
             ) as mock_print,
+            patch.object(model_extra_config.operator_opt_config, 'use_batch_invariant_op', True),
+            patch.dict(sys.modules, {'omni_npu.vllm_patches.patches.common.patch_matmul': mock_patch_module}),
         ):
 
             load_model_extra_config(mock_model_config, mock_vllm_config, mock_scheduler_config)
@@ -637,6 +641,7 @@ class TestConfigLoaderUnit(unittest.TestCase):
             # Verify that _print_model_config was called
             mock_print.assert_called_once()
             self.assertEqual(model_extra_config.dtype, torch.float16)
+            mock_patch_matmul.assert_called_once_with()
 
     def test_validate_config_runs_precision_consistency_validation(self):
         from omni_npu.model_config.config_loader.loader import (

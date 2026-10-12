@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -68,6 +69,77 @@ def test_mla_logical_weight_returns_tensor_instead_of_parameter():
     assert not isinstance(result, nn.Parameter)
     assert result is not weight
     assert layer.weight is weight
+
+
+@pytest.mark.parametrize("transposed", [False, True])
+@pytest.mark.parametrize("nz_marker", [None, False, True])
+def test_mla_logical_weight_casts_npu_layout_before_transpose(transposed, nz_marker):
+    """CANN 9.2 requires the original FlashComm weight to be ND-cast
+    before a transpose creates a non-contiguous internal-format view."""
+    logical = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    stored = logical.T.contiguous() if transposed else logical.clone()
+
+    class _NpuWeight:
+        device = SimpleNamespace(type="npu")
+        is_meta = False
+        is_weight_transposed = transposed
+
+        def dim(self):
+            return 2
+
+        @property
+        def T(self):
+            raise AssertionError("NZ tensor transposed before ND conversion")
+
+    calls = []
+
+    def fake_cast(weight, fmt):
+        assert weight is layer.weight
+        calls.append(fmt)
+        return stored.clone()
+
+    fake_torch_npu = SimpleNamespace(
+        npu_format_cast=fake_cast,
+        Format=SimpleNamespace(ND="ND"),
+    )
+    layer = SimpleNamespace(
+        weight=_NpuWeight(),
+        quant_method=UnquantizedFlashCommLinearMethod(),
+    )
+    if nz_marker is not None:
+        layer.weight.is_weight_nz = nz_marker
+
+    with patch.dict("sys.modules", {"torch_npu": fake_torch_npu}):
+        result = get_npu_mla_logical_weight(layer, torch.bfloat16)
+
+    assert calls == ["ND"]
+    torch.testing.assert_close(result, logical.to(torch.bfloat16))
+    torch.testing.assert_close(stored, logical.T.contiguous() if transposed else logical)
+
+
+def test_mla_logical_weight_preserves_legacy_nz_marker(monkeypatch):
+    import torch_npu
+
+    weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    weight.is_weight_nz = True
+    cast = patch.object(torch_npu, "npu_format_cast", return_value=weight.clone())
+    with cast as mock_cast:
+        result = get_npu_mla_logical_weight(
+            SimpleNamespace(weight=weight, quant_method=UnquantizedFlashCommLinearMethod()),
+            torch.float32,
+        )
+    mock_cast.assert_called_once_with(weight, torch_npu.Format.ND)
+    torch.testing.assert_close(result, weight)
+
+
+def test_mla_logical_weight_rejects_meta_nz_weight():
+    weight = torch.empty(2, 3, device="meta")
+    weight.is_weight_nz = True
+    with pytest.raises(RuntimeError, match="from meta"):
+        get_npu_mla_logical_weight(
+            SimpleNamespace(weight=weight, quant_method=UnquantizedFlashCommLinearMethod()),
+            torch.float32,
+        )
 
 
 def test_marks_split_projection_params_when_source_was_loaded():
