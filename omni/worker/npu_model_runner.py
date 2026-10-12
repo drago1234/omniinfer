@@ -3,7 +3,7 @@
 
 import time
 from collections.abc import Iterable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from typing import TYPE_CHECKING, Optional, Union, Any, TypeAlias, cast
 
@@ -825,6 +825,23 @@ class NPUModelRunner(GPUModelRunner):
             for layer in wrapped_layers.values():
                 if isinstance(layer, ACLGraphWrapper):
                     yield layer
+
+    @contextmanager
+    def synchronize_input_prep(self):
+        if self.prepare_inputs_event is None:
+            yield
+            return
+        # prepare_inputs_event is recorded on the compute stream. On NPU the
+        # non_blocking H2D is not on that stream, so the event completes while
+        # the DMA is still reading the pinned source and MoME can observe the
+        # GPU buffer early. Drain the device after the copies are queued and
+        # before the forward consumes them.
+        self.prepare_inputs_event.synchronize()
+        try:
+            yield
+        finally:
+            torch.npu.synchronize()
+            self.prepare_inputs_event.record()
 
     @torch.inference_mode()
     @model_output_decorator
