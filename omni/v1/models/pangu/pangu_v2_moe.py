@@ -333,18 +333,14 @@ class OpenPanguV2MOE(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
         )
         self.experts = moe_runner.routed_experts
+        self.moe_runner = moe_runner
         self.n_logical_experts = self.n_routed_experts
  
         if self.enable_eplb:
-            self.n_physical_experts = self.n_logical_experts + (self.experts.num_of_redundant_experts * self.ep_size)
+            self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         else:
             self.n_physical_experts = self.n_logical_experts
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
-        if self.enable_eplb:
-            self.experts._expert_map = torch.arange(
-                self.n_physical_experts,
-                dtype=self.experts._expert_map.dtype,
-                device=self.experts._expert_map.device) % self.n_local_physical_experts
         self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
         self.physical_expert_end = (
             self.physical_expert_start + self.n_local_physical_experts
@@ -441,17 +437,37 @@ class OpenPanguV2MOE(nn.Module):
                 hidden_states,
             )
 
+    def _apply_mapping(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        if self.use_moe_force_load_balance:  # forced load balance
+            n = topk_ids.numel()
+            repeat = n // self.n_routed_experts + 1
+            topk_ids = self.aux_load_balance_tensor.repeat(repeat, 1).flatten()[:n].view(*topk_ids.shape)
+            # NPU-EPLB 备选做法（aux 在 token 很少时会失效，本提交暂不启用）：topk_ids.fill_(self.n_local_physical_experts * self.ep_rank)
+        elif self.enable_eplb: # 映射
+            eplb_state = getattr(self.moe_runner, "eplb_state", None)
+            if eplb_state is not None and eplb_state.num_unpadded_tokens_tensors is not None:
+                topk_ids = eplb_state.apply_mapping(topk_ids)
+        return topk_ids
+
+    def _record_eplb_load(self, expert_tokens: torch.Tensor):
+        if self.enable_eplb:
+            eplb_state = getattr(self.moe_runner, "eplb_state", None)
+            if eplb_state is not None and eplb_state.num_unpadded_tokens_tensors is not None:
+                eplb_state.record_load(expert_tokens)
+
     def _forward_fused_moe(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        if self.enable_eplb:
+            raise NotImplementedError("EPLB not supported in _forward_fused_moe")
         num_tokens, hidden_size = hidden_states.shape
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         router_logits, _ = self.gate(hidden_states.float())
-        shared_output, final_hidden_states = self.experts(
+        shared_output, final_hidden_states = self.moe_runner(
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
@@ -521,24 +537,7 @@ class OpenPanguV2MOE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
             )
 
-            # forced load balance
-            if self.use_moe_force_load_balance: 
-                force_k = (topk_ids.shape[0] * self.experts.top_k) // self.n_routed_experts
-                topk_ids = self.aux_load_balance_tensor.repeat(force_k + 1, 1) \
-                            .view(-1, self.experts.top_k)[:topk_ids.shape[0]]
-
-            # AGRS routes with global physical expert IDs. Convert the logical
-            # IDs selected by the gate before all-gathering them so redundant
-            # expert replicas installed by EPLB can receive tokens.
-            elif self.enable_eplb and not use_allreduce:
-                _, topk_ids, _ = self.experts.planner.plan(
-                    layer_idx_moe=self.experts.moe_layer_idx,
-                    tokens=hidden_states,
-                    token_expert_ids=topk_ids,
-                    token_expert_scores=topk_weights,
-                    top_k=self.experts.top_k,
-                    expert_mapping=self.experts.expert_mapping,
-                )
+            topk_ids = self._apply_mapping(topk_ids)
 
 
             if self._is_quant:
@@ -579,12 +578,7 @@ class OpenPanguV2MOE(nn.Module):
                     active_expert_range=expert_range,
                     row_idx_type=1 if ENABLE_GMM_FR else 0,
                 )
-                if self.enable_eplb and not use_allreduce:
-                    self.experts.planner.record_activation(
-                        self.experts.moe_layer_idx,
-                        expert_tokens.to(torch.int64),
-                        support_multi_stream=False,
-                    )
+                self._record_eplb_load(expert_tokens)
                 if self._is_w4a8:
                     down_proj_output = w4a8_expert_ffn(
                         self.experts,
@@ -716,12 +710,7 @@ class OpenPanguV2MOE(nn.Module):
                         row_idx_type=0,
                     )
 
-                if self.enable_eplb and not use_allreduce:
-                    self.experts.planner.record_activation(
-                        self.experts.moe_layer_idx,
-                        expert_tokens.to(torch.int64),
-                        support_multi_stream=False,
-                    )
+                self._record_eplb_load(expert_tokens)
 
                 gate_up_proj_output = torch_npu.npu_grouped_matmul(
                     [sorted_tokens],
@@ -868,21 +857,7 @@ class OpenPanguV2MOE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
-        # forced load balance
-        if self.use_moe_force_load_balance:
-            force_k = (topk_ids.shape[0] * self.experts.top_k) // self.n_routed_experts
-            topk_ids = self.aux_load_balance_tensor.repeat(force_k + 1, 1) \
-                        .view(-1, self.experts.top_k)[:topk_ids.shape[0]]
-
-        elif self.enable_eplb:
-            _, topk_ids, _ = self.experts.planner.plan(
-                    layer_idx_moe=self.experts.moe_layer_idx,
-                    tokens=hidden_states,
-                    token_expert_ids=topk_ids,
-                    token_expert_scores=topk_weights,
-                    top_k=self.experts.top_k,
-                    expert_mapping=self.experts.expert_mapping,
-                )
+        topk_ids = self._apply_mapping(topk_ids)
         # Determine quantization mode
         # 0 - no quantization
         # 2 - w8a8 quantization
@@ -979,9 +954,7 @@ class OpenPanguV2MOE(nn.Module):
         # Convert expert_token_nums to int64 for grouped_matmul
         expert_tokens = expert_token_nums.to(torch.int64)
 
-        if self.enable_eplb:
-            self.experts.planner.record_activation(
-                self.experts.moe_layer_idx, expert_tokens, support_multi_stream=False)
+        self._record_eplb_load(expert_tokens)
 
         if self._is_quant:
             if dynamic_scale is None:
@@ -1013,7 +986,7 @@ class OpenPanguV2MOE(nn.Module):
                     dtype=torch.float32,
                     device=current_platform.device_type,
                 )
-                dequant_swiglu_quant_kwargs: Dict[str, object] = {
+                dequant_swiglu_quant_kwargs: dict[str, object] = {
                     "x": gate_up_proj,
                     "weight_scale": self.experts.w13_weight_scale,
                     "activation_scale": dynamic_scale,
@@ -1145,20 +1118,7 @@ class OpenPanguV2MOE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
-        # forced load balance
-        if self.use_moe_force_load_balance:
-            force_k = (topk_ids.shape[0] * self.experts.top_k) // self.n_routed_experts
-            topk_ids = self.aux_load_balance_tensor.repeat(force_k + 1, 1) \
-                        .view(-1, self.experts.top_k)[:topk_ids.shape[0]]
-        elif self.enable_eplb:
-            _, topk_ids, _ = self.experts.planner.plan(
-                layer_idx_moe=self.experts.moe_layer_idx,
-                tokens=hidden_states,
-                token_expert_ids=topk_ids,
-                token_expert_scores=topk_weights,
-                top_k=self.experts.top_k,
-                expert_mapping=self.experts.expert_mapping,
-            )
+        topk_ids = self._apply_mapping(topk_ids)
 
         # Step 2: npu_moe_init_routing_v2 - Local routing initialization
         # This sorts tokens locally without communication
@@ -1258,12 +1218,7 @@ class OpenPanguV2MOE(nn.Module):
                 per_token_scales=gathered_pertoken_scale,
             )
 
-        if self.enable_eplb:
-            self.experts.planner.record_activation(
-                self.experts.moe_layer_idx,
-                tokens_per_local_expert,
-                support_multi_stream=False,
-            )
+        self._record_eplb_load(tokens_per_local_expert)
 
         # Step 6: grouped_matmul + activation + grouped_matmul - Expert computation
         if self._is_quant:
@@ -1436,6 +1391,7 @@ class OpenPanguV2MOE(nn.Module):
         # === Phase 1: input parsing + gating + launch async quant/all_gather on com_stream ===
         e1 = record_event()  # mark parse start; com_stream will wait on e1
         sp_x, topk_w, sp_topk = self._parse_input(sp_x)
+        sp_topk = self._apply_mapping(sp_topk)
         N = self.n_routed_experts   # 256
         K: int = self.experts.top_k # 8
         T = sp_x.size(0)
@@ -1461,7 +1417,9 @@ class OpenPanguV2MOE(nn.Module):
         i8 = torch.index_select(x_i8, 0, idx1)
 
         # avg FFN on cur_stream: fixed portion, dispatched immediately (no D2H wait)
-        y1 = quant_ffn(self.experts, i8, sc, stat.hist1)
+        hist1 = stat.hist1.to(torch.int64)
+        self._record_eplb_load(hist1)
+        y1 = quant_ffn(self.experts, i8, sc, hist1)
         if quant_combine:
             y1, sc1 = torch_npu.npu_dynamic_quant(y1)
         recv = y1.new_empty(T * K, y1.size(1))
@@ -1482,7 +1440,9 @@ class OpenPanguV2MOE(nn.Module):
             i8 = x_i8.new_empty(cnt, x_i8.size(1))
             torch.index_select(x_sc, 0, idx2, out=sc[:total - avg])
             torch.index_select(x_i8, 0, idx2, out=i8[:total - avg])
-            y2 = quant_ffn(self.experts, i8, sc, stat.hist2)[:total - avg]
+            hist2 = stat.hist2.to(torch.int64)
+            self._record_eplb_load(hist2)
+            y2 = quant_ffn(self.experts, i8, sc, hist2)[:total - avg]
             if quant_combine:
                 y2, sc2 = torch_npu.npu_dynamic_quant(y2)
             send2 = rerouting(y2, stat.rest_map)
@@ -2628,7 +2588,7 @@ class OpenPanguV2ForCausalLM(
             if isinstance(layer.mlp, OpenPanguV2MOE):
                 # Pick last one layer since the first ones may be dense layers.
                 example_moe = layer.mlp
-                self.moe_layers.append(layer.mlp.experts)
+                self.moe_layers.append(layer.mlp.moe_runner)
 
         if example_moe is None:
             raise RuntimeError("No MOE layer found in model.layers.")
@@ -2639,6 +2599,8 @@ class OpenPanguV2ForCausalLM(
         self.n_routed_experts = example_moe.n_routed_experts
         self.n_shared_experts = example_moe.n_shared_experts
         self.num_redundant_experts = example_moe.n_redundant_experts
+        self.num_routed_experts = example_moe.n_routed_experts
+        self.num_shared_experts = example_moe.n_shared_experts
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
