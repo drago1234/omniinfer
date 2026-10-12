@@ -8,10 +8,10 @@ never reaches it (pinned by test_mrv1_path_does_not_import_upstream_gpu_package)
 """
 
 from __future__ import annotations
-
+import torch
 from types import SimpleNamespace
 
-import torch
+from copy import copy
 
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -19,6 +19,30 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from omni_npu.worker.npu.utils import install_torch_cuda_aliases
 
 logger = init_logger(__name__)
+
+
+def _mtp_prefill_config(vllm_config):
+    """Use one MTP step on a single-layer PD producer, as MRv1 does.
+
+    This private config is only for constructing speculative buffers. The
+    runner restores the original config before building KV specs, which must
+    match the EngineCore's MTP7 cache layout. Truncating only propose() would
+    broadcast one draft token into all seven request-state columns.
+    """
+    spec = getattr(vllm_config, "speculative_config", None)
+    if (spec is None or spec.method != "mtp"
+            or getattr(getattr(vllm_config, "kv_transfer_config", None),
+                       "kv_role", None) != "kv_producer"
+            or getattr(spec.draft_model_config.hf_config, "n_predict", 1) != 1
+            or spec.num_speculative_tokens <= 1):
+        return vllm_config
+
+    config = copy(vllm_config)
+    config.speculative_config = copy(spec)
+    config.speculative_config.num_speculative_tokens = 1
+    logger.info("[omni-npu/mrv2] MTP prefill_single_step=True; "
+                "runner draft steps: %d -> 1", spec.num_speculative_tokens)
+    return config
 
 
 def _dp_lmhead_enabled() -> bool:
@@ -47,7 +71,51 @@ class NPUModelRunnerV2(GPUModelRunner):
 
         init_aclgraph_config(vllm_config)
         logger.info("[omni-npu/mrv2] building NPUModelRunnerV2")
-        super().__init__(vllm_config, device)
+        runner_config = _mtp_prefill_config(vllm_config)
+        super().__init__(runner_config, device)
+        if runner_config is not vllm_config:
+            # Only step counts and token buffers use MTP1. KV specs, model
+            # loading and connectors keep the original producer/D cache ABI.
+            self.vllm_config = vllm_config
+            self.speculative_config = vllm_config.speculative_config
+            if self.speculator is not None:
+                self.speculator.vllm_config = vllm_config
+                self.speculator.speculative_config = self.speculative_config
+
+    def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+        """Load the model, then align its multimodal buffer with mHC output."""
+        super().load_model(load_dummy_weights, *args, **kwargs)
+        self._align_mhc_mm_embedding_width()
+
+    def _align_mhc_mm_embedding_width(self) -> None:
+        """Use the expanded mHC width for the V2 multimodal encoder buffer."""
+        hf_config = self.vllm_config.model_config.hf_config
+        if not (
+            getattr(hf_config, "use_mhc", False)
+            and hasattr(hf_config, "vision_config")
+        ):
+            return
+        num_streams = getattr(hf_config, "mhc_num_stream", 1)
+        if num_streams <= 1:
+            return
+
+        encoder_runner = getattr(
+            getattr(self, "model_state", None), "encoder_runner", None
+        )
+        inputs_embeds = getattr(encoder_runner, "inputs_embeds", None)
+        if inputs_embeds is None:
+            return
+        canonical_width = self.model_config.get_hidden_size()
+        expanded_width = canonical_width * num_streams
+        if inputs_embeds.shape[1] == expanded_width:
+            return
+        if inputs_embeds.shape[1] != canonical_width:
+            raise RuntimeError(
+                "[omni-npu/mrv2] cannot align multimodal embedding buffer: "
+                f"expected width {canonical_width} or {expanded_width}, "
+                f"got {inputs_embeds.shape[1]}"
+            )
+        encoder_runner.inputs_embeds = inputs_embeds.repeat(1, num_streams)
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         """Load the model, then align its multimodal buffer with mHC output."""

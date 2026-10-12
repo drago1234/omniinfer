@@ -31,6 +31,92 @@ _CLASS_NOISE = {
 }
 
 
+class _MTPConfig(SimpleNamespace):
+    @property
+    def num_speculative_tokens(self):
+        return self.speculative_config.num_speculative_tokens
+
+
+def _make_mtp_config(role="kv_producer", method="mtp", n_predict=1, steps=7):
+    return _MTPConfig(
+        speculative_config=SimpleNamespace(
+            method=method, num_speculative_tokens=steps,
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(n_predict=n_predict))),
+        kv_transfer_config=SimpleNamespace(kv_role=role),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        model_config=object(), scheduler_config=object())
+
+
+@pytest.mark.parametrize("role,method,n_predict,steps", [
+    ("kv_consumer", "mtp", 1, 7),
+    ("kv_both", "mtp", 1, 7),
+    (None, "mtp", 1, 7),
+    ("kv_producer", "eagle", 1, 7),
+    ("kv_producer", "dflash", 1, 7),
+    ("kv_producer", "mtp", 2, 7),
+    ("kv_producer", "mtp", 1, 1),
+])
+def test_mtp_prefill_config_leaves_other_modes_unchanged(
+    role, method, n_predict, steps
+):
+    from omni_npu.worker.npu.model_runner import _mtp_prefill_config
+
+    config = _make_mtp_config(role, method, n_predict, steps)
+    assert _mtp_prefill_config(config) is config
+    assert config.num_speculative_tokens == steps
+
+
+def test_mtp_prefill_config_preserves_scheduler_and_shared_layer_registry():
+    from omni_npu.worker.npu.model_runner import _mtp_prefill_config
+
+    config = _make_mtp_config()
+    runner_config = _mtp_prefill_config(config)
+    assert runner_config is not config
+    assert runner_config.speculative_config is not config.speculative_config
+    assert runner_config.num_speculative_tokens == 1
+    assert config.num_speculative_tokens == 7
+    for field in ("compilation_config", "scheduler_config", "model_config"):
+        assert getattr(runner_config, field) is getattr(config, field)
+    assert (runner_config.speculative_config.draft_model_config
+            is config.speculative_config.draft_model_config)
+
+
+def test_mtp_prefill_runner_passes_one_step_before_buffer_creation(
+    clean_cuda_aliases, monkeypatch
+):
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+    from omni_npu.compilation import npugraph_ex_config
+    from omni_npu.worker.npu.model_runner import NPUModelRunnerV2
+
+    seen = {}
+    monkeypatch.setattr(npugraph_ex_config, "init_aclgraph_config",
+                        lambda cfg: seen.update(graph_config=cfg))
+    def initialize_buffers(self, cfg, device):
+        seen["runner_config"] = cfg
+        self.vllm_config = cfg
+        self.speculative_config = cfg.speculative_config
+        self.num_speculative_steps = cfg.num_speculative_tokens
+        self.req_states = SimpleNamespace(
+            num_speculative_steps=cfg.num_speculative_tokens)
+        self.speculator = SimpleNamespace(
+            vllm_config=cfg, speculative_config=cfg.speculative_config,
+            num_speculative_steps=cfg.num_speculative_tokens)
+
+    monkeypatch.setattr(GPUModelRunner, "__init__", initialize_buffers)
+    config = _make_mtp_config()
+    runner = NPUModelRunnerV2(config, object())
+    assert seen["graph_config"] is config
+    assert seen["runner_config"].num_speculative_tokens == 1
+    assert runner.num_speculative_steps == 1
+    assert runner.req_states.num_speculative_steps == 1
+    assert runner.speculator.num_speculative_steps == 1
+    assert runner.vllm_config is runner.speculator.vllm_config is config
+    assert runner.speculative_config is config.speculative_config
+    assert runner.speculator.speculative_config is config.speculative_config
+    assert config.num_speculative_tokens == 7
+
+
 def test_runner_installs_cuda_aliases_and_pins_override_surface(
     clean_cuda_aliases, monkeypatch
 ):
