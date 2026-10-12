@@ -41,11 +41,10 @@ class NPURejectionSampler(RejectionSampler):
         # stream as contiguous copies, so the bonus and verify consumers no
         # longer interleave producers on this stream (IJTE2J).
 
-        rejection_sample_method = speculative_config.rejection_sample_method
-        if rejection_sample_method not in ("standard", "block"):
-            raise ValueError(f"Unsupported rejection sample method: {rejection_sample_method}")
+        if speculative_config.rejection_sample_method not in ("standard", "block"):
+            raise ValueError(f"Unsupported rejection sample method: {speculative_config.rejection_sample_method}")
 
-        self.rejection_sample_method = rejection_sample_method
+        self.rejection_sample_method = speculative_config.rejection_sample_method
         self.dsa_stream = sampler.dsa_stream
         self.use_npu_sample = not (
             model_extra_config.operator_opt_config.disable_npu_top_k_top_p_sample
@@ -287,6 +286,7 @@ def rejection_sample(
     stream: torch.npu.Stream,
     rejection_sample_method: str = "standard",
 ) -> torch.Tensor:
+    """vllm原版的generate_uniform_probs方法只能生成float64的随机数，triton需要float32的随机数"""
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
@@ -581,10 +581,6 @@ def sample_recovered_tokens_native(
             sample_probs = (
                 target_scale[:, None] * target_probs - draft_probs
             ).clamp_min(0)
-            # A padded boundary has no proposal: sample directly from P.
-            sample_probs = torch.where(
-                draft_token_ids[:, None] < 0, target_probs, sample_probs
-            )
 
     num_draft_tokens = cu_num_draft_tokens.clone()
     num_draft_tokens[1:] -= cu_num_draft_tokens[:-1]
@@ -775,13 +771,10 @@ def compute_block_acceptance_torch(
         ).clamp_min(0).sum(dim=-1)
 
         denominator = Z + (1 - c[:-1])
-        safe_denominator = torch.where(
-            denominator == 0, 1.0, denominator
-        )
 
         h = torch.empty_like(c)
         h[:-1] = torch.where(
-            denominator == 0, 1.0, Z / safe_denominator
+            denominator == 0, 1.0, Z / denominator
         )
         # The last real candidate uses c, not a residual from a padded Q.
         h[:-1] = torch.where(valid_prefix[1:], h[:-1], c[:-1])
