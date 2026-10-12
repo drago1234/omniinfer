@@ -253,6 +253,7 @@ def generate_uniform_probs(
     *,
     dtype: torch.dtype = torch.float64,
 ) -> torch.Tensor:
+    """vllm原版的generate_uniform_probs方法只能生成float64的随机数，triton需要float32的随机数"""
     uniform_probs = torch.rand(
         (num_tokens,),
         dtype=dtype,
@@ -286,7 +287,6 @@ def rejection_sample(
     stream: torch.npu.Stream,
     rejection_sample_method: str = "standard",
 ) -> torch.Tensor:
-    """vllm原版的generate_uniform_probs方法只能生成float64的随机数，triton需要float32的随机数"""
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
