@@ -88,10 +88,6 @@ from omni_npu.v1.layers.vocab_parallel_embedding import NPUParallelLMHead
 from omni_npu.v1.layers.attention.weight_utils import refresh_mla_wrappers
 from omni_npu.v1.utils import switch_torch_device
 from omni_npu.worker.npu_input_batch import NPUInputBatch
-from omni_npu.worker.mrv1_block_sampling import (
-    enable_block_draft_probs,
-    run_block_dummy_sampler,
-)
 from omni_npu.worker.npu_mem_pool import NpuMemAllocator
 from omni_npu.connector.kv_dump import maybe_dump_kv
 
@@ -105,8 +101,6 @@ class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         with switch_torch_device():
             super().__init__(vllm_config, device)
-
-        enable_block_draft_probs(self)
 
         self.dp_parallel_lmhead = model_extra_config.parall_config.ena_dp_lmhead_parallel
         self.local_parallel_lmhead = (
@@ -198,11 +192,6 @@ class NPUModelRunner(GPUModelRunner):
         # Number of valid entries in req_indices for the in-flight
         # _prepare_inputs; None outside it (dummy runs, capture).
         self._req_indices_valid_tokens: int | None = None
-
-    def _dummy_sampler_run(self, hidden_states: torch.Tensor):
-        return run_block_dummy_sampler(
-            self, hidden_states, getattr(super(), "_dummy_sampler_run", None)
-        )
 
     def _bind_slot_mapping_req_indices(self) -> None:
         """Let this runner's block table reuse the request ids we upload.
