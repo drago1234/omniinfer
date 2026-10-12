@@ -22,7 +22,6 @@ from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 logger = logging.getLogger(__name__)
 
 
-
 def _needs_block_draft_probs(owner):
     config = getattr(owner, "speculative_config", None)
     return (
@@ -123,4 +122,3 @@ else:
                 return __class__._upstream(self, hidden_states)
             finally:
                 handle.remove()
-
