@@ -192,4 +192,3 @@ def test_the_runner_no_longer_binds_mome():
 
     assert "bind_num_prompt_tokens" not in source
     assert "_bind_mome_prompt_lens" not in source
-    assert "def load_model" not in source  # 曾经只为包 prepare_attn 而存在

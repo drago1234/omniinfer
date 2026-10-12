@@ -72,7 +72,10 @@ def test_runner_installs_cuda_aliases_and_pins_override_surface(
     own = set(vars(type(runner))) - _CLASS_NOISE
     assert own == {
         "__init__",                  # torch.cuda 别名，必须早于上游 __init__ 建 Stream
+        "load_model",                # MRv2 mHC 多模态模型加载后对齐 encoder buffer 宽度
+        "_align_mhc_mm_embedding_width",  # mHC 多流输出宽度适配（来自基线提交）
         "capture_model",             # 裁剪守卫（内存 API 已由 !2496 接管）
+        "_install_acl_task_refresh", # FULL replay 后刷新动态 attention graph task
         "prepare_inputs",            # 为 prepare_attn 暂存本步 cudagraph 模式
         "prepare_attn",              # MRv1 的 pad_attn 开关：非 FULL 不 pad slot
         "prepare_dummy_attn",        # dummy forward 清零 block table，别写脏已交接的块
@@ -93,6 +96,231 @@ def test_runner_is_the_only_mrv2_entry_class():
     # 的 omni_npu.worker.npu_model_runner，同名会让 import 来源变得含糊。
     assert not hasattr(model_runner, "_get_runner_cls")
     assert not hasattr(model_runner, "NPUModelRunner")
+
+
+def test_mhc_mm_embedding_width_alignment():
+    """mHC encoder buffers are expanded exactly once to the stream width."""
+    import torch
+
+    from omni_npu.worker.npu.model_runner import NPUModelRunnerV2
+
+    runner = NPUModelRunnerV2.__new__(NPUModelRunnerV2)
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                use_mhc=True,
+                vision_config=SimpleNamespace(),
+                mhc_num_stream=4,
+            )
+        )
+    )
+    runner.model_config = SimpleNamespace(get_hidden_size=lambda: 3)
+    original = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    runner.model_state = SimpleNamespace(
+        encoder_runner=SimpleNamespace(inputs_embeds=original)
+    )
+
+    runner._align_mhc_mm_embedding_width()
+    expanded = runner.model_state.encoder_runner.inputs_embeds
+    assert expanded.shape == (2, 12)
+    assert torch.equal(expanded, original.repeat(1, 4))
+
+    # A second call must not expand an already aligned buffer again.
+    runner._align_mhc_mm_embedding_width()
+    assert runner.model_state.encoder_runner.inputs_embeds is expanded
+
+
+@pytest.mark.parametrize(
+    "hf_config, encoder_runner, expected_error",
+    [
+        (SimpleNamespace(use_mhc=False, vision_config=object()), None, None),
+        (SimpleNamespace(use_mhc=True, mhc_num_stream=4), None, None),
+        (SimpleNamespace(use_mhc=True, vision_config=object(), mhc_num_stream=1),
+         None, None),
+        (SimpleNamespace(use_mhc=True, vision_config=object(), mhc_num_stream=4),
+         SimpleNamespace(inputs_embeds=None), None),
+        (SimpleNamespace(use_mhc=True, vision_config=object(), mhc_num_stream=4),
+         SimpleNamespace(inputs_embeds=SimpleNamespace(shape=(2, 5))),
+         RuntimeError),
+    ],
+)
+def test_mhc_mm_embedding_width_alignment_guards(
+    hf_config, encoder_runner, expected_error
+):
+    from omni_npu.worker.npu.model_runner import NPUModelRunnerV2
+
+    runner = NPUModelRunnerV2.__new__(NPUModelRunnerV2)
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf_config)
+    )
+    runner.model_config = SimpleNamespace(get_hidden_size=lambda: 3)
+    runner.model_state = SimpleNamespace(encoder_runner=encoder_runner)
+
+    if expected_error is None:
+        runner._align_mhc_mm_embedding_width()
+    else:
+        with pytest.raises(expected_error, match="cannot align"):
+            runner._align_mhc_mm_embedding_width()
+
+
+def test_load_model_aligns_mhc_buffer_after_upstream_load(monkeypatch):
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    from omni_npu.worker.npu.model_runner import NPUModelRunnerV2
+
+    calls = []
+    monkeypatch.setattr(
+        GPUModelRunner,
+        "load_model",
+        lambda self, *args, **kwargs: calls.append((args, kwargs)),
+    )
+    runner = NPUModelRunnerV2.__new__(NPUModelRunnerV2)
+    monkeypatch.setattr(
+        runner,
+        "_align_mhc_mm_embedding_width",
+        lambda: calls.append("align"),
+    )
+
+    runner.load_model(True, marker="value")
+    assert calls == [((True,), {"marker": "value"}), "align"]
+
+
+def test_reshape_kv_cache_routes_backend_and_upstream_groups(monkeypatch):
+    import torch
+
+    from omni_npu.worker.npu import attn_utils
+
+    class Spec:
+        page_size_bytes = 16
+
+    backend_calls = []
+
+    class Backend:
+        def reshape_kv_cache(self, raw, num_blocks, spec):
+            backend_calls.append((raw, num_blocks, spec))
+            return "backend-cache"
+
+    upstream_group = SimpleNamespace(
+        layer_names=["upstream"], backend=SimpleNamespace(), kv_cache_spec=Spec()
+    )
+    backend_group = SimpleNamespace(
+        layer_names=["backend"], backend=Backend(), kv_cache_spec=Spec()
+    )
+    original_calls = []
+
+    def fake_original(**kwargs):
+        original_calls.append(kwargs)
+        return {"upstream": "upstream-cache"}
+
+    monkeypatch.setattr(attn_utils, "_ORIGINAL", fake_original)
+    raw = torch.zeros(8, dtype=torch.float32)  # 32 bytes = two 16-byte blocks.
+    result = attn_utils.reshape_kv_cache(
+        [upstream_group, backend_group],
+        {"upstream": raw, "backend": raw},
+        "auto",
+        [16],
+        {},
+    )
+
+    assert result == {"upstream": "upstream-cache", "backend": "backend-cache"}
+    assert len(original_calls) == 1
+    assert original_calls[0]["attn_groups"] == [upstream_group]
+    assert backend_calls[0][0] is raw
+    assert backend_calls[0][1:] == (2, backend_group.kv_cache_spec)
+
+
+def test_reshape_kv_cache_handles_shared_layers_and_filters_upstream_aliases(
+    monkeypatch,
+):
+    import torch
+
+    from omni_npu.worker.npu import attn_utils
+
+    class Spec:
+        page_size_bytes = 16
+
+    class Backend:
+        def reshape_kv_cache(self, raw, num_blocks, spec):
+            return raw
+
+    group = SimpleNamespace(
+        layer_names=["target"],
+        backend=Backend(),
+        kv_cache_spec=Spec(),
+    )
+    upstream_group = SimpleNamespace(
+        layer_names=["upstream"], backend=SimpleNamespace(), kv_cache_spec=Spec()
+    )
+    upstream_seen = []
+
+    def fake_original(**kwargs):
+        upstream_seen.append(kwargs["shared_kv_cache_layers"])
+        return {"upstream": "upstream-cache"}
+
+    monkeypatch.setattr(attn_utils, "_ORIGINAL", fake_original)
+    raw = torch.zeros(4, dtype=torch.float32)
+    result = attn_utils.reshape_kv_cache(
+        [upstream_group, group],
+        {
+            "upstream": raw,
+            "target": raw,
+        },
+        "auto",
+        [16],
+        {
+            "upstream": "target",
+            "missing_source": "upstream",
+        },
+    )
+
+    assert result["upstream"] is result["target"]
+    assert result["missing_source"] is result["target"]
+    assert upstream_seen == [{}]
+
+
+def test_reshape_kv_cache_rejects_unaligned_backend_allocation():
+    import torch
+
+    from omni_npu.worker.npu import attn_utils
+
+    class Spec:
+        page_size_bytes = 16
+
+    class Backend:
+        def reshape_kv_cache(self, raw, num_blocks, spec):
+            return "unused"
+
+    group = SimpleNamespace(
+        layer_names=["backend"], backend=Backend(), kv_cache_spec=Spec()
+    )
+    with pytest.raises(ValueError, match="raw size 12"):
+        attn_utils.reshape_kv_cache(
+            [group], {"backend": torch.zeros(3, dtype=torch.float32)},
+            "auto", [16], {},
+        )
+
+
+def test_reshape_kv_cache_rejects_missing_shared_target(monkeypatch):
+    import torch
+
+    from omni_npu.worker.npu import attn_utils
+
+    class Spec:
+        page_size_bytes = 16
+
+    class Backend:
+        def reshape_kv_cache(self, raw, num_blocks, spec):
+            return raw
+
+    group = SimpleNamespace(
+        layer_names=["source"], backend=Backend(), kv_cache_spec=Spec()
+    )
+    monkeypatch.setattr(attn_utils, "_ORIGINAL", lambda **kwargs: {})
+    with pytest.raises(RuntimeError, match="shared KV-cache target target"):
+        attn_utils.reshape_kv_cache(
+            [group], {"source": torch.zeros(4, dtype=torch.float32)},
+            "auto", [16], {"source": "target"},
+        )
 
 
 def test_dummy_run_joins_dp_lmhead_before_speculator(monkeypatch):

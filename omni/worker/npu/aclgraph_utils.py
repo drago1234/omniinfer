@@ -16,6 +16,8 @@ import functools
 import threading
 from typing import Any
 
+import torch
+
 from vllm.config import CUDAGraphMode
 
 
@@ -85,6 +87,15 @@ def build_capture_with_full_mode(original_capture):
 
     @functools.wraps(original_capture)
     def capture(self, create_forward_fn, *args, **kwargs):
+        from omni_npu.compilation.acl_graph import get_graph_params
+
+        graph_params = get_graph_params()
+        if graph_params is not None:
+            for entries in graph_params.task_entries.values():
+                entries.clear()
+            for workspaces in graph_params.workspaces.values():
+                workspaces.clear()
+
         def create_forward_fn_full(desc, warmup):
             forward_fn, attn_state = create_forward_fn(desc, warmup)
             # desc.cg_mode is already a resolved runtime mode: dual configs
@@ -95,7 +106,21 @@ def build_capture_with_full_mode(original_capture):
                 return forward_fn, attn_state
             return _force_full_mode(forward_fn), attn_state
 
-        return original_capture(self, create_forward_fn_full, *args, **kwargs)
+        result = original_capture(self, create_forward_fn_full, *args, **kwargs)
+
+        from omni_npu.compilation.acl_graph import ensure_weak_ref_graph_params
+
+        if graph_params is not None:
+            ensure_weak_ref_graph_params()
+            self._omni_acl_task_entries = {
+                size: dict(entries)
+                for size, entries in graph_params.task_entries.items()
+            }
+            self._omni_acl_workspaces = {
+                size: dict(workspaces)
+                for size, workspaces in graph_params.workspaces.items()
+            }
+        return result
 
     return capture
 
@@ -145,6 +170,52 @@ def assert_no_acl_tasks_registered() -> None:
             f"({registered}), but this branch omits the replay-time refresh. "
             "Restore feature/mrv2_graph_full before running this model."
         )
+
+
+def refresh_acl_graph_tasks(manager: Any, forward_context: Any, vllm_config: Any, update_stream: Any) -> None:
+    """Refresh dynamic attention graph tasks after an outer V2 replay."""
+    if forward_context.attn_metadata is None:
+        return
+    runtime_shape = forward_context.batch_descriptor.num_tokens
+    task_entries = getattr(manager, "_omni_acl_task_entries", {}).get(runtime_shape, {})
+    workspaces = getattr(manager, "_omni_acl_workspaces", {}).get(runtime_shape, {})
+    if not task_entries:
+        return
+    with torch.npu.stream(update_stream):
+        for layer_name, task_entry in task_entries.items():
+            update_fn = task_entry.op_desc.compute_dynamic_kwargs
+            dynamic_kwargs = None if update_fn is None else update_fn(
+                forward_context, layer_name, vllm_config
+            )
+            if dynamic_kwargs is None:
+                task_entry.event.record(update_stream)
+                continue
+            updated_kwargs = {**task_entry.captured_kwargs, **dynamic_kwargs}
+            if (updated_kwargs.get("input_layout", "").startswith("BSND")
+                    and "actual_seq_lengths" in updated_kwargs):
+                updated_kwargs["actual_seq_lengths"] = None
+            workspace = workspaces[task_entry.op_desc.workspace_fn]
+            torch.npu.graph_task_update_begin(update_stream, task_entry.handle)
+            task_entry.op_desc.op_out_fn(
+                **updated_kwargs, workspace=workspace, out=task_entry.out_tensors
+            )
+            torch.npu.graph_task_update_end(update_stream)
+            task_entry.event.record(update_stream)
+
+
+def build_run_fullgraph_with_acl_refresh(original_run_fullgraph):
+    """Add ACL task refresh to an upstream full-graph replay."""
+    @functools.wraps(original_run_fullgraph)
+    def run_fullgraph(self, desc, *args, **kwargs):
+        result = original_run_fullgraph(self, desc, *args, **kwargs)
+        context_provider = getattr(self, "_omni_acl_context_provider", None)
+        update_stream = getattr(self, "_omni_acl_update_stream", None)
+        if context_provider is not None and update_stream is not None:
+            refresh_acl_graph_tasks(
+                self, context_provider(desc), self.vllm_config, update_stream
+            )
+        return result
+    return run_fullgraph
 
 
 def reset_for_testing() -> None:

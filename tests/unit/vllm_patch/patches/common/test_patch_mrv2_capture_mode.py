@@ -143,18 +143,22 @@ def test_factory_second_return_value_and_extra_args_are_forwarded():
     assert result == "returned"
 
 
-def test_capture_mode_patch_replaces_only_capture():
+def test_capture_mode_patch_replaces_capture_and_fullgraph():
     cls = patch_mod.MRv2CaptureModePatch
     target = cls._target
     saved = target.capture
+    saved_run_fullgraph = target.run_fullgraph
     owners = dict(getattr(target, "_omni_npu_applied_patches", {}))
     target._omni_npu_applied_patches = {}
     try:
         cls.apply()
         assert target.capture is cls.__dict__["capture"]
         assert target.capture is not saved
+        assert target.run_fullgraph is cls.__dict__["run_fullgraph"]
+        assert target.run_fullgraph is not saved_run_fullgraph
     finally:
         target.capture = saved
+        target.run_fullgraph = saved_run_fullgraph
         target._omni_npu_applied_patches = owners
 
 
