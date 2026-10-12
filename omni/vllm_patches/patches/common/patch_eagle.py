@@ -628,6 +628,9 @@ class EagleProposerPatch(VLLMPatch):
             else:
                 group_cm = copy(common_attn_metadata)
                 group_cm.block_table_tensor = blk_table_tensor
+                group_cm.slot_mapping = (
+                    blk_table.slot_mapping.gpu[:common_attn_metadata.num_actual_tokens]
+                )
                 group_cm.slot_mapping[:slot_mapping.numel()] = slot_mapping
             group_cm.slot_mapping[slot_mapping.numel():] = -1
 
