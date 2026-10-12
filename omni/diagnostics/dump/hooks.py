@@ -5,9 +5,9 @@
 Each on_<role>_init entry point is vllm-free and mounts exit forensics for one
 process role:
 
-* worker: mounted at the end of NPUWorker.init_device; carries no stats
-  section (progress bookkeeping lives in EngineCore, the worker's unique
-  contribution is its stack plus process-level hardware).
+* worker: mounted at the end of NPUWorker.init_device, once self.model_runner
+  exists; stats section reports the model runner's exec_count and, for MTP,
+  the drafter's mtp_exec_count. Unavailable counts degrade to "ERROR:<...>".
 * engine: wraps executor.execute_model for the micro tick and reads live
   scheduler state at dump time.
 * api: needs a running asyncio event loop (loop.add_signal_handler); a missing
@@ -67,11 +67,39 @@ def worker_rank(worker):
     return None
 
 
+def build_worker_stats_fn(worker):
+    def stats_fn():
+        try:
+            model_runner = worker.model_runner
+        except Exception as e:  # noqa: BLE001
+            return {"exec_count": f"ERROR:{type(e).__name__}"}
+        exec_count = getattr(model_runner, "exec_count", None)
+        if exec_count is None:
+            stats = {"exec_count": "ERROR:no exec_count attribute"}
+        else:
+            stats = {"exec_count": exec_count}
+
+        speculative_config = getattr(model_runner, "speculative_config", None)
+        if getattr(speculative_config, "method", None) == "mtp":
+            drafter = getattr(model_runner, "drafter", None)
+            mtp_count = getattr(drafter, "mtp_exec_count", None)
+            stats["mtp_exec_count"] = (
+                mtp_count if mtp_count is not None
+                else "ERROR:no MTP drafter mtp_exec_count"
+            )
+        return stats
+
+    return stats_fn
+
+
 def on_worker_init(worker, dump_dir=None):
     if not enabled():
         return
     guarded_install(
-        role=constants.ROLE_WORKER, dump_dir=dump_dir, rank=worker_rank(worker)
+        role=constants.ROLE_WORKER,
+        dump_dir=dump_dir,
+        rank=worker_rank(worker),
+        stats_fn=build_worker_stats_fn(worker),
     )
 
 
