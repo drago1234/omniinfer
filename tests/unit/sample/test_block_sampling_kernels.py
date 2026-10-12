@@ -13,7 +13,7 @@ import torch
 
 @pytest.fixture
 def block_kernels(monkeypatch):
-    triton = pytest.importorskip("triton")
+    import triton
     import triton.language as tl
     from triton.runtime.interpreter import InterpretedFunction
 
@@ -183,7 +183,8 @@ class TestBlockKernelCases:
 
 
 def test_block_kernels_in_cpu_interpreter(tmp_path):
-    pytest.importorskip("triton")
+    # Import Triton only in the clean child process: other UTs can leave
+    # incompatible Triton modules in the parent, causing a false skip.
     env = dict(os.environ, TRITON_INTERPRET="1", OMNI_BLOCK_KERNEL_UT_CHILD="1",
                TORCH_DEVICE_BACKEND_AUTOLOAD="0", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
                OMP_NUM_THREADS="1", MKL_NUM_THREADS="1")
