@@ -22,7 +22,6 @@ from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 logger = logging.getLogger(__name__)
 
 
-### patch start for MRv1 block draft probabilities
 
 def _needs_block_draft_probs(owner):
     config = getattr(owner, "speculative_config", None)
@@ -125,4 +124,3 @@ else:
             finally:
                 handle.remove()
 
-### patch end for MRv1 block draft probabilities
