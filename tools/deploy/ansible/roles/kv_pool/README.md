@@ -36,7 +36,7 @@ tasks:
 
 ```yaml
 enable_kv_pool: false
-kv_pool_repo_root: "{{ (role_path ~ '/../../../../../../Pangu-FusionComm') | realpath }}"
+kv_pool_repo_root: "{{ (role_path ~ '/../../../../../../Pangu-Fusion') | realpath }}"
 ```
 
 只覆盖 `enable_kv_pool` 时仍使用默认的外部仓库路径。
@@ -44,13 +44,13 @@ kv_pool_repo_root: "{{ (role_path ~ '/../../../../../../Pangu-FusionComm') | rea
 且处理 M 主机时由 `ansible_env.DOCKER_NAME_M` 生成。M 容器仅在不存在时创建，
 不会随 P/D/C 重部署删除。
 
-`kv_pool_repo_root` 指向执行机上的 Pangu-FusionComm checkout，默认定位到
-OmniInfer 仓库旁的 `Pangu-FusionComm` 目录。路径由 role 所在位置解析，不随
+`kv_pool_repo_root` 指向执行机上的 Pangu-Fusion checkout，默认定位到
+OmniInfer 仓库旁的 `Pangu-Fusion` 目录。路径由 role 所在位置解析，不随
 Playbook 移入子目录而改变；部署时可覆盖为实际绝对路径。启用前须准备兼容的：
 
-- `kv_pool/deploy/install_kv_pool.yml`
-- `kv_pool/deploy/run_mooncake_master.yml`
-- `kv_pool/deploy/_kv_pool_runtime.sh.j2`
+- `Pangu-FusionPool/kv_pool/deploy/install_kv_pool.yml`
+- `Pangu-FusionPool/kv_pool/deploy/run_mooncake_master.yml`
+- `Pangu-FusionPool/kv_pool/deploy/_kv_pool_runtime.sh.j2`
 
 本 role 不获取外部仓库；外部模块继续维护安装、master 启动和 runtime 的实现。
 `run_server_prefill_profile.kv_pool` 与以下专用默认值递归合并：
@@ -94,7 +94,7 @@ ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --list-tags
 
 # 实际部署使用已填写的 Inventory 与兼容的外部模块。
 ansible-playbook -i /path/to/kv_pool_inventory.yml "$PLAYBOOK" \
-  -e kv_pool_repo_root=/path/to/Pangu-FusionComm
+  -e kv_pool_repo_root=/path/to/Pangu-Fusion
 ```
 
 仓库的 `ansible.cfg` 仍使用 `roles_path = roles`，嵌套 Playbook 无需更改 role
