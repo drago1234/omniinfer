@@ -391,8 +391,15 @@ class TestBuildPerGroupStep0Offset:
         assert per_layer == {"draft.0": "mome-metadata", "draft.1": "mome-metadata"}
 
 
-def _fake_block_table(tensor):
-    return SimpleNamespace(get_device_tensor=lambda num_reqs: tensor)
+def _fake_block_table(tensor, slot_buf_len=8):
+    # Real BlockTable exposes a persistent per-group slot_mapping.gpu buffer;
+    # non-base rebuilds write their draft slots through a slice of it.
+    return SimpleNamespace(
+        get_device_tensor=lambda num_reqs: tensor,
+        slot_mapping=SimpleNamespace(
+            gpu=torch.zeros(slot_buf_len, dtype=torch.int64)
+        ),
+    )
 
 
 def _rebuild_proposer(groups, block_tables, *, kv_cache_gid):
@@ -477,8 +484,11 @@ class TestRebuildPerGroupMetadataForStep:
                 assert kwargs["num_accepted_tokens"].tolist() == expected
 
     def test_non_base_group_gets_a_distinct_metadata_copy(self):
+        slot_buf = torch.full((self.BUFFER_LEN,), -7, dtype=torch.int64)
         cm = SimpleNamespace(
-            num_reqs=2, slot_mapping=torch.arange(8, dtype=torch.int64)
+            num_reqs=2,
+            num_actual_tokens=self.BUFFER_LEN,
+            slot_mapping=torch.arange(self.BUFFER_LEN, dtype=torch.int64),
         )
         base = DraftAttnGroup(
             kv_cache_group_id=0,
@@ -494,6 +504,8 @@ class TestRebuildPerGroupMetadataForStep:
             torch.tensor([[50, 60], [70, 80]], dtype=torch.int64),
         ]
         proposer = _rebuild_proposer([base, other], block_tables, kv_cache_gid=0)
+        # The non-base group's slot buffer lives on its own block table.
+        proposer.runner.input_batch.block_table[1].slot_mapping.gpu = slot_buf
 
         self._run(proposer, cm, [3, 5])
 
@@ -503,6 +515,14 @@ class TestRebuildPerGroupMetadataForStep:
         assert other_cm is not cm
         assert other_cm.block_table_tensor is block_tables[1]
         assert cm.block_table_tensor is block_tables[0]
+        # Non-base slots are computed from its own block table (50*4+3, 80*4+1)
+        # and written through its own buffer; the base buffer is untouched
+        # apart from the base group's own in-place update.
+        assert other_cm.slot_mapping is not cm.slot_mapping
+        # views the non-base group's own buffer (same storage, full length)
+        assert other_cm.slot_mapping.data_ptr() == slot_buf.data_ptr()
+        assert other_cm.slot_mapping.tolist() == [203, 321, -1, -1, -1, -1, -1, -1]
+        assert slot_buf[:2].tolist() == [203, 321]
 
 
 def _propose_step0_offset_flag(n_predict, num_speculative_tokens):
