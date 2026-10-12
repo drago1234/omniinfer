@@ -3334,3 +3334,94 @@ class TestSlotMappingReqIndices:
             NPUModelRunner._prepare_inputs(runner, object(), np.array([1]))
 
         assert runner._req_indices_valid_tokens is None
+
+
+class TestSynchronizeInputPrep:
+    """UT for NPUModelRunner.synchronize_input_prep.
+
+    The protocol under test:
+      - event None: plain passthrough, no device/event interaction.
+      - event set: event.synchronize() before the body runs (enter), then on
+        exit (even on exception) torch.npu.synchronize() followed by
+        event.record() so the next step's non_blocking H2D cannot race the
+        forward that just consumed the buffers.
+    """
+
+    def _make_runner(self, event=None):
+        runner = object.__new__(NPUModelRunner)
+        runner.prepare_inputs_event = event
+        return runner
+
+    def _make_event(self, log):
+        event = MagicMock(name="prepare_inputs_event")
+        event.synchronize.side_effect = lambda: log.append("event.synchronize")
+        event.record.side_effect = lambda: log.append("event.record")
+        return event
+
+    def _patch_npu_sync(self, monkeypatch, log):
+        monkeypatch.setattr(
+            runner_module.torch.npu, "synchronize",
+            lambda: log.append("npu.synchronize"),
+        )
+
+    def test_none_event_yields_without_sync(self, monkeypatch):
+        runner = self._make_runner()
+        log = []
+        self._patch_npu_sync(monkeypatch, log)
+
+        ran = False
+        with runner.synchronize_input_prep():
+            ran = True
+            # Nothing before or during the body when there is no event.
+            assert log == []
+
+        assert ran
+        assert log == []
+
+    def test_event_synchronized_before_body(self, monkeypatch):
+        log = []
+        runner = self._make_runner(event=self._make_event(log))
+        self._patch_npu_sync(monkeypatch, log)
+
+        with runner.synchronize_input_prep():
+            # Drained on enter, before the body could consume the buffers.
+            assert log == ["event.synchronize"]
+            log.clear()
+
+        # Only the exit path ran since: drain device, then re-arm event.
+        assert log == ["npu.synchronize", "event.record"]
+
+    def test_device_sync_and_record_after_body(self, monkeypatch):
+        log = []
+        runner = self._make_runner(event=self._make_event(log))
+        self._patch_npu_sync(monkeypatch, log)
+
+        with runner.synchronize_input_prep():
+            pass
+
+        # Exit order: drain device first, then re-arm the event for the
+        # next step's H2D.
+        assert log == ["event.synchronize", "npu.synchronize", "event.record"]
+
+    def test_recorded_on_body_exception(self, monkeypatch):
+        log = []
+        runner = self._make_runner(event=self._make_event(log))
+        self._patch_npu_sync(monkeypatch, log)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with runner.synchronize_input_prep():
+                raise RuntimeError("boom")
+
+        # finally-branch still runs and keeps the original error.
+        assert log == ["event.synchronize", "npu.synchronize", "event.record"]
+
+    def test_none_event_propagates_without_sync(self, monkeypatch):
+        runner = self._make_runner()
+        log = []
+        self._patch_npu_sync(monkeypatch, log)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with runner.synchronize_input_prep():
+                raise RuntimeError("boom")
+
+        assert log == []
