@@ -87,18 +87,56 @@ def fused_experts_tp(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
 ):
-    row_idx = (
-        torch.arange(topk_ids.numel(), device=current_platform.device_type, dtype=torch.int32)
-        .view(-1, x.shape[0])
-        .transpose(0, 1)
-    )
-    num_tokens, hidden_size = x.shape
     experts = layer.routed_experts
     n_routed_experts = experts.global_num_experts
-    sorted_tokens, expanded_src_to_dst_row, expanded_expert_idx = torch_npu.npu_moe_init_routing(
-        x, row_idx, topk_ids, num_tokens
-    )
-    expert_tokens = torch_npu.npu_moe_compute_expert_tokens(expanded_expert_idx, n_routed_experts).to(torch.int64)
+    use_routing_v2 = (model_extra_config.operator_opt_config.enable_moe_init_routing_v2)
+
+    if use_routing_v2:
+        topk_ids = topk_ids.int()
+        (
+            sorted_tokens,
+            expanded_src_to_dst_row,
+            expert_tokens,
+            _,
+        ) = torch_npu.npu_moe_init_routing_v2(
+            x,
+            expert_idx=topk_ids,
+            expert_num=n_routed_experts,
+            active_expert_range=[0, n_routed_experts],
+            expert_tokens_num_type=0,
+            expert_tokens_num_flag=True,
+            active_num=topk_ids.numel(),
+            drop_pad_mode=0,
+            row_idx_type=0,
+            quant_mode=-1,
+        )
+        expert_tokens = expert_tokens.to(torch.int64)
+    else:
+        row_idx = (
+            torch.arange(
+                topk_ids.numel(),
+                device=current_platform.device_type,
+                dtype=torch.int32,
+            )
+            .view(-1, x.shape[0])
+            .transpose(0, 1)
+        )
+        num_tokens = x.shape[0]
+        (
+            sorted_tokens,
+            expanded_src_to_dst_row,
+            expanded_expert_idx,
+        ) = torch_npu.npu_moe_init_routing(
+            x,
+            row_idx,
+            topk_ids,
+            num_tokens,
+        )
+        expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
+            expanded_expert_idx,
+            n_routed_experts,
+        ).to(torch.int64)
+
     if experts.quant_config is None:
         pertoken_scale = None
     else:
@@ -118,6 +156,18 @@ def fused_experts_tp(
             sorted_tokens, pertoken_scale = torch_npu.npu_dynamic_quant(sorted_tokens)
 
     out = _apply_experts(layer, sorted_tokens, expert_tokens, pertoken_scale)
+
+    if use_routing_v2:
+        return torch_npu.npu_moe_finalize_routing(
+            out.unsqueeze(0),
+            skip1=None,
+            skip2=None,
+            bias=None,
+            scales=topk_weights.to(out.dtype),
+            expanded_src_to_dst_row=expanded_src_to_dst_row,
+            export_for_source_row=topk_ids,
+            drop_pad_mode=3,
+        ).to(model_extra_config.dtype)
 
     return torch_npu.npu_moe_finalize_routing(
         out, None, None, None, topk_weights, expanded_src_to_dst_row, topk_ids
