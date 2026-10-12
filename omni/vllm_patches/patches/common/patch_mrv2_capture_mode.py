@@ -22,6 +22,7 @@ from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 from omni_npu.worker.npu.aclgraph_utils import (
     _CapturingDescriptor,
     build_capture_with_full_mode,
+    build_run_fullgraph_with_acl_refresh,
 )
 
 logger = init_logger(__name__)
@@ -55,6 +56,9 @@ else:
     # all reach through super(), so one patch covers every capture path.
     @register_patch("MRv2CaptureModePatch", CudaGraphManager)
     class MRv2CaptureModePatch(VLLMPatch):
-        _attr_names_to_apply = ["capture"]
+        _attr_names_to_apply = ["capture", "run_fullgraph"]
 
         capture = build_capture_with_full_mode(CudaGraphManager.capture)
+        run_fullgraph = build_run_fullgraph_with_acl_refresh(
+            CudaGraphManager.run_fullgraph
+        )
