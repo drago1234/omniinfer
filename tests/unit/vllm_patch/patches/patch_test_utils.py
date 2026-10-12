@@ -30,6 +30,21 @@ def install_named_module(name, **attrs):
     return mod
 
 
+@contextmanager
+def preserved_sys_modules():
+    """Restore ``sys.modules`` after a test temporarily installs stubs."""
+    saved = dict(sys.modules)
+    try:
+        yield
+    finally:
+        for name in list(sys.modules):
+            if name not in saved:
+                sys.modules.pop(name, None)
+        for name, module in saved.items():
+            if sys.modules.get(name) is not module:
+                sys.modules[name] = module
+
+
 def silent_logger(_name=None):
     """No-op logger used when tests stub vllm.logger.init_logger."""
 

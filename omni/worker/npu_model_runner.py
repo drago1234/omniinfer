@@ -75,6 +75,7 @@ from omni_npu.compilation.acl_graph import (
     set_graph_params,
 )
 from omni_npu.configs import OmniAdditionalConfig
+from omni_npu.layers.fused_moe import routed_experts_handle
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.sample.sampler import NPUSamplerV1, ENABLE_NPU_PENALTY_CACHE
 from omni_npu.sample.rejection_sampler import NPURejectionSampler
@@ -1437,10 +1438,16 @@ class NPUModelRunner(GPUModelRunner):
     ) -> None:
         super().initialize_kv_cache(kv_cache_config, is_profiling)
 
-        # patch start
-        if self.model_config.enable_return_routed_experts:
-            self.init_routed_experts_capturer()
-        # patch end
+        # Capturer initialization follows this method in the worker lifecycle.
+
+    def _bind_routed_experts_capturer(self, capturer) -> None:
+        """Publish the capturer to the NPU fused-MoE layers.
+
+        Native routers use the parent binding. NPU MoE layers retrieve the
+        same capturer through ``routed_experts_handle``.
+        """
+        super()._bind_routed_experts_capturer(capturer)
+        routed_experts_handle.publish_capturer(capturer)
 
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
