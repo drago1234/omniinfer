@@ -44,6 +44,7 @@ def _fake_proposer(attn_metadata):
     fake.inputs_embeds = torch.zeros(4, 2)
     fake.hidden_states = torch.zeros(4, 2)
     fake.model = MagicMock(return_value=torch.zeros(2, 2))
+    fake.mtp_exec_count = 0
 
     def _arange_positions(num_tokens):
         return torch.arange(num_tokens)
@@ -99,6 +100,109 @@ def test_eagle_dummy_run_without_metadata_skips_padding(monkeypatch):
     fake.build_per_group_and_layer_attn_metadata.assert_not_called()
     fake.model.assert_called_once()
 
+
+@pytest.mark.unit
+@pytest.mark.parametrize("method, expected", [("mtp", 3), ("eagle", 0)])
+def test_draft_dummy_run_counts_each_forward(monkeypatch, method, expected):
+    fake = _fake_proposer(None)
+    fake.method = method
+    fake.n_predict = 3
+    fake.num_speculative_tokens = 3
+    monkeypatch.setattr(eagle_mod, "set_forward_context", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        eagle_mod, "get_forward_context", lambda: SimpleNamespace(capturing=True)
+    )
+
+    EagleProposerPatch.dummy_run(fake, num_tokens=2, is_profile=True)
+
+    assert fake.model.call_count == 3
+    assert fake.mtp_exec_count == expected
+
+
+@pytest.mark.unit
+def test_draft_graph_capture_counts_each_forward(monkeypatch):
+    fake = _fake_proposer(None)
+    fake.method = "mtp"
+    fake.n_predict = 2
+    fake.num_speculative_tokens = 3
+    monkeypatch.setattr(eagle_mod, "set_forward_context", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        eagle_mod, "get_forward_context", lambda: SimpleNamespace(capturing=True)
+    )
+
+    EagleProposerPatch.dummy_run(fake, num_tokens=2, is_graph_capturing=True)
+
+    assert fake.model.call_count == 2
+    assert fake.mtp_exec_count == 2
+
+
+@pytest.mark.unit
+def test_draft_forward_counts_before_model_call():
+    fake = SimpleNamespace(
+        method="mtp",
+        mtp_exec_count=0,
+        model=MagicMock(side_effect=RuntimeError("forward failed")),
+    )
+    with pytest.raises(RuntimeError, match="forward failed"):
+        eagle_mod._forward_draft_model(fake, input_ids=None)
+    assert fake.mtp_exec_count == 1
+
+
+@pytest.mark.unit
+def test_draft_counter_starts_at_zero(monkeypatch):
+    def original_init(proposer, **_kwargs):
+        proposer.draft_model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(n_predict=1)
+        )
+        proposer.num_speculative_tokens = 3
+
+    monkeypatch.setattr(eagle_mod, "EagleProposer_original_init", original_init)
+    fake = SimpleNamespace(method="mtp")
+    config = SimpleNamespace(kv_transfer_config=None)
+    EagleProposerPatch.__init__(fake, config, torch.device("cpu"))
+    assert fake.mtp_exec_count == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("num_speculative_tokens", [1, 3])
+def test_mtp_proposal_counts_each_draft_forward(monkeypatch, num_speculative_tokens):
+    fake = _fake_proposer(None)
+    fake.method = "mtp"
+    fake.input_ids = torch.arange(4, dtype=torch.int32)
+    fake.n_predict = num_speculative_tokens
+    fake.allowed_attn_types = None
+    fake.parallel_drafting = False
+    fake.model_returns_tuple = lambda: False
+    fake.set_inputs_first_pass = MagicMock(
+        return_value=(2, torch.tensor([0]), SimpleNamespace(slot_mapping=torch.zeros(2)))
+    )
+    fake._save_and_change_target_input = MagicMock()
+    fake.build_model_inputs_first_pass = MagicMock(return_value=(
+        {"input_ids": None, "inputs_embeds": torch.zeros(2, 2)},
+        2,
+    ))
+    fake._get_slot_mapping = MagicMock(return_value=torch.zeros(2))
+    fake._sample_draft_tokens = MagicMock(return_value=(torch.tensor([9]), None))
+    monkeypatch.setattr(eagle_mod, "set_forward_context", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        eagle_mod, "get_forward_context", lambda: SimpleNamespace(capturing=True)
+    )
+
+    output = EagleProposerPatch.propose(
+        fake,
+        num_speculative_tokens=num_speculative_tokens,
+        target_token_ids=torch.zeros(2, dtype=torch.int64),
+        target_positions=torch.zeros(2, dtype=torch.int64),
+        target_hidden_states=torch.zeros(2, 2),
+        next_token_ids=torch.zeros(1, dtype=torch.int64),
+        token_indices_to_sample=torch.tensor([0]),
+        common_attn_metadata=SimpleNamespace(slot_mapping=torch.zeros(2)),
+        sampling_metadata=SimpleNamespace(),
+    )
+
+    assert output.shape == (1, num_speculative_tokens)
+    assert fake.model.call_count == num_speculative_tokens
+    assert fake.mtp_exec_count == num_speculative_tokens
 
 # --------------------------------------------------------------------------
 # draft attention groups: which one is the base, and what step0 passes down

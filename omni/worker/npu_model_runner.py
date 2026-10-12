@@ -331,9 +331,8 @@ class NPUModelRunner(GPUModelRunner):
         forward_context = get_forward_context()
         forward_context.capturing = False
         self._capture_dp_pad_target(forward_context)
-        if self.is_debugging_mode:
-            self.exec_count += 1
-            logger.debug(f"Executing model forward {self.exec_count=}")
+        self.exec_count += 1
+        logger.debug(f"Executing model forward {self.exec_count=}")
         return self.model(
             input_ids=input_ids,
             positions=positions,
@@ -1293,9 +1292,8 @@ class NPUModelRunner(GPUModelRunner):
                 # Idle DP ranks must use the same LMHead all-gather pad target
                 # as the active rank before entering dummy compute_logits.
                 self._capture_dp_pad_target(forward_context)
-                if self.is_debugging_mode:
-                    self.exec_count += 1
-                    logger.debug(f"Executing dummy forward {self.exec_count=}")
+                self.exec_count += 1
+                logger.debug(f"Executing dummy forward {self.exec_count=}")
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,

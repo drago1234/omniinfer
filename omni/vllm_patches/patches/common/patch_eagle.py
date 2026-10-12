@@ -60,6 +60,13 @@ class DraftAttnGroup:
     is_base: bool = False  # True for group containing attn_layer_names[0]
 
 
+def _forward_draft_model(proposer, **model_kwargs):
+    """Run one draft model forward, counting MTP draft executions."""
+    if getattr(proposer, "method", None) == "mtp":
+        proposer.mtp_exec_count = getattr(proposer, "mtp_exec_count", 0) + 1
+    return proposer.model(**model_kwargs)
+
+
 @register_patch("TorchEagleProposer", EagleProposer)
 class EagleProposerPatch(VLLMPatch):
     """Patch for vLLM's EagleProposer to support omni-npu compilation and execution.
@@ -93,6 +100,7 @@ class EagleProposerPatch(VLLMPatch):
             self, vllm_config=vllm_config, device=device, runner=runner
         )
         self.runner = runner
+        self.mtp_exec_count = 0
         self._draft_attn_layer_names: set[str] = set()
         self.attn_layer_names: list[str] = []
         self.use_cuda_graph = True
@@ -323,7 +331,7 @@ class EagleProposerPatch(VLLMPatch):
                 )
                 if self.method == "mtp" and self.n_predict > 1:
                     model_kwargs["spec_step_idx"] = fwd_idx
-                ret_hidden_states = self.model(**model_kwargs)
+                ret_hidden_states = _forward_draft_model(self, **model_kwargs)
 
                 # Mirror active rank's per-iter (forward, compute_logits)
                 # order so idle DP ranks stay lock-step on the DP collectives
@@ -923,7 +931,7 @@ class EagleProposerPatch(VLLMPatch):
         ):
             forward_context = get_forward_context()
             forward_context.capturing = False
-            ret_hidden_states = self.model(**model_kwargs)
+            ret_hidden_states = _forward_draft_model(self, **model_kwargs)
 
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
@@ -1153,7 +1161,7 @@ class EagleProposerPatch(VLLMPatch):
                     get_forward_context()
                 )
                 forward_context.capturing = False
-                ret_hidden_states = self.model(
+                ret_hidden_states = _forward_draft_model(self,
                     **model_kwargs
                 )
 
