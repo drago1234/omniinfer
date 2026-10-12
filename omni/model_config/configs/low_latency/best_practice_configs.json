@@ -350,6 +350,16 @@
         }
     },
     {
+        "model": "openpangu_v2_omni_30B",
+        "hardware": "A2",
+        "precision": "w8a8c16",
+        "configs": {
+            "hybrid": {
+                "config_file": "openpangu_v2/pangu_v2_moe_w8a8c16_a2_30B_hybrid.json"
+            }
+        }
+    },
+    {
         "model": "pangu_v2_moe_92B",
         "hardware": "A2",
         "precision": "w8a8c16",

@@ -183,6 +183,16 @@ class TestConfigLoaderUnit(unittest.TestCase):
         config = ModelOperatorOptConfig()
         self.assertFalse(config.lmhead_fp32)
 
+    def test_moe_init_routing_v2_default_and_override(self):
+        """MoeInitRoutingV2 stays opt-in and can be explicitly enabled."""
+        from omni_npu.model_config.config_loader.loader import ModelOperatorOptConfig
+
+        default_config = ModelOperatorOptConfig()
+        enabled_config = ModelOperatorOptConfig(enable_moe_init_routing_v2=True)
+
+        self.assertFalse(default_config.enable_moe_init_routing_v2)
+        self.assertTrue(enabled_config.enable_moe_init_routing_v2)
+
     def test_pr1_config_defaults_for_vit_sp_and_dispatch_combine(self):
         from omni_npu.model_config.config_loader.loader import (
             ModelOperatorOptConfig,

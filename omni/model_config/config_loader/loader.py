@@ -135,6 +135,7 @@ class ModelOperatorOptConfig:
     enable_kv_rmsnorm_rope_cache: bool = False
     enable_prefill_mla_absorb_pa: bool = False
     kv_nz: bool = False
+    enable_moe_init_routing_v2: bool = False
     gmm_nz: bool = True
     gmm_autotiling: bool = False
     lmhead_fp32: bool = False

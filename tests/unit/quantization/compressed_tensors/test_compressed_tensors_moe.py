@@ -433,10 +433,14 @@ def _make_w4a8_method(module, layer, *, asymmetric):
     )
 
 
-def _make_prepare_result(dynamic_scale=None, row_idx_type=0):
+def _make_prepare_result(dynamic_scale=None, row_idx_type=0, expert_tokens=None):
     return DummyPreparePermuteResult(
         hidden_states_sorted_by_experts=torch.ones(3, 4, dtype=torch.int8),
-        expert_tokens=torch.tensor([1, 2], dtype=torch.int64),
+        expert_tokens=(
+            torch.tensor([1, 2], dtype=torch.int64)
+            if expert_tokens is None
+            else expert_tokens
+        ),
         dynamic_scale=dynamic_scale,
         avg_tokens_per_expert=[1, 2],
         row_idx_type=row_idx_type,
@@ -866,6 +870,89 @@ def test_apply_experts_grouped_finalize_returns_intermediate_and_scale(
     assert output[1] is pertoken_scale
     assert len(grouped_calls) == 1
 
+
+def _run_apply_experts_capturing_kernel_kwargs(
+    compressed_moe_module, monkeypatch, *, use_ep, expert_tokens
+):
+    """Drive the quantized apply_experts path and capture every kernel kwarg."""
+    layer = MockMoELayer(use_ep=use_ep)
+    layer.quant_config = object()
+    method = _make_method(compressed_moe_module, layer)
+    method.create_weights(
+        layer=layer,
+        num_experts=2,
+        hidden_size=4,
+        intermediate_size_per_partition=3,
+        params_dtype=torch.float16,
+        weight_loader="mock_loader",
+    )
+    method.process_weights_after_loading(layer)
+
+    grouped_calls = []
+
+    def _fake_grouped_matmul(inputs, weights, **kwargs):
+        grouped_calls.append(kwargs)
+        if kwargs.get("output_dtype") == torch.int32:
+            return [torch.ones(inputs[0].shape[0], 6, dtype=torch.int32)]
+        return [torch.ones(inputs[0].shape[0], 4, dtype=torch.bfloat16)]
+
+    dequant_mock = MagicMock(
+        return_value=(
+            torch.ones(3, 3, dtype=torch.int8),
+            torch.ones(3, dtype=torch.float32),
+        )
+    )
+    monkeypatch.setattr(
+        compressed_moe_module.torch_npu, "npu_grouped_matmul", _fake_grouped_matmul
+    )
+    monkeypatch.setattr(
+        compressed_moe_module.torch_npu, "npu_dequant_swiglu_quant", dequant_mock
+    )
+
+    method.apply_experts(
+        layer,
+        _make_prepare_result(
+            dynamic_scale=torch.ones(1, 3), expert_tokens=expert_tokens
+        ),
+    )
+    return grouped_calls, dequant_mock
+
+
+def test_apply_experts_tp_only_reads_expert_tokens_as_cumsum(
+    compressed_moe_module, monkeypatch
+):
+    """TP-only expert_tokens is a cumsum: group_list_type must drop to 0.
+
+    fused_experts_tp feeds npu_moe_compute_expert_tokens output, which is a
+    cumulative sum. Reading it as per-expert counts (group_list_type=1) makes
+    the GMM group sizes sum to many more rows than exist.
+    """
+    cumsum = torch.tensor([2, 5], dtype=torch.int64)
+    grouped_calls, dequant_mock = _run_apply_experts_capturing_kernel_kwargs(
+        compressed_moe_module, monkeypatch, use_ep=False, expert_tokens=cumsum
+    )
+
+    assert [kwargs["group_list_type"] for kwargs in grouped_calls] == [0, 0]
+    assert all(kwargs["group_list"] is cumsum for kwargs in grouped_calls)
+    # npu_dequant_swiglu_quant only takes counts for group_index.
+    group_index = dequant_mock.call_args.kwargs["group_index"]
+    assert group_index.tolist() == [2, 3]
+    assert group_index is not cumsum
+
+
+def test_apply_experts_ep_keeps_count_convention(
+    compressed_moe_module, monkeypatch
+):
+    """The EP path publishes counts, so group_index passes through unchanged."""
+    counts = torch.tensor([2, 3], dtype=torch.int64)
+    grouped_calls, dequant_mock = _run_apply_experts_capturing_kernel_kwargs(
+        compressed_moe_module, monkeypatch, use_ep=True, expert_tokens=counts
+    )
+
+    assert [kwargs["group_list_type"] for kwargs in grouped_calls] == [1, 1]
+    assert dequant_mock.call_args.kwargs["group_index"] is counts
+
+
 def test_apply_with_ep_returns_tuple_when_shared_experts_enabled(
     compressed_moe_module, monkeypatch
 ):
@@ -902,6 +989,155 @@ def test_apply_with_ep_returns_tuple_when_shared_experts_enabled(
     shared_output, routed_output = output
     assert torch.equal(shared_output, torch.full((3, 4), 2.0))
     assert torch.equal(routed_output, torch.full((3, 4), 5.0))
+
+
+def test_apply_without_ep_returns_tuple_when_shared_experts_enabled(
+    compressed_moe_module,
+):
+    """``use_ep`` is False whenever tp_size * dp_size == 1, so single-card runs
+    take the TP-only path. It must keep the same (shared, routed) contract as
+    the EP path.
+    """
+    layer = MockMoELayer(use_ep=False)
+    layer.quant_config = object()
+    layer.shared_experts = lambda x: torch.full_like(x, 2.0)
+    layer.shared_experts.gate_up_proj = SimpleNamespace(
+        tp_size=1, weight=torch.zeros(1, dtype=torch.float32)
+    )
+    layer.shared_experts.down_proj = SimpleNamespace(
+        tp_size=1, weight=torch.zeros(1, dtype=torch.float32)
+    )
+
+    method = _make_method(compressed_moe_module, layer)
+    compressed_moe_module.fused_experts_tp.return_value = torch.full((3, 4), 3.0)
+    # Without an EP group there is nothing to communicate with, and selecting a
+    # strategy would instantiate an EP strategy object on the side.
+    method.select_communication_strategy = MagicMock(
+        side_effect=AssertionError("strategy selector used without EP")
+    )
+
+    hidden_states = torch.randn(3, 4, dtype=torch.bfloat16)
+    router_logits = torch.randn(3, 2, dtype=torch.float32)
+    output = method.apply(
+        layer=layer,
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        top_k=1,
+        renormalize=False,
+    )
+
+    assert isinstance(output, tuple)
+    shared_output, routed_output = output
+    assert torch.equal(shared_output, torch.full((3, 4), 2.0))
+    assert torch.equal(routed_output, torch.full((3, 4), 3.0))
+    assert method.select_communication_strategy.call_count == 0
+
+    call = compressed_moe_module.fused_experts_tp.call_args
+    assert call.kwargs["x"] is hidden_states
+    assert torch.equal(call.kwargs["topk_ids"], torch.zeros(3, 1, dtype=torch.int64))
+    assert torch.equal(call.kwargs["topk_weights"], torch.ones(3, 1))
+
+
+def test_apply_without_ep_all_reduces_tp_shared_expert_output(
+    compressed_moe_module, monkeypatch
+):
+    """TP-sharded shared experts consume full input and all-reduce output."""
+    layer = MockMoELayer(use_ep=False)
+    layer.quant_config = object()
+    shared_experts = MagicMock(
+        side_effect=lambda x: torch.full_like(x, 2.0)
+    )
+    shared_experts.gate_up_proj = SimpleNamespace(
+        tp_size=2, weight=torch.zeros(1, dtype=torch.float32)
+    )
+    shared_experts.down_proj = SimpleNamespace(
+        tp_size=2, weight=torch.zeros(1, dtype=torch.float32)
+    )
+    layer.shared_experts = shared_experts
+
+    method = _make_method(compressed_moe_module, layer)
+    routed = torch.full((3, 4), 3.0, dtype=torch.bfloat16)
+    compressed_moe_module.fused_experts_tp.return_value = routed
+    reduced_shared = torch.full((3, 4), 4.0, dtype=torch.bfloat16)
+    all_reduce = MagicMock(return_value=reduced_shared)
+    monkeypatch.setattr(
+        compressed_moe_module,
+        "tensor_model_parallel_all_reduce",
+        all_reduce,
+    )
+
+    hidden_states = torch.randn(3, 4, dtype=torch.bfloat16)
+    output = method.apply(
+        layer=layer,
+        hidden_states=hidden_states,
+        router_logits=torch.randn(3, 2, dtype=torch.float32),
+        top_k=1,
+        renormalize=False,
+    )
+
+    assert isinstance(output, tuple)
+    shared_output, routed_output = output
+    assert shared_output is reduced_shared
+    assert routed_output is routed
+    assert shared_experts.call_count == 1
+    assert shared_experts.call_args.args[0] is hidden_states
+    assert all_reduce.call_count == 1
+    assert torch.equal(
+        all_reduce.call_args.args[0],
+        torch.full_like(hidden_states, 2.0),
+    )
+
+
+def test_apply_without_ep_returns_bare_tensor_without_shared_experts(
+    compressed_moe_module,
+):
+    layer = MockMoELayer(use_ep=False)
+    layer.quant_config = object()
+    method = _make_method(compressed_moe_module, layer)
+    routed = torch.full((3, 4), 3.0)
+    compressed_moe_module.fused_experts_tp.return_value = routed
+
+    output = method.apply(
+        layer=layer,
+        hidden_states=torch.randn(3, 4, dtype=torch.bfloat16),
+        router_logits=torch.randn(3, 2, dtype=torch.float32),
+        top_k=1,
+        renormalize=False,
+    )
+
+    assert not isinstance(output, tuple)
+    assert torch.equal(output, routed)
+
+
+def test_apply_without_ep_gathers_routed_output_when_tokens_are_sliced(
+    compressed_moe_module, monkeypatch
+):
+    """TP without EP slices tokens per rank, so the routed output has to be
+    gathered back to the original token count.
+    """
+    layer = MockMoELayer(use_ep=False)
+    layer.quant_config = object()
+    method = _make_method(compressed_moe_module, layer)
+    method.tp_size = 2
+    method.tp_rank = 0
+    compressed_moe_module.fused_experts_tp.return_value = torch.full((2, 4), 3.0)
+    monkeypatch.setattr(
+        compressed_moe_module,
+        "tensor_model_parallel_all_gather",
+        lambda x, dim=0: torch.cat([x, x], dim=0),
+    )
+
+    output = method.apply(
+        layer=layer,
+        hidden_states=torch.randn(3, 4, dtype=torch.bfloat16),
+        router_logits=torch.randn(3, 2, dtype=torch.float32),
+        top_k=1,
+        renormalize=False,
+    )
+
+    assert output.shape == (3, 4)
+    # 3 tokens padded up to 4, then split across 2 ranks.
+    assert compressed_moe_module.fused_experts_tp.call_args.kwargs["x"].shape == (2, 4)
 
 
 def test_apply_passes_grouped_finalize_flag_for_agrs_decode(compressed_moe_module):

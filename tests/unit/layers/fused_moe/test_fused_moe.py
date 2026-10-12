@@ -25,6 +25,7 @@ def fused_module(monkeypatch):
     torch_npu.npu_moe_gating_top_k_softmax = MagicMock()
     torch_npu.npu_moe_finalize_routing = MagicMock(side_effect=lambda *args, **kwargs: args[0])
     torch_npu.npu_moe_init_routing = MagicMock()
+    torch_npu.npu_moe_init_routing_v2 = MagicMock()
     torch_npu.npu_moe_compute_expert_tokens = MagicMock()
     torch_npu.npu_dynamic_quant = MagicMock()
     torch_npu.npu_dynamic_mx_quant = MagicMock()
@@ -180,8 +181,104 @@ def test_fused_experts_tp_no_quant(fused_module):
         topk_weights=torch.ones(3, 1),
     )
 
+    stubs.torch_npu.npu_moe_init_routing.assert_called_once()
+    stubs.torch_npu.npu_moe_init_routing_v2.assert_not_called()
+    stubs.torch_npu.npu_moe_compute_expert_tokens.assert_called_once()
     layer.quant_method.apply_experts.assert_called_once()
+    finalize_call = stubs.torch_npu.npu_moe_finalize_routing.call_args
+    assert "drop_pad_mode" not in finalize_call.kwargs
     assert torch.equal(output, torch.full((3, 2), 6.0))
+
+
+@pytest.mark.unit
+def test_fused_experts_tp_uses_routing_v2(fused_module, monkeypatch):
+    module, stubs = fused_module
+    monkeypatch.setattr(
+        module.model_extra_config.operator_opt_config,
+        "enable_moe_init_routing_v2",
+        True,
+    )
+    layer = _moe_layer(
+        global_num_experts=4,
+        quant_config=object(),
+        quant_method=MagicMock(),
+    )
+    x = torch.ones(3, 2)
+    topk_ids = torch.zeros(3, 1, dtype=torch.int64)
+    topk_weights = torch.ones(3, 1)
+    sorted_tokens = torch.ones(3, 2)
+    expanded_src_to_dst_row = torch.tensor(
+        [[0], [1], [2]],
+        dtype=torch.int32,
+    )
+    expert_tokens = torch.tensor([1, 2, 3, 3], dtype=torch.int64)
+    routing_map = torch.empty(0, dtype=torch.int32)
+    stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
+        sorted_tokens,
+        expanded_src_to_dst_row,
+        expert_tokens,
+        routing_map,
+    )
+    stubs.torch_npu.npu_dynamic_quant.return_value = (
+        sorted_tokens,
+        torch.ones(3),
+    )
+    expert_output = torch.full((3, 2), 5.0)
+    layer.quant_method.apply_experts.return_value = expert_output
+    finalized_output = torch.full((3, 2), 6.0)
+    stubs.torch_npu.npu_moe_finalize_routing.side_effect = None
+    stubs.torch_npu.npu_moe_finalize_routing.return_value = finalized_output
+
+    output = module.fused_experts_tp(
+        layer=layer,
+        x=x,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+    )
+
+    stubs.torch_npu.npu_moe_init_routing_v2.assert_called_once()
+    stubs.torch_npu.npu_moe_init_routing.assert_not_called()
+    stubs.torch_npu.npu_moe_compute_expert_tokens.assert_not_called()
+
+    init_call = stubs.torch_npu.npu_moe_init_routing_v2.call_args
+    assert init_call.args == (x,)
+    assert init_call.kwargs["expert_num"] == 4
+    assert init_call.kwargs["active_expert_range"] == [0, 4]
+    assert init_call.kwargs["expert_tokens_num_type"] == 0
+    assert init_call.kwargs["expert_tokens_num_flag"] is True
+    assert init_call.kwargs["active_num"] == topk_ids.numel()
+    assert init_call.kwargs["drop_pad_mode"] == 0
+    assert init_call.kwargs["row_idx_type"] == 0
+    assert init_call.kwargs["quant_mode"] == -1
+    assert init_call.kwargs["expert_idx"].dtype == torch.int32
+
+    apply_call = layer.quant_method.apply_experts.call_args
+    prepare_result = apply_call.kwargs["prepare_permute_result"]
+    assert torch.equal(
+        prepare_result.hidden_states_sorted_by_experts,
+        sorted_tokens,
+    )
+    assert torch.equal(prepare_result.expert_tokens, expert_tokens)
+
+    finalize_call = stubs.torch_npu.npu_moe_finalize_routing.call_args
+    assert torch.equal(finalize_call.args[0], expert_output.unsqueeze(0))
+    assert finalize_call.kwargs["skip1"] is None
+    assert finalize_call.kwargs["skip2"] is None
+    assert finalize_call.kwargs["bias"] is None
+    assert finalize_call.kwargs["drop_pad_mode"] == 3
+    assert torch.equal(
+        finalize_call.kwargs["scales"],
+        topk_weights.to(expert_output.dtype),
+    )
+    assert torch.equal(
+        finalize_call.kwargs["expanded_src_to_dst_row"],
+        expanded_src_to_dst_row,
+    )
+    assert finalize_call.kwargs["export_for_source_row"].dtype == torch.int32
+    assert torch.equal(
+        output,
+        finalized_output.to(module.model_extra_config.dtype),
+    )
 
 
 @pytest.mark.unit
