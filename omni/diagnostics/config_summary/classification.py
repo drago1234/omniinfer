@@ -162,6 +162,7 @@ RUNTIME_FIELD_EXCLUDE = frozenset({
     "ReasoningConfig._reasoning_end_token_ids",
     "ReasoningConfig._tool_call_start_token_id",
     "ReasoningConfig._tool_call_end_token_id",
+    "ReasoningConfig._sequence_end_token_ids",
 })
 
 # Object-valued attributes that are *known config carriers*: the adapter chain

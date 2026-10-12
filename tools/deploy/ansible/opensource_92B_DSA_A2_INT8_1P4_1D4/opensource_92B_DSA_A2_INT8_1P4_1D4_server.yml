@@ -98,7 +98,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --enable-lopt --lopt-pool-size 16"
         EXTRA_ARGS="${EXTRA_ARGS} --lopt-chunk-size 4096"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-log-requests --enable-log-outputs --enable-logging-iteration-details"
-        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
+        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","ban_sequence_end_in_thinking":true}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
       args:
         - --max-model-len 524288
@@ -157,7 +157,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --enable-lopt --lopt-pool-size 16"
         EXTRA_ARGS="${EXTRA_ARGS} --lopt-chunk-size 4096"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-log-requests --enable-logging-iteration-details"
-        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
+        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","ban_sequence_end_in_thinking":true}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
       args:
         - --max-model-len 524288
