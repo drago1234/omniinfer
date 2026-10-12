@@ -79,6 +79,7 @@
         export RAY_CGRAPH_get_timeout=7200
         export OMNI_PIGGYBACK_INPUT_IDS=1
         export OMNI_SKIP_DECODE_TOKENIZE=0
+        export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
         EXTRA_ARGS="--no-disable-hybrid-kv-cache-manager --max-num-batched-tokens 4096"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-expert-parallel --max-num-seqs 4"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prompt-tokens-details --enable-chunked-prefill"
