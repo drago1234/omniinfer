@@ -11,7 +11,9 @@ When a queued step schedules no real tokens, the idle rank submits its dummy
 batch asynchronously before draining the queued output. The dummy future is
 waited only after ``Scheduler.update_from_output()``, and before the global
 unfinished-request sync, so dummy execution can overlap host-side output drain
-without crossing into the next engine step.
+without crossing into the next engine step. On a TP1/PP1 Decode node, the
+control-batch path instead waits before that one scheduler update and merges
+completions received during dummy execution into the control output.
 """
 
 import time
@@ -25,7 +27,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 
-def _start_dummy_batch_async(engine: DPEngineCoreProc) -> Any | None:
+def _start_dummy_batch_async(engine: DPEngineCoreProc, *, poll_kv: bool = False) -> Any | None:
     if engine.model_executor.is_sleeping:
         return None
 
@@ -34,12 +36,27 @@ def _start_dummy_batch_async(engine: DPEngineCoreProc) -> Any | None:
     output_rank = getattr(executor, "output_rank", None)
     if output_rank is not None:
         kwargs["unique_reply_rank"] = output_rank
-    return executor.collective_rpc("execute_dummy_batch", **kwargs)
+    method = "execute_dummy_batch_and_poll_kv" if poll_kv else "execute_dummy_batch"
+    return executor.collective_rpc(method, **kwargs)
 
 
-def _wait_future(future: Any | None) -> None:
+def _wait_future(future: Any | None) -> Any:
     if future is not None and hasattr(future, "result"):
-        future.result()
+        return future.result()
+    return None
+
+
+def _can_poll_kv_after_dummy(engine, batch_queue) -> bool:
+    config = engine.vllm_config
+    kv = config.kv_transfer_config
+    parallel = config.parallel_config
+    return (
+        kv is not None and kv.kv_role == "kv_consumer"
+        and parallel.tensor_parallel_size == 1
+        and parallel.pipeline_parallel_size == 1
+        and bool(batch_queue)
+        and batch_queue[-1][1].total_num_scheduled_tokens == 0
+    )
 
 
 def _mark_dummy_submitted(engine: DPEngineCoreProc, future: Any | None) -> None:
@@ -116,11 +133,16 @@ class StepWithBatchQueueAsyncDummyDPEnginePatch(VLLMPatch):
             return None, False
 
         dummy_future = None
+        poll_after_dummy = False
         # After a wave ends, drain queued outputs without starting collectives.
         # For new local work, let the outer loop decide after output updates.
         if not model_executed and self.engines_running:
             with self.log_iteration_details(None):
-                dummy_future = _start_dummy_batch_async(self)
+                poll_after_dummy = _can_poll_kv_after_dummy(self, batch_queue)
+                dummy_future = (
+                    _start_dummy_batch_async(self, poll_kv=True)
+                    if poll_after_dummy else _start_dummy_batch_async(self)
+                )
             _yield_after_dummy_submit(self, dummy_future)
 
         future, scheduler_output, exec_model_fut = batch_queue.pop()
@@ -132,6 +154,15 @@ class StepWithBatchQueueAsyncDummyDPEnginePatch(VLLMPatch):
             if model_output is None:
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+
+        if poll_after_dummy:
+            # A control output was produced before dummy execution. Include KV
+            # that completed during dummy in this step's ONE normal update.
+            # This also keeps invalid-block recovery ahead of completion.
+            from omni_npu.connector.late_kv_completion import merge_llmdatadist_reply
+            model_output = merge_llmdatadist_reply(
+                model_output, _wait_future(dummy_future)
+            )
 
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
@@ -151,7 +182,8 @@ class StepWithBatchQueueAsyncDummyDPEnginePatch(VLLMPatch):
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
-        _wait_future(dummy_future)
+        if not poll_after_dummy:
+            _wait_future(dummy_future)
         _mark_dummy_submitted(self, dummy_future)
 
         return engine_core_outputs, model_executed
