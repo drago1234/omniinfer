@@ -1049,3 +1049,215 @@ def test_apply_uses_fp32_input_when_gate_weight_is_fp32(
 
     assert len(gate.inputs) == 1
     assert gate.inputs[0].dtype == torch.float32
+
+
+# Routed-experts capture
+
+
+class _RecordingCapturer:
+    """Record captured routing data."""
+
+    def __init__(self):
+        self.calls = []
+
+    def capture(self, layer_id, topk_ids):
+        self.calls.append((layer_id, topk_ids.clone()))
+
+
+def _routed_experts_layer(*, layer_id=3):
+    """Build a minimal routed-experts layer."""
+    return SimpleNamespace(layer_id=layer_id)
+
+
+def _run_capture(module, layer, topk_ids, *, is_need_slice, orig_num_tokens):
+    method = module.NPUUnquantizedFusedMoEMethod.__new__(
+        module.NPUUnquantizedFusedMoEMethod
+    )
+    method._maybe_capture_routed_experts(
+        layer,
+        topk_ids,
+        is_need_slice=is_need_slice,
+        orig_num_tokens=orig_num_tokens,
+    )
+
+
+@pytest.fixture
+def bound_capturer(layer_module):
+    """Publish a recording capturer for the test."""
+    module, _, _ = layer_module
+    capturer = _RecordingCapturer()
+    module.routed_experts_handle.publish_capturer(capturer)
+    yield capturer
+    module.routed_experts_handle.clear_capturer()
+
+
+def test_capture_no_op_when_capturer_unbound(layer_module):
+    """Capture is a no-op before a capturer is bound."""
+    module, _, _ = layer_module
+    module.routed_experts_handle.clear_capturer()
+
+    def _boom(tensor, dim=0):  # pragma: no cover - must not run
+        raise AssertionError("all_gather must not be reached")
+
+    module.tensor_model_parallel_all_gather = _boom
+    try:
+        _run_capture(
+            module,
+            _routed_experts_layer(),
+            torch.zeros((4, 2), dtype=torch.int32),
+            is_need_slice=True,
+            orig_num_tokens=4,
+        )
+    finally:
+        del module.tensor_model_parallel_all_gather
+
+
+def test_capture_forwards_topk_ids_unchanged_when_not_sliced(
+    layer_module, bound_capturer
+):
+    module, _, _ = layer_module
+    topk_ids = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
+    _run_capture(
+        module,
+        _routed_experts_layer(layer_id=7),
+        topk_ids,
+        is_need_slice=False,
+        orig_num_tokens=3,
+    )
+
+    assert len(bound_capturer.calls) == 1
+    layer_id, captured = bound_capturer.calls[0]
+    assert layer_id == 7
+    torch.testing.assert_close(captured, topk_ids)
+
+
+def test_capture_restores_tp_slice(layer_module, bound_capturer, monkeypatch):
+    """Gather and trim explicitly sharded TP routing data."""
+    module, _, _ = layer_module
+    shard = torch.tensor([[1, 1], [2, 2]], dtype=torch.int32)
+    full = torch.tensor(
+        [[1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6]], dtype=torch.int32
+    )
+
+    gathered = []
+
+    def _fake_all_gather(tensor, dim=0):
+        gathered.append((tensor, dim))
+        return full
+
+    monkeypatch.setattr(
+        module, "tensor_model_parallel_all_gather", _fake_all_gather
+    )
+
+    # 5 real tokens, padded to 6 by the ceil-div split across TP=3.
+    _run_capture(
+        module,
+        _routed_experts_layer(),
+        shard,
+        is_need_slice=True,
+        orig_num_tokens=5,
+    )
+
+    assert len(gathered) == 1, "expected exactly one all_gather"
+    assert gathered[0][0] is shard
+    assert gathered[0][1] == 0, "must gather along the token dim"
+
+    assert len(bound_capturer.calls) == 1
+    _, captured = bound_capturer.calls[0]
+    assert captured.shape[0] == 5, "ceil-div padding row must be trimmed"
+    torch.testing.assert_close(captured, full[:5])
+
+
+@pytest.mark.parametrize(
+    ("shard", "full"),
+    [
+        (
+            torch.tensor([[1, 1], [2, 2]], dtype=torch.int32),
+            torch.tensor(
+                [[1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6]],
+                dtype=torch.int32,
+            ),
+        ),
+        (
+            torch.tensor([[7, 8]], dtype=torch.int32),
+            torch.tensor([[7, 8], [0, 0], [0, 0]], dtype=torch.int32),
+        ),
+    ],
+    ids=["prefill", "single-token-decode"],
+)
+def test_capture_restores_sequence_parallel_shard_for_single_dp(
+    layer_module, bound_capturer, monkeypatch, shard, full
+):
+    """Restore sequence-parallel routing without DP metadata."""
+    module, _, context_holder = layer_module
+    module.model_extra_config.parall_config.ena_seq_parallel = True
+    context_holder.dp_metadata = None
+
+    gathered = []
+
+    def _fake_all_gather(tensor, dim=0):
+        gathered.append((tensor, dim))
+        return full
+
+    monkeypatch.setattr(
+        module, "tensor_model_parallel_all_gather", _fake_all_gather
+    )
+    method = module.NPUUnquantizedFusedMoEMethod.__new__(
+        module.NPUUnquantizedFusedMoEMethod
+    )
+    method.tp_size = 3
+    method._maybe_capture_routed_experts(
+        _routed_experts_layer(),
+        shard,
+        is_need_slice=False,
+        orig_num_tokens=shard.shape[0],
+    )
+
+    assert gathered == [(shard, 0)]
+    _, captured = bound_capturer.calls[0]
+    torch.testing.assert_close(captured, full)
+
+
+def test_capture_leaves_sequence_parallel_gather_to_upstream_for_multi_dp(
+    layer_module, bound_capturer, monkeypatch
+):
+    """When DP metadata exists, upstream capture owns SP aggregation."""
+    module, _, context_holder = layer_module
+    module.model_extra_config.parall_config.ena_seq_parallel = True
+    context_holder.dp_metadata = SimpleNamespace()
+    shard = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+
+    def _boom(tensor, dim=0):  # pragma: no cover - must not run
+        raise AssertionError("NPU capture must not double-gather")
+
+    monkeypatch.setattr(module, "tensor_model_parallel_all_gather", _boom)
+    method = module.NPUUnquantizedFusedMoEMethod.__new__(
+        module.NPUUnquantizedFusedMoEMethod
+    )
+    method.tp_size = 2
+    method._maybe_capture_routed_experts(
+        _routed_experts_layer(),
+        shard,
+        is_need_slice=False,
+        orig_num_tokens=shard.shape[0],
+    )
+
+    _, captured = bound_capturer.calls[0]
+    torch.testing.assert_close(captured, shard)
+
+
+def test_capture_fires_when_layer_has_no_config(layer_module, bound_capturer):
+    """A bound capturer does not require layer-level configuration."""
+    module, _, _ = layer_module
+    topk_ids = torch.tensor([[9, 8], [7, 6]], dtype=torch.int32)
+    _run_capture(
+        module,
+        _routed_experts_layer(layer_id=11),
+        topk_ids,
+        is_need_slice=False,
+        orig_num_tokens=2,
+    )
+    assert len(bound_capturer.calls) == 1
+    layer_id, captured = bound_capturer.calls[0]
+    assert layer_id == 11
+    torch.testing.assert_close(captured, topk_ids)

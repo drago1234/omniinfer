@@ -24,14 +24,12 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    RoutedExpertsCapturer,
-)
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from omni_npu.compilation.acl_graph import set_aclgraph_recapture
+from omni_npu.layers.fused_moe import routed_experts_handle
 from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp, fused_experts_tp_with_shared
 from omni_npu.layers.fused_moe.fused_moe_method_base import NPUFusedMoEMethodBase
 from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import PreparePermuteOptions, PreparePermuteResult
@@ -162,6 +160,14 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
             topk_ids = topk_ids.gather(dim=-1, index=sorted_indices).contiguous()
             topk_weights = topk_weights.gather(dim=-1, index=sorted_indices).contiguous()
 
+        # Capture before the non-EP path returns early.
+        self._maybe_capture_routed_experts(
+            layer,
+            topk_ids,
+            is_need_slice=is_need_slice,
+            orig_num_tokens=orig_num_tokens,
+        )
+
         # TODO: Support TP-only mode
         if not moe_parallel_config.use_ep:
             if self.on_ascend950:
@@ -176,16 +182,6 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
             )
-
-        if (
-            getattr(layer, "vllm_config", None) is not None
-            and layer.vllm_config.model_config is not None
-            and getattr(layer.vllm_config.model_config, "enable_return_routed_experts", False)
-        ):
-            # In dummy/profile runs the capturer may not be initialized yet.
-            capturer = RoutedExpertsCapturer.get_instance()
-            if capturer is not None:
-                capturer.capture(layer_id=layer.layer_id, topk_ids=topk_ids)
 
         prepare_permute_result = self.apply_prepare_permute(
             strategy_impl, layer, x_slice, topk_ids,
@@ -272,6 +268,48 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
             return shared_output, routed_output
         
         return routed_output
+
+    def _maybe_capture_routed_experts(
+        self,
+        layer: torch.nn.Module,
+        topk_ids: torch.Tensor,
+        *,
+        is_need_slice: bool,
+        orig_num_tokens: int,
+    ) -> None:
+        """Capture routing decisions, restoring TP-sharded tokens first.
+
+        Capturer availability indicates whether capture is enabled and ready.
+        Gather explicit TP slices here. For sequence parallelism, gather only
+        without DP metadata; otherwise ``capturer.capture`` owns the gather.
+        All TP ranks must take the same collective path.
+        """
+        capturer = routed_experts_handle.get_capturer()
+        if capturer is None:
+            return
+
+        forward_ctx = get_forward_context()
+        sequence_parallel = (
+            model_extra_config.parall_config.ena_seq_parallel
+            or getattr(
+                getattr(layer, "moe_config", None),
+                "is_sequence_parallel",
+                False,
+            )
+        )
+        gather_sequence_parallel_shard = (
+            getattr(self, "tp_size", 1) > 1
+            and sequence_parallel
+            and getattr(forward_ctx, "dp_metadata", None) is None
+        )
+
+        if is_need_slice or gather_sequence_parallel_shard:
+            topk_ids = tensor_model_parallel_all_gather(topk_ids, dim=0)
+            if is_need_slice:
+                # Remove padding introduced by the explicit TP split.
+                topk_ids = topk_ids[:orig_num_tokens]
+
+        capturer.capture(layer_id=layer.layer_id, topk_ids=topk_ids)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
