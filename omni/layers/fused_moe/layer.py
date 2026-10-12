@@ -78,10 +78,6 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
-        enable_eplb: bool = False,
-        expert_load_view: Optional[torch.Tensor] = None,
-        logical_to_physical_map: Optional[torch.Tensor] = None,
-        logical_replica_count: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
 
         orig_num_tokens = hidden_states.shape[0]
@@ -414,12 +410,31 @@ class NPUFusedMoERunner(MoERunner):
 
         return topk_weights, topk_ids
 
+    def set_eplb_state(
+        self,
+        moe_layer_idx: int,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ):
+        super().set_eplb_state(
+            moe_layer_idx,
+            expert_load_view,
+            logical_to_physical_map,
+            logical_replica_count,
+        )
+        eplb_state = self.router.eplb_state
+        if eplb_state is not None:
+            eplb_state.refresh_replica_table()
+
 
 @RoutedExperts.register_oot
 class NPURoutedExperts(RoutedExperts):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.quant_method.make_communication_strategy_selector(self)
+
+    # NPU-EPLB: get_expert_weights 沿用父类实现；RawTensor 包装在 HixlEplbCommunicator 里做
 
     def weight_loader(
         self,
@@ -442,24 +457,6 @@ class NPURoutedExperts(RoutedExperts):
 
         if is_weight_transposed:
             param.data = param.data.transpose(1, 2)
-
-        ep_rank = get_ep_group().rank_in_group
-        enable_eplb = getattr(
-            self, "enable_eplb", self.moe_config.moe_parallel_config.enable_eplb
-        )
-
-        if enable_eplb:
-            exists_locally, local_pos = (
-                self.quant_method.planner.is_expert_on_current_rank(
-                    self.quant_method.moe_layer_idx,
-                    expert_id,
-                    ep_rank,
-                    self.local_num_experts,
-                )
-            )
-            if not exists_locally:
-                return False if return_success else None
-            expert_id = local_pos + self.local_num_experts * ep_rank
 
         if (
             "weight_bias" in weight_name
@@ -564,7 +561,6 @@ def _npu_moe_apply(self, hidden_states: torch.Tensor, router_logits: torch.Tenso
         e_score_correction_bias=self.routed_experts.e_score_correction_bias,
         activation=self.routed_experts.activation.value,
         apply_router_weight_on_input=self.routed_experts.apply_router_weight_on_input,
-        enable_eplb=self.moe_config.moe_parallel_config.enable_eplb,
     )
 
 
