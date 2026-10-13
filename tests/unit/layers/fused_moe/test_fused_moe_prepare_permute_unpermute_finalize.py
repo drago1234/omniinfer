@@ -1013,6 +1013,7 @@ def test_dispatch_prepare_permute_mxfp_disables_dispatch_quant(
         local_num_experts=2,
         quant_config=object(),
         quant_method=SimpleNamespace(
+            quant_config=SimpleNamespace(enable_mxfp8_comm_quant=False),
             moe_quant_config=SimpleNamespace(
                 use_mxfp8_w8a8=use_mxfp8_w8a8,
                 use_mxfp4_w4a8=use_mxfp4_w4a8,
@@ -1088,6 +1089,83 @@ def test_dispatch_prepare_permute_hifloat8_casts_and_clears_scale(prepare_module
     )
     assert torch.equal(result.hidden_states_sorted_by_experts, cast_x)
     assert result.dynamic_scale is None
+
+
+@pytest.mark.parametrize(
+    ("use_mxfp8_w8a8", "use_mxfp4_w4a8"),
+    [(True, False), (False, True)],
+)
+def test_dispatch_prepare_permute_mxfp_communication_quant(
+    prepare_module,
+    monkeypatch,
+    use_mxfp8_w8a8,
+    use_mxfp4_w4a8,
+):
+    module, stubs = prepare_module
+    monkeypatch.setattr(module, "on_ascend950", lambda: True)
+    layer = _moe_layer(
+        global_num_experts=4,
+        local_num_experts=2,
+        quant_config=object(),
+        quant_method=SimpleNamespace(
+            quant_config=SimpleNamespace(enable_mxfp8_comm_quant=True),
+            moe_quant_config=SimpleNamespace(
+                use_mxfp8_w8a8=use_mxfp8_w8a8,
+                use_mxfp4_w4a8=use_mxfp4_w4a8,
+            ),
+        ),
+    )
+    stubs.context_holder.attn_metadata = {
+        0: SimpleNamespace(decode=SimpleNamespace(mc2_mask=torch.tensor([1, 1], dtype=torch.bool)))
+    }
+    expand_x = torch.ones(2, 3)
+    dynamic_scale = torch.ones(2, 1, dtype=torch.uint8)
+    recv_counts = torch.tensor([1, 1], dtype=torch.int32)
+    stubs.torch_npu.npu_moe_distribute_dispatch_v2.return_value = (
+        expand_x,
+        dynamic_scale,
+        torch.zeros(2, dtype=torch.int32),
+        torch.tensor([1, 1], dtype=torch.int32),
+        recv_counts,
+        recv_counts,
+    )
+
+    result = module.DispatchCombinePrepPmtAndUnpmtFinal(layer).prepare_permute(
+        layer=layer,
+        x=torch.ones(2, 3),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int32),
+    )
+
+    kwargs = stubs.torch_npu.npu_moe_distribute_dispatch_v2.call_args.kwargs
+    assert kwargs["quant_mode"] == 4
+    assert kwargs["y_dtype"] is torch.float8_e4m3fn
+    assert result.hidden_states_sorted_by_experts is expand_x
+    assert result.dynamic_scale is dynamic_scale
+
+
+def test_dispatch_prepare_permute_mxfp_communication_quant_requires_ascend950(
+    prepare_module,
+    monkeypatch,
+):
+    module, stubs = prepare_module
+    monkeypatch.setattr(module, "on_ascend950", lambda: False)
+    layer = _moe_layer(
+        global_num_experts=4,
+        local_num_experts=2,
+        quant_config=object(),
+        quant_method=SimpleNamespace(
+            quant_config=SimpleNamespace(enable_mxfp8_comm_quant=True),
+            moe_quant_config=SimpleNamespace(use_mxfp8_w8a8=True),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="requires Ascend 950"):
+        module.DispatchCombinePrepPmtAndUnpmtFinal(layer).prepare_permute(
+            layer=layer,
+            x=torch.ones(2, 3),
+            topk_ids=torch.zeros(2, 1, dtype=torch.int32),
+        )
+    stubs.torch_npu.npu_moe_distribute_dispatch_v2.assert_not_called()
 
 
 def test_dispatch_unpermute_finalize_passes_counts_and_mask(prepare_module):

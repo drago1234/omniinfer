@@ -361,14 +361,25 @@ def mxfp8_moe_quant_config(
 class Mxfp8Config(QuantizationConfig):
     """OCP MXFP8 config: FP8 E4M3 data + E8M0 block scales, block size 32."""
 
-    def __init__(self, ignored_layers: list[str] | None = None):
+    def __init__(
+        self,
+        ignored_layers: list[str] | None = None,
+        enable_mxfp8_comm_quant: bool = False,
+    ):
         super().__init__()
         self.ignored_layers = ignored_layers
+        self.enable_mxfp8_comm_quant = enable_mxfp8_comm_quant
 
     @classmethod
     def from_config(cls, config):
         ignored_layers = config.get("ignore", None) or None
-        return cls(ignored_layers=ignored_layers)
+        enable_mxfp8_comm_quant = config.get("enable_mxfp8_comm_quant", False)
+        if not isinstance(enable_mxfp8_comm_quant, bool):
+            raise ValueError(
+                "enable_mxfp8_comm_quant must be bool, got "
+                f"{enable_mxfp8_comm_quant!r}"
+            )
+        return cls(ignored_layers=ignored_layers, enable_mxfp8_comm_quant=enable_mxfp8_comm_quant)
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
