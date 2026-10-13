@@ -13,24 +13,34 @@ import torch
 
 @pytest.fixture
 def block_kernels(monkeypatch):
-    import triton
-    import triton.language as tl
-    from triton.runtime.interpreter import InterpretedFunction
-
-    utils = ModuleType("vllm.triton_utils")
-    utils.triton, utils.tl = triton, tl
     source = Path(__file__).resolve().parents[3] / "omni/sample/ops"
     modules = []
     with monkeypatch.context() as imports:
         imports.setenv("TRITON_INTERPRET", "1")
+        # CPU kernels use core tl operations, not optional language extensions.
+        # Bypass extra/__init__.py's eager backend discovery (e.g. cann), while
+        # preserving explicit submodule imports for native Ascend installations.
+        triton_root = Path(importlib.util.find_spec("triton").origin).parent
+        extra = ModuleType("triton.language.extra")
+        extra.__path__ = [str(triton_root / "language/extra")]
+        imports.setitem(sys.modules, extra.__name__, extra)
+
+        import triton
+        import triton.language as tl
+        from triton.runtime.interpreter import InterpretedFunction
+
+        utils = ModuleType("vllm.triton_utils")
+        utils.triton, utils.tl = triton, tl
         imports.setitem(sys.modules, "vllm.triton_utils", utils)
         for filename in ("block_acceptance", "block_selection"):
             spec = importlib.util.spec_from_file_location("_cpu_test_" + filename, source / (filename + ".py"))
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             modules.append(mod)
-    assert isinstance(modules[0]._compute_block_prefix_kernel, InterpretedFunction)
-    return modules
+        # Keep the isolation active during launches: newer interpreters also
+        # import optional language modules lazily on the first kernel call.
+        assert isinstance(modules[0]._compute_block_prefix_kernel, InterpretedFunction)
+        yield modules
 
 
 class TestBlockKernelCases:
