@@ -21,8 +21,20 @@ from omni_npu.vllm_patches.patches.common.patch_eagle import (
 )
 
 
+def _set_greedy_draft_sampling_state(proposer):
+    """Supply sampling state when a test bypasses the real initializer."""
+    proposer.speculative_config = SimpleNamespace(
+        draft_sample_method="greedy",
+        rejection_sample_method="standard",
+    )
+    proposer._enable_probabilistic_draft_probs = False
+    proposer._temperature_only = False
+    proposer._draft_top_k = None
+
+
 def _fake_proposer(attn_metadata):
     fake = SimpleNamespace()
+    _set_greedy_draft_sampling_state(fake)
     fake.runner = SimpleNamespace(
         _omni_spec_decode_common_attn_metadata=attn_metadata,
         batch_execution_and_padding_state=(
@@ -151,6 +163,7 @@ def test_draft_forward_counts_before_model_call():
 @pytest.mark.unit
 def test_draft_counter_starts_at_zero(monkeypatch):
     def original_init(proposer, **_kwargs):
+        _set_greedy_draft_sampling_state(proposer)
         proposer.draft_model_config = SimpleNamespace(
             hf_config=SimpleNamespace(n_predict=1)
         )
@@ -542,6 +555,7 @@ def _propose_step0_offset_flag(n_predict, num_speculative_tokens):
     fake = SimpleNamespace()
     fake.method = "mtp"
     fake.n_predict = n_predict
+    _set_greedy_draft_sampling_state(fake)
     # Non-None runner, but no padding state: propose raises right after the build.
     fake.runner = SimpleNamespace(batch_execution_and_padding_state=None)
     fake.set_inputs_first_pass = MagicMock(return_value=(4, None, object()))
@@ -593,6 +607,7 @@ def test_prefill_single_step_scope(monkeypatch, role, method, n_predict, expecte
         draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(n_predict=n_predict)),
         num_speculative_tokens=7,
     )
+    _set_greedy_draft_sampling_state(fake)
     monkeypatch.setattr(eagle_mod, "EagleProposer_original_init", lambda *args, **kwargs: None)
     EagleProposerPatch.__init__(fake, config, torch.device("cpu"))
     assert fake.prefill_single_step is expected

@@ -11,6 +11,7 @@ from omni_npu.sample.rejection_sampler import compute_probs
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.vllm_patches.patches.common.patch_eagle import EagleProposerPatch
 from vllm.v1.sample.sampler import _SAMPLING_EPS
+from vllm.v1.spec_decode.llm_base_proposer import compute_probs_and_sample_next_token
 
 
 def entrypoint():
@@ -64,7 +65,8 @@ def test_entrypoint_q_and_fixed_uniform(monkeypatch, vocab, slots, dtype, noncon
     prepared = ds.prepare_draft_logits(x, meta.temperature, meta.top_k, meta.top_p, model_extra_config.dtype)
     torch.testing.assert_close(prepared, filtered, rtol=0, atol=0)
     monkeypatch.setattr(ds, 'make_uniform_noise', lambda *args: u)
-    ids, q = entrypoint()(SimpleNamespace(_enable_probabilistic_draft_probs=True), x, meta)
+    ids, q = entrypoint()(SimpleNamespace(_enable_probabilistic_draft_probs=True,
+                                        _temperature_only=False), x, meta)
     torch.testing.assert_close(q, q_ref, rtol=3e-6, atol=2e-7)
     torch.testing.assert_close(q.sum(-1), torch.ones(x.shape[0], device='npu'), rtol=2e-6, atol=2e-6)
     torch.testing.assert_close(ids, expected, rtol=0, atol=0)
@@ -123,15 +125,35 @@ def test_parallel_rng_keeps_default_generator():
     assert torch.equal(after, torch.npu.get_rng_state())
 
 
-@pytest.mark.parametrize('probabilistic,all_greedy', [(False, False), (True, True)])
-def test_greedy_does_not_consume_rng(probabilistic, all_greedy):
+@pytest.mark.parametrize('probabilistic,all_greedy,temperature_only', [
+    (False, False, False), (True, True, False), (True, True, True),
+])
+def test_greedy_does_not_consume_rng(probabilistic, all_greedy, temperature_only):
     x = torch.randn(3, 127, device='npu')
     meta = metadata([1., 1., 1.])
     meta.all_greedy = all_greedy
     state = torch.npu.get_rng_state()
-    ids, q = entrypoint()(SimpleNamespace(_enable_probabilistic_draft_probs=probabilistic), x, meta)
+    ids, q = entrypoint()(SimpleNamespace(_enable_probabilistic_draft_probs=probabilistic,
+                                        _temperature_only=temperature_only), x, meta)
     torch.testing.assert_close(ids, x.argmax(-1), rtol=0, atol=0)
     assert q is None and torch.equal(state, torch.npu.get_rng_state())
+
+
+@pytest.mark.parametrize('temps', [[0.7, 1.3], [0., 1.3]])
+def test_temperature_only_matches_upstream(temps):
+    x = torch.randn(2, 127, device='npu', dtype=torch.float32)
+    meta = metadata(temps, k=[1, 1], p=[.01, .01], all_random=all(t > 0 for t in temps))
+    proposer = SimpleNamespace(_enable_probabilistic_draft_probs=True,
+                               _temperature_only=True, use_fp64_gumbel=False)
+    state = torch.npu.get_rng_state()
+    ids, q = entrypoint()(proposer, x.clone(), meta)
+    after = torch.npu.get_rng_state()
+    torch.npu.set_rng_state(state)
+    ref_ids, ref_q = compute_probs_and_sample_next_token(x.clone(), meta, False)
+    torch.testing.assert_close(ids, ref_ids, rtol=0, atol=0)
+    torch.testing.assert_close(q, ref_q, rtol=0, atol=0)
+    assert torch.equal(after, torch.npu.get_rng_state())
+    assert q.dtype == torch.float32 and (q > 0).all()  # top-k/top-p are ignored.
 
 
 def test_step_outputs_survive_later_calls():

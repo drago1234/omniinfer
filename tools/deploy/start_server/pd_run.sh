@@ -99,7 +99,7 @@ print_help() {
     echo "  --hccl-op-expansion-mode         vLLM framework: HCCL_OP_EXPANSION_MODE"
     echo "  --hccl-buffsize                  vLLM framework: HCCL_BUFFSIZE"
     echo "  --rejection-sample-method        MTP rejection method: standard, block, synthetic (default: vLLM default)"
-    echo "  --draft-sample-method            MTP draft method: greedy, probabilistic (default: vLLM default)"
+    echo "  --draft-sample-method            MTP draft method: greedy, probabilistic, temperature_only (default: vLLM default)"
     echo "  --num-speculative-tokens         vLLM framework: Speculative decoding parameter, number of speculative tokens per step (default: $NUM_SPECULATIVE_TOKENS)"
     exit 0
 }
