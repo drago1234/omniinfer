@@ -157,6 +157,7 @@ def test_runner_installs_cuda_aliases_and_pins_override_surface(
     # 钉住覆写面：多出来说明有人加了覆写没说明原因，少了说明某个适配被删掉了。
     own = set(vars(type(runner))) - _CLASS_NOISE
     assert own == {
+        "initialize_kv_cache",       # Scoped NPU target/draft graph managers
         "add_requests",              # Track budget after sampler creation in load_model
         "_remove_request",           # Clear state before request-slot reuse
         "__init__",                  # torch.cuda 别名，必须早于上游 __init__ 建 Stream
@@ -169,6 +170,7 @@ def test_runner_installs_cuda_aliases_and_pins_override_surface(
         "prepare_dummy_attn",        # dummy forward 清零 block table，别写脏已交接的块
         "_omni_has_separate_kv_update",
         "_sync_dummy_main_compute_logits",
+        "sample_tokens",             # Scope NPU device APIs over MTP proposal
         "execute_model",             # 在 dummy target forward 后补 lm_head logits
     }, f"NPUModelRunnerV2 覆写面变化，实际定义了: {own}"
 
