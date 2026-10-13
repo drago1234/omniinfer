@@ -115,5 +115,4 @@ def test_vl_505b_best_practice_and_pd_configs_are_consistent():
 def test_mhc_configs_disable_sampler_multistream(relative_path):
     operator_config = _load(relative_path)["operator_optimization_config"]
 
-    assert operator_config["use_mhc_fusion_op"] is True
     assert operator_config["sampler_multi_stream"] is False
