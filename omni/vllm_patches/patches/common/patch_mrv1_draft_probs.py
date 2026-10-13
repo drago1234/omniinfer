@@ -5,7 +5,8 @@
 # NPUModelRunner inheritance is possible but intentionally not used here; this
 # is an explicit project exception to the inheritance-first preference. There
 # is no upstream plugin entry point for these two MRv1 draft-Q decisions.
-# Original methods are captured only during registered apply(), not at import.
+# Original methods are kept on each patch class before registration applies
+# replacements; installation and duplicate checks remain with VLLMPatch.
 # Exit: remove after this NPU path migrates to upstream MRv2 block support
 # (https://github.com/vllm-project/vllm/pull/46781), with draft-Q collection and
 # sampler warmup verified. A version bump alone is not proof of support.
@@ -18,21 +19,13 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 
-class _MRv1OriginalMethodPatch(VLLMPatch):
-    @classmethod
-    def apply(cls):
-        upstream = getattr(cls._target, cls._attr_names_to_apply[0])
-        # Save only after apply succeeds to preserve the original on conflicts.
-        super().apply()
-        cls._upstream = staticmethod(upstream)
-
-
 @register_patch("MRv1ProbabilisticDraftProposerPatch", SpecDecodeBaseProposer)
-class MRv1ProbabilisticDraftProposerPatch(_MRv1OriginalMethodPatch):
+class MRv1ProbabilisticDraftProposerPatch(VLLMPatch):
     _attr_names_to_apply = ["__init__"]
+    _original_init = staticmethod(SpecDecodeBaseProposer.__init__)
 
     def __init__(self, *args, **kwargs):
-        __class__._upstream(self, *args, **kwargs)
+        __class__._original_init(self, *args, **kwargs)
         if (
             self.speculative_config.rejection_sample_method == "block"
             and self.speculative_config.draft_sample_method == "probabilistic"
@@ -41,8 +34,9 @@ class MRv1ProbabilisticDraftProposerPatch(_MRv1OriginalMethodPatch):
 
 
 @register_patch("MRv1ProbabilisticDraftDummySamplerPatch", GPUModelRunner)
-class MRv1ProbabilisticDraftDummySamplerPatch(_MRv1OriginalMethodPatch):
+class MRv1ProbabilisticDraftDummySamplerPatch(VLLMPatch):
     _attr_names_to_apply = ["_dummy_sampler_run"]
+    _original_dummy_sampler_run = staticmethod(GPUModelRunner._dummy_sampler_run)
 
     @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor):
@@ -52,7 +46,7 @@ class MRv1ProbabilisticDraftDummySamplerPatch(_MRv1OriginalMethodPatch):
             and config.rejection_sample_method == "block"
             and config.draft_sample_method == "probabilistic"
         ):
-            return __class__._upstream(self, hidden_states)
+            return __class__._original_dummy_sampler_run(self, hidden_states)
 
         def add_dummy_draft_probs(_module, args, kwargs):
             metadata, draft_probs, logits, sampling_metadata = args
@@ -68,6 +62,6 @@ class MRv1ProbabilisticDraftDummySamplerPatch(_MRv1OriginalMethodPatch):
             add_dummy_draft_probs, with_kwargs=True
         )
         try:
-            return __class__._upstream(self, hidden_states)
+            return __class__._original_dummy_sampler_run(self, hidden_states)
         finally:
             handle.remove()
