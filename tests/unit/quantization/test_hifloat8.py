@@ -226,7 +226,22 @@ def hifloat8_module(monkeypatch):
     class FusedMLP:
         pass
 
+    class FusedMLPMethodBase:
+        pass
+
     fused_mlp_module.FusedMLP = FusedMLP
+    fused_mlp_module.FusedMLPMethodBase = FusedMLPMethodBase
+
+    v1_utils_module = _make_module(monkeypatch, "omni_npu.v1.utils")
+    v1_utils_module.on_ascend950 = lambda: False
+
+    fused_moe_impl_module = _make_module(
+        monkeypatch, "omni_npu.layers.fused_moe.fused_moe"
+    )
+    fused_moe_impl_module.fused_experts_tp = MagicMock()
+
+    prefetch_module = _make_module(monkeypatch, "omni_npu.layers.prefetch")
+    prefetch_module.PrefetchManager = MagicMock
 
     v1_layers_utils_module = _make_module(
         monkeypatch, "omni_npu.v1.layers.utils"
@@ -470,9 +485,11 @@ def test_hifloat8_mlp_pipeline(hifloat8_module, mock_torch_npu):
     assert output.shape == (2, 3)
     mock_torch_npu.npu_dtype_cast.assert_called()
     layer.gate_up_proj.assert_called_once()
-    layer.act_fn.assert_called_once()
-    assert layer.act_fn.call_args.kwargs == {"quant_symbol": True}
-    assert layer.act_fn.call_args.args[0]["quant_type"] == 1
+    # The activation runs npu_swiglu + HiF8 cast directly instead of act_fn.
+    layer.act_fn.assert_not_called()
+    mock_torch_npu.npu_swiglu.assert_called_once()
+    down_input = layer.down_proj.call_args.args[0]
+    assert set(down_input) == {"x_hif8"}
     layer.down_proj.assert_called_once()
 
 
@@ -508,11 +525,14 @@ def test_moe_apply_experts_flattens_scale_and_uses_swiglu_cast(
     hifloat8_module, mock_torch_npu
 ):
     method = hifloat8_module.Hifloat8MoEMethod.__new__(hifloat8_module.Hifloat8MoEMethod)
-    layer = moe_layer(
-        w13_weight=torch.zeros(2, 4, 8, dtype=torch.uint8),
-        w13_weight_scale=torch.ones(2, 8, dtype=torch.float32),
-        w2_weight=torch.zeros(2, 4, 4, dtype=torch.uint8),
-        w2_weight_scale=torch.ones(2, 4, dtype=torch.float32),
+    layer = as_moe_runner(
+        SimpleNamespace(
+            w13_weight=torch.zeros(2, 4, 8, dtype=torch.uint8),
+            w13_weight_scale=torch.ones(2, 8, dtype=torch.float32),
+            w2_weight=torch.zeros(2, 4, 4, dtype=torch.uint8),
+            w2_weight_scale=torch.ones(2, 4, dtype=torch.float32),
+        ),
+        use_ep=False,
     )
     prepare_result = SimpleNamespace(
         hidden_states_sorted_by_experts=torch.zeros(2, 2, 4, dtype=torch.int8),
@@ -532,6 +552,8 @@ def test_moe_apply_experts_flattens_scale_and_uses_swiglu_cast(
     assert mock_torch_npu.npu_grouped_matmul.call_count == 2
     first_kwargs = mock_torch_npu.npu_grouped_matmul.call_args_list[0].kwargs
     second_kwargs = mock_torch_npu.npu_grouped_matmul.call_args_list[1].kwargs
+    assert first_kwargs["group_list_type"] == 0
+    assert second_kwargs["group_list_type"] == 0
     assert first_kwargs["per_token_scale"][0].shape == (4,)
     assert second_kwargs["per_token_scale"] is None
     mock_torch_npu.npu_swiglu.assert_called_once()
@@ -615,7 +637,7 @@ def test_linear_apply_with_tensor_input_casts_to_hifloat8(
     assert qm_kwargs["bias"].dtype == torch.float32
 
 
-def test_moe_process_weights_calls_npu_trans_quant_param_for_both_scales(
+def test_moe_process_weights_keeps_float_scales_for_grouped_matmul(
     hifloat8_module, mock_torch_npu
 ):
     method = hifloat8_module.Hifloat8MoEMethod.__new__(hifloat8_module.Hifloat8MoEMethod)
@@ -639,11 +661,82 @@ def test_moe_process_weights_calls_npu_trans_quant_param_for_both_scales(
 
     assert layer.w13_weight.shape == (2, 4, 8)
     assert layer.w2_weight.shape == (2, 8, 4)
-    assert mock_torch_npu.npu_trans_quant_param.call_count == 2
-    # squeeze(-1).float() => shape (2, 8) and (2, 4) of float32 (here +1 from mock)
+    mock_torch_npu.npu_trans_quant_param.assert_not_called()
     assert layer.w13_weight_scale.shape == (2, 8)
     assert layer.w2_weight_scale.shape == (2, 4)
+    assert layer.w13_weight_scale.dtype == torch.float32
+    assert layer.w2_weight_scale.dtype == torch.float32
     layer._ensure_moe_quant_config_init.assert_called_once()
+
+
+def test_mlp_process_weights_is_noop(hifloat8_module):
+    method = hifloat8_module.Hifloat8MlpMethod(quant_config=object())
+    original_scale = torch.nn.Parameter(torch.ones(4, 1, dtype=torch.bfloat16))
+    layer = SimpleNamespace(
+        gate_up_proj=SimpleNamespace(weight_scale=original_scale),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.gate_up_proj.weight_scale is original_scale
+
+
+def test_mlp_activation_uses_swiglu_then_hifloat8_cast(
+    hifloat8_module, mock_torch_npu
+):
+    method = hifloat8_module.Hifloat8MlpMethod(quant_config=object())
+    gate_up = torch.ones(2, 8, dtype=torch.bfloat16)
+
+    result = method.apply_part2_activation_on_stream(
+        SimpleNamespace(), gate_up
+    )
+
+    mock_torch_npu.npu_swiglu.assert_called_once()
+    assert mock_torch_npu.npu_swiglu.call_args.args[0] is gate_up
+    mock_torch_npu.npu_dtype_cast.assert_called_once()
+    cast_input, cast_dtype = mock_torch_npu.npu_dtype_cast.call_args.args
+    assert torch.equal(cast_input, gate_up[:, :4])
+    assert cast_dtype is mock_torch_npu.hifloat8
+    assert set(result) == {"x_hif8"}
+    assert result["x_hif8"].dtype == torch.int8
+
+
+def test_mlp_apply_forwards_stream_label_by_keyword(hifloat8_module):
+    method = hifloat8_module.Hifloat8MlpMethod(quant_config=object())
+    stream = object()
+    x = torch.ones(2, 4)
+    x_hif8 = torch.zeros(2, 4, dtype=torch.int8)
+    x_scale = torch.ones(2)
+    method.apply_quant = MagicMock(return_value=(x_hif8, x_scale))
+    method.apply_part1_gate_up_on_stream = MagicMock(return_value=torch.ones(2, 8))
+    method.apply_part2_activation_on_stream = MagicMock(
+        return_value={"x_hif8": torch.zeros(2, 4, dtype=torch.int8)}
+    )
+    method.apply_part3_down_on_stream = MagicMock(return_value=torch.ones(2, 4))
+
+    method.apply(SimpleNamespace(), x, stream_label=stream)
+
+    method.apply_quant.assert_called_once_with(x, stream_label=stream)
+
+
+def test_mlp_apply_quant_accepts_prequantized_hif8_mapping(hifloat8_module):
+    method = hifloat8_module.Hifloat8MlpMethod(quant_config=object())
+    x_hif8 = torch.zeros(2, 4, dtype=torch.int8)
+    x_scale = torch.ones(2)
+
+    result, scale = method.apply_quant(
+        {"x_hif8": x_hif8, "pertoken_scale": x_scale}
+    )
+
+    assert result is x_hif8
+    assert scale is x_scale
+
+
+def test_mlp_apply_quant_rejects_invalid_prequantized_mapping(hifloat8_module):
+    method = hifloat8_module.Hifloat8MlpMethod(quant_config=object())
+
+    with pytest.raises(ValueError, match="x_hif8"):
+        method.apply_quant({"x_int8": torch.zeros(2, 4, dtype=torch.int8)})
 
 
 def test_moe_apply_experts_with_routed_experts_cv_returns_tuple(
@@ -775,6 +868,8 @@ def test_moe_init_records_shared_experts_stream_via_named_stream(
     assert method.shared_experts_stream.label == "sub_stream"
     assert method.n_routed_experts == 8
     assert method.prefix == "layer_0"
+    assert method.on_ascend950 is False
+    assert method.model_prefetch is not None
 
 
 def _build_apply_method(hifloat8_module, monkeypatch):
@@ -800,6 +895,66 @@ def _build_apply_method(hifloat8_module, monkeypatch):
     )
     monkeypatch.setattr(hifloat8_module, "NPUFusedMoE", fake_npu_moe)
     return method
+
+
+@pytest.mark.parametrize("with_shared", [False, True])
+@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize("strategy", ["agrs", "all2all", "dispatch_combine"])
+def test_moe_apply_non_ep_a5_uses_hifloat_tp_path(
+    hifloat8_module, monkeypatch, with_shared, tp_size, strategy
+):
+    # use_ep lives on layer.moe_config.moe_parallel_config under vLLM 0.25, and
+    # the shared MLP on layer._shared_experts._layer (not the runner wrapper).
+    _patch_npu_streams(monkeypatch)
+    method = _build_apply_method(hifloat8_module, monkeypatch)
+    method.tp_size = tp_size
+    method.tp_rank = tp_size - 1
+    method.select_communication_strategy.return_value = (strategy, SimpleNamespace())
+    method.on_ascend950 = True
+    method.model_prefetch = MagicMock()
+    # An odd token count also detects accidental padding before TP execution.
+    hidden_states = torch.ones(3, 4)
+    router_logits = torch.zeros(3, 3)
+    topk_weights = torch.ones(3, 1)
+    topk_ids = torch.zeros(3, 1, dtype=torch.int32)
+    select_experts = MagicMock(return_value=(topk_weights, topk_ids))
+    monkeypatch.setattr(hifloat8_module.NPUFusedMoE, "select_experts", select_experts)
+    routed = torch.full((3, 4), 3.0)
+    fused_tp = MagicMock(return_value=routed)
+    monkeypatch.setattr(hifloat8_module, "fused_experts_tp", fused_tp)
+    shared_mlp = MagicMock(return_value=torch.full((3, 4), 2.0))
+    wrapper = MagicMock(spec=["__call__"])
+    layer = as_moe_runner(
+        SimpleNamespace(
+            gate=None,
+            shared_experts=wrapper if with_shared else None,
+            _shared_experts=SimpleNamespace(_layer=shared_mlp) if with_shared else None,
+        ),
+        use_ep=False,
+    )
+
+    result = method.apply(
+        layer=layer,
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        top_k=1,
+        renormalize=False,
+    )
+
+    fused_tp.assert_called_once()
+    assert fused_tp.call_args.kwargs["x"] is hidden_states
+    assert fused_tp.call_args.kwargs["topk_ids"] is topk_ids
+    assert fused_tp.call_args.kwargs["topk_weights"] is topk_weights
+    assert select_experts.call_args.kwargs["router_logits"] is router_logits
+    method.apply_prepare_permute.assert_not_called()
+    if with_shared:
+        shared_mlp.assert_called_once_with(hidden_states)
+        wrapper.assert_not_called()
+        shared_out, total = result
+        assert torch.equal(shared_out, shared_mlp.return_value)
+        assert torch.equal(total, routed + shared_mlp.return_value)
+    else:
+        assert result is routed
 
 
 def test_moe_apply_with_routed_experts_cv_unpacks_tuple(

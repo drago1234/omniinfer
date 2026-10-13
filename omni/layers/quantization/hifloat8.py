@@ -30,6 +30,10 @@ from omni_npu.layers.mhc import cube_side_task_ops  # noqa: F401  registers cube
 from omni_npu.layers.utils import named_stream
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.v1.layers.linear import FlashCommLinearMethodBase
+from omni_npu.v1.layers.fused_mlp.layer import FusedMLPMethodBase
+from omni_npu.v1.utils import on_ascend950
+from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp
+from omni_npu.layers.prefetch import PrefetchManager
 
 logger = init_logger(__name__)
 
@@ -245,18 +249,21 @@ class Hifloat8FCLinearMethod(FlashCommLinearMethodBase):
         return y
 
 
-class Hifloat8MlpMethod:
+class Hifloat8MlpMethod(FusedMLPMethodBase):
     def __init__(self, quant_config: Hifloat8Config):
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer):
-        layer.gate_up_proj.weight_scale = torch.nn.Parameter(
-            layer.gate_up_proj.weight_scale.data.float(),
-            requires_grad=False
-        )
+        pass
 
     def apply_quant(self, x, x_transform=None, stream_label=None):
         from omni_npu.v1.layers.utils import get_npu_execution_type
+
+        if isinstance(x, dict):
+            x_hif8 = x.get("x_hif8")
+            if x_hif8 is None:
+                raise ValueError("HiF8 fused MLP expects an 'x_hif8' tensor in the input mapping.")
+            return x_hif8, x.get("pertoken_scale")
 
         with get_npu_execution_type(stream_label):
             x_scale = torch.ones((x.shape[0],), dtype=torch.float32, device=x.device)
@@ -274,8 +281,9 @@ class Hifloat8MlpMethod:
         from omni_npu.v1.layers.utils import get_npu_execution_type
 
         with get_npu_execution_type(stream_label):
-            x = {'x_hif8': gate_up, 'quant_type': 1}
-            x = layer.act_fn(x, quant_symbol=True)
+            x = torch_npu.npu_swiglu(gate_up)
+            x = torch_npu.npu_dtype_cast(x, torch_npu.hifloat8)
+            x = {"x_hif8": x}
         return x
 
     def apply_part3_down_on_stream(self, layer, x, stream_label=None):
@@ -286,7 +294,7 @@ class Hifloat8MlpMethod:
         return output
 
     def apply(self, layer, x, stream_label=None):
-        x, x_scale = self.apply_quant(x, stream_label)
+        x, x_scale = self.apply_quant(x, stream_label=stream_label)
         x = {'x_hif8': x, 'pertoken_scale': x_scale}
         gate_up = self.apply_part1_gate_up_on_stream(layer, x, stream_label)
         x = self.apply_part2_activation_on_stream(layer, gate_up, stream_label)
@@ -309,6 +317,8 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         self.prefix = layer.layer_name
         self.vllm_config = get_current_vllm_config().model_config.hf_config
         self.num_of_redundant_experts = 0
+        self.on_ascend950 = on_ascend950()
+        self.model_prefetch = PrefetchManager()
 
     def create_weights(
         self,
@@ -397,16 +407,12 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         layer.w13_weight = torch.nn.Parameter(layer.w13_weight.transpose(1, 2).contiguous(), requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(layer.w2_weight.transpose(1, 2).contiguous(), requires_grad=False)
         layer.w13_weight_scale = torch.nn.Parameter(
-            torch_npu.npu_trans_quant_param(
-                layer.w13_weight_scale.data.squeeze(-1).float()
-            ),
-            requires_grad=False
+            layer.w13_weight_scale.data.squeeze(-1).float(),
+            requires_grad=False,
         )
         layer.w2_weight_scale = torch.nn.Parameter(
-            torch_npu.npu_trans_quant_param(
-                layer.w2_weight_scale.data.squeeze(-1).float()
-            ),
-            requires_grad=False
+            layer.w2_weight_scale.data.squeeze(-1).float(),
+            requires_grad=False,
         )
         layer._ensure_moe_quant_config_init()
 
@@ -437,7 +443,9 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         orig_num_tokens = hidden_states.shape[0]
         strategy, strategy_impl = self.select_communication_strategy(orig_num_tokens)
 
-        is_need_slice = self.tp_size > 1 and (strategy == "all2all" or strategy == "dispatch_combine")
+        moe_parallel_config = layer.moe_config.moe_parallel_config
+        use_ep = getattr(moe_parallel_config, "use_ep", True)
+        is_need_slice = use_ep and self.tp_size > 1 and strategy in ("all2all", "dispatch_combine")
         x_slice = hidden_states
         if is_need_slice:
             padded_num_tokens = -(orig_num_tokens // -self.tp_size) * self.tp_size
@@ -454,11 +462,20 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         if layer.gate is not None:
             router_logits, _ = layer.gate(x_slice)
         else:
-            assert router_logits is not None, "Expected gate or router_logits must be provided."
+            if router_logits is None:
+                raise ValueError("Expected gate or router_logits must be provided.")
             if is_need_slice:
                 if num_pads > 0:
                     router_logits = torch.nn.functional.pad(router_logits, (0, 0, 0, num_pads), value=0)
                 router_logits = router_logits[start:end]
+
+        multi_stream = model_extra_config.operator_opt_config.shared_expert_multi_stream
+        enable_prefetch = getattr(model_extra_config.operator_opt_config, "enable_prefetch", False)
+        cur_stream = torch.npu.current_stream()
+        if enable_prefetch:
+            self.shared_experts_stream.wait_stream(cur_stream)
+            with torch.npu.stream(self.shared_experts_stream):
+                self.model_prefetch.prefetch("moe", router_logits, layer=layer)
 
         topk_weights, topk_ids = NPUFusedMoE.select_experts(
             router_logits=router_logits,
@@ -473,6 +490,27 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
             e_score_correction_bias=e_score_correction_bias,
         )
 
+        if not use_ep:
+            if self.on_ascend950:
+                if multi_stream or enable_prefetch:
+                    cur_stream.wait_stream(self.shared_experts_stream)
+                routed_output = fused_experts_tp(
+                    layer=layer,
+                    x=x_slice,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                )
+                if shared_experts is not None:
+                    shared_output = shared_experts(x_slice)
+                    return shared_output, routed_output + shared_output
+                return routed_output
+            return fused_experts_tp(
+                layer=layer,
+                x=x_slice,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            )
+
         prepare_permute_result = self.apply_prepare_permute(strategy_impl, layer, x_slice, topk_ids)
 
         use_grouped_matmul_finalize_routing = (strategy == "agrs" and prepare_permute_result.row_idx_type == 1)
@@ -484,7 +522,6 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         )
 
         shared_output = None
-        multi_stream = model_extra_config.operator_opt_config.shared_expert_multi_stream
         schedule = model_extra_config.operator_opt_config.shared_expert_parallel_schedule
         if multi_stream and schedule == "with_routed_experts_cv":
             # Shared experts already ran on the side stream interleaved with the
@@ -510,19 +547,35 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
                 else:
                     shared_output = shared_experts(x_slice)
 
+        if enable_prefetch:
+            self.shared_experts_stream.wait_stream(cur_stream)
+            with torch.npu.stream(self.shared_experts_stream):
+                self.model_prefetch.prefetch("next_attn", shared_output, layer=layer)
+
         routed_output = self.apply_unpermute_finalize(
             strategy_impl, layer, output, topk_ids, topk_weights, prepare_permute_result,
         )
 
+        use_custom_model_add = "omni_custom_models" in os.environ.get("VLLM_PLUGINS", "")
         if multi_stream and schedule == "with_finalize":
             if shared_experts is not None:
                 cur_stream.wait_stream(self.shared_experts_stream)
                 if shared_experts.gate_up_proj.tp_size > 1:
                     shared_output = tensor_model_parallel_all_reduce(shared_output)
+                elif use_custom_model_add:
+                    routed_output = routed_output + shared_output
+        elif schedule == "with_finalize":
+            if shared_experts is not None:
+                if shared_experts.gate_up_proj.tp_size > 1:
+                    shared_output = tensor_model_parallel_all_reduce(shared_output)
+                elif use_custom_model_add:
+                    routed_output = routed_output + shared_output
 
         if is_need_slice:
             routed_output = tensor_model_parallel_all_gather(routed_output, dim=0)[:orig_num_tokens]
 
+        if shared_output is not None and shared_experts.gate_up_proj.tp_size > 1 and use_custom_model_add:
+            return shared_output, routed_output + shared_output
         if shared_output is not None:
             return shared_output, routed_output
         return routed_output
@@ -538,6 +591,9 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         shared_experts = shared_expert_mlp(layer)
         hidden_states = prepare_permute_result.hidden_states_sorted_by_experts
         expert_tokens = prepare_permute_result.expert_tokens
+        moe_parallel_config = layer.moe_config.moe_parallel_config
+        use_ep = getattr(moe_parallel_config, "use_ep", True)
+        group_list_type = int(use_ep)
         avg_tokens_per_expert = prepare_permute_result.avg_tokens_per_expert or [0]
         pertoken_scale = prepare_permute_result.dynamic_scale
         if pertoken_scale is not None and pertoken_scale.dim() > 1:
@@ -563,7 +619,7 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
             group_list=expert_tokens,
             split_item=3, output_dtype=torch.bfloat16, group_type=0,
             x_dtype=torch_npu.hifloat8, weight_dtype=torch_npu.hifloat8,
-            group_list_type=1,
+            group_list_type=group_list_type,
         )[0]
 
         shared_expert_results = None
@@ -596,7 +652,7 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
             group_list=expert_tokens,
             split_item=3, output_dtype=torch.bfloat16, group_type=0,
             x_dtype=torch_npu.hifloat8, weight_dtype=torch_npu.hifloat8,
-            group_list_type=1, tuning_config=avg_tokens_per_expert,
+            tuning_config=avg_tokens_per_expert, group_list_type=group_list_type,
         )[0]
 
         hidden_states_experts = torch.ops.vllm.cube_side_wait(
