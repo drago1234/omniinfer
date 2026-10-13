@@ -108,6 +108,9 @@ def prepare_module(monkeypatch):
     torch_npu = MagicMock()
     torch_npu.npu_moe_init_routing_v2 = MagicMock()
     torch_npu.npu_dynamic_quant = MagicMock()
+    torch_npu.npu_dynamic_mx_quant = MagicMock()
+    torch_npu.npu_dtype_cast = MagicMock()
+    torch_npu.hifloat8 = object()
     torch_npu.npu_moe_re_routing = MagicMock()
     torch_npu.npu_moe_finalize_routing = MagicMock()
     torch_npu.npu_grouped_matmul_finalize_routing = MagicMock()
@@ -333,6 +336,40 @@ def test_all2all_prepare_permute_mxfp_routes_bf16_then_quants_sorted(
     assert quant_kwargs["dst_type"] is torch.float8_e4m3fn
     assert result.hidden_states_sorted_by_experts is sorted_fp8
     assert result.dynamic_scale is sorted_scale
+
+
+def test_all2all_prepare_permute_hifloat8_routes_bf16_then_casts_sorted(
+    prepare_module,
+):
+    module, stubs = prepare_module
+    layer = _moe_layer(
+        global_num_experts=4,
+        local_num_experts=2,
+        ep_size=stubs.ep_group.world_size,
+        quant_method=SimpleNamespace(
+            moe_quant_config=SimpleNamespace(use_hifloat8_w8a8=True),
+            num_of_redundant_experts=0,
+        ),
+        quant_config=object(),
+        w13_weight=torch.zeros(2, 1, 1),
+    )
+    sorted_states, _ = _set_all2all_routing_results(stubs, torch.ones(2))
+    cast_states = torch.zeros(2, 3, dtype=torch.int8)
+    stubs.torch_npu.npu_dtype_cast.return_value = cast_states
+
+    result = module.All2AllPrepPmtAndUnpmtFinal(layer).prepare_permute(
+        layer=layer,
+        x=torch.ones(2, 3),
+        topk_ids=torch.zeros(2, 2, dtype=torch.int32),
+    )
+
+    assert stubs.torch_npu.npu_moe_init_routing_v2.call_args.kwargs["quant_mode"] == -1
+    stubs.torch_npu.npu_dtype_cast.assert_called_once_with(
+        sorted_states, stubs.torch_npu.hifloat8
+    )
+    stubs.torch_npu.npu_dynamic_mx_quant.assert_not_called()
+    assert torch.equal(result.hidden_states_sorted_by_experts, cast_states)
+    assert result.dynamic_scale is None
 
 
 def test_agrs_prepare_permute_no_quant_all_gathers_before_routing(prepare_module):
@@ -1011,6 +1048,46 @@ def test_dispatch_prepare_permute_mxfp_disables_dispatch_quant(
     assert result.hidden_states_sorted_by_experts is expand_x
     assert result.dynamic_scale is None
     assert result.expert_tokens.dtype == torch.int64
+
+
+def test_dispatch_prepare_permute_hifloat8_casts_and_clears_scale(prepare_module):
+    module, stubs = prepare_module
+    layer = _moe_layer(
+        global_num_experts=4,
+        local_num_experts=2,
+        quant_config=object(),
+        quant_method=SimpleNamespace(
+            moe_quant_config=SimpleNamespace(use_hifloat8_w8a8=True),
+        ),
+    )
+    stubs.context_holder.attn_metadata = {
+        0: SimpleNamespace(decode=SimpleNamespace(mc2_mask=torch.tensor([1, 1], dtype=torch.bool)))
+    }
+    expand_x = torch.ones(2, 3)
+    cast_x = torch.zeros(2, 3, dtype=torch.int8)
+    recv_counts = torch.tensor([1, 1], dtype=torch.int32)
+    stubs.torch_npu.npu_moe_distribute_dispatch_v2.return_value = (
+        expand_x,
+        torch.ones(2),
+        torch.zeros(2, dtype=torch.int32),
+        torch.tensor([1, 1], dtype=torch.int32),
+        recv_counts,
+        recv_counts,
+    )
+    stubs.torch_npu.npu_dtype_cast.return_value = cast_x
+
+    result = module.DispatchCombinePrepPmtAndUnpmtFinal(layer).prepare_permute(
+        layer=layer,
+        x=torch.ones(2, 3),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int32),
+    )
+
+    assert stubs.torch_npu.npu_moe_distribute_dispatch_v2.call_args.kwargs["quant_mode"] == 0
+    stubs.torch_npu.npu_dtype_cast.assert_called_once_with(
+        expand_x, stubs.torch_npu.hifloat8
+    )
+    assert torch.equal(result.hidden_states_sorted_by_experts, cast_x)
+    assert result.dynamic_scale is None
 
 
 def test_dispatch_unpermute_finalize_passes_counts_and_mask(prepare_module):

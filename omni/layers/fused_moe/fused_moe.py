@@ -7,6 +7,10 @@ import torch
 import torch_npu
 from vllm.platforms import current_platform
 from omni_npu.model_config.config_loader.loader import model_extra_config
+from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import (
+    _uses_hifloat_activation,
+    _uses_mxfp_activation,
+)
 
 
 def _apply_experts(layer: torch.nn.Module, h: torch.Tensor, expert_tokens: torch.Tensor, pertoken_scale=None):
@@ -141,12 +145,11 @@ def fused_experts_tp(
         pertoken_scale = None
     else:
         moe_quant_config = getattr(experts.quant_method, "moe_quant_config", None)
-        use_mxfp = bool(moe_quant_config and (
-                getattr(moe_quant_config, "use_mxfp8_w8a8", False) is True
-                or getattr(moe_quant_config, "use_mxfp4_w4a8", False) is True
-            )
-        )
-        if use_mxfp:
+        if _uses_hifloat_activation(moe_quant_config):
+            sorted_tokens = torch_npu.npu_dtype_cast(sorted_tokens, torch_npu.hifloat8)
+            sorted_tokens = sorted_tokens.view(dtype=torch.int8)
+            pertoken_scale = None
+        elif _uses_mxfp_activation(moe_quant_config):
             sorted_tokens, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
                 sorted_tokens,
                 dst_type=torch.float8_e4m3fn,

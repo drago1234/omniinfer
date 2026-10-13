@@ -646,6 +646,29 @@ class TestMxfp8MlpMethod:
         assert out.shape == (4, 128)
         mock_torch_npu.npu_dynamic_mx_quant.assert_called_once()
 
+    def test_apply_forwards_stream_label_by_keyword(self, mlp_method):
+        stream = object()
+        x = torch.zeros(2, 4)
+        x_fp8 = torch.zeros(2, 4, dtype=torch.int8)
+        x_scale = torch.ones(2, 1)
+        mlp_method.apply_quant = MagicMock(return_value=(x_fp8, x_scale))
+        mlp_method.apply_part1_gate_up_on_stream = MagicMock(
+            return_value=torch.ones(2, 8)
+        )
+        mlp_method.apply_part2_activation_on_stream = MagicMock(
+            return_value={
+                "x_mxfp8": torch.zeros(2, 4, dtype=torch.int8),
+                "pertoken_scale": torch.ones(2, 1),
+            }
+        )
+        mlp_method.apply_part3_down_on_stream = MagicMock(
+            return_value=torch.ones(2, 4)
+        )
+
+        mlp_method.apply(SimpleNamespace(), x, stream_label=stream)
+
+        mlp_method.apply_quant.assert_called_once_with(x, stream_label=stream)
+
 
 # --------------------------------------------------------------------------- #
 # Mxfp8MoEMethod tests
