@@ -288,7 +288,8 @@ def _rewrite_named_stream_finish_chunk(chunk: str, request: Any) -> str:
 # so re-registering the *same* name replaces the earlier class -- which is what keeps
 # VLLMPatch.apply() from raising "already patched by".  The module-level references
 # below still hold the replaced class's method, so the chain
-# ``vLLM -> routed_experts -> serving_apc`` is stitched together by hand.
+# ``APC -> routed_experts -> prefilled_token_skip -> vLLM`` is stitched
+# together by hand for non-streaming chat.
 #
 # Extra arguments are forwarded blind (``*args, **kwargs``) so 0.25.1's new
 # ``chat_template_kwargs`` / ``mm_token_counts`` / ``parser`` keywords reach the
@@ -299,9 +300,10 @@ def _chain_to(module_path: str, class_name: str, method_name: str, fallback):
 
     Normally that is the previous link in the relay chain.  If that module is
     unimportable -- during a vLLM version bump it may be listed in
-    OMNI_NPU_SKIP_PATCH_FILES, or not yet ported -- fall back to the vLLM
-    implementation so the APC line still works on its own, and say so loudly:
-    the feature that link provided is then NOT active.
+    OMNI_NPU_SKIP_PATCH_FILES, or not yet ported -- use the supplied fallback
+    so APC can retain the remaining relay links. Non-streaming
+    chat falls back to the existing PD handler; other paths use native vLLM.
+    The feature provided by the unavailable link is then NOT active.
     """
     try:
         module = importlib.import_module(module_path)
@@ -309,8 +311,9 @@ def _chain_to(module_path: str, class_name: str, method_name: str, fallback):
     except Exception as exc:  # noqa: BLE001 - the fallback is always safe
         logger.warning(
             "patch_serving_apc: %s.%s.%s unavailable (%s); chaining "
-            "%s directly to vLLM. The patch that link provided is NOT active.",
-            module_path, class_name, method_name, exc, method_name,
+            "to fallback %s. The patch that link provided is NOT active.",
+            module_path, class_name, method_name, exc,
+            getattr(fallback, "__qualname__", method_name),
         )
         return fallback
 
@@ -323,11 +326,17 @@ _orig_chat_stream = _chain_to(
     "chat_completion_stream_generator",
     OpenAIServingChat.chat_completion_stream_generator,
 )
-_orig_chat_full = _chain_to(
+_orig_pd_chat_full = _chain_to(
     f"{_COMMON}.patch_prefilled_token_skip_tokenize",
     "OpenAIServingChatPatch",
     "chat_completion_full_generator",
     OpenAIServingChat.chat_completion_full_generator,
+)
+_orig_chat_full = _chain_to(
+    f"{_COMMON}.patch_routed_experts",
+    "ExpertIdServingChatFinal",
+    "chat_completion_full_generator",
+    _orig_pd_chat_full,
 )
 
 

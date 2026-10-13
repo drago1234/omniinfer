@@ -166,7 +166,7 @@ def _install_stubs():
                 usage["prompt_tokens_details"] = {"cached_tokens": num_cached}
             yield f"data: {json.dumps({'usage': usage})}\n\n"
 
-    class OpenAIServingChatPatch:
+    class ExpertIdServingChatFinal:
         async def chat_completion_full_generator(
             self, request, result_generator, *args, **kwargs
         ):
@@ -185,11 +185,8 @@ def _install_stubs():
     _module(
         "omni_npu.vllm_patches.patches.common.patch_routed_experts",
         ExpertIdServingChatStream=ExpertIdServingChatStream,
+        ExpertIdServingChatFinal=ExpertIdServingChatFinal,
         ExpertIdServingCompletionStream=ExpertIdServingCompletionStream,
-    )
-    _module(
-        "omni_npu.vllm_patches.patches.common.patch_prefilled_token_skip_tokenize",
-        OpenAIServingChatPatch=OpenAIServingChatPatch,
     )
 
 

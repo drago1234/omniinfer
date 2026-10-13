@@ -9,6 +9,10 @@ import torch
 import torch_npu
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
+from vllm.model_executor.layers.attention.kv_transfer_utils import (
+    maybe_transfer_kv_layer,
+)
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_dcp_group,
@@ -1078,14 +1082,15 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         topk_indices_buffer: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return torch.ops.vllm.npu_dsa_forward(
-            x, cos, sin, self.prefix, topk_indices_buffer
+            x, cos, sin, self.prefix, topk_indices_buffer, self.attn.layer_name
         )
 
     def forward_mhc_deferred(
         self, x, cos, sin, residual, mhc_layer_name, task_key, topk_indices_buffer=None
     ):
         hidden_states, h_post, h_res = torch.ops.vllm.npu_dsa_forward_mhc_deferred(
-            x, cos, sin, residual, self.prefix, mhc_layer_name, task_key
+            x, cos, sin, residual, self.prefix, mhc_layer_name, task_key,
+            self.attn.layer_name,
         )
         return (hidden_states, h_post, h_res), topk_indices_buffer
 
@@ -1802,18 +1807,21 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         )
 
 
+@eager_break_during_capture
+@maybe_transfer_kv_layer
 def npu_dsa_forward(
     hs: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    layer_name: str,
+    module_name: str,
     topk_indices_buffer: torch.Tensor,
+    layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     forward_context = get_forward_context()
-    self: NPUDeepseekSparseAttention = forward_context.no_compile_layers[layer_name]
+    self: NPUDeepseekSparseAttention = forward_context.no_compile_layers[module_name]
     attn_metadata = forward_context.attn_metadata
     if isinstance(attn_metadata, dict):
-        attn_metadata = attn_metadata[f"{self.prefix}.attn"]
+        attn_metadata = attn_metadata[layer_name]
     kv_cache = self.attn.kv_cache if attn_metadata else None
     p_slice, d_slice, has_prefill, has_decode = get_batch_desc(
         attn_metadata, self.layer_idx
@@ -1897,8 +1905,9 @@ def npu_dsa_forward_fake(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    layer_name: str,
+    module_name: str,
     topk_indices_buffer: torch.Tensor,
+    layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(x), torch.empty_like(topk_indices_buffer)
 
@@ -1908,27 +1917,29 @@ def npu_dsa_forward_mhc_deferred(
     cos: torch.Tensor,
     sin: torch.Tensor,
     residual: torch.Tensor,
-    layer_name: str,
+    module_name: str,
     mhc_layer_name: str,
     task_key: str,
+    layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch next-layer MHC work between attention and the DSA epilog."""
-    layer = get_forward_context().no_compile_layers[layer_name]
+    layer = get_forward_context().no_compile_layers[module_name]
     topk_indices_buffer = torch.zeros(
         (hidden_states.shape[0], 1, layer.index_topk),
         dtype=torch.int32, device=hidden_states.device,
     )
     return call_attention_mhc_deferred(
-        lambda x, cos, sin, name: npu_dsa_forward(
-            x, cos, sin, name, topk_indices_buffer
+        lambda x, cos, sin, module, kv_layer: npu_dsa_forward(
+            x, cos, sin, module, topk_indices_buffer, kv_layer
         )[0],
         hidden_states,
         cos,
         sin,
         residual,
-        layer_name,
+        module_name,
         mhc_layer_name,
         task_key,
+        layer_name,
     )
 
 

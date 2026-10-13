@@ -111,6 +111,7 @@ class TestWorkerOnInit:
         assert call["role"] == constants.ROLE_WORKER
         assert call["dump_dir"] == tmp_path
         assert call["rank"] == 5
+        assert callable(call["stats_fn"])
 
     def test_disabled_does_not_install(
             self, tmp_path, monkeypatch, record_guarded_install):

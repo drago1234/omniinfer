@@ -1,0 +1,312 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+---
+# Baseline: omniinfer/tools/deploy/ansible/xiaoyiclaw_505B_DSA_A3_INT8_4P8_1D16_kv_offload/
+# Pair with inventory/505b_int8_4p8_1d16.yml; all four P instances are single-host.
+# See README_505B_QUANTIZED.md for baseline differences and validation limits.
+- name: Run PanguV2 505B INT8 4P8_1D16 with OmniCache V2.
+  hosts: all
+  any_errors_fatal: true
+  max_fail_percentage: 0
+  gather_facts: true
+  environment:
+    LOG_PATH: "{{ pangu_log_path }}"
+    LOG_PATH_IN_EXECUTOR: "{{ pangu_executor_log_path }}"
+    CODE_PATH: "{{ pangu_code_path }}"
+    DOCKER_IMAGE_ID: "{{ pangu_container_image }}"
+    DOCKER_NAME_P: "{{ pangu_prefill_container_name }}"
+    DOCKER_NAME_D: "{{ pangu_decode_container_name }}"
+    DOCKER_NAME_C: "{{ pangu_proxy_container_name }}"
+    SCRIPTS_PATH: "{{ pangu_scripts_path }}"
+
+    # export ANSIBLE_ROLES_PATH=/data/xxx/pangu21/omniinfer/tools/deploy/ansible/roles
+
+  vars:
+    # Keep the OmniInfer Pangu deployment interface, while allowing the same
+    # command-line -e overrides used by the DSV4 bootstrap/start workflow.
+    pangu_code_path: /data/xxx/pangu21/
+    pangu_container_image: "registry-cbu.huawei.com/omniai_omniinfer/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_master-vllm-202609291016:0.0.1"
+    pangu_prefill_container_name: "xxx_p"
+    pangu_decode_container_name: "xxx_d"
+    pangu_proxy_container_name: "xxx_c"
+    pangu_log_path: /data/xxx/pangu21/logs_path/logs
+    pangu_executor_log_path: /data/xxx/pangu21/logs_path/log_path_in_executor
+    pangu_scripts_path: /data/xxx/pangu21/logs_path/scripts_path
+
+    model: pangu-v2-505b
+    model_path: "/mnt/sfs_turbo_new/bucket-910c-6055/s30033981/models/505B_iter_0015398_llt_w8a8"
+    enable_prefix_caching: true
+
+    # Budgets are per physical host; Decode's connector budget spans D0.
+    pangu_prefill_host_memory_bytes: 1288490188800
+    pangu_decode_host_memory_bytes: 644245094400
+    pangu_prefill_async_scheduling: true
+    # Preserve baseline AIV; override with AI_CPU to isolate the observed hang.
+    pangu_prefill_hccl_op_expansion_mode: AIV
+    enable_kv_pool: false
+
+    omnicache_v2_prefill_kv_transfer_config:
+      kv_connector: OmniCacheConnector
+      kv_connector_module_path: omni_cache.v2.vllm_adapter.connector.connector
+      kv_role: kv_producer
+      kv_port: "30000"
+      kv_connector_extra_config:
+        cpu_bytes_to_use: 1288490188800
+        enable_volatile_single_layer_hbm: true
+        host_memory_pool_path: /dev/hugepages/omni_cache_p
+        ox_listen_endpoints: "16077"
+        # Each P is single-host; its TP rank 0 owns the OX endpoint.
+        ox_advertised_endpoints: "{{ host_ip }}:16077"
+        ox_endpoint: tcp://127.0.0.1:17555
+        ox_control_bind_endpoint: tcp://*:17555
+        pd_completion_enabled: true
+        pd_completion_port: 5568
+    omnicache_v2_decode_kv_transfer_config:
+      kv_connector: OmniCacheConnector
+      kv_connector_module_path: omni_cache.v2.vllm_adapter.connector.connector
+      kv_role: kv_consumer
+      kv_port: "30400"
+      kv_connector_extra_config:
+        # Capacity is divided by global DP in the core. Scale the per-node
+        # budget by global/local DP so each D host keeps its intended budget.
+        cpu_bytes_to_use: 1288490188800
+        enable_volatile_single_layer_hbm: false
+        host_memory_pool_path: /dev/hugepages/omni_cache_d
+        host_memory_node_dp_rank_start: "{{ DECODE_SERVER_OFFSET_BY_GROUP[inventory_hostname] | int }}"
+        host_memory_node_dp_size: "{{ ascend_rt_visible_devices.split(',') | length }}"
+        # P/D run on distinct physical hosts, so local OX ports can be reused.
+        ox_listen_endpoints: "16077"
+        ox_endpoint: tcp://127.0.0.1:17555
+        ox_control_bind_endpoint: tcp://*:17555
+        pd_completion_enabled: true
+        pd_completion_port: 5568
+
+    run_docker_profile:
+      shm_size: 1800g
+      envs:
+        - PYTHONHASHSEED=1234
+      extra_mounts:
+        - /mnt:/mnt
+        - /tmp:/tmp
+        - /home:/home
+        - /dev/hugepages:/dev/hugepages
+
+    sync_code_profile:
+      container_copy:
+        prefill: >-
+          docker exec "$DOCKER_NAME_P" mkdir -p
+          '{{ container_workspace }}/omniinfer/components' &&
+          docker exec "$DOCKER_NAME_P" find
+          '{{ container_workspace }}/omniinfer'
+          -mindepth 1 -maxdepth 1 ! -name components
+          -exec rm -rf -- '{}' + &&
+          docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/.'
+          "${DOCKER_NAME_P}:{{ container_workspace }}/omniinfer/" &&
+          docker exec "$DOCKER_NAME_P" rm -rf
+          '{{ container_workspace }}/omni-cache' &&
+          docker exec "$DOCKER_NAME_P" mkdir -p
+          '{{ container_workspace }}/omni-cache' &&
+          docker cp '{{ ansible_env.CODE_PATH }}/omni-cache/.'
+          "${DOCKER_NAME_P}:{{ container_workspace }}/omni-cache/"
+        decode: >-
+          docker exec "$DOCKER_NAME_D" mkdir -p
+          '{{ container_workspace }}/omniinfer/components' &&
+          docker exec "$DOCKER_NAME_D" find
+          '{{ container_workspace }}/omniinfer'
+          -mindepth 1 -maxdepth 1 ! -name components
+          -exec rm -rf -- '{}' + &&
+          docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/.'
+          "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/" &&
+          docker exec "$DOCKER_NAME_D" rm -rf
+          '{{ container_workspace }}/omni-cache' &&
+          docker exec "$DOCKER_NAME_D" mkdir -p
+          '{{ container_workspace }}/omni-cache' &&
+          docker cp '{{ ansible_env.CODE_PATH }}/omni-cache/.'
+          "${DOCKER_NAME_D}:{{ container_workspace }}/omni-cache/"
+
+    pip_install_profile:
+      prefill: >-
+        docker exec "$DOCKER_NAME_P" bash -lc
+        'source ~/.bashrc &&
+        python -m pip uninstall -y omni-npu omni-cache &&
+        TORCH_DEVICE_BACKEND_AUTOLOAD=0
+        python -m pip install --force-reinstall
+        --no-deps --no-build-isolation --editable
+        {{ container_workspace }}/omniinfer &&
+        TORCH_DEVICE_BACKEND_AUTOLOAD=0
+        python -m pip install --force-reinstall
+        --no-deps --no-build-isolation --editable
+        {{ container_workspace }}/omni-cache'
+      decode: >-
+        docker exec "$DOCKER_NAME_D" bash -lc
+        'source ~/.bashrc &&
+        python -m pip uninstall -y omni-npu omni-cache &&
+        TORCH_DEVICE_BACKEND_AUTOLOAD=0
+        python -m pip install --force-reinstall
+        --no-deps --no-build-isolation --editable
+        {{ container_workspace }}/omniinfer &&
+        TORCH_DEVICE_BACKEND_AUTOLOAD=0
+        python -m pip install --force-reinstall
+        --no-deps --no-build-isolation --editable
+        {{ container_workspace }}/omni-cache'
+
+    run_server_prefill_profile:
+      # OmniCache owns Host KV; do not enable the framework offload connector.
+      kv_offload:
+        enable: false
+      prepare_commands: |-
+        export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_ALL | replace(' ', '') | trim | quote }}
+        export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=36000
+        export VLLM_DISABLE_PYNCCL=1
+        export HCCL_BUFFSIZE=100
+        export HCCL_CONNECT_TIMEOUT=1800
+        export HCCL_EXEC_TIMEOUT=1800
+        export HCCL_OP_RETRY_ENABLE="L0:0,L1:0,L2:0"
+        export HCCL_OP_EXPANSION_MODE="AIV"
+        export ASCEND_GLOBAL_LOG_LEVEL=3
+        export TASK_QUEUE_ENABLE=2
+        export OMNI_REUSE_PREFILLED_TOKENS=1
+        export OMNI_SKIP_DECODE_TOKENIZE=1
+        export VLLM_MQ_MAX_CHUNK_BYTES_MB=100
+        export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
+        export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models,omni_cache_v2_volatile_layout"
+        export OMNI_HYBRID_ATTN_GROUP_SIZE=18
+        export OMNI_VLLM_PATCHES_DIR="pangu_v2_hybrid, pangu_v2_moe"
+        export OMNI_VLLM_PATCHES="ALL"
+        export OMNI_ENABLE_OMNI_CACHE=1
+        ENDPOINT_PORT=$((API_PORT + 100))
+        KV_EVENTS_CONFIG='{"enable_kv_cache_events":true,"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:'${ENDPOINT_PORT}'"}'
+        EXTRA_ARGS="--kv-events-config ${KV_EVENTS_CONFIG}"
+        # EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
+        EXTRA_ARGS="${EXTRA_ARGS} --no-disable-hybrid-kv-cache-manager --max-num-batched-tokens 30720"
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-expert-parallel --max-num-seqs 3"
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-prompt-tokens-details --enable-chunked-prefill"
+        EXTRA_ARGS="${EXTRA_ARGS} --dtype bfloat16 --enforce-eager"
+        export OMNI_CACHE_V2_ASYNC_PRODUCER={{ '1' if pangu_prefill_async_scheduling | bool else '0' }}
+        # EXTRA_ARGS="${EXTRA_ARGS} {{ '--async-scheduling' if pangu_prefill_async_scheduling | bool else '--no-async-scheduling' }}"
+        EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
+        EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu"
+        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
+        EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
+        {% if enable_prefix_caching | bool %}
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-prefix-caching --mamba-block-size 128"
+        export OMNI_CUSTOM_MODEL_CONFIG_PATH="low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_p_omnicache_claw.json"
+        {% else %}
+        EXTRA_ARGS="${EXTRA_ARGS} --no-enable-prefix-caching"
+        export OMNI_CUSTOM_MODEL_CONFIG_PATH="low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_p_claw_noapc.json"
+        {% endif %}
+        export TORCH_COMPILE_DISABLE=1
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        GPU_UTIL=0.88
+      args:
+        - --max-model-len 262144
+        - --served-model-name {{ model | quote }}
+        - '--additional-config ''{"enable_low_latency": true, "enable_omni_cache": true}'''
+        - --gpu-util "${GPU_UTIL}"
+        - >-
+          --kv-transfer-config '{{
+          (omnicache_v2_prefill_kv_transfer_config
+          | combine({'engine_id': kv_rank | string})) | to_json }}'
+        - --extra-args "${EXTRA_ARGS}"
+        - --hccl-buffsize "${HCCL_BUFFSIZE}"
+        - --hccl-op-expansion-mode "${HCCL_OP_EXPANSION_MODE}"
+        - --num-speculative-tokens 3
+
+    run_server_decode_profile:
+      # OmniCache owns Host KV; do not enable the framework offload connector.
+      kv_offload:
+        enable: false
+      prepare_commands: |-
+        export DECODE_DATA_PARALLEL_SIZE={{ DECODE_SERVER_BY_GROUP | quote }}
+        export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_BY_GROUP | replace(' ', '') | trim | quote }}
+        export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=36000
+        export VLLM_DISABLE_PYNCCL=1
+        export HCCL_BUFFSIZE=1200
+        export HCCL_CONNECT_TIMEOUT=1800
+        export HCCL_EXEC_TIMEOUT=1800
+        export HCCL_OP_RETRY_ENABLE="L0:0,L1:0,L2:0"
+        export HCCL_OP_EXPANSION_MODE="AIV"
+        export ASCEND_GLOBAL_LOG_LEVEL=3
+        export OMNI_REUSE_PREFILLED_TOKENS=1
+        export OMNI_SKIP_DECODE_TOKENIZE=1
+        export VLLM_MQ_MAX_CHUNK_BYTES_MB=100
+        export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
+        export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models,omni_cache_v2_volatile_layout"
+        export OMNI_HYBRID_ATTN_GROUP_SIZE=18
+        export ENABLE_DP_LB=false
+        export TASK_QUEUE_ENABLE=1
+        export HCCL_SOCKET_IFNAME=enp23s0f3
+        export LOCAL_WORLD_SIZE={{ ascend_rt_visible_devices.split(",") | length }}
+        export OMNI_VLLM_PATCHES_DIR="pangu_v2_hybrid, pangu_v2_moe"
+        export OMNI_VLLM_PATCHES="ALL"
+        export OMNI_ENABLE_OMNI_CACHE=1
+        EXTRA_ARGS="--no-disable-hybrid-kv-cache-manager"
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-expert-parallel --max-num-seqs 3"
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-prompt-tokens-details --enable-chunked-prefill"
+        EXTRA_ARGS="${EXTRA_ARGS} --distributed-executor-backend mp --dtype bfloat16"
+        COMPILATION_CONFIG='{"mode": 3, "cudagraph_mode":"FULL", "cudagraph_capture_sizes":[4,8,12], "backend":"", "compile_sizes":[4,8,12]}'
+        EXTRA_ARGS="${EXTRA_ARGS} --compilation-config ${COMPILATION_CONFIG}"
+        EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
+        EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu"
+        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
+        EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
+        {% if enable_prefix_caching | bool %}
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-prefix-caching --mamba-block-size 128"
+        export OMNI_CUSTOM_MODEL_CONFIG_PATH="low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_d_omnicache_claw.json"
+        {% else %}
+        EXTRA_ARGS="${EXTRA_ARGS} --no-enable-prefix-caching"
+        export OMNI_CUSTOM_MODEL_CONFIG_PATH="low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_d_claw_noapc.json"
+        {% endif %}
+        export TORCH_COMPILE_DISABLE=0
+        export VLLM_DISABLE_COMPILE_CACHE=1
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        GPU_UTIL=0.95
+      args:
+        - --max-model-len 262144
+        - --served-model-name {{ model | quote }}
+        - --tp 1
+        - >-
+          --additional-config
+          '{"enable_low_latency": true, "enable_omni_cache": true,
+          "npugraph_ex_config":{"enable": true,
+          "super_kernel_optimize": false,
+          "static_kernel_compile": false}}'
+        - --gpu-util "${GPU_UTIL}"
+        - >-
+          --kv-transfer-config '{{
+          (omnicache_v2_decode_kv_transfer_config
+          | combine({'engine_id': OMNI_PD_PREFILL_POD_NUM | string})) | to_json }}'
+        - --extra-args "${EXTRA_ARGS}"
+        - --hccl-buffsize "${HCCL_BUFFSIZE}"
+        - --hccl-op-expansion-mode "${HCCL_OP_EXPANSION_MODE}"
+        - --num-speculative-tokens 3
+
+    run_server_common_profile:
+      restart_proxy: true
+
+    run_proxy_profile:
+      prepare_commands: |-
+        export PYTHONHASHSEED=1234
+        export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+        rm -f "${LOG_PATH}/{{ inventory_hostname }}/nginx_error.log" \
+              "${LOG_PATH}/{{ inventory_hostname }}/nginx_access.log"
+      args:
+        - --omni-proxy-model-path {{ model_path | quote }}
+        - --log-file ${LOG_PATH}/{{ inventory_hostname }}/nginx_error.log
+        - --log-level info
+        - --access-log-file ${LOG_PATH}/{{ inventory_hostname }}/nginx_access.log
+        - --core-num 16
+        - --start-core-index 16
+        - --subrequest-output-buffer-size 10M
+        - --omni-proxy-pd-policy sequential
+        - --omni-proxy-max-batch-num-token 20480
+        - --omni-proxy-prefill-max-num-seqs 3
+        - --omni-proxy-decode-max-num-seqs 3
+
+    proc_bind_profile:
+      enabled: "{{ proc_bind_enabled | default(false) | bool }}"
+
+  tasks:
+    - ansible.builtin.import_role:
+        name: elastic_server

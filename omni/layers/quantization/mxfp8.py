@@ -638,7 +638,7 @@ class Mxfp8MlpMethod(FusedMLPMethodBase):
         return output
 
     def apply(self, layer, x, stream_label=None):
-        x_fp8, x_scale = self.apply_quant(x, stream_label)
+        x_fp8, x_scale = self.apply_quant(x, stream_label=stream_label)
         x = {'x_mxfp8': x_fp8, 'pertoken_scale': x_scale}
         gate_up = self.apply_part1_gate_up_on_stream(layer, x, stream_label)
         x = self.apply_part2_activation_on_stream(layer, gate_up, stream_label)

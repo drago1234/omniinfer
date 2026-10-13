@@ -89,7 +89,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --enable-auto-tool-choice --tool-call-parser pangu"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-lopt --lopt-pool-size 16"
         EXTRA_ARGS="${EXTRA_ARGS} --lopt-chunk-size 4096"
-        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
+        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","ban_sequence_end_in_thinking":true}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
       args:
@@ -150,7 +150,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --enable-auto-tool-choice --tool-call-parser pangu"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-lopt --lopt-pool-size 16"
         EXTRA_ARGS="${EXTRA_ARGS} --lopt-chunk-size 4096"
-        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
+        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","ban_sequence_end_in_thinking":true}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
       args:

@@ -348,6 +348,10 @@ def test_unquant_kv_uses_pa_cache_without_expanding_values(case, monkeypatch):
 def test_mixed_forward_restores_shared_metadata(case, monkeypatch):
     a = case.attention
     a.prefix, a.cla_swa_attn_name = "global", "local"
+    # attn_metadata is keyed by the inner attention name the layer registers as
+    # f"{prefix}.attn", so the fake must expose the same name the fixture calls
+    # "global" through attn.layer_name.
+    a.attn.layer_name = "global.attn"
     a.is_cp_layer = a.is_attn_sp_layer = a.enable_flashcomm2 = False
     a.is_flashcomm2_layer = False
     a.tp_size = 1
@@ -372,7 +376,7 @@ def test_mixed_forward_restores_shared_metadata(case, monkeypatch):
     monkeypatch.setattr(a, "_forward_prefill", forward)
     monkeypatch.setattr(a, "_forward_decode", forward)
     hidden = torch.zeros(3, 4)
-    output = mod.npu_pangu_forward(hidden, case.pe, case.pe, "layer")
+    output = mod.npu_pangu_forward(hidden, case.pe, case.pe, "layer", "global.attn")
     torch.testing.assert_close(output, torch.tensor([[10.0] * 4, [20.0] * 4, [20.0] * 4]))
     for meta, (prefill, slots, slots_2d) in zip((global_meta, local_meta), initial):
         assert meta.prefill is prefill and meta.num_actual_tokens == 3

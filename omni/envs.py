@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     OMNI_PROFILE_SKIP_REQUESTS: int
     # Patch / Attention
     OMNI_DISABLE_PLUGIN_BACKENDS: str
+    OMNI_DISABLE_SPEC_DECODE_PAD: bool
     OMNI_STATIC_KERNEL_COMPILE_JOBS: int
     OMNI_HYBRID_ATTN_GROUP_SIZE: int
     OMNI_REPETITION_DETECTION_CONFIG: Optional[str]
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
     OMNI_MAX_DISPATCH_COMBINE_THRESHOLD: int
     OMNI_BEST_EP: bool
     OMNI_NPU_TOP_K_TOP_P_SAMPLE_NOT_SUPPORT_FLOAT: bool
+    OMNI_DRAFT_TOP_K: Optional[int]
     # Diagnostics
     OMNI_DUMP_ENABLE: bool
     OMNI_DUMP_DIR: str
@@ -310,6 +312,15 @@ env_variables: Dict[str, Callable[[], Any]] = {
     "OMNI_DISABLE_PLUGIN_BACKENDS":
     lambda: get_env_with_fallback("OMNI_DISABLE_PLUGIN_BACKENDS", ["DISABLE_PLUGIN_BACKENDS"], ""),
 
+    # Skip the upstream branch that pads a newly scheduled decode request from
+    # 1 token up to 1 + num_spec_tokens so the step keeps a full CUDA graph.
+    # On NPU the padded dummy draft slots break the step, so this is on (True)
+    # by default. Set to 0/false to restore the upstream padding. Effective
+    # only when OMNI_VLLM_PATCHES_DIR loads pangu_v2_base.
+    # Consumers: patch_scheduler_spec_decode_pad.py (Scheduler.schedule fork).
+    "OMNI_DISABLE_SPEC_DECODE_PAD":
+    lambda: get_env_with_fallback("OMNI_DISABLE_SPEC_DECODE_PAD", None, True, _as_bool),
+
     # Override for the KV-cache group size in pangu_v2_hybrid models. The
     # default heuristic is min(num_layers_per_type), with a 1.25x bump to
     # max when types are similar in size. Setting this >0 forces the value
@@ -415,6 +426,14 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Consumers: layers/quantization/compressed_tensors/compressed_tensors_moe.py:65,316-328.
     "OMNI_BEST_EP":
     lambda: get_env_with_fallback("OMNI_BEST_EP", ["BEST_EP"], False, _as_bool),
+
+    # Probabilistic draft only: unset follows each request's top_k; -1/0
+    # disables draft top-k; positive values override it (clamped to vocab size).
+    # Read once at proposer initialization. Target top-k and draft top-p remain
+    # request-controlled; greedy and temperature_only ignore this variable.
+    # Consumer: vllm_patches/patches/common/patch_eagle.py:EagleProposerPatch.
+    "OMNI_DRAFT_TOP_K":
+    lambda: get_env_with_fallback("OMNI_DRAFT_TOP_K", None, None, _as_int),
 
     # CANN 8.5.1 compatibility path for npu_top_k_top_p_sample: normalize
     # float32 logits and cast logits/top_p to model dtype before invoking the

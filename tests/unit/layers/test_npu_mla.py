@@ -411,7 +411,7 @@ def test_build_mome_conv_sets_state_and_constructs_attention(monkeypatch):
     assert fake.cache_dtype_str is None
     assert constructed["kernel_size"] == 7
     assert constructed["num_spec_tokens"] == 3
-    assert constructed["prefix"] == "layer0.conv"
+    assert constructed["prefix"] == "layer0.attn.mome"
     assert constructed["vllm_config"] is vllm_config
     assert isinstance(fake.conv, FakeMome)
 
@@ -1455,6 +1455,7 @@ class TestNPUDeepseekMLAAttention:
                 torch.zeros(T0, 1, 1, R, **env.cfg_bf16),
                 torch.zeros(T0, 1, 1, R, **env.cfg_bf16),
                 "test_layer",
+                "test_layer.attn",
             )
             assert out.shape == (T, D)
 

@@ -2,7 +2,7 @@
 # Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 from copy import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import cast
 import os
 
@@ -41,10 +41,12 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from omni_npu.attention.backends.mome import NPUMomeAttentionMetadataBuilder
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 from omni_npu.model_config.config_loader.loader import model_extra_config
+from omni_npu import envs as omni_envs
 
 logger = init_logger(__name__)
 
 EagleProposer_original_init = EagleProposer.__init__
+EagleProposer_original_sample_from_logits = EagleProposer._sample_from_logits
 
 
 @dataclass
@@ -58,6 +60,13 @@ class DraftAttnGroup:
     layer_names: list[str] = field(default_factory=list)
     builder: AttentionMetadataBuilder | None = None
     is_base: bool = False  # True for group containing attn_layer_names[0]
+
+
+def _forward_draft_model(proposer, **model_kwargs):
+    """Run one draft model forward, counting MTP draft executions."""
+    if getattr(proposer, "method", None) == "mtp":
+        proposer.mtp_exec_count = getattr(proposer, "mtp_exec_count", 0) + 1
+    return proposer.model(**model_kwargs)
 
 
 @register_patch("TorchEagleProposer", EagleProposer)
@@ -92,7 +101,16 @@ class EagleProposerPatch(VLLMPatch):
         EagleProposer_original_init(
             self, vllm_config=vllm_config, device=device, runner=runner
         )
+        self._draft_top_k = omni_envs.OMNI_DRAFT_TOP_K if self._enable_probabilistic_draft_probs else None
+        if self._draft_top_k is not None and self._draft_top_k < -1:
+            raise ValueError("OMNI_DRAFT_TOP_K must be -1, 0, or a positive integer")
+
+        # disable top k in temperature_only mode
+        self._temperature_only = self.speculative_config.draft_sample_method == "temperature_only"
+        if self._temperature_only:
+            self._enable_probabilistic_draft_probs = self.speculative_config.rejection_sample_method == "standard"
         self.runner = runner
+        self.mtp_exec_count = 0
         self._draft_attn_layer_names: set[str] = set()
         self.attn_layer_names: list[str] = []
         self.use_cuda_graph = True
@@ -323,7 +341,7 @@ class EagleProposerPatch(VLLMPatch):
                 )
                 if self.method == "mtp" and self.n_predict > 1:
                     model_kwargs["spec_step_idx"] = fwd_idx
-                ret_hidden_states = self.model(**model_kwargs)
+                ret_hidden_states = _forward_draft_model(self, **model_kwargs)
 
                 # Mirror active rank's per-iter (forward, compute_logits)
                 # order so idle DP ranks stay lock-step on the DP collectives
@@ -620,6 +638,9 @@ class EagleProposerPatch(VLLMPatch):
             else:
                 group_cm = copy(common_attn_metadata)
                 group_cm.block_table_tensor = blk_table_tensor
+                group_cm.slot_mapping = (
+                    blk_table.slot_mapping.gpu[:common_attn_metadata.num_actual_tokens]
+                )
                 group_cm.slot_mapping[:slot_mapping.numel()] = slot_mapping
             group_cm.slot_mapping[slot_mapping.numel():] = -1
 
@@ -649,6 +670,7 @@ class EagleProposerPatch(VLLMPatch):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Sample draft tokens and cache the proposal distribution q for verify.
 
+        temperature_only reuses upstream temperature-only sampling.
         vLLM 0.25 upstream only applies temperature when building draft_probs.
         Target verify uses ``compute_probs`` (temperature + top_k + top_p) for p.
         Align draft q with the same constraints so standard p/q rejection sampling
@@ -658,6 +680,11 @@ class EagleProposerPatch(VLLMPatch):
             return logits.argmax(dim=-1), None
         if sampling_metadata.all_greedy:
             return logits.argmax(dim=-1), None
+
+        if self._temperature_only:
+            return EagleProposer_original_sample_from_logits(
+                self, logits, sampling_metadata
+            )
 
         if HAS_TRITON and logits.device.type == "npu":
             return sample_draft_logits(
@@ -803,6 +830,16 @@ class EagleProposerPatch(VLLMPatch):
         self._last_draft_probs = None
         batch_size = next_token_ids.shape[0]
 
+        is_standard_sample = self._enable_probabilistic_draft_probs and not self._temperature_only
+        if is_standard_sample and not sampling_metadata.all_greedy and self._draft_top_k is not None:
+            # Prepare once per propose; leave target metadata and storage intact.
+            sampling_metadata = replace(
+                sampling_metadata,
+                top_k=torch.full_like(
+                    sampling_metadata.temperature, self._draft_top_k, dtype=torch.int32,
+                ) if self._draft_top_k > 0 else None,
+            )
+
         use_multi_mtp = (
                 self.method == "mtp"
                 and self.n_predict > 1
@@ -923,7 +960,7 @@ class EagleProposerPatch(VLLMPatch):
         ):
             forward_context = get_forward_context()
             forward_context.capturing = False
-            ret_hidden_states = self.model(**model_kwargs)
+            ret_hidden_states = _forward_draft_model(self, **model_kwargs)
 
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
@@ -1153,7 +1190,7 @@ class EagleProposerPatch(VLLMPatch):
                     get_forward_context()
                 )
                 forward_context.capturing = False
-                ret_hidden_states = self.model(
+                ret_hidden_states = _forward_draft_model(self,
                     **model_kwargs
                 )
 

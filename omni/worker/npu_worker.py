@@ -398,6 +398,12 @@ class NPUWorker(Worker):
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True, force_attention=True)
 
+    def execute_dummy_batch_and_poll_kv(self):
+        """D control-batch RPC; regular dummy callers never drain KV."""
+        self.execute_dummy_batch()
+        from omni_npu.connector.late_kv_completion import poll_llmdatadist_completion
+        return poll_llmdatadist_completion(self.vllm_config)
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",  # type: ignore[name-defined]

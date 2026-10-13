@@ -336,7 +336,7 @@ if __name__ == "__main__":
                 "arbitrary physical devices instead of always 0,1.")
     parser.add_argument("--num-speculative-tokens", type=int, default=1)
     parser.add_argument("--rejection-sample-method", choices=("standard", "synthetic", "block"), default=None)
-    parser.add_argument("--draft-sample-method", choices=("greedy", "probabilistic"), default=None)
+    parser.add_argument("--draft-sample-method", choices=("greedy", "probabilistic", "temperature_only"), default=None)
     parser.add_argument("--pp", type=int, default=1, help="Pipeline parallelism size")
     parser.add_argument("--distributed-executor-backend", type=str, default=None, help="Distributed executor backend for vLLM (e.g., 'mp', 'ray')")
 

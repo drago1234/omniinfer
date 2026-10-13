@@ -47,10 +47,10 @@
           -exec rm -rf -- '{}' + &&
           docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/.'
           "${DOCKER_NAME_P}:{{ container_workspace }}/omniinfer/" &&
-          if [ -d '{{ ansible_env.CODE_PATH }}/Pangu-FusionComm' ]; then
+          if [ -d '{{ ansible_env.CODE_PATH }}/Pangu-Fusion' ]; then
           docker exec "$DOCKER_NAME_P" rm -rf
-          '{{ container_workspace }}/omniinfer/components/Pangu-FusionComm' &&
-          docker cp '{{ ansible_env.CODE_PATH }}/Pangu-FusionComm'
+          '{{ container_workspace }}/omniinfer/components/Pangu-Fusion' &&
+          docker cp '{{ ansible_env.CODE_PATH }}/Pangu-Fusion'
           "${DOCKER_NAME_P}:{{ container_workspace }}/omniinfer/components/";
           fi
         decode: >-
@@ -62,10 +62,10 @@
           -exec rm -rf -- '{}' + &&
           docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/.'
           "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/" &&
-          if [ -d '{{ ansible_env.CODE_PATH }}/Pangu-FusionComm' ]; then
+          if [ -d '{{ ansible_env.CODE_PATH }}/Pangu-Fusion' ]; then
           docker exec "$DOCKER_NAME_D" rm -rf
-          '{{ container_workspace }}/omniinfer/components/Pangu-FusionComm' &&
-          docker cp '{{ ansible_env.CODE_PATH }}/Pangu-FusionComm'
+          '{{ container_workspace }}/omniinfer/components/Pangu-Fusion' &&
+          docker cp '{{ ansible_env.CODE_PATH }}/Pangu-Fusion'
           "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/components/";
           fi
         proxy: >-
@@ -123,7 +123,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --enable-lopt --lopt-pool-size 16"
         EXTRA_ARGS="${EXTRA_ARGS} --lopt-chunk-size 4096"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
-        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
+        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","ban_sequence_end_in_thinking":true}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
         {% if enable_kv_pool | bool %}
         if [ -f "{{ ansible_env.SCRIPTS_PATH }}/kv_pool_runtime.sh" ]; then
@@ -192,7 +192,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --enable-lopt --lopt-pool-size 16"
         EXTRA_ARGS="${EXTRA_ARGS} --lopt-chunk-size 4096"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
-        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
+        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","ban_sequence_end_in_thinking":true}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
         {% if enable_kv_pool | bool %}
         if [ -f "{{ ansible_env.SCRIPTS_PATH }}/kv_pool_runtime.sh" ]; then

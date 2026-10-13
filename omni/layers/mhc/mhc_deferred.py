@@ -14,12 +14,13 @@ def run_attention_mhc_deferred(
     cos: torch.Tensor,
     sin: torch.Tensor,
     residual: torch.Tensor,
-    layer_name: str,
+    module_name: str,
     mhc_layer_name: str,
     task_key: str,
+    layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch next-layer MHC work between attention and the attention epilog."""
-    layer = forward_context.no_compile_layers[layer_name]
+    layer = forward_context.no_compile_layers[module_name]
     mhc_module = forward_context.no_compile_layers[mhc_layer_name]
     deferred_results: list[tuple[torch.Tensor, torch.Tensor]] = []
 
@@ -30,7 +31,7 @@ def run_attention_mhc_deferred(
 
     layer.pre_epilog_callback = _launch_mhc
     try:
-        output = attn_forward(hidden_states, cos, sin, layer_name)
+        output = attn_forward(hidden_states, cos, sin, module_name, layer_name)
     finally:
         layer.pre_epilog_callback = None
 
@@ -50,9 +51,10 @@ def call_attention_mhc_deferred(
     cos: torch.Tensor,
     sin: torch.Tensor,
     residual: torch.Tensor,
-    layer_name: str,
+    module_name: str,
     mhc_layer_name: str,
     task_key: str,
+    layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Resolve the current forward context and launch deferred MHC work."""
     return run_attention_mhc_deferred(
@@ -62,9 +64,10 @@ def call_attention_mhc_deferred(
         cos,
         sin,
         residual,
-        layer_name,
+        module_name,
         mhc_layer_name,
         task_key,
+        layer_name,
     )
 
 
@@ -73,9 +76,10 @@ def attention_mhc_deferred_fake(
     cos: torch.Tensor,
     sin: torch.Tensor,
     residual: torch.Tensor,
-    layer_name: str,
+    module_name: str,
     mhc_layer_name: str,
     task_key: str,
+    layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     mhc_module = get_forward_context().no_compile_layers[mhc_layer_name]
     residual = residual.reshape(

@@ -238,26 +238,20 @@ def test_forward_allgather_agrs_eplb_maps_and_records_physical_experts(monkeypat
     moe = _make_quant_moe(gmm_fr_token_threshold=TOKENS)
     moe.enable_eplb = True
     mapped_ids = torch.ones(TOKENS, TOP_K, dtype=torch.int32)
-    planner = SimpleNamespace(
-        plan=MagicMock(return_value=(None, mapped_ids, None)),
-        record_activation=MagicMock(),
+    eplb_state = SimpleNamespace(
+        num_unpadded_tokens_tensors=[torch.tensor(TOKENS, dtype=torch.int32)],
+        apply_mapping=MagicMock(return_value=mapped_ids),
+        record_load=MagicMock(),
     )
-    moe.experts.planner = planner
-    moe.experts.moe_layer_idx = 3
-    moe.experts.expert_mapping = torch.arange(EXPERTS)
+    moe.moe_runner = SimpleNamespace(eplb_state=eplb_state)
     _patch_quant_ops(monkeypatch, calls)
 
     hidden = torch.ones(TOKENS, HIDDEN, dtype=torch.bfloat16)
     _forward_allgather(moe, hidden, use_allreduce=False)
 
-    plan_kwargs = planner.plan.call_args.kwargs
-    assert plan_kwargs["layer_idx_moe"] == 3
-    assert plan_kwargs["tokens"] is hidden
-    assert plan_kwargs["top_k"] == TOP_K
-    assert plan_kwargs["expert_mapping"] is moe.experts.expert_mapping
+    # logical -> physical mapping happens before init_routing / all-gather
+    assert eplb_state.apply_mapping.call_args.args[0].shape[-1] == TOP_K
     assert calls["init_routing"][1] is mapped_ids
-    planner.record_activation.assert_called_once()
-    record_args = planner.record_activation.call_args
-    assert record_args.args[0] == 3
-    assert record_args.args[1].dtype == torch.int64
-    assert record_args.kwargs == {"support_multi_stream": False}
+    # the per-rank physical expert load is recorded for this layer
+    eplb_state.record_load.assert_called_once()
+    assert eplb_state.record_load.call_args.args[0].dtype == torch.int64
