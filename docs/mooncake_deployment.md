@@ -325,3 +325,64 @@ python3 tools/scripts/start_mooncake.py check \
 [部署指南](https://github.com/kvcache-ai/Mooncake/blob/v0.3.13.post1/docs/source/deployment/mooncake-store-deployment-guide.md)、
 [客户端绑定](https://github.com/kvcache-ai/Mooncake/blob/v0.3.13.post1/mooncake-integration/store/store_py.cpp)、
 [副本分配实现](https://github.com/kvcache-ai/Mooncake/blob/v0.3.13.post1/mooncake-store/src/master_service.cpp)。
+
+
+## FeatureStore 客户端容量和 I/O 配置
+
+通过 `start_mooncake.py client-config` 生成 `feature-store.json` 和配套的
+`feature-store.env`。容量与 I/O 参数如下，省略时使用表中的默认值：
+
+| client-config 参数 | JSON 字段 | 默认值 | 范围或约束 |
+|---|---|---|---|
+| `--max-payload-mib` | `max_payload_bytes` | 32 MiB | 正整数，单个 embedding 上限 |
+| `--max-inflight-mib` | `max_inflight_bytes` | 1024 MiB | 至少为单个 embedding 上限的 4 倍 |
+| `--max-items` | `max_items` | 8 | 1..128，单次请求的特征引用数量 |
+| `--io-workers` | `io_workers` | 4 | 1..64，特征 I/O 线程数 |
+| `--max-inflight-requests` | `max_inflight_requests` | 8 | 1..1024，特征准备并发请求数 |
+| `--io-timeout-seconds` | `io_timeout_seconds` | 30.0 秒 | 大于 0 且不超过 600，支持小数 |
+| `--buffer-mib` | `mooncake.local_buffer_size` | 64 MiB | 至少 32 MiB，本地传输缓冲 |
+
+前六项参数仅适用于 `client-config`；`--buffer-mib` 也用于其他操作。
+MiB 参数写入 JSON 时会乘以 `1024 ** 2`，转换为字节。
+非法参数会在写文件前被拒绝，不覆盖现有配置。
+`max_inflight_requests` 控制特征准备并发，与推理客户端的 HTTP 并发数不同。
+这些客户端配置不改变 Mooncake 的存储池大小；存储池由 `start --pool-mib` 配置。
+
+例如，在客户端 `10.0.0.21` 上生成连接存储主机 `10.0.0.11` 的配置：
+
+```bash
+python3 tools/scripts/start_mooncake.py client-config \
+  --mode standalone --hosts 10.0.0.11 \
+  --cluster-id rl-embeddings-v1 --local-host 10.0.0.21 \
+  --model pangu_ultra_moe --buffer-mib 256 \
+  --max-payload-mib 64 --max-inflight-mib 2048 \
+  --max-items 8 --io-workers 4 --max-inflight-requests 8 \
+  --io-timeout-seconds 30 \
+  --output-dir /data/feature-store/client
+```
+
+请替换为实际存储地址、客户端地址、集群标识和模型名称。
+生成结果中的容量与 I/O 字段为：
+
+```json
+{
+  "max_payload_bytes": 67108864,
+  "max_inflight_bytes": 2147483648,
+  "max_items": 8,
+  "io_workers": 4,
+  "max_inflight_requests": 8,
+  "io_timeout_seconds": 30.0
+}
+```
+
+运行客户端或推理服务之前，在同一启动环境中加载生成的环境文件：
+
+```bash
+source /data/feature-store/client/feature-store.env
+```
+
+`client-config` 只生成文件，不启动或重启服务。重新生成会覆盖原来的配置文件，
+因此每次都应传入需要保留的非默认设置。运行中的消费者不会自动重新加载文件：
+修改容量或 I/O 配置后，重新启动相应的 P 推理服务；独立客户端重新执行命令即可。
+仅修改这些客户端配置，无需重启 Mooncake 存储服务。
+使用新参数前，确认执行的生成脚本已更新到支持这些参数的版本。

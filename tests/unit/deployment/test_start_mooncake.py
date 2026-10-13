@@ -1408,3 +1408,62 @@ def test_main_bootstraps_with_original_arguments_before_native_work(
         if action == "start"
         else ["bootstrap", "cluster"]
     )
+
+
+@pytest.mark.parametrize("options,payload,inflight", [({},32,1024),({"max-payload-mib":64,"max-inflight-mib":2048},64,2048)])
+def test_generated_capacity_fields(tmp_path, options, payload, inflight):
+    args = launcher.parse_args(argv("client-config", model="served-model", **{"local-host":"10.20.1.8","output-dir":tmp_path, **options}))
+    launcher.generate_client(args)
+    config = json.loads((tmp_path/"feature-store.json").read_text())
+    assert config["max_payload_bytes"] == payload * 1024**2
+    assert config["max_inflight_bytes"] == inflight * 1024**2
+
+
+@pytest.mark.parametrize("options", [{"max-payload-mib":0},{"max-payload-mib":-1},{"max-payload-mib":64,"max-inflight-mib":255},{"max-inflight-mib":-1}])
+def test_reject_invalid_client_capacity_without_writing(tmp_path, options):
+    with pytest.raises(SystemExit):
+        launcher.parse_args(argv("client-config", model="served-model", **{"local-host":"10.20.1.8","output-dir":tmp_path, **options}))
+    assert not (tmp_path/"feature-store.json").exists()
+
+
+def test_reject_capacity_on_storage_start(tmp_path):
+    with pytest.raises(SystemExit):
+        start_args(tmp_path, **{"max-payload-mib":64})
+
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({}, {"max_items":8,"io_workers":4,"max_inflight_requests":8,"io_timeout_seconds":30.0}),
+    ({"max-items":128,"io-workers":64,"max-inflight-requests":1024,"io-timeout-seconds":0.5},
+     {"max_items":128,"io_workers":64,"max_inflight_requests":1024,"io_timeout_seconds":0.5}),
+])
+def test_client_io_settings_are_written(tmp_path, overrides, expected):
+    args = launcher.parse_args(argv("client-config", model="served-model", **{"local-host":"10.20.1.8","output-dir":tmp_path, **overrides}))
+    launcher.generate_client(args)
+    config = json.loads((tmp_path/"feature-store.json").read_text())
+    for key,value in expected.items():
+        assert config[key] == value
+    assert isinstance(config["io_timeout_seconds"], float)
+
+
+@pytest.mark.parametrize("name,value", [
+    ("max-items",0),("max-items",129),("io-workers",0),("io-workers",65),
+    ("max-inflight-requests",0),("max-inflight-requests",1025),
+    ("io-timeout-seconds",0),("io-timeout-seconds",601),
+    ("io-timeout-seconds","nan"),("io-timeout-seconds","inf"),
+])
+def test_invalid_client_io_settings_do_not_overwrite(tmp_path, name, value):
+    existing=tmp_path/"feature-store.json"
+    existing.write_text("keep existing settings")
+    with pytest.raises(SystemExit):
+        launcher.parse_args(argv("client-config", model="served-model", **{"local-host":"10.20.1.8","output-dir":tmp_path,name:value}))
+    assert existing.read_text() == "keep existing settings"
+
+
+@pytest.mark.parametrize("name,value", [("max-items",8),("io-workers",4),("max-inflight-requests",8),("io-timeout-seconds",30)])
+@pytest.mark.parametrize("action", ["start","check"])
+def test_client_io_settings_reject_wrong_action(tmp_path, name, value, action):
+    with pytest.raises(SystemExit):
+        if action == "start":
+            start_args(tmp_path, **{name:value})
+        else:
+            check_args(**{name:value})

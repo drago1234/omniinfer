@@ -70,6 +70,18 @@ def parse_args(argv=None):
     )
     parser.add_argument("--pool-mib", type=int, default=4096)
     parser.add_argument("--buffer-mib", type=int, default=64)
+    parser.add_argument("--max-payload-mib", type=int,
+                        help="client-config only: embedding size limit in MiB (default: 32)")
+    parser.add_argument("--max-inflight-mib", type=int,
+                        help="client-config only: in-flight memory budget in MiB (default: 1024)")
+    parser.add_argument("--max-items", type=int,
+                        help="client-config only: feature references per request, 1..128 (default: 8)")
+    parser.add_argument("--io-workers", type=int,
+                        help="client-config only: feature I/O workers, 1..64 (default: 4)")
+    parser.add_argument("--max-inflight-requests", type=int,
+                        help="client-config only: concurrent preparations, 1..1024 (default: 8)")
+    parser.add_argument("--io-timeout-seconds", type=float,
+                        help="client-config only: feature I/O timeout, >0..600 (default: 30)")
     parser.add_argument(
         "--kv-lease-ttl-ms",
         type=int,
@@ -165,6 +177,24 @@ def validate_args(args):
         used |= current
     if args.pool_mib < 64 or args.buffer_mib < 32:
         raise ValueError("pool-mib must be >=64 and buffer-mib must be >=32")
+    client_options = (args.max_payload_mib, args.max_inflight_mib,
+                      args.max_items, args.io_workers, args.max_inflight_requests,
+                      args.io_timeout_seconds)
+    if any(value is not None for value in client_options) and args.action != "client-config":
+        raise ValueError("FeatureStore limits and I/O options are supported only for client-config")
+    for name, value, maximum in (
+        ("max-items", args.max_items, 128),
+        ("io-workers", args.io_workers, 64),
+        ("max-inflight-requests", args.max_inflight_requests, 1024),
+    ):
+        if value is not None and not 1 <= value <= maximum:
+            raise ValueError(f"{name} must be within 1..{maximum}")
+    if args.io_timeout_seconds is not None and not 0 < args.io_timeout_seconds <= 600:
+        raise ValueError("io-timeout-seconds must be finite and within (0, 600]")
+    payload = args.max_payload_mib if args.max_payload_mib is not None else 32
+    inflight = args.max_inflight_mib if args.max_inflight_mib is not None else 1024
+    if payload <= 0 or inflight < 4 * payload:
+        raise ValueError("max-payload-mib must be positive and max-inflight-mib must be >= 4 * max-payload-mib")
     if args.kv_lease_ttl_ms is not None:
         if not 1 <= args.kv_lease_ttl_ms <= 2**64 - 1:
             raise ValueError(
@@ -373,6 +403,12 @@ def build_plan(args):
 def render_client(args):
     config = {
         "model": args.model,
+        "max_items": args.max_items if args.max_items is not None else 8,
+        "io_workers": args.io_workers if args.io_workers is not None else 4,
+        "max_inflight_requests": args.max_inflight_requests if args.max_inflight_requests is not None else 8,
+        "io_timeout_seconds": args.io_timeout_seconds if args.io_timeout_seconds is not None else 30.0,
+        "max_payload_bytes": (args.max_payload_mib if args.max_payload_mib is not None else 32) * MIB,
+        "max_inflight_bytes": (args.max_inflight_mib if args.max_inflight_mib is not None else 1024) * MIB,
         "mooncake": {
             "local_hostname": args.local_host,
             "metadata_server": endpoint(args),
