@@ -2,7 +2,7 @@
 # Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 from copy import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import cast
 import os
 
@@ -41,10 +41,12 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from omni_npu.attention.backends.mome import NPUMomeAttentionMetadataBuilder
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 from omni_npu.model_config.config_loader.loader import model_extra_config
+from omni_npu import envs as omni_envs
 
 logger = init_logger(__name__)
 
 EagleProposer_original_init = EagleProposer.__init__
+EagleProposer_original_sample_from_logits = EagleProposer._sample_from_logits
 
 
 @dataclass
@@ -99,6 +101,14 @@ class EagleProposerPatch(VLLMPatch):
         EagleProposer_original_init(
             self, vllm_config=vllm_config, device=device, runner=runner
         )
+        self._draft_top_k = omni_envs.OMNI_DRAFT_TOP_K if self._enable_probabilistic_draft_probs else None
+        if self._draft_top_k is not None and self._draft_top_k < -1:
+            raise ValueError("OMNI_DRAFT_TOP_K must be -1, 0, or a positive integer")
+
+        # disable top k in temperature_only mode
+        self._temperature_only = self.speculative_config.draft_sample_method == "temperature_only"
+        if self._temperature_only:
+            self._enable_probabilistic_draft_probs = self.speculative_config.rejection_sample_method == "standard"
         self.runner = runner
         self.mtp_exec_count = 0
         self._draft_attn_layer_names: set[str] = set()
@@ -660,6 +670,7 @@ class EagleProposerPatch(VLLMPatch):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Sample draft tokens and cache the proposal distribution q for verify.
 
+        temperature_only reuses upstream temperature-only sampling.
         vLLM 0.25 upstream only applies temperature when building draft_probs.
         Target verify uses ``compute_probs`` (temperature + top_k + top_p) for p.
         Align draft q with the same constraints so standard p/q rejection sampling
@@ -669,6 +680,11 @@ class EagleProposerPatch(VLLMPatch):
             return logits.argmax(dim=-1), None
         if sampling_metadata.all_greedy:
             return logits.argmax(dim=-1), None
+
+        if self._temperature_only:
+            return EagleProposer_original_sample_from_logits(
+                self, logits, sampling_metadata
+            )
 
         if HAS_TRITON and logits.device.type == "npu":
             return sample_draft_logits(
@@ -813,6 +829,16 @@ class EagleProposerPatch(VLLMPatch):
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
         batch_size = next_token_ids.shape[0]
+
+        is_standard_sample = self._enable_probabilistic_draft_probs and not self._temperature_only
+        if is_standard_sample and not sampling_metadata.all_greedy and self._draft_top_k is not None:
+            # Prepare once per propose; leave target metadata and storage intact.
+            sampling_metadata = replace(
+                sampling_metadata,
+                top_k=torch.full_like(
+                    sampling_metadata.temperature, self._draft_top_k, dtype=torch.int32,
+                ) if self._draft_top_k > 0 else None,
+            )
 
         use_multi_mtp = (
                 self.method == "mtp"

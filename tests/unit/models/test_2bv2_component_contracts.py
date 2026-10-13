@@ -17,11 +17,21 @@ import importlib.util
 
 import pytest
 
-if importlib.util.find_spec("omni_models") is None:
-    pytest.skip(
-        "optional omni_models package is not installed",
-        allow_module_level=True,
-    )
+
+@pytest.fixture
+def require_component_models():
+    """Only component contracts require the optional models implementation.
+
+    An editable install can leave an importable omni_models namespace without
+    omni_models.models. Do not mistake that namespace for the full component,
+    or skip the independent vLLM/transformers contracts when it is absent.
+    Once models is discoverable, import errors must still fail the tests.
+    """
+    if (
+        importlib.util.find_spec("omni_models") is None
+        or importlib.util.find_spec("omni_models.models") is None
+    ):
+        pytest.skip("optional omni_models.models component is not installed")
 
 
 class TestVLLM025SymbolContracts:
@@ -93,7 +103,7 @@ class TestComponentModelRegistry:
         from vllm.model_executor.models import ModelRegistry
         assert hasattr(ModelRegistry, "register_model")
 
-    def test_register_model_registers_2bv2_arch(self):
+    def test_register_model_registers_2bv2_arch(self, require_component_models):
         """After register_model(), PanguEmbeddedForCausalLM is in the registry.
 
         register_model triggers register_processor/register_configuration, whose
@@ -109,7 +119,9 @@ class TestComponentModelRegistry:
         assert "PanguEmbeddedForCausalLM" in archs
         assert "PanguProMoEV2ForCausalLM" in archs
 
-    def test_registered_class_resolves_to_component_impl(self, load_patch):
+    def test_registered_class_resolves_to_component_impl(
+        self, require_component_models, load_patch
+    ):
         """The registered entry resolves to the component impl (component-route switch).
 
         openpangu.py's top-level import only requires patch_static_sink_attention
@@ -159,7 +171,7 @@ class TestImageProcessorTransformers5Contracts:
         # The fast module is currently the PIL variant; it also exports Qwen2VLImageProcessor.
         assert FastVariant is not None
 
-    def test_component_imageprocessor_imports(self):
+    def test_component_imageprocessor_imports(self, require_component_models):
         """Component imageprocessor full import chain (incl. register_transformers decorator)."""
         from omni_models.models.openpangu_vl.huggingface.imageprocessor_openpangu_vl import (
             OpenPanguVLImageProcessorFast,

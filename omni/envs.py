@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     OMNI_MAX_DISPATCH_COMBINE_THRESHOLD: int
     OMNI_BEST_EP: bool
     OMNI_NPU_TOP_K_TOP_P_SAMPLE_NOT_SUPPORT_FLOAT: bool
+    OMNI_DRAFT_TOP_K: Optional[int]
     # Diagnostics
     OMNI_DUMP_ENABLE: bool
     OMNI_DUMP_DIR: str
@@ -425,6 +426,14 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Consumers: layers/quantization/compressed_tensors/compressed_tensors_moe.py:65,316-328.
     "OMNI_BEST_EP":
     lambda: get_env_with_fallback("OMNI_BEST_EP", ["BEST_EP"], False, _as_bool),
+
+    # Probabilistic draft only: unset follows each request's top_k; -1/0
+    # disables draft top-k; positive values override it (clamped to vocab size).
+    # Read once at proposer initialization. Target top-k and draft top-p remain
+    # request-controlled; greedy and temperature_only ignore this variable.
+    # Consumer: vllm_patches/patches/common/patch_eagle.py:EagleProposerPatch.
+    "OMNI_DRAFT_TOP_K":
+    lambda: get_env_with_fallback("OMNI_DRAFT_TOP_K", None, None, _as_int),
 
     # CANN 8.5.1 compatibility path for npu_top_k_top_p_sample: normalize
     # float32 logits and cast logits/top_p to model dtype before invoking the
