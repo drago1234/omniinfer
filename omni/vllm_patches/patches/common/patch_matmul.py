@@ -43,22 +43,22 @@ class _NpuAiInfraMatmul(torch.autograd.Function):
         return grad_input, grad_other
 
 
-def _npu_ai_infra_matmul(input_tensor, other):
+def _npu_ai_infra_matmul(input, other):
     """Call the forward-only NPU matmul op for supported input shapes."""
-    if input_tensor.numel() == 0:
-        return input_tensor.new_zeros((*input_tensor.shape[:-1], other.shape[1]))
+    if input.numel() == 0:
+        return input.new_zeros((*input.shape[:-1], other.shape[1]))
 
-    if input_tensor.dim() == 2:
-        output = torch.ops.custom.npu_ai_infra_matmul(input_tensor, other)
+    if input.dim() == 2:
+        output = torch.ops.custom.npu_ai_infra_matmul(input, other)
     else:
-        batch_size, seq_length, hidden_size = input_tensor.shape
-        flattened_input = input_tensor.reshape(batch_size * seq_length, hidden_size)
+        batch_size, seq_length, hidden_size = input.shape
+        flattened_input = input.reshape(batch_size * seq_length, hidden_size)
         output = torch.ops.custom.npu_ai_infra_matmul(flattened_input, other)
         output = output.reshape(batch_size, seq_length, other.shape[1])
     return output
 
 
-def matmul_npu(input_tensor, other, *, out=None):
+def matmul_npu(input, other, *, out=None):
     if out is not None:
         raise ValueError("torch.ops.custom.npu_ai_infra_matmul does not support out")
     if other.dim() != 2:
@@ -66,16 +66,16 @@ def matmul_npu(input_tensor, other, *, out=None):
             "torch.ops.custom.npu_ai_infra_matmul requires a 2-D right-hand tensor, "
             f"but got other.dim()={other.dim()}"
         )
-    if input_tensor.dim() not in (2, 3):
+    if input.dim() not in (2, 3):
         raise ValueError(
             "torch.ops.custom.npu_ai_infra_matmul supports only 2-D or 3-D left-hand "
-            f"tensors, but got input_tensor.dim()={input_tensor.dim()}"
+            f"tensors, but got input.dim()={input.dim()}"
         )
-    return _NpuAiInfraMatmul.apply(input_tensor, other)
+    return _NpuAiInfraMatmul.apply(input, other)
 
 
-def linear_npu(input_tensor, weight, bias=None):
-    output = matmul_npu(input_tensor, weight.t())
+def linear_npu(input, weight, bias=None):
+    output = matmul_npu(input, weight.t())
     if bias is not None:
         output = output + bias
     return output
