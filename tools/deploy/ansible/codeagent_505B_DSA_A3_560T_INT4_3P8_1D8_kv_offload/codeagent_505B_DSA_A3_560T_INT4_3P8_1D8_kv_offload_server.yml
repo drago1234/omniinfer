@@ -22,10 +22,6 @@
     model_path: "/mnt/sfs_turbo/bucket-pangu-green-guiyang/b00938090/models/505b_w4a8"
     enable_prefix_caching: true
 
-    kv_offload_cann_toolkit_home: /usr/local/Ascend/cann-9.1.0
-    kv_offload_force_rebuild: false
-    kv_offload_require_memcpy_batch: true
-
     run_docker_profile:
       envs:
         - PYTHONHASHSEED=1234
@@ -58,37 +54,11 @@
     pip_install_profile:
       prefill: >-
         docker exec "$DOCKER_NAME_P" bash -lc
-        'set -euo pipefail;
-        export http_proxy="http://p_atlas:proxy%40123@172.18.94.89:8080";
-        export https_proxy="http://p_atlas:proxy%40123@172.18.94.89:8080";
-        export no_proxy="7.150.11.22,7.150.11.233,.huawei.com,api.code-agent.rnd.huawei.com,localhost,127.0.0.1";
-        if [ -d "{{ kv_offload_cann_toolkit_home }}" ]; then
-        export ASCEND_TOOLKIT_HOME="{{ kv_offload_cann_toolkit_home }}";
-        export ASCEND_HOME_PATH="$ASCEND_TOOLKIT_HOME";
-        if [ -f "$ASCEND_TOOLKIT_HOME/set_env.sh" ]; then . "$ASCEND_TOOLKIT_HOME/set_env.sh"; fi;
-        export LD_LIBRARY_PATH="$ASCEND_TOOLKIT_HOME/aarch64-linux/lib64:$ASCEND_TOOLKIT_HOME/lib64:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64:${LD_LIBRARY_PATH:-}";
-        echo "[kv-offload] CANN toolkit: $ASCEND_TOOLKIT_HOME";
-        else
-        echo "[kv-offload] WARNING: {{ kv_offload_cann_toolkit_home }} not found, keep container default CANN env";
-        fi;
-        pip uninstall -y omni-models omni-cache omni-npu omni_infer || true;
-        cd /workspace/omniinfer;
-        pip install --no-build-isolation --no-deps -e .;
-        python -c "import vllm, omni_npu; print(vllm.__version__)";
-        {% if kv_offload_force_rebuild | bool %}build_needed=1;{% else %}if python -c "from omni_npu.v1.kv_offload.cpu import _swap_blocks_batch as m; raise SystemExit(0 if getattr(m, \"cann_memcpy_batch\", False) else 1)" >/dev/null 2>&1; then build_needed=0; else build_needed=1; fi;{% endif %}
-        if [ "$build_needed" = "1" ]; then echo "[kv-offload] rebuild _swap_blocks_batch extension"; rm -f omni/v1/kv_offload/cpu/_swap_blocks_batch*.so; python setup.py build_ext --inplace; else echo "[kv-offload] _swap_blocks_batch already enabled, skip rebuild"; fi;
-        KV_OFFLOAD_REQUIRE_MEMCPY_BATCH={{ '1' if kv_offload_require_memcpy_batch | bool else '0' }} python -c "import os; from omni_npu.v1.kv_offload.cpu import _swap_blocks_batch as m; ok=bool(getattr(m, \"cann_memcpy_batch\", False)); req=os.environ.get(\"KV_OFFLOAD_REQUIRE_MEMCPY_BATCH\", \"1\")==\"1\"; print(\"[kv-offload] module=\", m.__file__); print(\"[kv-offload] host_location=\", getattr(m, \"host_location\", \"MISSING\")); print(\"[kv-offload] cann_memcpy_batch=\", ok); raise SystemExit(0 if (ok or not req) else 1)"'
+        'set -euo pipefail;'
 
       decode: >-
         docker exec "$DOCKER_NAME_D" bash -lc
-        'set -euo pipefail;
-        export http_proxy="http://p_atlas:proxy%40123@172.18.94.89:8080";
-        export https_proxy="http://p_atlas:proxy%40123@172.18.94.89:8080";
-        export no_proxy="7.150.11.22,7.150.11.233,.huawei.com,api.code-agent.rnd.huawei.com,localhost,127.0.0.1";
-        pip uninstall -y omni-models omni-cache omni-npu omni_infer || true;
-        cd /workspace/omniinfer;
-        pip install --no-build-isolation --no-deps -e .;
-        python -c "import vllm, omni_npu; print(vllm.__version__)"'
+        'set -euo pipefail;'
 
     run_server_prefill_profile:
       kv_offload:
