@@ -406,10 +406,17 @@ def alloc_caches(layer, vllm_config, num_blocks: int) -> None:
 
 
 def _mome_layer_and_name(layer):
-    """Return the MoME cache owner and its production metadata key."""
+    """Return the MoME cache owner and its production metadata key.
+
+    The key must match the layer registration name chosen by OmniInfer:
+    the inner attention layer name (``layer.attn.layer_name``, i.e.
+    ``<outer>.attn``) plus ``.mome`` - not the outer ``layer.layer_name``.
+    See NPUPanguSparseAttention._init_mome_layer /
+    MomeAttentionMixin._build_mome_conv.
+    """
     if getattr(layer, "_test_implementation", "low_latency") == "low_latency":
-        return layer.mome_attn, f"{layer.layer_name}.mome"
-    return layer.conv, f"{layer.layer_name}.conv"
+        return layer.mome_attn, f"{layer.attn.layer_name}.mome"
+    return layer.conv, f"{layer.attn.layer_name}.mome"
 
 
 def build_metadata(layer, vllm_config, reqs, num_blocks: int,

@@ -696,6 +696,7 @@ def _mock_mla_attention(
             **kwargs,
         ):
             super().__init__()
+            self.layer_name = prefix
             impl = SimpleNamespace()
             self.W_UK_T = torch.zeros(
                 num_heads,
@@ -2170,7 +2171,7 @@ def test_npu_dsa_forward_fake_returns_matching_hidden_and_topk_shapes():
     hidden = torch.zeros(3, 16)
     topk = torch.zeros(3, 1, 8, dtype=torch.int32)
     out, out_topk = npu_dsa_forward_fake(
-        hidden, torch.zeros(3, 1, 64), torch.zeros(3, 1, 64), "layer", topk
+        hidden, torch.zeros(3, 1, 64), torch.zeros(3, 1, 64), "layer", topk, "layer.attn"
     )
     assert out.shape == hidden.shape
     assert out.dtype == hidden.dtype

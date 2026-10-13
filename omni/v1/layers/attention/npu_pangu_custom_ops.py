@@ -179,7 +179,7 @@ def _lookup_mome_metadata(layer_name: str, phase: str):
         raise ValueError(f"Unsupported MoME phase: {phase}")
     context = get_forward_context()
     layer = context.no_compile_layers[layer_name]
-    metadata = context.attn_metadata[f"{layer.prefix}.mome"]
+    metadata = context.attn_metadata[f"{layer.attn.layer_name}.mome"]
     if metadata.num_prefills > 0 and metadata.num_decodes > 0:
         metadata = getattr(metadata, phase)
     return metadata

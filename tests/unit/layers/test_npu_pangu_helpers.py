@@ -418,6 +418,9 @@ class TestPanguIndexShare(unittest.TestCase):
 
         layer = SimpleNamespace(
             prefix="model.layers.7.self_attn",
+            # attn_metadata is keyed by the inner attention name, which the
+            # layer registers as f"{prefix}.attn".
+            attn=SimpleNamespace(layer_name="model.layers.7.self_attn.attn"),
             cla_swa_attn_name="model.cla_swa_layers.40.attn",
             is_cla_reuse_layer=True,
             is_cp_layer=True,
@@ -446,7 +449,13 @@ class TestPanguIndexShare(unittest.TestCase):
         )
 
         with patch("omni_npu.v1.layers.attention.npu_pangu.get_forward_context", return_value=context):
-            output = npu_pangu_forward(hidden, torch.empty(0), torch.empty(0), "layer")
+            output = npu_pangu_forward(
+                hidden,
+                torch.empty(0),
+                torch.empty(0),
+                "layer",
+                "model.layers.7.self_attn.attn",
+            )
 
         torch.testing.assert_close(output, hidden + 1)
         self.assertIs(layer._forward_cla_prefill_cp.call_args.args[3], global_metadata)
@@ -1290,6 +1299,8 @@ class TestPanguCLA(unittest.TestCase):
                 regular_fc2_output = hidden + 2
                 layer = SimpleNamespace(
                     prefix="model.layers.7.self_attn",
+                    # attn_metadata is keyed by the inner attention name.
+                    attn=SimpleNamespace(layer_name="model.layers.7.self_attn.attn"),
                     cla_swa_attn_name="model.cla_swa_layers.40.attn",
                     is_cla_reuse_layer=True,
                     is_cp_layer=False,
@@ -1312,7 +1323,13 @@ class TestPanguCLA(unittest.TestCase):
                 )
 
                 with patch("omni_npu.v1.layers.attention.npu_pangu.get_forward_context", return_value=context):
-                    output = npu_pangu_forward(hidden, torch.empty(0), torch.empty(0), "layer")
+                    output = npu_pangu_forward(
+                        hidden,
+                        torch.empty(0),
+                        torch.empty(0),
+                        "layer",
+                        "model.layers.7.self_attn.attn",
+                    )
 
                 if use_mome:
                     torch.testing.assert_close(output, regular_fc2_output)
@@ -2427,7 +2444,7 @@ def _call_npu_pangu_forward_sp(attention, hidden):
     ctx = _prefill_sp_forward_ctx(attention)
     with patch.object(pangu_mod, "get_forward_context", return_value=ctx):
         return pangu_mod.npu_pangu_forward(
-            hidden, torch.zeros(4, 2), torch.zeros(4, 2), "layer"
+            hidden, torch.zeros(4, 2), torch.zeros(4, 2), "layer", "layer.attn"
         )
 
 
@@ -2548,7 +2565,7 @@ class TestPanguDSADecodeCustomOp(unittest.TestCase):
         )
 
         with patch.object(pangu_mod, "get_forward_context", return_value=context):
-            result = pangu_mod.npu_pangu_forward(hidden, cos, sin, "layer")
+            result = pangu_mod.npu_pangu_forward(hidden, cos, sin, "layer", "layer.attn")
 
         self.assertIs(result, hidden)
         self.assertTrue(torch.equal(result[:2], decoded))
@@ -2615,6 +2632,7 @@ class TestPanguSWASeqParallel(unittest.TestCase):
                     torch.zeros(4, 2),
                     torch.zeros(4, 2),
                     "layer",
+                    "layer.attn",
                 )
 
     def test_npu_pangu_forward_keeps_dsa_prefill(self):
@@ -2632,6 +2650,7 @@ class TestPanguSWASeqParallel(unittest.TestCase):
                 torch.zeros(4, 2),
                 torch.zeros(4, 2),
                 "layer",
+                "layer.attn",
             )
 
         attention._forward_prefill.assert_called_once()

@@ -7,6 +7,10 @@ import torch
 import torch_npu
 from torch import nn
 from transformers import PretrainedConfig
+from vllm.model_executor.layers.attention.kv_transfer_utils import (
+    maybe_transfer_kv_layer,
+)
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
@@ -202,7 +206,7 @@ class MomeAttentionMixin:
             "state_shapes": self.mome_state_shapes,
             "quant_config": None,
             "vllm_config": vllm_config,
-            "prefix": f"{prefix}.conv",
+            "prefix": f"{prefix}.attn.mome",
         }
         self.conv = MomeAttention(**mome_kwargs)
 
@@ -1941,7 +1945,9 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         a consumer ever needs the selection.
         """
         return (
-            torch.ops.vllm.npu_mla_forward(x, cos, sin, self.prefix),
+            torch.ops.vllm.npu_mla_forward(
+                x, cos, sin, self.prefix, self.attn.layer_name
+            ),
             topk_indices_buffer,
         )
 
@@ -1949,7 +1955,8 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         self, x, cos, sin, residual, mhc_layer_name, task_key, topk_indices_buffer=None
     ):
         hidden_states, h_post, h_res = torch.ops.vllm.npu_mla_forward_mhc_deferred(
-            x, cos, sin, residual, self.prefix, mhc_layer_name, task_key
+            x, cos, sin, residual, self.prefix, mhc_layer_name, task_key,
+            self.attn.layer_name,
         )
         return (hidden_states, h_post, h_res), topk_indices_buffer
 
@@ -2379,17 +2386,20 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         return out
 
 
+@eager_break_during_capture
+@maybe_transfer_kv_layer
 def npu_mla_forward(
     hs: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    module_name: str,
     layer_name: str,
 ) -> torch.Tensor:
     forward_context = get_forward_context()
-    self: NPUDeepseekMLAAttention = forward_context.no_compile_layers[layer_name]
+    self: NPUDeepseekMLAAttention = forward_context.no_compile_layers[module_name]
     attn_metadata: NPUMLAMetadata = forward_context.attn_metadata
     if isinstance(attn_metadata, dict):
-        attn_metadata = attn_metadata[f"{self.prefix}.attn"]
+        attn_metadata = attn_metadata[layer_name]
     p_slice, d_slice, has_prefill, has_decode = get_batch_desc(attn_metadata)
     prefill = getattr(attn_metadata, "prefill", None)  # None for dummy_run
     decode = getattr(attn_metadata, "decode", None)  # None for dummy_run
@@ -2427,6 +2437,7 @@ def npu_mla_forward_fake(
     hidden_states: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    module_name: str,
     layer_name: str,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
@@ -2437,14 +2448,15 @@ def npu_mla_forward_mhc_deferred(
     cos: torch.Tensor,
     sin: torch.Tensor,
     residual: torch.Tensor,
-    layer_name: str,
+    module_name: str,
     mhc_layer_name: str,
     task_key: str,
+    layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch next-layer MHC work between attention and the MLA epilog."""
     return call_attention_mhc_deferred(
         npu_mla_forward, hidden_states, cos, sin, residual,
-        layer_name, mhc_layer_name, task_key,
+        module_name, mhc_layer_name, task_key, layer_name,
     )
 
 
