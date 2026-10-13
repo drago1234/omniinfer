@@ -99,10 +99,13 @@ class TestMomeSPThreshold(unittest.TestCase):
                 metadata, _, _ = self.build_metadata(tokens, 8192)
                 attn = SimpleNamespace(num_actual_tokens=tokens, num_decode_tokens=0,
                                        num_decodes=0, num_prefills=1, prefill=SimpleNamespace())
+                attn_name = f"{prefix}.attn"
                 context = SimpleNamespace(no_compile_layers={"layer": layer},
-                                          attn_metadata={f"{prefix}.attn": attn, f"{prefix}.mome": metadata})
+                                          attn_metadata={attn_name: attn, f"{attn_name}.mome": metadata})
                 with patch.object(pangu_mod, "get_forward_context", return_value=context):
-                    pangu_mod.npu_pangu_forward(torch.empty(0), torch.empty(0), torch.empty(0), "layer")
+                    pangu_mod.npu_pangu_forward(
+                        torch.empty(0), torch.empty(0), torch.empty(0), "layer", attn_name
+                    )
                 self.assertIs(seen[-1], metadata)
                 self.assertEqual(vars(layer), original_state)
             self.assertEqual([m.use_mome_sp for m in seen], [False, True, False, True])

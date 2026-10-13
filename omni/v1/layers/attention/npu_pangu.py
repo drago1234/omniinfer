@@ -22,6 +22,10 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadata,
     MLACommonPrefillMetadata,
 )
+from vllm.model_executor.layers.attention.kv_transfer_utils import (
+    maybe_transfer_kv_layer,
+)
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from omni_npu.attention.backends.mome import NPUMomeAttentionMetadata
 from vllm.logger import init_logger
 
@@ -1508,7 +1512,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             "state_shapes": self.mome_state_shapes,
             "quant_config": self.quant_config,
             "cache_config": self.cache_config,
-            "prefix": f"{self.layer_name}.mome",
+            "prefix": f"{self.attn.layer_name}.mome",
             "page_size_padded": self.page_size_padded,
             "num_extra_reserved_blocks": model_extra_config.operator_opt_config.num_extra_reserved_blocks,
         }
@@ -1733,12 +1737,15 @@ class NPUPanguSparseAttention(torch.nn.Module):
             # into the captured graph, which the cudagraph buffer-mutation guard
             # rejects. Non-950 keeps the plain call and the prolog multi-stream.
             return torch.ops.vllm.npu_pangu_forward(
-                hidden_states=hidden_states,
-                cos=cos,
-                sin=sin,
-                layer_name=self.layer_name,
+                hidden_states,
+                cos,
+                sin,
+                self.layer_name,
+                self.attn.layer_name,
             )
-        return npu_pangu_forward(hidden_states, cos, sin, self.layer_name)
+        return npu_pangu_forward(
+            hidden_states, cos, sin, self.layer_name, self.attn.layer_name
+        )
 
     def _prepare_phase_inputs(
         self,
@@ -4800,19 +4807,22 @@ class NPUPanguSparseAttention(torch.nn.Module):
         return get_cla_mapping(config)
 
 
+@eager_break_during_capture
+@maybe_transfer_kv_layer
 def npu_pangu_forward(
     hidden_states: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    module_name: str,
     layer_name: str,
 ) -> torch.Tensor:
     forward_context = get_forward_context()
-    self = forward_context.no_compile_layers[layer_name]    
+    self = forward_context.no_compile_layers[module_name]
     attn_metadata = get_forward_context().attn_metadata
     if isinstance(attn_metadata, dict):
-        mome_metadata = attn_metadata.get(f"{self.prefix}.mome")
+        mome_metadata = attn_metadata.get(f"{layer_name}.mome")
         attn_metadata_cla_swa = attn_metadata.get(self.cla_swa_attn_name) if self.is_cla_reuse_layer else None
-        attn_metadata = attn_metadata.get(f"{self.prefix}.attn")
+        attn_metadata = attn_metadata.get(layer_name)
     else:
         mome_metadata = None
         attn_metadata_cla_swa = None
@@ -4955,6 +4965,7 @@ def npu_pangu_forward_fake(
     hidden_states: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    module_name: str,
     layer_name: str,
 ) -> torch.Tensor:
     return torch.zeros_like(hidden_states)

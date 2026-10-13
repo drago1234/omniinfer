@@ -42,8 +42,13 @@ def _metadata(num_reqs, *, prefill=False, apc=True, num_tokens=None):
 
 def _context(metadata):
     return SimpleNamespace(
-        no_compile_layers={"layer": SimpleNamespace(prefix="model.layers.0.self_attn")},
-        attn_metadata={"model.layers.0.self_attn.mome": metadata},
+        no_compile_layers={
+            "layer": SimpleNamespace(
+                prefix="model.layers.0.self_attn",
+                attn=SimpleNamespace(layer_name="model.layers.0.self_attn.attn"),
+            )
+        },
+        attn_metadata={"model.layers.0.self_attn.attn.mome": metadata},
     )
 
 
@@ -67,7 +72,9 @@ class TestMomeContextOps(unittest.TestCase):
             ):
                 with self.subTest(num_reqs=num_reqs, prefill=prefill, apc=apc):
                     metadata = _metadata(num_reqs, prefill=prefill, apc=apc)
-                    context.attn_metadata["model.layers.0.self_attn.mome"] = metadata
+                    context.attn_metadata[
+                        "model.layers.0.self_attn.attn.mome"
+                    ] = metadata
                     actual = ops.npu_pangu_mome_conv_from_context(
                         x,
                         weight,
@@ -205,7 +212,7 @@ class TestMomeContextOps(unittest.TestCase):
                 return graph.forward
 
             def forward(x):
-                metadata = context.attn_metadata["model.layers.0.self_attn.mome"]
+                metadata = context.attn_metadata["model.layers.0.self_attn.attn.mome"]
                 return attention._apply_MOME(x, conv, attn_metadata, metadata) * 2
 
             def kernel(x, _weight, conv_states, **kwargs):
@@ -230,7 +237,7 @@ class TestMomeContextOps(unittest.TestCase):
                     ),
                 ):
                     for tokens, reqs in ((64, 16), (4, 4), (16, 16), (8, 8), (64, 16)):
-                        context.attn_metadata["model.layers.0.self_attn.mome"] = (
+                        context.attn_metadata["model.layers.0.self_attn.attn.mome"] = (
                             _metadata(reqs)
                         )
                         x = torch.ones(tokens, 8)
