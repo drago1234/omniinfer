@@ -307,6 +307,16 @@
     {
         "model": "openpangu_v2_92B",
         "hardware": "A5",
+        "precision": "w4a8_mxfp",
+        "configs":{
+            "hybrid":{
+                "config_file":"openpangu_v2/openpangu_v2_w4a8_mxfp_a5_hybrid.json"
+            }
+        }
+    },
+    {
+        "model": "openpangu_v2_92B",
+        "hardware": "A5",
         "precision": "bf16",
         "configs":{
             "hybrid":{

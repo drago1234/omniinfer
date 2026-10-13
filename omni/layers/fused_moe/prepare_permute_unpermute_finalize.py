@@ -735,12 +735,29 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
         topk_ids: torch.Tensor,
         options: Optional[PreparePermuteOptions] = None,
     ) -> DispatchCombinePreparePermuteResult:
-        quant_mode = 2 if layer.routed_experts.quant_config is not None else 0
-        moe_quant_config = getattr(layer.routed_experts.quant_method, "moe_quant_config", None)
+        quant_method = getattr(layer.routed_experts, "quant_method", None)
+        moe_quant_config = getattr(quant_method, "moe_quant_config", None)
         use_mxfp8 = _uses_mxfp_activation(moe_quant_config)
         use_hifloat8 = _uses_hifloat_activation(moe_quant_config)
-        if use_mxfp8 or use_hifloat8:
+        quant_config = getattr(quant_method, "quant_config", None)
+        enable_mxfp8_comm_quant = bool(
+            quant_config
+            and getattr(quant_config, "enable_mxfp8_comm_quant", False)
+        )
+        dispatch_quant_kwargs = {}
+        if use_mxfp8 and enable_mxfp8_comm_quant:
+            if not on_ascend950():
+                raise RuntimeError(
+                    "MXFP8 communication quantization requires Ascend 950"
+                )
+            quant_mode = 4
+            # quant_mode=4 selects MX dynamic quantization. Explicitly set the
+            # payload dtype; otherwise torch_npu allocates expand_x as INT8.
+            dispatch_quant_kwargs["y_dtype"] = torch.float8_e4m3fn
+        elif use_mxfp8 or use_hifloat8:
             quant_mode = 0
+        else:
+            quant_mode = 2 if layer.routed_experts.quant_config is not None else 0
 
         output = torch_npu.npu_moe_distribute_dispatch_v2(
             x=x,
@@ -755,17 +772,15 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
             ep_world_size=self.ep_size,
             ep_rank_id=self.ep_rank,
             x_active_mask=self._get_mc2_mask(topk_ids.shape[0]),
+            **dispatch_quant_kwargs,
         )
 
         expand_x, dynamic_scale, expand_idx, expert_token_nums, ep_recv_counts, tp_recv_counts = output[0:6]
-
-        # leaves activations unquantized for MXFP8; apply_experts
-        # will quantize when scale is None
         if use_hifloat8:
             expand_x = torch_npu.npu_dtype_cast(expand_x, torch_npu.hifloat8)
             expand_x = expand_x.view(dtype=torch.int8)
             dynamic_scale = None
-        elif use_mxfp8:
+        elif use_mxfp8 and not enable_mxfp8_comm_quant:
             dynamic_scale = None
 
         return DispatchCombinePreparePermuteResult(
