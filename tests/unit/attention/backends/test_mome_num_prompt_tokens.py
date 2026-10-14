@@ -284,9 +284,14 @@ class TestBlockIndexArithmetic(unittest.TestCase):
     ``mome_block_size = 4`` and ``num_spec = 1``.
     """
 
-    def test_previous_schedule_was_prefill_uses_logical_water_mark(self):
-        # prompt = 8 (exactly two full blocks), prefill just wrote 0..7,
-        # this is the first decode step: computed == prompt.
+    def test_first_decode_after_prefill_uses_physical_water_mark(self):
+        # prompt = 8 (exactly two full blocks), the prefill (which also
+        # drafted) just wrote 0..7, this is the first decode step:
+        # computed == prompt.  The ``>=`` boundary routes this to the MTP
+        # branch -- num_accepted_tokens is meaningful here, and the logical
+        # water mark cdiv(8, 4) - 1 == 1 would point the read at the stale
+        # draft tail of the previous iteration instead of the committed
+        # history: cdiv(8 - 1 + 1 + 1, 4) - 1 == 2.
         b = make_builder(num_spec=1)
         cm = FakeCommonAttentionMetadata(seq_lens=[10], query_lens=[2])
         self.assertEqual(cm.compute_num_computed_tokens().tolist(), [8])
@@ -296,16 +301,22 @@ class TestBlockIndexArithmetic(unittest.TestCase):
         last_computed, _, _ = b._compute_prefix_caching_block_indices(
             cm, MOME_BLOCK_SIZE, num_accepted, num_prompt_tokens
         )
-        # cdiv(8, 4) - 1 == 1, the block holding tokens 4..7
-        self.assertEqual(last_computed.tolist(), [1])
+        self.assertEqual(last_computed.tolist(), [2])
 
-        # Dropping the prompt lengths (which is what the all-zero buffer did on
-        # the drafter path) pushes it into the MTP branch: cdiv(9, 4) - 1 == 2,
-        # a block this step has not written yet.
-        wrong, _, _ = b._compute_prefix_caching_block_indices(
-            cm, MOME_BLOCK_SIZE, num_accepted, torch.tensor([0], dtype=torch.int32)
+    def test_computed_below_prompt_uses_logical_water_mark(self):
+        # Chunked prefill / prefix-cache hit: computed 8 < prompt 12, the
+        # previous schedule was a prefill, so index by the logical water
+        # mark cdiv(8, 4) - 1 == 1 (the MTP formula would give 2).
+        b = make_builder(num_spec=1)
+        cm = FakeCommonAttentionMetadata(seq_lens=[10], query_lens=[2])
+        self.assertEqual(cm.compute_num_computed_tokens().tolist(), [8])
+
+        num_prompt_tokens = torch.tensor([12], dtype=torch.int32)
+        num_accepted = torch.tensor([1], dtype=torch.int32)
+        last_computed, _, _ = b._compute_prefix_caching_block_indices(
+            cm, MOME_BLOCK_SIZE, num_accepted, num_prompt_tokens
         )
-        self.assertEqual(wrong.tolist(), [2])
+        self.assertEqual(last_computed.tolist(), [1])
 
     def test_previous_schedule_was_mtp_uses_physical_water_mark(self):
         # previous step scheduled 2 tokens (physical 11, 12), accepted 1,
@@ -636,6 +647,46 @@ class TestStep0NumAcceptedTokensSynthesis(unittest.TestCase):
         self.assertIs(self.captured["num_prompt_tokens"], prompt)
 
 
+class TestAcceptedCountResetBoundary(unittest.TestCase):
+    """``build()``'s in-place reset of the accepted count vs prompt length.
+
+    The reset (num_accepted_tokens -> fake_num_spec + 1) fires only when
+    computed < prompt.  On the first decode round (computed == prompt) the
+    count produced by the previous MTP schedule must survive: masking it
+    back there points the kernel read at the stale draft tail of the
+    previous iteration instead of the committed history.
+    """
+
+    def _build(self, *, seq_len, query_len, prompt, accepted):
+        builder = make_builder(num_spec=2)  # fake_num_spec = 2
+        seen = {}
+
+        def spy(cm, block_size, num_accepted_tokens, num_prompt_tokens=None):
+            seen["num_accepted_tokens"] = num_accepted_tokens
+            zeros = torch.zeros(cm.num_reqs, dtype=torch.int32)
+            return zeros, zeros.clone(), zeros.clone()
+
+        builder._compute_prefix_caching_block_indices = spy
+        cm = FakeCommonAttentionMetadata(seq_lens=[seq_len], query_lens=[query_len])
+        builder.build(
+            0,
+            cm,
+            num_accepted_tokens=torch.tensor([accepted], dtype=torch.int32),
+            num_prompt_tokens=torch.tensor([prompt], dtype=torch.int32),
+        )
+        return seen["num_accepted_tokens"]
+
+    def test_computed_equals_prompt_keeps_accepted_count(self):
+        # First decode round after a full prefill: computed == prompt.
+        self.assertEqual(self._build(seq_len=10, query_len=2, prompt=8,
+                                     accepted=5).tolist(), [5])
+
+    def test_computed_below_prompt_resets_accepted_count(self):
+        # Chunked prefill continuation: computed 7 < prompt 8.
+        self.assertEqual(self._build(seq_len=9, query_len=2, prompt=8,
+                                     accepted=5).tolist(), [3])
+
+
 class TestStep0EndToEnd(unittest.TestCase):
     """The count that finally reaches the block-index arithmetic.
 
@@ -662,7 +713,7 @@ class TestStep0EndToEnd(unittest.TestCase):
         )
 
         # computed 8 / 12 / 5 against prompt 8:
-        #   all -> synthesized K - 1 = 4; build()'s prefill reset (computed <=
+        #   all -> synthesized K - 1 = 4; build()'s prefill reset (computed <
         #   prompt -> fake_num_spec + 1) is skipped for the synthesized step0,
         #   and its decode-node pass re-arms only the computed < prompt row
         #   (5 < 8) back to fake_num_spec = 2

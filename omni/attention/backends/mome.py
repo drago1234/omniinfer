@@ -233,7 +233,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             # the last scheduling must be MTP and num_accepted_tokens is meaningful,
             # and we need to get the correct block index for the running cache
             block_idx_last_computed_token = torch.where(
-                num_computed_tokens > num_prompt_tokens,
+                num_computed_tokens >= num_prompt_tokens,
                 cdiv(num_computed_tokens - num_accepted_tokens + self.num_spec + 1, mome_block_size) - 1,
                 cdiv(num_computed_tokens, mome_block_size) - 1,
             )
@@ -464,7 +464,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             # would point the read at the stale draft tail of the previous
             # iteration instead of the committed history.
             if not draft_step0:
-                num_accepted_tokens.masked_fill_(num_computed_tokens <= num_prompt_tokens, self.fake_num_spec + 1)
+                num_accepted_tokens.masked_fill_(num_computed_tokens < num_prompt_tokens, self.fake_num_spec + 1)
 
         # if the current schedule is the recompute of the last prompt,
         # we reset num_accepted_tokens = fake_num_spec to let the kernel read the [-3:-1] tokens from the cache
