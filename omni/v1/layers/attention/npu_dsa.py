@@ -41,6 +41,7 @@ from omni_npu.attention import ops
 from omni_npu.attention.backends.dsa import NPUDSAMetadata
 from omni_npu.v1.layers.attention.gpt_oss_sink import GptOssSinkMixin
 from omni_npu.attention.backends.utils import (
+    CrossLayerSharedOp,
     DummyKVSPMaganer,
     DummySPManager,
     KVSPMaganer,
@@ -77,6 +78,47 @@ from omni_npu.v1.layers.utils import yarn_get_mscale
 from omni_npu.v1.utils import on_ascend950
 
 
+# Enable via --kv-cache-dtype {fp8,hif8}_ds_mla.
+SFA_C8_DTYPES = ("fp8_ds_mla", "hif8_ds_mla")
+FP8_TILE_SIZE = 128
+
+quant_lightning_indexer_v2_metadata: CrossLayerSharedOp | None = None
+
+
+def _skip_topk_for_layer(config, layer_id: int) -> bool:
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    indexer_types = getattr(config, "indexer_types", None)
+    if index_topk_pattern is not None:
+        return (
+            0 <= layer_id < len(index_topk_pattern)
+            and index_topk_pattern[layer_id] == "S"
+        )
+    if indexer_types is not None:
+        return (
+            0 <= layer_id < len(indexer_types)
+            and indexer_types[layer_id] == "shared"
+        )
+    index_topk_freq = getattr(config, "index_topk_freq", 1)
+    index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
+    return max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
+
+
+def is_sfa_c8_dtype(cache_dtype: str | None) -> bool:
+    return cache_dtype in SFA_C8_DTYPES
+
+
+def get_li_quant_mode(cache_dtype: str | None) -> str | None:
+    if cache_dtype == "fp8_ds_mla":
+        return "fp8"
+    if cache_dtype == "hif8_ds_mla":
+        return "hif8"
+    if cache_dtype == "int8_ds_mla":
+        raise ValueError("INT8 C8 is not supported by this DSA path; use fp8_ds_mla or hif8_ds_mla.")
+    if cache_dtype == "li_int8_ds_mla":
+        return "int8"
+    return None
+
+
 class NPUDSAAttention(NPUMLAAttention, DSAAttention):
     """A DSA cache page plus the NPU-derived absorb weights.
 
@@ -97,6 +139,7 @@ class Indexer(torch.nn.Module):
         cache_config: CacheConfig | None,
         sink_len: int = 0,
         prefix: str = "",
+        is_metadata_producer: bool = False,
     ):
         super().__init__()
         self.vllm_config = vllm_config
@@ -107,6 +150,7 @@ class Indexer(torch.nn.Module):
         self.head_dim = config.index_head_dim  # 128
         self.rope_dim = config.qk_rope_head_dim  # 64
         self.q_lora_rank = q_lora_rank  # 1536
+        self.is_metadata_producer = is_metadata_producer
         if model_extra_config.operator_opt_config.enable_precision_strong_consistency:
             self.softmax_scale = self.head_dim ** -0.5
             self.weights_scale = self.n_head ** -0.5
@@ -125,8 +169,7 @@ class Indexer(torch.nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wk",
         )
-        # The Pangu indexer normalises with an RMSNorm and projects without a bias;
-        # DeepSeek's uses a LayerNorm and keeps the bias.
+        # Pangu uses RMSNorm and no bias; DeepSeek uses LayerNorm and a bias.
         if "pangu" in str(getattr(config, "model_type", "")).lower():
             self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
             self.weights_proj = ReplicatedFlashCommLinear(
@@ -144,6 +187,91 @@ class Indexer(torch.nn.Module):
             model_extra_config.operator_opt_config.use_rope_fusion_op
             and not model_extra_config.operator_opt_config.enable_precision_strong_consistency
         )
+        self.cache_dtype = getattr(cache_config, "cache_dtype", None) if cache_config else None
+        self.li_quant_mode = get_li_quant_mode(self.cache_dtype)
+        if self.li_quant_mode and self.head_dim != 128:
+            raise ValueError("Quantized DSA indexer caches require index_head_dim=128.")
+        if self.li_quant_mode and not self.on_ascend950:
+            raise ValueError(f"{self.cache_dtype} LI quant is only enabled for Ascend950/A5.")
+        if self.li_quant_mode and not model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            raise ValueError(f"{self.cache_dtype} requires use_noncontiguous_kv=True.")
+        self.use_qli_v2 = bool(
+            self.cache_dtype == "hif8_ds_mla"
+            and self.on_ascend950
+            and getattr(
+                model_extra_config.operator_opt_config,
+                "use_quant_lightning_indexer_v2",
+                False,
+            )
+        )
+        if self.use_qli_v2:
+            self._init_qli_v2_ops()
+
+    def _init_qli_v2_ops(self) -> None:
+        global quant_lightning_indexer_v2_metadata
+        import cann_ops_transformer.ops.attention.indexer_quant_cache.indexer_quant_cache  # noqa: F401
+        import cann_ops_transformer.ops.attention.quant_lightning_indexer_v2.quant_lightning_indexer  # noqa: F401
+
+        if quant_lightning_indexer_v2_metadata is None:
+            callers = tuple(
+                (caller, 3)
+                for caller in ("decode", "prefill")
+            )
+            quant_lightning_indexer_v2_metadata = CrossLayerSharedOp(
+                op=torch.ops.cann_ops_transformer.quant_lightning_indexer_metadata,
+                shape=(1024,),
+                dtype=torch.int32,
+                callers=callers,
+            )
+        self.qli_v2_metadata_op = quant_lightning_indexer_v2_metadata
+
+    def _apply_quant_lightning_indexer_v2(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        weights: torch.Tensor,
+        query_scale: torch.Tensor,
+        key_scale: torch.Tensor,
+        q_cumlens: torch.Tensor,
+        kv_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        metadata_caller: str,
+    ) -> torch.Tensor:
+        quant_mode = 3
+        cu_seqlens_q = torch.cat((q_cumlens.new_zeros(1), q_cumlens))
+        common_kwargs = {
+            "cu_seqlens_q": cu_seqlens_q,
+            "seqused_k": kv_lens,
+            "layout_q": "TND",
+            "layout_k": "PA_BBND",
+            "mask_mode": 3,
+            "cmp_ratio": 1,
+        }
+        metadata = self.qli_v2_metadata_op(
+            {
+                "num_heads_q": self.n_head,
+                "num_heads_k": 1,
+                "head_dim": self.head_dim,
+                "topk": self.topk_tokens,
+                "quant_mode": quant_mode,
+                **common_kwargs,
+            },
+            self.is_metadata_producer,
+            (metadata_caller, quant_mode),
+        )
+        out = torch.ops.cann_ops_transformer.quant_lightning_indexer(
+            query,
+            key,
+            weights,
+            query_scale,
+            key_scale,
+            self.topk_tokens,
+            quant_mode,
+            block_table=block_table,
+            metadata=metadata,
+            **common_kwargs,
+        )
+        return out[0] if isinstance(out, (tuple, list)) else out
 
     def _apply_rope(
         self,
@@ -222,13 +350,68 @@ class Indexer(torch.nn.Module):
         ki: torch.Tensor,  # TD or T1D
         slots_2d: torch.Tensor | NPUDSAMetadata | None,
         ki_cache: torch.Tensor | None,  # [*, pg, D] or [*, pg, 1, D]
+        ki_scale_cache: torch.Tensor | None = None,
     ):
-        slots_2d = getattr(slots_2d, "slot_mapping_2d", slots_2d)
+        metadata = slots_2d
+        slots_2d = getattr(metadata, "slot_mapping_2d", metadata)
         if None in [slots_2d, ki_cache] or ki.size(0) == 0:
             assert (slots_2d is None and ki_cache is None) or ki.size(0) == 0
             return  # dummy_run or no local_kv
         assert slots_2d.dim() == 2 and ki.dim() in [2, 3] and ki_cache.dim() in [3, 4]
         assert slots_2d.size(0) == ki.size(0)
+
+        # Mirror npu_pangu Indexer quant cache update for quantLI.
+        li_quant_mode = getattr(self, "li_quant_mode", None)
+        if li_quant_mode:
+            assert ki_scale_cache is not None
+            ki_flat = ki.view(-1, ki.size(-1))
+            if getattr(self, "use_qli_v2", False):
+                slots = getattr(metadata, "slot_mapping", None)
+                assert slots is not None and slots.size(0) == ki_flat.size(0)
+                key_cache = ki_cache if ki_cache.dim() == 4 else ki_cache.unsqueeze(2)
+                scale_cache = (
+                    ki_scale_cache
+                    if ki_scale_cache.dim() == 4
+                    else ki_scale_cache.reshape(
+                        ki_scale_cache.shape[0], ki_scale_cache.shape[1], 1, -1
+                    )
+                )
+                torch.ops.cann_ops_transformer.indexer_quant_cache(
+                    key_cache,
+                    scale_cache,
+                    ki_flat,
+                    slots.to(torch.int32),
+                    quant_mode="mxfp8",
+                    round_scale=True,
+                )
+                return
+            elif li_quant_mode == "int8":
+                ki_quant, ki_scale = torch_npu.npu_dynamic_quant(ki_flat)
+                ki_scale = ki_scale.to(torch.float16).view(-1, 1)
+                torch_npu.npu_scatter_nd_update_(ki_cache, slots_2d, ki_quant)
+            elif li_quant_mode == "fp8":
+                ki_quant, ki_scale = torch_npu.npu_dynamic_quant(
+                    ki_flat, dst_type=torch.float8_e4m3fn
+                )
+                ki_scale = ki_scale.to(torch.float32).view(-1, 1)
+                torch_npu.npu_scatter_nd_update_(ki_cache, slots_2d, ki_quant)
+            elif li_quant_mode == "hif8":
+                ki_quant, ki_scale = torch_npu.npu_dynamic_quant(
+                    ki_flat,
+                    dst_type=torch_npu.hifloat8,
+                    dst_type_max=15.0,
+                )
+                ki_scale = ki_scale.to(torch.float32).view(-1, 1)
+                torch_npu.npu_scatter_nd_update_(
+                    ki_cache.view(torch.int8),
+                    slots_2d,
+                    ki_quant.view(torch.int8),
+                )
+            else:
+                raise ValueError(f"Unsupported LI quant mode: {li_quant_mode}")
+            torch_npu.npu_scatter_nd_update_(ki_scale_cache, slots_2d, ki_scale)
+            return
+
         if self.on_ascend950:
             torch_npu.npu_scatter_nd_update_(
                 ki_cache,
@@ -250,14 +433,99 @@ class Indexer(torch.nn.Module):
         q_cumlens: torch.Tensor = None,  # int32 [B]
         kv_lens: torch.Tensor = None,  # int32 [B]
         block_table: torch.Tensor = None,  # int32 [B, *]
+        ki_scale_cache: torch.Tensor | None = None,
+        metadata_caller: str = "prefill",
     ) -> torch.Tensor:  # int32 [T, 1, K]
         if None in [q_cumlens, kv_lens, block_table]:
             return None  # dummy_run
 
         if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            key = ki_cache.unsqueeze(2) if ki_cache.dim() == 3 else ki_cache
+            li_quant_mode = getattr(self, "li_quant_mode", None)
+            if li_quant_mode:
+                # Mirror npu_pangu quantLI path.
+                assert ki_scale_cache is not None
+                query_dtype = None
+                key_dtype = None
+                if getattr(self, "use_qli_v2", False):
+                    qi_shape = qi.shape
+                    qi_quant, qi_scale = torch_npu.npu_dynamic_mx_quant(
+                        qi.reshape(-1, qi_shape[-1]),
+                        dst_type=torch.float8_e4m3fn,
+                        scale_alg=1,
+                    )
+                    qi_quant = qi_quant.reshape(qi_shape)
+                    qi_scale = qi_scale.reshape(
+                        *qi_shape[:-1], qi_shape[-1] // 64, 2
+                    )
+                    return self._apply_quant_lightning_indexer_v2(
+                        qi_quant,
+                        key,
+                        wi.to(torch.float32),
+                        qi_scale.view(torch.float8_e8m0fnu),
+                        ki_scale_cache.view(torch.float8_e8m0fnu).reshape(
+                            *ki_scale_cache.shape[:-1], self.head_dim // 64, 2
+                        ),
+                        q_cumlens,
+                        kv_lens,
+                        block_table,
+                        metadata_caller,
+                    )
+                if li_quant_mode == "int8":
+                    qi_quant, qi_scale = torch_npu.npu_dynamic_quant(qi)
+                    weights = wi.to(torch.float16)
+                    qi_scale = qi_scale.to(torch.float16)
+                elif li_quant_mode == "fp8":
+                    qi_quant, qi_scale = torch_npu.npu_dynamic_quant(
+                        qi, dst_type=torch.float8_e4m3fn
+                    )
+                    weights = wi.to(torch.bfloat16)
+                    qi_scale = qi_scale.to(torch.float32)
+                elif li_quant_mode == "hif8":
+                    qi_quant, qi_scale = torch_npu.npu_dynamic_quant(
+                        qi,
+                        dst_type=torch_npu.hifloat8,
+                        dst_type_max=15.0,
+                    )
+                    weights = wi.to(torch.bfloat16)
+                    qi_scale = qi_scale.to(torch.float32)
+                    query_dtype = torch_npu.hifloat8
+                    key_dtype = torch_npu.hifloat8
+                else:
+                    raise ValueError(f"Unsupported LI quant mode: {li_quant_mode}")
+
+                kwargs = dict(
+                    query=qi_quant,
+                    key=key,
+                    weights=weights,
+                    query_dequant_scale=qi_scale,
+                    key_dequant_scale=ki_scale_cache,
+                    actual_seq_lengths_query=q_cumlens,
+                    actual_seq_lengths_key=kv_lens,
+                    block_table=block_table,
+                    query_quant_mode=0,
+                    key_quant_mode=0,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.topk_tokens,
+                    sparse_mode=3,
+                )
+                if query_dtype is not None:
+                    kwargs["query_dtype"] = query_dtype
+                    kwargs["key_dtype"] = key_dtype
+                # Ascend950 built-in QuantLightningIndexer covers int8/fp8/hif8.
+                # AiInfraQuantLightningIndexer has no binary in this CANN build.
+                if not hasattr(torch_npu, "npu_quant_lightning_indexer"):
+                    raise RuntimeError(
+                        "torch_npu.npu_quant_lightning_indexer is required "
+                        f"for {self.cache_dtype}."
+                    )
+                out = torch_npu.npu_quant_lightning_indexer(**kwargs)
+                return out[0] if isinstance(out, (tuple, list)) else out
+
             kwargs = dict(
                 query=qi,
-                key=ki_cache.unsqueeze(2),
+                key=key,
                 weights=wi,
                 actual_seq_lengths_query=q_cumlens,
                 actual_seq_lengths_key=kv_lens,
@@ -301,12 +569,13 @@ class Indexer(torch.nn.Module):
         sin: torch.Tensor,  # BNSD
         attn_metadata: NPUDSAMetadata,
         ki_cache: torch.Tensor,  # [*, pg, 1, D]
+        ki_scale_cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         wi, qi, ki = self._li_prolog(x, qr, cos, sin)
         if None in [attn_metadata, ki_cache]:
             return None, ki  # dummy_run
 
-        self._update_cache(ki, attn_metadata, ki_cache)
+        self._update_cache(ki, attn_metadata, ki_cache, ki_scale_cache)
         tok_idx = self._apply_lightning_indexer(
             wi,
             qi,
@@ -314,6 +583,7 @@ class Indexer(torch.nn.Module):
             q_cumlens=attn_metadata.query_cumlens.to(torch.int32),
             kv_lens=attn_metadata.seq_lens.to(torch.int32),
             block_table=attn_metadata.block_table,
+            ki_scale_cache=ki_scale_cache,
         )
         return tok_idx, ki
 
@@ -366,6 +636,31 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         )
         self.use_mome_inplace_update = model_extra_config.operator_opt_config.use_mome_inplace_update
         self.on_ascend950 = on_ascend950()
+        # C8 enable: --kv-cache-dtype {fp8,hif8}_ds_mla.
+        self.cache_dtype = getattr(cache_config, "cache_dtype", None) if cache_config else None
+        self.is_sfa_c8 = is_sfa_c8_dtype(self.cache_dtype)
+        if self.is_sfa_c8 and self.dtype != torch.bfloat16:
+            raise ValueError("C8 DSA attention requires BF16 activations and rotary cache data.")
+        if self.is_sfa_c8 and (self.kv_lora_rank != 512 or self.qk_rope_head_dim != 64):
+            raise ValueError("C8 DSA caches require kv_lora_rank=512 and qk_rope_head_dim=64.")
+        # packed: nope_quant + rope_bf16 + fp32 scale per tile
+        self.fp8_packed_kv_dim = (
+            self.kv_lora_rank
+            + self.qk_rope_head_dim * 2
+            + self.kv_lora_rank // FP8_TILE_SIZE * 4
+        )
+        self.li_quant_mode = get_li_quant_mode(self.cache_dtype)
+        if (self.is_sfa_c8 or self.li_quant_mode) and not self.noncontiguous_kv:
+            raise ValueError(f"{self.cache_dtype} KV cache requires use_noncontiguous_kv=True.")
+        if (self.is_sfa_c8 or self.li_quant_mode) and not self.on_ascend950:
+            raise ValueError(f"{self.cache_dtype} KV cache is only enabled for Ascend950/A5.")
+        if (
+            (self.is_sfa_c8 or self.li_quant_mode)
+            and model_extra_config.operator_opt_config.enable_precision_strong_consistency
+        ):
+            raise ValueError(
+                f"{self.cache_dtype} does not support precision strong consistency."
+            )
         self.use_mlaprolog = model_extra_config.operator_opt_config.enable_mlaprolog
         self.ena_sp = model_extra_config.parall_config.ena_seq_parallel
         self.ena_cp = model_extra_config.parall_config.ena_context_parallel
@@ -520,23 +815,21 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         self.index_topk = config.index_topk
 
         # IndexCache config
-        index_topk_freq = getattr(config, "index_topk_freq", 1)
-        index_topk_pattern = getattr(config, "index_topk_pattern", None)
-        index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
-        indexer_types = getattr(config, "indexer_types", None)
         layer_id = extract_layer_index(prefix)
-
-        if index_topk_pattern is not None:
-            _skip_topk = index_topk_pattern[layer_id] == "S"
-        elif indexer_types is not None:
-            _skip_topk = indexer_types[layer_id] == "shared"
-        else:
-            _skip_topk = (
-                max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq
-                != 0
-            )
-        self.skip_topk = _skip_topk
+        self.skip_topk = _skip_topk_for_layer(config, layer_id)
         if not self.skip_topk:
+            dsa_layers = tuple(
+                getattr(config, "dsa_layers", ())
+                or range(config.num_hidden_layers)
+            )
+            indexer_layers = tuple(
+                idx for idx in dsa_layers if not _skip_topk_for_layer(config, idx)
+            )
+            first_indexer_layer = min(indexer_layers, default=layer_id)
+            is_metadata_producer = (
+                layer_id >= config.num_hidden_layers
+                or layer_id == first_indexer_layer
+            )
             self.indexer = Indexer(
                 vllm_config,
                 config,
@@ -546,6 +839,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 cache_config,
                 self.param_sink_number,
                 f"{prefix}.indexer",
+                is_metadata_producer=is_metadata_producer,
             )
         else:
             self.indexer = None
@@ -575,8 +869,11 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         if self.param_sink_number == 0:
             self.attn = NPUDSAAttention(
                 **self._inner_mla_attn_kwargs(cache_config, quant_config, prefix),
-                indexer=self.indexer,
                 indexer_head_dim=config.index_head_dim,
+                cache_dtype_str=self.cache_dtype,
+                block_size=cache_config.block_size * (2 if self.is_sfa_c8 else 1) if cache_config else None,
+                page_size_padded=getattr(cache_config, "mamba_page_size_padded", None),
+                indexer=self.indexer,
             )
         else:
             from vllm.model_executor.layers.attention.static_sink_attention import (
@@ -592,10 +889,19 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             )
             self._register_sink_params(config)
 
-        self._init_gpt_oss_sink(config)
-
         if self.noncontiguous_kv:
             self.dummy_value_cache = torch.zeros((1, cache_config.block_size, 1, self.kv_lora_rank), **self.default_cfg)
+            if self.is_sfa_c8:
+                dsa_c8_block_size = cache_config.block_size * 2
+                self.dummy_value_cache_quant = torch.zeros(
+                    (1, dsa_c8_block_size, 1, self.fp8_packed_kv_dim),
+                    device=current_platform.device_type,
+                    dtype=torch.uint8,
+                )
+
+        self._init_gpt_oss_sink(config)
+        if self.is_sfa_c8 and self.use_gpt_oss_sink:
+            raise ValueError("C8 DSA attention does not support GPT-OSS sink logits.")
 
         self.post_weight_load()  # To enable dummy run with out weight
 
@@ -646,7 +952,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         # Skip when the fused mla_prolog path can run: it consumes
         # q_b_proj.weight directly.
         use_fused_mla_prolog = (
-            self.use_mlaprolog and not self.use_mome and self.param_sink_number == 0
+            self.use_mlaprolog and not self.is_sfa_c8 and not self.use_mome and self.param_sink_number == 0
         )
         if self.split_q_up_in_multistream and not use_fused_mla_prolog:
             release_q_b_proj_storage(self.q_b_proj)
@@ -712,6 +1018,88 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             perm_y=(1, 0, 2),  # NTD -> TND
         )
 
+    def _pack_pertile128_kv(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pack DSA C8 KV. Mirrors npu_pangu: hif8 unit-scale; fp8 dynamic tile128."""
+        if k_nope.size(-1) != self.kv_lora_rank or k_pe.size(-1) != self.qk_rope_head_dim:
+            raise ValueError(
+                f"Unexpected dims for C8 pack: k_nope={k_nope.shape}, k_pe={k_pe.shape}"
+            )
+        tiled_shape = (*k_nope.shape[:-1], self.kv_lora_rank // FP8_TILE_SIZE, FP8_TILE_SIZE)
+        if self.cache_dtype == "hif8_ds_mla":
+            # npu_pangu default: direct cast + unit scale
+            k_nope_quant = torch_npu.npu_dtype_cast(k_nope, torch_npu.hifloat8)
+            scale_shape = (*k_nope.shape[:-1], self.kv_lora_rank // FP8_TILE_SIZE)
+            k_nope_scale = torch.ones(scale_shape, dtype=torch.float32, device=k_nope.device)
+        elif self.cache_dtype == "fp8_ds_mla":
+            k_nope_quant, k_nope_scale = torch_npu.npu_dynamic_quant(
+                k_nope.contiguous().view(tiled_shape),
+                dst_type=torch.float8_e4m3fn,
+            )
+            k_nope_quant = k_nope_quant.view(k_nope.shape)
+            k_nope_scale = k_nope_scale.view(*k_nope.shape[:-1], self.kv_lora_rank // FP8_TILE_SIZE)
+        else:
+            raise ValueError(f"Unsupported C8 dtype for pack: {self.cache_dtype}")
+
+        packed = torch.cat(
+            (
+                k_nope_quant.view(torch.uint8),
+                k_pe.contiguous().view(torch.uint8),
+                k_nope_scale.contiguous().view(torch.uint8),
+            ),
+            dim=-1,
+        )
+        if packed.size(-1) != self.fp8_packed_kv_dim:
+            raise RuntimeError(f"packed KV dim must be {self.fp8_packed_kv_dim}, got {packed.size(-1)}")
+        return packed
+
+    def _scatter_c8_kv_cache(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        slots: torch.Tensor,
+        slots_2d: torch.Tensor | None,
+    ) -> None:
+        packed = self._pack_pertile128_kv(k_nope, k_pe)
+        cache = kv_cache[0].view(torch.int8)
+        values = packed.view(torch.int8)
+        if slots_2d is not None:
+            torch_npu.npu_scatter_nd_update_(cache, slots_2d, values)
+            return
+        block_size = kv_cache[0].size(1)
+        flat_slots = slots.reshape(-1)
+        block_slots = torch.stack(
+            (
+                torch.div(flat_slots, block_size, rounding_mode="floor"),
+                torch.remainder(flat_slots, block_size),
+            ),
+            dim=-1,
+        )
+        torch_npu.npu_scatter_nd_update_(
+            cache,
+            block_slots,
+            values.view(-1, self.fp8_packed_kv_dim),
+        )
+
+    def _get_li_caches(
+        self,
+        kv_cache: tuple[torch.Tensor, ...] | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if kv_cache is None:
+            return None, None
+        if self.noncontiguous_kv:
+            # C8 layout from develop dsa.py: [0]=packed MLA, [1]=LI, [2]=LI scale
+            ki_cache = kv_cache[1]
+            ki_scale = kv_cache[2] if self.li_quant_mode else None
+        else:
+            ki_cache = kv_cache[2]
+            ki_scale = None
+        return ki_cache, ki_scale
+
     def _kv_norm_rope_cache(
         self,
         latent_kv: torch.Tensor,  # TD
@@ -723,10 +1111,9 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         kv_a_layernorm: torch.nn.Module | None = None,
         packed_kv: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:  # k_nope: T1D, k_pe: T1D
-        # A CLA layer's local branch normalises with its own gamma.
         kv_a_layernorm = self.kv_a_layernorm if kv_a_layernorm is None else kv_a_layernorm
-        # A CLA layer's local window cache keeps nope and RoPE in separate tensors.
         packed_kv = self.noncontiguous_kv if packed_kv is None else packed_kv
+        is_c8_cache = packed_kv and getattr(self, "is_sfa_c8", False)
         R, L = self.qk_rope_head_dim, self.kv_lora_rank
         slots_2d = getattr(slots, "slot_mapping_2d", None)
         slots = getattr(slots, "slot_mapping", slots)
@@ -736,7 +1123,8 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         valid_cache = None not in [kv_cache, slots]
         if latent_kv.size(0) == 0:  # no local_kv
             return cos.new_zeros(0, 1, L), cos.new_zeros(0, 1, R)
-        fused_op = fused_op and model_extra_config.operator_opt_config.enable_kv_rmsnorm_rope_cache
+        # Quantized packed caches use explicit per-tile packing below.
+        fused_op = fused_op and model_extra_config.operator_opt_config.enable_kv_rmsnorm_rope_cache and not is_c8_cache
 
         if valid_cache and fused_op and packed_kv:
             assert kv_cache[0].size(-1) == L + R
@@ -774,17 +1162,23 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             k_nope = kv_a_layernorm(k_nope)  # TD
             k_pe = self._apply_rope(k_pe, cos, sin)  # TD
             if valid_cache:
-                if self.on_ascend950:
+                if is_c8_cache:
+                    assert slots_2d is not None or slots is not None
+                    self._scatter_c8_kv_cache(k_nope, k_pe, kv_cache, slots, slots_2d)
+                elif self.on_ascend950 and self.noncontiguous_kv:
                     assert slots_2d is not None
-                    kv = torch.cat([k_nope, k_pe], dim=-1)
-                    torch_npu.npu_scatter_nd_update_(kv_cache[0], slots_2d, kv)
+                    if packed_kv:
+                        kv = torch.cat([k_nope, k_pe], dim=-1)
+                        torch_npu.npu_scatter_nd_update_(kv_cache[0], slots_2d, kv)
+                    else:
+                        torch_npu.npu_scatter_nd_update_(kv_cache[0], slots_2d, k_nope)
+                        torch_npu.npu_scatter_nd_update_(kv_cache[1], slots_2d, k_pe)
                 elif packed_kv:
                     assert slots_2d is not None
                     slot_indices = slots_2d
                     kv = torch.cat([k_nope, k_pe], dim=-1)
                     torch.ops.custom.npu_ai_infra_scatter_block_update_(kv_cache[0], slot_indices, kv)
                 elif self.noncontiguous_kv:
-                    # A CLA layer's local cache: unpacked, still block addressed.
                     assert slots_2d is not None
                     torch.ops.custom.npu_ai_infra_scatter_block_update_(kv_cache[0], slots_2d, k_nope)
                     torch.ops.custom.npu_ai_infra_scatter_block_update_(kv_cache[1], slots_2d, k_pe)
@@ -1035,6 +1429,52 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
     ) -> torch.Tensor:  # [T, N, L]
         if None in [q_cumlens, kv_lens, block_table, topk_idx]:
             return torch.zeros_like(q_nope)  # dummy
+        if getattr(self, "is_sfa_c8", False):
+            # Packed FP8/HiF8 latent cache plus BF16 rotary data and independent sinks.
+            if self.cache_dtype == "hif8_ds_mla" and topk_idx.size(-1) != 2048:
+                raise ValueError(
+                    "HiFloat8 SFA requires sparse_indices.size(-1) == 2048, "
+                    f"got {topk_idx.size(-1)}."
+                )
+            query = torch.cat([q_nope, q_pe], dim=-1).contiguous()
+            key = kv_cache[0].unsqueeze(2) if kv_cache[0].dim() == 3 else kv_cache[0]
+            key_dtype = None
+            value_dtype = None
+            if self.cache_dtype == "fp8_ds_mla":
+                key = key.view(torch.float8_e4m3fn)
+                value = self.dummy_value_cache_quant.view(torch.float8_e4m3fn)
+            elif self.cache_dtype == "hif8_ds_mla":
+                value = self.dummy_value_cache_quant
+                key_dtype = torch_npu.hifloat8
+                value_dtype = torch_npu.hifloat8
+            kwargs = dict(
+                query=query,
+                key=key,
+                value=value,
+                sparse_indices=topk_idx,
+                scale_value=self.scaling,
+                key_quant_mode=2,
+                value_quant_mode=2,
+                block_table=block_table,
+                actual_seq_lengths_query=q_cumlens.clone(),
+                actual_seq_lengths_kv=kv_lens.clone(),
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                quant_scale_repo_mode=1,
+                tile_size=128,
+                rope_head_dim=64,
+            )
+            if self.param_sink_number > 0:
+                kwargs["key_sink"] = self.attn.impl.sink_kv
+                kwargs["value_sink"] = self.attn.impl.sink_k_nope
+            if key_dtype is not None:
+                kwargs["key_dtype"] = key_dtype
+                kwargs["value_dtype"] = value_dtype
+            return torch.ops.custom.npu_ai_infra_kv_quant_sparse_flash_attention(**kwargs)
+
         if self.noncontiguous_kv and self.param_sink_number == 0:
             kwargs = dict(
                 query=q_nope,
@@ -1163,9 +1603,10 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             kv_lens = attn_metadata.seq_lens.to(torch.int32)
             q_cumlens = attn_metadata.query_cumlens.to(torch.int32)
             block_table = attn_metadata.block_table
-            ki_cache = kv_cache[1] if self.noncontiguous_kv else kv_cache[2]
+            ki_cache, ki_scale_cache = self._get_li_caches(kv_cache)
         else:
-            q_cumlens, kv_lens, block_table, ki_cache = None, None, None, None
+            q_cumlens, kv_lens, block_table = None, None, None
+            ki_cache, ki_scale_cache = None, None
         is_dummy = None in [q_cumlens, kv_lens, block_table]
 
         sp_manager = getattr(attn_metadata, "sp_manager", DummySPManager())
@@ -1202,8 +1643,11 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 qi = sp_manager.ag_tokens(qi)
             else:
                 wi, qi, ki = self.indexer._li_prolog(x, q, cos, sin)
-            self.indexer._update_cache(ki, attn_metadata, ki_cache)
-            topk_idx = self.indexer._apply_lightning_indexer(wi, qi, ki_cache, q_cumlens, kv_lens, block_table)
+            self.indexer._update_cache(ki, attn_metadata, ki_cache, ki_scale_cache)
+            topk_idx = self.indexer._apply_lightning_indexer(
+                wi, qi, ki_cache, q_cumlens, kv_lens, block_table,
+                ki_scale_cache, metadata_caller="prefill"
+            )
         elif not is_dummy:
             topk_idx = topk_indices_buffer
         else:
@@ -1255,9 +1699,9 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         """
 
         if attn_metadata:
-            ki_cache = kv_cache[1] if self.noncontiguous_kv else kv_cache[2]
+            ki_cache, ki_scale_cache = self._get_li_caches(kv_cache)
         else:
-            ki_cache = None
+            ki_cache, ki_scale_cache = None, None
 
         def get_mome_args():
             if self.noncontiguous_kv:
@@ -1323,7 +1767,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 if hasattr(attn_metadata, "cache_fn") and not self.noncontiguous_kv:
                     attn_metadata.cache_fn(ki.view(-1, ki.size(-1)), ki_cache)
                 else:
-                    self.indexer._update_cache(ki, attn_metadata, ki_cache)
+                    self.indexer._update_cache(ki, attn_metadata, ki_cache, ki_scale_cache)
 
         if self.sharded_o_proj:
             sub_stream.wait_stream(cur_stream)
@@ -1338,6 +1782,8 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 q_cumlens,
                 kv_lens,  # int32 [2B]
                 blk_table,  # int32 [2B, *]
+                ki_scale_cache,
+                metadata_caller="prefill",
             )  # int32 [T_cp, 1, K] or None for dummy_run
         else:
             # A full DSA layer returns CP-layout top-k; shared consumes it directly.
@@ -1443,6 +1889,12 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert not self.ena_sp  # TODO: support decode sp in the future
         assert not self.sharded_o_proj  # sharded_o_proj is for prefill only
+        use_fused_mla_prolog = (
+            self.use_mlaprolog
+            and not self.is_sfa_c8
+            and not self.use_mome
+            and self.param_sink_number == 0
+        )
 
         def get_mome_args():
             if self.noncontiguous_kv:
@@ -1453,7 +1905,6 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                     "short_prefill": True if pd_mixed_flag == 2 else False,
                 }
 
-        use_fused_mla_prolog = self.use_mlaprolog and not self.use_mome and self.param_sink_number == 0
         can_decode_multistream = self.side_stream is not None and not self.skip_topk
         if can_decode_multistream and not use_fused_mla_prolog and not self.ena_kvsp:
             if self.li_stream is not None:
@@ -1464,7 +1915,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 x, cos, sin, attn_metadata, kv_cache,
                 topk_indices_buffer, pd_mixed_flag,
             )
-        ki_cache = kv_cache[1] if self.noncontiguous_kv else kv_cache[2]
+        ki_cache, ki_scale_cache = self._get_li_caches(kv_cache)
         q_cumlens = attn_metadata.query_cumlens.to(torch.int32)
         kv_lens = attn_metadata.seq_lens.to(torch.int32)
         blk_table = attn_metadata.block_table
@@ -1489,10 +1940,11 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 self.wi_stream.wait_stream(cur_stream)
 
             wi, qi, ki = self.indexer._li_prolog(x, q_lora, cos, sin)
-            self.indexer._update_cache(ki, attn_metadata, ki_cache)
+            self.indexer._update_cache(ki, attn_metadata, ki_cache, ki_scale_cache)
 
             if self.ena_kvsp:
                 assert not self.use_mome and not self.noncontiguous_kv
+                assert not self.li_quant_mode
                 kvsp_manager: KVSPMaganer = attn_metadata.kvsp_manager
                 nope_cache, rope_cache, ki_cache = kv_cache
                 nope_cache, *_ = kvsp_manager.ag_pages(nope_cache)
@@ -1500,6 +1952,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 ki_cache, blk_table, _ = kvsp_manager.ag_pages(ki_cache)
                 # replace local-cache with full-cache
                 kv_cache = (nope_cache, rope_cache, ki_cache)
+                ki_scale_cache = None
 
             topk_idx = self.indexer._apply_lightning_indexer(
                 wi,
@@ -1508,6 +1961,8 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 q_cumlens,
                 kv_lens,  # [B]
                 blk_table,  # [B, *]
+                ki_scale_cache,
+                metadata_caller="decode",
             )  # -> int32 [T, 1, K]
         else:
             topk_idx = topk_indices_buffer[:x.shape[0]]
@@ -1548,7 +2003,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         q_cumlens = attn_metadata.query_cumlens.to(torch.int32)
         kv_lens = attn_metadata.seq_lens.to(torch.int32)
         block_table = attn_metadata.block_table
-        ki_cache = kv_cache[1] if self.noncontiguous_kv else kv_cache[2]
+        ki_cache, ki_scale_cache = self._get_li_caches(kv_cache)
 
         def get_mome_args():
             if self.noncontiguous_kv:
@@ -1604,15 +2059,12 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
 
                 indexer_kw_ready.wait(side_stream)
                 indexer_k = self.indexer._apply_rope(indexer_k, cos, sin)
-                self.indexer._update_cache(indexer_k, attn_metadata, ki_cache)
+                self.indexer._update_cache(indexer_k, attn_metadata, ki_cache, ki_scale_cache)
             with torch.npu.npugraph_ex.scope.limit_core_num(20, 40):
                 topk_idx = self.indexer._apply_lightning_indexer(
-                    indexer_weights,
-                    indexer_q,
-                    ki_cache,
-                    q_cumlens,
-                    kv_lens,
-                    block_table,
+                    indexer_weights, indexer_q, ki_cache,
+                    q_cumlens, kv_lens, block_table, ki_scale_cache,
+                    metadata_caller="decode",
                 )
             side_done = torch.npu.Event()
             side_done.record()
@@ -1733,7 +2185,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         q_cumlens = attn_metadata.query_cumlens.to(torch.int32)
         kv_lens = attn_metadata.seq_lens.to(torch.int32)
         block_table = attn_metadata.block_table
-        ki_cache = kv_cache[1] if self.noncontiguous_kv else kv_cache[2]
+        ki_cache, ki_scale_cache = self._get_li_caches(kv_cache)
 
         main_stream = torch.npu.current_stream()
         side_stream = self.side_stream
@@ -1802,7 +2254,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                     -1, 1, self.indexer.head_dim
                 )
                 indexer_k = self.indexer._apply_rope(indexer_k, cos, sin)
-                self.indexer._update_cache(indexer_k, attn_metadata, ki_cache)
+                self.indexer._update_cache(indexer_k, attn_metadata, ki_cache, ki_scale_cache)
             q_side_ready.wait(li_stream)
             if self.split_q_up_in_multistream:
                 with torch.npu.npugraph_ex.scope.limit_core_num(8, 16):
@@ -1842,12 +2294,9 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         q_pe_ready.wait(main_stream)
         attn_kv_ready.wait(main_stream)
         topk_idx = self.indexer._apply_lightning_indexer(
-            indexer_weights,
-            indexer_q,
-            ki_cache,
-            q_cumlens,
-            kv_lens,
-            block_table,
+            indexer_weights, indexer_q, ki_cache,
+            q_cumlens, kv_lens, block_table, ki_scale_cache,
+            metadata_caller="decode",
         )
 
         return self._finish_multistream_decode(

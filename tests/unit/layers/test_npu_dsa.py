@@ -67,6 +67,8 @@ def test_forward_decode_routes_to_a5_multistream_when_eligible():
     fake.skip_topk = False
     fake.ena_kvsp = False
     fake.use_mlaprolog = False
+    fake.is_sfa_c8 = False
+    fake.li_quant_mode = None
     fake.use_mome = True
     fake.param_sink_number = 0
     fake._forward_decode_multistream_a5 = MagicMock(return_value="a5")
@@ -1855,7 +1857,7 @@ def test_indexer_noncontiguous_lightning_uses_a5_op(monkeypatch):
 
 
 @pytest.mark.unit
-def test_sparse_kv_norm_rope_cache_a5_updates_combined_cache(monkeypatch):
+def test_sparse_kv_norm_rope_cache_a5_updates_contiguous_parts_separately(monkeypatch):
     from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
     from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
 
@@ -1875,7 +1877,7 @@ def test_sparse_kv_norm_rope_cache_a5_updates_combined_cache(monkeypatch):
         slot_mapping=torch.arange(3, dtype=torch.int64),
         slot_mapping_2d=torch.arange(3, dtype=torch.int64).view(3, 1),
     )
-    kv_cache = (torch.zeros(4, 8, 1, 6), torch.zeros(4, 8, 1, 2))
+    kv_cache = (torch.zeros(4, 8, 1, 4), torch.zeros(4, 8, 1, 2))
 
     k_nope, k_pe = NPUDeepseekSparseAttention._kv_norm_rope_cache(
         fake,
@@ -1888,9 +1890,9 @@ def test_sparse_kv_norm_rope_cache_a5_updates_combined_cache(monkeypatch):
 
     assert k_nope.shape == (3, 1, 4)
     assert k_pe.shape == (3, 1, 2)
-    scatter_mock.assert_called_once()
-    assert scatter_mock.call_args.args[0] is kv_cache[0]
-    assert scatter_mock.call_args.args[2].shape == (3, 6)
+    assert scatter_mock.call_count == 2
+    assert scatter_mock.call_args_list[0].args[2].shape == (3, 1, 4)
+    assert scatter_mock.call_args_list[1].args[2].shape == (3, 1, 2)
 
 
 @pytest.mark.unit
@@ -2270,6 +2272,7 @@ def test_cp_mome_sp_output_keeps_the_topk_return_contract(with_topk):
         ena_sp=True, ena_kvsp=False, noncontiguous_kv=True, use_mome=True,
         skip_topk=True, sharded_o_proj=False, kv_lora_rank=2,
         _cp_attention_metadata=lambda manager: (None, None, None),
+        _get_li_caches=lambda cache: (cache[1], None),
         _cp_rotary_rows=lambda manager, cos, sin: (cos, sin),
         _cp_q_lora=lambda x, manager, args: x,
         _q_absorb=lambda q, cos, sin: (q, q),
@@ -2396,7 +2399,9 @@ def test_enhance_fallback_refuses_a_sink_in_either_mode(rescale):
 
 
 @pytest.mark.unit
-def test_unpacked_local_cache_writes_its_two_parts_separately():
+@pytest.mark.parametrize("on_a5", (False, True))
+@pytest.mark.parametrize("c8_global_cache", (False, True))
+def test_unpacked_local_cache_writes_its_two_parts_separately(on_a5, c8_global_cache):
     """A CLA layer's local cache keeps nope and RoPE apart while the model's are packed."""
     from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
     from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
@@ -2404,7 +2409,9 @@ def test_unpacked_local_cache_writes_its_two_parts_separately():
     host = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
     host.qk_rope_head_dim, host.kv_lora_rank = 2, 4
     host.noncontiguous_kv = True
-    host.on_ascend950 = False
+    host.on_ascend950 = on_a5
+    host.is_sfa_c8 = c8_global_cache
+    host.cache_dtype = "hif8_ds_mla" if c8_global_cache else "auto"
     host.rope_interleaved = False
     host.kv_a_layernorm = lambda x: x
     host._apply_rope = lambda x, _c, _s: x
@@ -2415,6 +2422,7 @@ def test_unpacked_local_cache_writes_its_two_parts_separately():
     update = MagicMock()
     opt = SimpleNamespace(enable_kv_rmsnorm_rope_cache=False)
     with patch.object(dsa_mod, "model_extra_config", SimpleNamespace(operator_opt_config=opt)), \
+         patch.object(dsa_mod.torch_npu, "npu_scatter_nd_update_", update), \
          patch.object(torch.ops.custom, "npu_ai_infra_scatter_block_update_", update, create=True):
         host._kv_norm_rope_cache(
             torch.zeros(3, 6), torch.zeros(3, 2), torch.zeros(3, 2), slots, kv_cache,
@@ -2423,6 +2431,8 @@ def test_unpacked_local_cache_writes_its_two_parts_separately():
     assert update.call_count == 2  # one call per part, not one concatenated write
     assert update.call_args_list[0].args[0] is kv_cache[0]
     assert update.call_args_list[1].args[0] is kv_cache[1]
+    assert update.call_args_list[0].args[2].shape[-1] == 4
+    assert update.call_args_list[1].args[2].shape[-1] == 2
 
 
 @pytest.mark.unit
@@ -2539,6 +2549,7 @@ def test_dsa_cp_prepares_sp_rotary_rows_before_cp_rotary_rows():
         q_b_proj=SimpleNamespace(tp_size=1), kv_b_proj=SimpleNamespace(tp_size=1),
         ena_sp=True, ena_kvsp=False, noncontiguous_kv=True,
         _cp_attention_metadata=lambda sp: calls.append("metadata") or (None, None, None),
+        _get_li_caches=lambda cache: (cache[1], None),
         _cp_rotary_rows=lambda sp, cos, sin: calls.append("cp rotary") or (cos, sin),
         _cp_q_lora=MagicMock(side_effect=RuntimeError("stop before projection")),
     )
@@ -2550,3 +2561,580 @@ def test_dsa_cp_prepares_sp_rotary_rows_before_cp_rotary_rows():
         with pytest.raises(RuntimeError, match="stop before projection"):
             NPUDeepseekSparseAttention._forward_prefill_cp(host, None, "cos", "sin", meta, (None, None))
     assert calls == ["metadata", "sp cos", "sp sin", "cp rotary"]
+
+
+@pytest.mark.unit
+def test_dsa_c8_dtype_helpers():
+    from omni_npu.v1.layers.attention.npu_dsa import (
+        get_li_quant_mode,
+        is_sfa_c8_dtype,
+    )
+
+    assert is_sfa_c8_dtype("fp8_ds_mla")
+    assert is_sfa_c8_dtype("hif8_ds_mla")
+    assert not is_sfa_c8_dtype("int8_ds_mla")
+    assert not is_sfa_c8_dtype("li_int8_ds_mla")
+    assert not is_sfa_c8_dtype(None)
+
+    assert get_li_quant_mode("fp8_ds_mla") == "fp8"
+    assert get_li_quant_mode("hif8_ds_mla") == "hif8"
+    with pytest.raises(ValueError, match="INT8 C8 is not supported"):
+        get_li_quant_mode("int8_ds_mla")
+    assert get_li_quant_mode("li_int8_ds_mla") == "int8"
+    assert get_li_quant_mode("bf16") is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("cache_dtype", "dynamic_calls"),
+    [
+        ("hif8_ds_mla", 0),
+        ("fp8_ds_mla", 1),
+    ],
+)
+def test_dsa_c8_pack_pertile128_kv(monkeypatch, cache_dtype, dynamic_calls):
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    fake = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    fake.cache_dtype = cache_dtype
+    fake.kv_lora_rank = 512
+    fake.qk_rope_head_dim = 64
+    fake.fp8_packed_kv_dim = 656
+    dtype_cast = MagicMock(side_effect=lambda tensor, _dtype: torch.zeros_like(tensor, dtype=torch.uint8))
+
+    def fake_dynamic_quant(tensor, **_kwargs):
+        return torch.zeros_like(tensor, dtype=torch.uint8), torch.ones(tensor.shape[:-1])
+
+    dynamic_quant = MagicMock(side_effect=fake_dynamic_quant)
+    monkeypatch.setattr(dsa_mod.torch_npu, "npu_dtype_cast", dtype_cast)
+    monkeypatch.setattr(dsa_mod.torch_npu, "npu_dynamic_quant", dynamic_quant)
+    monkeypatch.setattr(dsa_mod.torch_npu, "hifloat8", torch.uint8, raising=False)
+
+    packed = NPUDeepseekSparseAttention._pack_pertile128_kv(
+        fake,
+        torch.zeros(2, 1, 512, dtype=torch.float16),
+        torch.zeros(2, 1, 64, dtype=torch.float16),
+    )
+
+    assert packed.shape == (2, 1, 656)
+    assert dtype_cast.call_count == int(cache_dtype == "hif8_ds_mla")
+    assert dynamic_quant.call_count == dynamic_calls
+
+
+@pytest.mark.unit
+def test_dsa_c8_pack_rejects_bad_dims_and_dtype():
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    fake = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    fake.cache_dtype = "hif8_ds_mla"
+    fake.kv_lora_rank = 512
+    fake.qk_rope_head_dim = 64
+    fake.fp8_packed_kv_dim = 656
+    with pytest.raises(ValueError, match="Unexpected dims"):
+        NPUDeepseekSparseAttention._pack_pertile128_kv(
+            fake,
+            torch.zeros(1, 1, 4),
+            torch.zeros(1, 1, 64),
+        )
+
+    fake.cache_dtype = "bad_dtype"
+    with pytest.raises(ValueError, match="Unsupported C8 dtype"):
+        NPUDeepseekSparseAttention._pack_pertile128_kv(
+            fake,
+            torch.zeros(1, 1, 512),
+            torch.zeros(1, 1, 64),
+        )
+
+
+@pytest.mark.unit
+def test_dsa_c8_scatter_cache_supports_slots_and_slots_2d(monkeypatch):
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    fake = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    fake.fp8_packed_kv_dim = 656
+    packed = torch.zeros(3, 656, dtype=torch.uint8)
+    fake._pack_pertile128_kv = MagicMock(return_value=packed)
+    scatter = MagicMock()
+    monkeypatch.setattr(dsa_mod.torch_npu, "npu_scatter_nd_update_", scatter)
+    kv_cache = (torch.zeros(4, 8, 656, dtype=torch.uint8),)
+
+    NPUDeepseekSparseAttention._scatter_c8_kv_cache(
+        fake,
+        torch.empty(0),
+        torch.empty(0),
+        kv_cache,
+        slots=torch.tensor([0, 9, 17]),
+        slots_2d=torch.arange(3).view(3, 1),
+    )
+    assert torch.equal(scatter.call_args.args[1], torch.arange(3).view(3, 1))
+
+    NPUDeepseekSparseAttention._scatter_c8_kv_cache(
+        fake,
+        torch.empty(0),
+        torch.empty(0),
+        kv_cache,
+        slots=torch.tensor([0, 9, 17]),
+        slots_2d=None,
+    )
+    block_slots = scatter.call_args.args[1]
+    assert torch.equal(block_slots, torch.tensor([[0, 0], [1, 1], [2, 1]]))
+
+
+@pytest.mark.unit
+def test_dsa_get_li_caches():
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    fake = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    assert NPUDeepseekSparseAttention._get_li_caches(fake, None) == (None, None)
+
+    kv_cache = ("mla", "li", "scale")
+    fake.noncontiguous_kv = True
+    fake.li_quant_mode = "int8"
+    assert NPUDeepseekSparseAttention._get_li_caches(fake, kv_cache) == ("li", "scale")
+    fake.li_quant_mode = None
+    assert NPUDeepseekSparseAttention._get_li_caches(fake, kv_cache) == ("li", None)
+
+    fake.noncontiguous_kv = False
+    assert NPUDeepseekSparseAttention._get_li_caches(fake, kv_cache) == ("scale", None)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("li_quant_mode", ["int8", "fp8", "hif8"])
+def test_indexer_update_cache_quant_li(monkeypatch, li_quant_mode):
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import Indexer
+
+    idx = Indexer.__new__(Indexer)
+    idx.li_quant_mode = li_quant_mode
+    scatter = MagicMock()
+
+    def fake_dynamic_quant(tensor, **_kwargs):
+        return torch.zeros_like(tensor, dtype=torch.uint8), torch.ones(tensor.size(0))
+
+    monkeypatch.setattr(dsa_mod.torch_npu, "npu_dynamic_quant", MagicMock(side_effect=fake_dynamic_quant))
+    monkeypatch.setattr(dsa_mod.torch_npu, "npu_scatter_nd_update_", scatter)
+    monkeypatch.setattr(dsa_mod.torch_npu, "hifloat8", torch.uint8, raising=False)
+
+    Indexer._update_cache(
+        idx,
+        ki=torch.zeros(3, 1, 8),
+        slots_2d=torch.arange(3).view(3, 1),
+        ki_cache=torch.zeros(4, 8, 1, 8, dtype=torch.uint8),
+        ki_scale_cache=torch.zeros(4, 8, 1),
+    )
+
+    assert scatter.call_count == 2
+
+
+@pytest.mark.unit
+def test_indexer_update_cache_quant_li_rejects_unknown_mode():
+    from omni_npu.v1.layers.attention.npu_dsa import Indexer
+
+    idx = Indexer.__new__(Indexer)
+    idx.li_quant_mode = "bad"
+    with pytest.raises(ValueError, match="Unsupported LI quant mode"):
+        Indexer._update_cache(
+            idx,
+            ki=torch.zeros(1, 1, 8),
+            slots_2d=torch.zeros(1, 1, dtype=torch.int64),
+            ki_cache=torch.zeros(1, 1, 1, 8),
+            ki_scale_cache=torch.zeros(1, 1, 1),
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("li_quant_mode", ["int8", "fp8", "hif8"])
+def test_indexer_apply_lightning_indexer_quant_li(monkeypatch, li_quant_mode):
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import Indexer
+
+    idx = Indexer.__new__(Indexer)
+    idx.li_quant_mode = li_quant_mode
+    idx.cache_dtype = f"{li_quant_mode}_ds_mla"
+    idx.topk_tokens = 3
+    expected = torch.ones(2, 1, 3, dtype=torch.int32)
+
+    def fake_dynamic_quant(tensor, **_kwargs):
+        scale_shape = tensor.shape[:-1]
+        return torch.zeros_like(tensor, dtype=torch.uint8), torch.ones(scale_shape)
+
+    quant_indexer = MagicMock(return_value=(expected,))
+    monkeypatch.setattr(dsa_mod.torch_npu, "npu_dynamic_quant", MagicMock(side_effect=fake_dynamic_quant))
+    monkeypatch.setattr(dsa_mod.torch_npu, "npu_quant_lightning_indexer", quant_indexer, raising=False)
+    monkeypatch.setattr(dsa_mod.torch_npu, "hifloat8", torch.uint8, raising=False)
+    monkeypatch.setattr(
+        dsa_mod,
+        "model_extra_config",
+        SimpleNamespace(operator_opt_config=SimpleNamespace(use_noncontiguous_kv=True)),
+    )
+
+    out = Indexer._apply_lightning_indexer(
+        idx,
+        wi=torch.zeros(2, 4),
+        qi=torch.zeros(2, 1, 8),
+        ki_cache=torch.zeros(4, 8, 8, dtype=torch.uint8),
+        q_cumlens=torch.tensor([2], dtype=torch.int32),
+        kv_lens=torch.tensor([2], dtype=torch.int32),
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        ki_scale_cache=torch.zeros(4, 8, 1),
+    )
+
+    assert out is expected
+    kwargs = quant_indexer.call_args.kwargs
+    assert kwargs["sparse_count"] == 3
+    assert kwargs["key_dequant_scale"].shape == (4, 8, 1)
+    assert kwargs["weights"].dtype == (torch.float16 if li_quant_mode == "int8" else torch.bfloat16)
+    if li_quant_mode == "hif8":
+        assert kwargs["query_dtype"] is torch.uint8
+        assert kwargs["key_dtype"] is torch.uint8
+
+
+@pytest.mark.unit
+def test_indexer_apply_lightning_indexer_quant_li_requires_op(monkeypatch):
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import Indexer
+
+    idx = Indexer.__new__(Indexer)
+    idx.li_quant_mode = "int8"
+    idx.cache_dtype = "int8_ds_mla"
+    idx.topk_tokens = 3
+    monkeypatch.delattr(dsa_mod.torch_npu, "npu_quant_lightning_indexer", raising=False)
+    monkeypatch.setattr(
+        dsa_mod.torch_npu,
+        "npu_dynamic_quant",
+        MagicMock(return_value=(torch.zeros(1, 1, 8), torch.ones(1, 1))),
+    )
+    monkeypatch.setattr(
+        dsa_mod,
+        "model_extra_config",
+        SimpleNamespace(operator_opt_config=SimpleNamespace(use_noncontiguous_kv=True)),
+    )
+
+    with pytest.raises(RuntimeError, match="npu_quant_lightning_indexer is required"):
+        Indexer._apply_lightning_indexer(
+            idx,
+            wi=torch.zeros(1, 4),
+            qi=torch.zeros(1, 1, 8),
+            ki_cache=torch.zeros(1, 1, 8),
+            q_cumlens=torch.tensor([1], dtype=torch.int32),
+            kv_lens=torch.tensor([1], dtype=torch.int32),
+            block_table=torch.zeros(1, 1, dtype=torch.int32),
+            ki_scale_cache=torch.zeros(1, 1, 1),
+        )
+
+
+@pytest.mark.unit
+def test_sparse_kv_norm_rope_cache_c8_delegates_to_scatter(monkeypatch):
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    fake = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    fake.qk_rope_head_dim = 64
+    fake.kv_lora_rank = 512
+    fake.is_sfa_c8 = True
+    fake.cache_dtype = "hif8_ds_mla"
+    fake.noncontiguous_kv = True
+    fake.kv_a_layernorm = lambda x: x
+    fake._apply_rope = lambda x, _cos, _sin: x
+    fake._scatter_c8_kv_cache = MagicMock()
+    monkeypatch.setattr(
+        dsa_mod,
+        "model_extra_config",
+        SimpleNamespace(operator_opt_config=SimpleNamespace(enable_kv_rmsnorm_rope_cache=False)),
+    )
+
+    slots = SimpleNamespace(
+        slot_mapping=torch.arange(2, dtype=torch.int64),
+        slot_mapping_2d=torch.arange(2, dtype=torch.int64).view(2, 1),
+    )
+    kv_cache = (torch.zeros(4, 8, 656, dtype=torch.uint8),)
+    k_nope, k_pe = NPUDeepseekSparseAttention._kv_norm_rope_cache(
+        fake,
+        latent_kv=torch.zeros(2, 576),
+        cos=torch.zeros(2, 1, 1, 64),
+        sin=torch.zeros(2, 1, 1, 64),
+        slots=slots,
+        kv_cache=kv_cache,
+    )
+
+    assert k_nope.shape == (2, 1, 512)
+    assert k_pe.shape == (2, 1, 64)
+    fake._scatter_c8_kv_cache.assert_called_once()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cache_dtype", ["fp8_ds_mla", "hif8_ds_mla"])
+def test_apply_attn_absorb_c8_quant_sfa(monkeypatch, cache_dtype):
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    fake = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    fake.noncontiguous_kv = True
+    fake.param_sink_number = 128
+    fake.is_sfa_c8 = True
+    fake.cache_dtype = cache_dtype
+    fake.scaling = 0.5
+    fake.dummy_value_cache_quant = torch.zeros(1, 8, 1, 656, dtype=torch.uint8)
+    fake.attn = SimpleNamespace(
+        impl=SimpleNamespace(
+            sink_kv=torch.zeros(1, 1, 1),
+            sink_k_nope=torch.zeros(1, 1, 1),
+        )
+    )
+    monkeypatch.setattr(dsa_mod.torch_npu, "hifloat8", torch.uint8, raising=False)
+    monkeypatch.setattr(
+        dsa_mod,
+        "model_extra_config",
+        SimpleNamespace(
+            operator_opt_config=SimpleNamespace(enable_precision_strong_consistency=False)
+        ),
+    )
+    expected = torch.full((2, 1, 4), 9.0)
+    custom_quant_sfa = MagicMock(return_value=expected)
+    int8_quant_sfa = MagicMock(return_value=expected)
+    monkeypatch.setattr(
+        torch.ops.custom,
+        "npu_ai_infra_kv_quant_sparse_flash_attention",
+        custom_quant_sfa,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        dsa_mod.torch_npu,
+        "npu_kv_quant_sparse_flash_attention",
+        int8_quant_sfa,
+        raising=False,
+    )
+
+    out = NPUDeepseekSparseAttention._apply_attn_absorb(
+        fake,
+        q_nope=torch.zeros(2, 1, 4),
+        q_pe=torch.zeros(2, 1, 2),
+        q_cumlens=torch.tensor([2], dtype=torch.int32),
+        kv_lens=torch.tensor([2], dtype=torch.int32),
+        topk_idx=torch.zeros(2, 1, 2048, dtype=torch.int32),
+        block_table=torch.zeros(1, 4, dtype=torch.int32),
+        kv_cache=(torch.zeros(1, 8, 656, dtype=torch.uint8),),
+    )
+
+    assert out is expected
+    custom_quant_sfa.assert_called_once()
+    int8_quant_sfa.assert_not_called()
+    assert "key_sink" in custom_quant_sfa.call_args.kwargs
+    if cache_dtype == "hif8_ds_mla":
+        assert custom_quant_sfa.call_args.kwargs["key_dtype"] is torch.uint8
+
+
+
+@pytest.mark.unit
+def test_apply_attn_absorb_hif8_requires_sparse_count_2048(monkeypatch):
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    fake = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    fake.noncontiguous_kv = True
+    fake.param_sink_number = 128
+    fake.is_sfa_c8 = True
+    fake.cache_dtype = "hif8_ds_mla"
+    monkeypatch.setattr(
+        dsa_mod,
+        "model_extra_config",
+        SimpleNamespace(
+            operator_opt_config=SimpleNamespace(enable_precision_strong_consistency=False)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="HiFloat8 SFA requires"):
+        NPUDeepseekSparseAttention._apply_attn_absorb(
+            fake,
+            q_nope=torch.zeros(2, 1, 4),
+            q_pe=torch.zeros(2, 1, 2),
+            q_cumlens=torch.tensor([2], dtype=torch.int32),
+            kv_lens=torch.tensor([2], dtype=torch.int32),
+            topk_idx=torch.zeros(2, 1, 7, dtype=torch.int32),
+            block_table=torch.zeros(1, 4, dtype=torch.int32),
+            kv_cache=(torch.zeros(1, 8, 656, dtype=torch.uint8),),
+        )
+
+
+@pytest.mark.unit
+def test_indexer_update_cache_qli_v2_uses_mxfp8(monkeypatch):
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import Indexer
+
+    idx = Indexer.__new__(Indexer)
+    idx.li_quant_mode = "hif8"
+    idx.use_qli_v2 = True
+    cache_op = MagicMock()
+    monkeypatch.setattr(
+        dsa_mod.torch.ops.cann_ops_transformer,
+        "indexer_quant_cache",
+        cache_op,
+        raising=False,
+    )
+    metadata = SimpleNamespace(
+        slot_mapping=torch.tensor([0, 9, 18], dtype=torch.int64),
+        slot_mapping_2d=torch.tensor([[0, 0], [1, 1], [2, 2]]),
+    )
+    key_cache = torch.zeros(4, 8, 1, 128, dtype=torch.float8_e4m3fn)
+    scale_cache = torch.zeros(4, 8, 1, 4, dtype=torch.uint8)
+
+    Indexer._update_cache(
+        idx,
+        ki=torch.zeros(3, 1, 128),
+        slots_2d=metadata,
+        ki_cache=key_cache,
+        ki_scale_cache=scale_cache,
+    )
+
+    args = cache_op.call_args
+    assert args.args[0] is key_cache
+    assert args.args[1] is scale_cache
+    assert args.args[2].shape == (3, 128)
+    assert torch.equal(args.args[3], metadata.slot_mapping.to(torch.int32))
+    assert args.args[3].dtype == torch.int32
+    assert args.kwargs == {"quant_mode": "mxfp8", "round_scale": True}
+
+
+@pytest.mark.unit
+def test_indexer_apply_qli_v2_reuses_metadata(monkeypatch):
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import Indexer
+
+    idx = Indexer.__new__(Indexer)
+    idx.li_quant_mode = "hif8"
+    idx.use_qli_v2 = True
+    idx.is_metadata_producer = False
+    idx.n_head = 64
+    idx.head_dim = 128
+    idx.topk_tokens = 3
+    metadata = torch.zeros(1024, dtype=torch.int32)
+    idx.qli_v2_metadata_op = MagicMock(return_value=metadata)
+    expected = torch.ones(2, 1, 3, dtype=torch.int32)
+    qli_v2_op = MagicMock(return_value=(expected, torch.empty(0)))
+    monkeypatch.setattr(
+        dsa_mod.torch.ops.cann_ops_transformer,
+        "quant_lightning_indexer",
+        qli_v2_op,
+        raising=False,
+    )
+
+    def fake_mx_quant(tensor, **_kwargs):
+        return (
+            torch.zeros_like(tensor, dtype=torch.float8_e4m3fn),
+            torch.zeros(tensor.shape[0], 4, dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(
+        dsa_mod.torch_npu,
+        "npu_dynamic_mx_quant",
+        MagicMock(side_effect=fake_mx_quant),
+    )
+    monkeypatch.setattr(
+        dsa_mod,
+        "model_extra_config",
+        SimpleNamespace(operator_opt_config=SimpleNamespace(use_noncontiguous_kv=True)),
+    )
+
+    q_cumlens = torch.tensor([1, 2], dtype=torch.int32)
+    kv_lens = torch.tensor([5, 9], dtype=torch.int32)
+    block_table = torch.zeros(2, 1, dtype=torch.int32)
+    key_scale = torch.zeros(4, 8, 1, 4, dtype=torch.uint8)
+    out = Indexer._apply_lightning_indexer(
+        idx,
+        wi=torch.zeros(2, 64),
+        qi=torch.zeros(2, 64, 128),
+        ki_cache=torch.zeros(4, 8, 1, 128, dtype=torch.float8_e4m3fn),
+        q_cumlens=q_cumlens,
+        kv_lens=kv_lens,
+        block_table=block_table,
+        ki_scale_cache=key_scale,
+        metadata_caller="decode",
+    )
+
+    assert out is expected
+    metadata_args, recompute, caller = idx.qli_v2_metadata_op.call_args.args
+    assert recompute is False
+    assert caller == ("decode", 3)
+    assert torch.equal(metadata_args["cu_seqlens_q"], torch.tensor([0, 1, 2]))
+    assert metadata_args["seqused_k"] is kv_lens
+    assert metadata_args["layout_k"] == "PA_BBND"
+    main_args = qli_v2_op.call_args
+    assert main_args.args[5:] == (3, 3)
+    assert main_args.kwargs["metadata"] is metadata
+    assert main_args.kwargs["block_table"] is block_table
+    assert main_args.args[2].dtype == torch.float32
+    assert main_args.args[3].dtype == torch.float8_e8m0fnu
+    assert main_args.args[4].dtype == torch.float8_e8m0fnu
+    assert main_args.args[4].shape == (4, 8, 1, 2, 2)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cache_dtype", ("auto", "fp8_ds_mla", "hif8_ds_mla", "li_int8_ds_mla"))
+@pytest.mark.parametrize("enabled", (False, True))
+def test_qli_v2_activation_matches_cache_layout(cache_dtype, enabled):
+    from omni_npu.v1.layers.attention import npu_dsa as mod
+
+    config = SimpleNamespace(
+        model_type="openpangu_v2", index_topk=2048, index_n_heads=64,
+        index_head_dim=128, qk_rope_head_dim=64, rms_norm_eps=1e-5,
+    )
+    opt = SimpleNamespace(
+        enable_precision_strong_consistency=False, use_rope_fusion_op=False,
+        use_noncontiguous_kv=True, use_quant_lightning_indexer_v2=enabled,
+    )
+    with patch.object(mod, "model_extra_config", SimpleNamespace(operator_opt_config=opt)), \
+         patch.object(mod, "ReplicatedFlashCommLinear", MagicMock()), \
+         patch.object(mod, "RMSNorm", MagicMock()), \
+         patch.object(mod, "on_ascend950", return_value=True), \
+         patch.object(mod.Indexer, "_init_qli_v2_ops") as init:
+        indexer = mod.Indexer(None, config, 512, 512, None, SimpleNamespace(cache_dtype=cache_dtype))
+    expected = enabled and cache_dtype == "hif8_ds_mla"
+    assert indexer.use_qli_v2 is expected
+    assert init.call_count == int(expected)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cache_dtype", ("hif8_ds_mla", "fp8_ds_mla"))
+def test_c8_external_sinks_do_not_change_sparse_indices(cache_dtype):
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    host = SimpleNamespace(param_sink_number=128, noncontiguous_kv=True, cache_dtype=cache_dtype)
+    indices = torch.tensor([[[0, 4, -1]]], dtype=torch.int32)
+    assert NPUDeepseekSparseAttention._apply_sink_offset(host, indices) is indices
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "cache_dtype,on_a5,packed,strong,dtype,latent_dim,message",
+    [
+        ("int8_ds_mla", True, True, False, torch.bfloat16, 512, "INT8 C8 is not supported"),
+        ("hif8_ds_mla", False, True, False, torch.bfloat16, 512, "Ascend950/A5"),
+        ("fp8_ds_mla", True, False, False, torch.bfloat16, 512, "use_noncontiguous_kv"),
+        ("hif8_ds_mla", True, True, True, torch.bfloat16, 512, "precision strong consistency"),
+        ("li_int8_ds_mla", True, True, True, torch.bfloat16, 512, "precision strong consistency"),
+        ("hif8_ds_mla", True, True, False, torch.float16, 512, "BF16"),
+        ("fp8_ds_mla", True, True, False, torch.bfloat16, 256, "kv_lora_rank=512"),
+    ],
+)
+def test_dsa_rejects_unsupported_quantized_cache_before_allocating_weights(
+    cache_dtype, on_a5, packed, strong, dtype, latent_dim, message,
+):
+    from omni_npu.v1.layers.attention import npu_dsa as mod
+
+    opt = SimpleNamespace(
+        kv_nz=False, use_noncontiguous_kv=packed, enable_multi_stream=False,
+        split_q_up_in_multistream=False, use_mome_inplace_update=False,
+        enable_precision_strong_consistency=strong,
+    )
+    with patch.object(mod, "model_extra_config", SimpleNamespace(dtype=dtype, operator_opt_config=opt)), \
+         patch.object(mod, "get_tp_group", return_value=SimpleNamespace(world_size=1)), \
+         patch.object(mod, "on_ascend950", return_value=on_a5), \
+         pytest.raises(ValueError, match=message):
+        mod.NPUDeepseekSparseAttention(
+            vllm_config=SimpleNamespace(kv_transfer_config=None), config=SimpleNamespace(),
+            hidden_size=512, num_heads=16, qk_nope_head_dim=128, qk_rope_head_dim=64,
+            v_head_dim=128, q_lora_rank=512, kv_lora_rank=latent_dim,
+            cache_config=SimpleNamespace(cache_dtype=cache_dtype), prefix="model.layers.0.self_attn",
+        )

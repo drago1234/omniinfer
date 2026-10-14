@@ -206,6 +206,34 @@ def test_static_sink_mla_get_kv_cache_spec_uses_dsa_for_noncontiguous_sparse(
     )
     assert isinstance(spec, kv_mod.DSAAttentionSpec)
     assert spec.head_size == 576 + 128
+    assert spec.block_size == 16
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cache_dtype", ["fp8_ds_mla", "hif8_ds_mla"])
+def test_static_sink_mla_c8_dsa_spec_doubles_block_and_pads_page(
+    monkeypatch, cache_dtype
+):
+    spec, kv_mod, _sink_spec_mod = _static_sink_mla_spec(
+        monkeypatch,
+        use_noncontiguous_kv=True,
+        use_sparse=True,
+        indexer=SimpleNamespace(head_dim=128),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(),
+            cache_config=SimpleNamespace(
+                block_size=16,
+                cache_dtype=cache_dtype,
+                mamba_page_size_padded=32768,
+            ),
+            quant_config=None,
+        ),
+    )
+
+    assert isinstance(spec, kv_mod.DSAAttentionSpec)
+    assert spec.block_size == 32
+    assert spec.cache_dtype_str == cache_dtype
+    assert spec.real_page_size_bytes <= spec.page_size_bytes == 32768
 
 
 @pytest.mark.unit

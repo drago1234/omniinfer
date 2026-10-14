@@ -190,6 +190,7 @@ class ModelOperatorOptConfig:
     omni_disable_npu_add_rms_norm: bool = False
     use_noncontiguous_kv: bool = False
     use_aicpu_fa_tiling: bool = False
+    use_quant_lightning_indexer_v2: bool = False
     merge_q_kv_conv: bool = False # 是否合并qa_conv和compresskv_conv
     disable_npu_top_k_top_p_sample: bool = False
     use_mome_inplace_update: bool = False
