@@ -322,6 +322,10 @@
             "1P1D": {
                 "prefill_config_file": "openpangu_v2_vl/pangu_v2_vl_moe_w8a8c16_a2_92B_xp1d_p_open.json",
                 "decode_config_file": "openpangu_v2_vl/pangu_v2_vl_moe_w8a8c16_a2_92B_xp1d_d_open.json"
+            },
+            "3P1D": {
+                "prefill_config_file": "openpangu_v2_vl/pangu_v2_vl_moe_w8a8c16_a2_92B_3p1d_p_open.json",
+                "decode_config_file": "openpangu_v2_vl/pangu_v2_vl_moe_w8a8c16_a2_92B_xp1d_d_open.json"
             }
         }
     },
