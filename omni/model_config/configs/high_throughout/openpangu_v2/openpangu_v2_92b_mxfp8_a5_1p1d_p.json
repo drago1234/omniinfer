@@ -18,7 +18,12 @@
         "use_noncontiguous_kv": true,
         "enable_kv_rmsnorm_rope_cache": true,
         "decode_moe_dispatch_combine": false,
-        "enable_moe_agrs": false,
+        "enable_moe_agrs": true,
+        "enable_agrs_finalize_metadata_overlap": true,
+        "shared_expert_multi_stream": true,
+        "enable_mome_sp": true,
+        "mome_sp_token_threshold": 10240,
+        "swa_prefill_absorb_max_tokens": 8192,
         "kv_nz": false,
         "merge_q_kv_conv": false,
         "use_aicpu_fa_tiling": true

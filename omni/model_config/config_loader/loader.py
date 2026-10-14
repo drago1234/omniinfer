@@ -220,6 +220,7 @@ class ModelOperatorOptConfig:
     enable_mome_sp: bool = False # prefill only, support prefix cache
     mome_sp_token_threshold: int = 0 # Minimum actual tokens per TP-global step; 0 keeps static MoME-SP behavior
     mome_sp_allgather_multi_stream: bool = True # Whether MoME-SP cache-state AllGather runs on a side stream
+    swa_prefill_absorb_max_tokens: int = 8192  # Ascend 950 SWA global prefill tokens; 0 keeps standard path
     optimize_first_chunk: bool = False # Whether turn off PA (non-absorb mode) and use MoME SP for the first chunk
     use_w4a8_enk_gmm: bool = False # W4A8 MoE EnK 优化，仅对称量化，默认关闭
 
@@ -526,10 +527,15 @@ def _validate_precision_strong_consistency(vllm_config):
 
     from vllm.config.compilation import CUDAGraphMode
     cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
-    if cudagraph_mode != CUDAGraphMode.FULL:
+    allowed_modes = [CUDAGraphMode.FULL]
+    # A5 hybrid serving uses eager prefill and captured decode with the
+    # batch-invariant operators checked above.
+    if on_ascend950() and not model_extra_config.task_config.is_pd_disaggregation:
+        allowed_modes.append(CUDAGraphMode.FULL_DECODE_ONLY)
+    if cudagraph_mode not in allowed_modes:
         _report_precision_consistency_violation(
             "enable_precision_strong_consistency requires compilation_config.cudagraph_mode "
-            f"to be CUDAGraphMode.FULL, but got {cudagraph_mode}"
+            f"to be one of {allowed_modes}, but got {cudagraph_mode}"
         )
 
 

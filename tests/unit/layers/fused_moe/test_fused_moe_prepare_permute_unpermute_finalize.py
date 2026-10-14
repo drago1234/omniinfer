@@ -1245,6 +1245,50 @@ def test_agrs_unpermute_finalize_quant_uses_gathered_weights_drop_pad_mode_3(pre
     assert kwargs["drop_pad_mode"] == 3
 
 
+def test_agrs_post_finalize_callback_runs_before_reduce_scatter(prepare_module):
+    module, stubs = prepare_module
+    events = []
+    layer = _moe_layer(
+        global_num_experts=4,
+        local_num_experts=2,
+        quant_config=object(),
+        top_k=1,
+    )
+    stubs.torch_npu.npu_moe_finalize_routing.side_effect = (
+        lambda *args, **kwargs: events.append("finalize")
+        or torch.ones(2, 2, dtype=torch.float32)
+    )
+    stubs.ep_group.reduce_scatter = (
+        lambda tensor, dim=0: events.append("reduce_scatter") or tensor
+    )
+    handler = module.AGRSPrepPmtAndUnpmtFinal(layer)
+    prepare_result = module.AGRSPreparePermuteResult(
+        hidden_states_sorted_by_experts=torch.zeros(2, 2),
+        expert_tokens=torch.tensor([1, 1], dtype=torch.int32),
+        dynamic_scale=torch.ones(2),
+        expert_range=[2, 4],
+        expanded_row_idx=torch.tensor([0, 1], dtype=torch.int32),
+        gathered_topk_ids=torch.tensor([[0], [3], [0], [3]], dtype=torch.int32),
+        dtype=torch.float16,
+        row_idx_type=0,
+    )
+    metadata = module.AGRSFinalizeMetadata(
+        gathered_topk_weights=torch.ones(4, 1, dtype=torch.float32)
+    )
+
+    handler.unpermute_finalize(
+        layer=layer,
+        hidden_states=torch.ones(2, 2, dtype=torch.float32),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int32),
+        topk_weights=torch.ones(2, 1, dtype=torch.float32),
+        agrs_prepare_permute_result=prepare_result,
+        finalize_metadata=metadata,
+        post_finalize_callback=lambda: events.append("shared_expert"),
+    )
+
+    assert events == ["finalize", "shared_expert", "reduce_scatter"]
+
+
 def test_agrs_prepare_finalize_metadata_gathers_topk_weights(prepare_module):
     module, stubs = prepare_module
     layer = _moe_layer(

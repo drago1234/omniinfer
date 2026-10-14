@@ -115,6 +115,9 @@ class ColumnParallelMOMERL(torch.nn.Module):
         inplace: bool = True, 
     ) -> torch.Tensor:
         assert mome_metadata.num_computed_tokens is not None
+        enable_precision_strong_consistency = (
+            model_extra_config.operator_opt_config.enable_precision_strong_consistency
+        )
         if self.on_ascend950:
             num_input_tokens = x.size(0)
             num_valid_tokens = mome_metadata.num_actual_tokens
@@ -131,7 +134,7 @@ class ColumnParallelMOMERL(torch.nn.Module):
                 "initial_state_idx": mome_metadata.block_idx_last_computed_token,
                 "activation": "None",
                 "run_mode": 0,
-                "residual_connection": 1,
+                "residual_connection": 0 if enable_precision_strong_consistency else 1,
                 "pad_slot_id": mome_metadata.pad_slot_id,
                 "max_query_len": mome_metadata.max_query_len,
                 "block_size": mome_metadata.B_size,
@@ -157,11 +160,8 @@ class ColumnParallelMOMERL(torch.nn.Module):
                     x, self.weight, conv_states, **conv_kwargs
                 )
 
-            return output
+            return output + x if enable_precision_strong_consistency else output
 
-        enable_precision_strong_consistency = (
-            model_extra_config.operator_opt_config.enable_precision_strong_consistency
-        )
         result = torch.ops.custom.npu_ai_infra_fused_causal_conv1d(
             x,
             self.weight,

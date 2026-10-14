@@ -3,6 +3,7 @@
 
 
 import contextlib
+import math
 from collections.abc import Callable
 
 import torch
@@ -59,6 +60,7 @@ from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.plugin_decorators import attn_decorator
 from omni_npu.v1.layers.attention.npu_mla import (
     MomeAttentionMixin,
+    _a5_sink_attention_kwargs,
     NPUMLAAttention,
 )
 from omni_npu.v1.layers.attention.weight_utils import (
@@ -347,7 +349,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         self.num_heads = num_heads
         self.tp_size = get_tp_group().world_size
 
-        self.scaling = self.qk_head_dim**-0.5
+        self.scaling = 1 / math.sqrt(self.qk_head_dim)
         self.max_position_embeddings = max_position_embeddings
         self.prefix = prefix
         self.layer_idx = extract_layer_index(prefix)
@@ -627,6 +629,11 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             self.ki_stream = named_stream("ki_stream")
             self.indexer.wi_stream = self.wi_stream
             self.indexer.ki_stream = self.ki_stream
+
+        if model_extra_config.operator_opt_config.enable_precision_strong_consistency and self.on_ascend950:
+            self.atten_mask = torch.triu(
+                torch.ones(2048, 2048, dtype=torch.bool), diagonal=1
+            ).to(current_platform.device_type)
 
     def post_weight_load(self):
         if self.param_sink_number > 0:
@@ -918,53 +925,92 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         )
 
 
-        sink_k_nope = self.attn.impl.sink_k_nope.repeat(q_cumlens.numel(), 1, 1)
-        sink_value = sink_k_nope
-        sink_k_pe = self.attn.impl.sink_kv[..., self.kv_lora_rank:].repeat(q_cumlens.numel(), 1, 1)
-
         act_seq_qlen = q_cumlens.to(torch.int64)
-        actual_seq_sink_len = torch.arange(
-            self.param_sink_number,
-            (q_cumlens.numel() + 1) * self.param_sink_number,
-            self.param_sink_number,
-            dtype=q_cumlens.dtype,
-            device=q_cumlens.device,
-        ).to(torch.int64)
-
-        meta_data = torch.ops.custom._npu_fused_infer_attention_sink_metadata(
-            num_heads_q=self.num_local_heads,
-            num_heads_kv=1,
-            head_dim_qk=q_nope.shape[-1],
-            head_dim_v=sink_k_nope.shape[-1],
-            actual_seq_lengths=act_seq_qlen,
-            actual_seq_lengths_kv=actual_seq_sink_len,
-            sparse_mode=0,
-            batch_invariant=True,
-            input_layout="TND",
-            input_layout_kv="TND",
-            rope_head_dim=q_pe.shape[-1],
-        )
-
-        output_sink, _, smax_sink, ssum_sink = (
-            torch.ops.custom.npu_fused_infer_attention_sink_v2(
-                q_nope,
-                sink_k_nope,
-                sink_value,
-                query_rope=q_pe,
-                key_rope=sink_k_pe,
-                actual_seq_qlen=act_seq_qlen,
-                actual_seq_kvlen=actual_seq_sink_len,
-                num_query_heads=self.num_local_heads,
-                num_key_value_heads=1,
-                softmax_scale=self.scaling,
-                input_layout="TND",
-                sparse_mode=0,
-                batch_invariant=True,
-                return_softmax_lse=False,
-                return_softmax_max_sum=True,
-                meta_data=meta_data,
+        if self.on_ascend950:
+            batch_size = q_cumlens.numel()
+            key_cache = self.attn.impl.sink_k_nope.unsqueeze(0).expand(batch_size, -1, -1, -1).squeeze(2).contiguous()
+            key_rope_cache = (
+                self.attn.impl.sink_kv[..., self.kv_lora_rank:]
+                .unsqueeze(0).expand(batch_size, -1, -1, -1).squeeze(2).contiguous()
             )
-        )
+
+            block_table = torch.zeros(q_cumlens.numel(), dtype=torch.int32, device=key_cache.device).unsqueeze(1)
+            kv_sequence_lengths = torch.full_like(act_seq_qlen, self.param_sink_number)
+
+            meta_data = torch.ops.custom.npu_ai_infra_attention_pioneer_metadata(
+                                        self.num_local_heads,
+                                        1,
+                                        q_nope.shape[-1],
+                                        key_cache.shape[-1],
+                                        actual_seq_lengths=act_seq_qlen,
+                                        actual_seq_lengths_kv=kv_sequence_lengths,
+                                        sparse_mode=4,
+                                        pre_tokens=2147483647,
+                                        next_tokens=2147483647,
+                                        input_layout="TND",
+                                        rope_head_dim=q_pe.shape[-1],
+                                        sink_number=0,
+                                        block_size=self.param_sink_number,
+                                        soc_version="ascend950",
+                                    )
+
+            output_sink, _, smax_sink, ssum_sink = torch.ops.custom.npu_ai_infra_attention_pioneer_v2(
+                q_nope,
+                key_cache,
+                key_cache,
+                meta_data,
+                atten_mask=self.atten_mask,
+                actual_seq_lengths=act_seq_qlen,
+                actual_seq_lengths_kv=kv_sequence_lengths,
+                block_table=block_table,
+                query_rope=q_pe,
+                key_rope=key_rope_cache,
+                **_a5_sink_attention_kwargs(self.num_local_heads, self.scaling, self.param_sink_number),
+            )
+        else:
+            sink_k_nope = self.attn.impl.sink_k_nope.repeat(q_cumlens.numel(), 1, 1)
+            sink_value = sink_k_nope
+            sink_k_pe = self.attn.impl.sink_kv[..., self.kv_lora_rank:].repeat(q_cumlens.numel(), 1, 1)
+            actual_seq_sink_len = torch.arange(
+                            self.param_sink_number,
+                            (q_cumlens.numel() + 1) * self.param_sink_number,
+                            self.param_sink_number,
+                            dtype=q_cumlens.dtype,
+                            device=q_cumlens.device,
+                        ).to(torch.int64)
+            meta_data = torch.ops.custom._npu_fused_infer_attention_sink_metadata(
+                            num_heads_q=self.num_local_heads,
+                            num_heads_kv=1,
+                            head_dim_qk=q_nope.shape[-1],
+                            head_dim_v=sink_k_nope.shape[-1],
+                            actual_seq_lengths=act_seq_qlen,
+                            actual_seq_lengths_kv=actual_seq_sink_len,
+                            sparse_mode=0,
+                            batch_invariant=True,
+                            input_layout="TND",
+                            input_layout_kv="TND",
+                            rope_head_dim=q_pe.shape[-1],
+                        )
+            output_sink, _, smax_sink, ssum_sink = (
+                torch.ops.custom.npu_fused_infer_attention_sink_v2(
+                    q_nope,
+                    sink_k_nope,
+                    sink_value,
+                    query_rope=q_pe,
+                    key_rope=sink_k_pe,
+                    actual_seq_qlen=act_seq_qlen,
+                    actual_seq_kvlen=actual_seq_sink_len,
+                    num_query_heads=self.num_local_heads,
+                    num_key_value_heads=1,
+                    softmax_scale=self.scaling,
+                    input_layout="TND",
+                    sparse_mode=0,
+                    batch_invariant=True,
+                    return_softmax_lse=False,
+                    return_softmax_max_sum=True,
+                    meta_data=meta_data,
+                )
+            )
 
         attn_output = torch.empty_like(output_normal)
         smax_normal = smax_normal.squeeze(0).unsqueeze(2)  # 1TN -> TN1
@@ -1665,8 +1711,8 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
 
             main stream                 LI side stream              KV/weight side stream
             ------------------------    -------------------------   -------------------------
-            q_a_proj (24, 48)       |   wk (8, 32)                  wait q_a_proj + wk
-            q_mome + q_norm (8, 32) |   k_norm/rope/cache (8, 32)   weights_proj (32, 32) + kv_a_proj (32, 32)
+            q_a_proj (24, 48)       |   wk (8, 32)                  wait wk, weights_proj (8, 32)
+            q_mome + q_norm (8, 32) |   k_norm/rope/cache (8, 32)   wait q_a_proj, kv_a_proj (32, 32)
             wq_b (24, 48)           |   q_b_pe if split (8, 16)     kv_mome
             q_b_nope/q_b (32, 32)   |   indexer_q rope (16, 32)     kv_norm/rope/cache
             q_nope absorb           |   q_pe rope (16, 32)          (16, 32)
@@ -1694,6 +1740,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         li_stream = self.li_stream
 
         input_ready = torch.npu.Event()
+        wk_done = torch.npu.Event()
         q_a_cube_done = torch.npu.Event()
         q_side_ready = torch.npu.Event()
         wq_b_ready = torch.npu.Event()
@@ -1750,6 +1797,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             input_ready.wait(li_stream)
             with torch.npu.npugraph_ex.scope.limit_core_num(8, 32):
                 indexer_k = self.indexer.wk(x)[0]
+                wk_done.record()
                 indexer_k = self.indexer.k_norm(indexer_k).view(
                     -1, 1, self.indexer.head_dim
                 )
@@ -1770,7 +1818,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             q_pe_ready.record()
 
         with torch.npu.stream(side_stream):
-            q_a_cube_done.wait(side_stream)
+            wk_done.wait(side_stream)
             with torch.npu.npugraph_ex.scope.limit_core_num(32, 32):
                 indexer_weights = self.indexer.weights_proj(x)[0]
                 if (
@@ -1781,6 +1829,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                         * self.indexer.weights_scale
                         * self.indexer.softmax_scale
                     )
+                q_a_cube_done.wait(side_stream)
                 kv = self.kv_a_proj_with_mqa(shared_x)[0]
             indexer_weights.record_stream(main_stream)
             with torch.npu.npugraph_ex.scope.limit_core_num(16, 32):

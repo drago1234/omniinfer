@@ -88,6 +88,7 @@ def run_mome_out_partition_case(
     split = MagicMock(return_value=split_output)
     monkeypatch.setattr(mla_mod, "split_tensor_along_last_dim", split)
     attention.use_mome = True
+    attention.tp_size = 2  # o_proj TP == attention TP: no token gather needed
     attention.kv_b_proj = SimpleNamespace(tp_size=1)
     attention.o_proj = SimpleNamespace(
         tp_size=2,

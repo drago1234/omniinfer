@@ -2058,3 +2058,26 @@ def test_kv_offload_reserved_bytes(config, reserved):
         assert _kv_offload_reserved_bytes(config) == reserved
     if reserved:
         fn.assert_called_once_with(16)
+
+
+@pytest.mark.parametrize(
+    ("on_a5", "batch_invariant", "expected_calls"),
+    [(True, True, [3]), (True, False, []), (False, True, [])],
+)
+def test_enable_batch_invariant_determinism_only_on_a5(
+    monkeypatch, on_a5, batch_invariant, expected_calls
+):
+    from omni_npu.worker import npu_worker as worker_mod
+
+    calls = []
+    monkeypatch.setattr(worker_mod, "on_ascend950", lambda: on_a5)
+    monkeypatch.setattr(
+        worker_mod.torch_npu.npu, "set_deterministic_level", calls.append, raising=False
+    )
+    extra = SimpleNamespace(
+        operator_opt_config=SimpleNamespace(use_batch_invariant_op=batch_invariant)
+    )
+
+    worker_mod._enable_batch_invariant_determinism(extra)
+
+    assert calls == expected_calls

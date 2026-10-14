@@ -4,7 +4,7 @@
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -449,18 +449,23 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                     # x_quant here would produce (ep_size * local_N, H) rows,
                     # mismatching the routed path's post-reduce-scatter shape.
                     if use_mxfp:
-                        shared_expert_gate_up = layer._shared_experts._layer.gate_up_proj(
+                        gate_up_result = layer._shared_experts._layer.gate_up_proj(
                             {
                                 "x_mxfp8": x_quant_local,
                                 "pertoken_scale": x_scale_local,
                             }
                         )
                     elif use_hifloat8:
-                        shared_expert_gate_up = layer._shared_experts._layer.gate_up_proj({"x_hif8": x_quant_local})
+                        gate_up_result = layer._shared_experts._layer.gate_up_proj({"x_hif8": x_quant_local})
                     else:
                         raise NotImplementedError(
                             "with_routed_experts_cv schedule only supports hifloat8 or mxfp8 quant methods."
                         )
+                    # FlashCommLinearBase returns (output, bias) by default;
+                    # the activation path consumes only the output tensor.
+                    shared_expert_gate_up = (
+                        gate_up_result[0] if isinstance(gate_up_result, tuple) else gate_up_result
+                    )
                     x_quant_local.record_stream(self.side_stream)
                     if use_mxfp:
                         x_scale_local.record_stream(self.side_stream)
@@ -559,6 +564,7 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
         agrs_prepare_permute_result: AGRSPreparePermuteResult,
         finalize_params: Optional[AGRSFinalizeParams] = None,
         finalize_metadata: Optional[AGRSFinalizeMetadata] = None,
+        post_finalize_callback: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
         expanded_row_idx = agrs_prepare_permute_result.expanded_row_idx
         gathered_topk_ids = agrs_prepare_permute_result.gathered_topk_ids
@@ -637,6 +643,10 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                 export_for_source_row=gathered_topk_ids,
                 drop_pad_mode=3,
             )
+        # Give callers a scheduling point between FinalizeRouting and RS.
+        # A side stream waiting here can overlap independent work with RS.
+        if post_finalize_callback is not None:
+            post_finalize_callback()
         return get_ep_group().reduce_scatter(y, dim=0)
 
 

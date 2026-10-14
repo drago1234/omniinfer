@@ -261,6 +261,7 @@ def test_forward_decode_a5_multistream_runs_three_stream_pipeline(
         *q_up_ops,
         "q_absorb",
         "indexer_k",
+        "record",
         "indexer_k_norm",
         "indexer_rope",
         "indexer_cache",
@@ -2060,6 +2061,7 @@ def test_apply_attention_rescale_pioneer_calls_custom_ops(monkeypatch):
 
     T, N, L, R, S, B = 2, 2, 4, 2, 3, 1
     fake = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    fake.on_ascend950 = False
     fake.scaling = 0.5
     fake.param_sink_number = S
     fake.num_local_heads = N

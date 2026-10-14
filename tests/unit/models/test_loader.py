@@ -639,6 +639,7 @@ class TestConfigLoaderUnit(unittest.TestCase):
                 'omni_npu.model_config.config_loader.loader._print_model_config'
             ) as mock_print,
             patch.object(model_extra_config.operator_opt_config, 'use_batch_invariant_op', True),
+            patch('omni_npu.model_config.config_loader.loader.on_ascend950', return_value=False),
             patch.dict(sys.modules, {'omni_npu.vllm_patches.patches.common.patch_matmul': mock_patch_module}),
         ):
 
@@ -689,6 +690,7 @@ class TestConfigLoaderUnit(unittest.TestCase):
         NONE = "NONE"
         PIECEWISE = "PIECEWISE"
         FULL = "FULL"
+        FULL_DECODE_ONLY = "FULL_DECODE_ONLY"
 
     def _patch_cudagraph_mode_module(self):
         fake_compilation_mod = MagicMock()
@@ -697,7 +699,7 @@ class TestConfigLoaderUnit(unittest.TestCase):
 
     def _run_precision_consistency_validation(
         self, *, enabled=True, prefill=False, use_batch_invariant_op=True,
-        cudagraph_mode=None,
+        cudagraph_mode=None, on_a5=False, pd=True,
     ):
         from omni_npu.model_config.config_loader.loader import (
             _validate_precision_strong_consistency,
@@ -709,22 +711,27 @@ class TestConfigLoaderUnit(unittest.TestCase):
             operator_config.enable_precision_strong_consistency,
             operator_config.use_batch_invariant_op,
             model_extra_config.task_config.is_prefill_node,
+            model_extra_config.task_config.is_pd_disaggregation,
         )
         operator_config.enable_precision_strong_consistency = enabled
         operator_config.use_batch_invariant_op = use_batch_invariant_op
         model_extra_config.task_config.is_prefill_node = prefill
+        model_extra_config.task_config.is_pd_disaggregation = pd
         fake_vllm_config = MagicMock()
         fake_vllm_config.compilation_config.cudagraph_mode = (
             self._FakeCUDAGraphMode.FULL if cudagraph_mode is None else cudagraph_mode
         )
         try:
-            with self._patch_cudagraph_mode_module():
+            with self._patch_cudagraph_mode_module(), patch(
+                'omni_npu.model_config.config_loader.loader.on_ascend950', return_value=on_a5
+            ):
                 _validate_precision_strong_consistency(fake_vllm_config)
         finally:
             (
                 operator_config.enable_precision_strong_consistency,
                 operator_config.use_batch_invariant_op,
                 model_extra_config.task_config.is_prefill_node,
+                model_extra_config.task_config.is_pd_disaggregation,
             ) = original
 
     def test_precision_strong_consistency_disabled_skips_checks(self):
@@ -769,6 +776,23 @@ class TestConfigLoaderUnit(unittest.TestCase):
         }, clear=True):
             self._run_precision_consistency_validation(
                 prefill=True, cudagraph_mode=self._FakeCUDAGraphMode.NONE)
+
+    def test_precision_strong_consistency_decode_only_requires_a5_hybrid(self):
+        with patch.dict(os.environ, {
+            'HCCL_DETERMINISTIC': 'STRICT',
+            'PYTORCH_NPU_ALLOC_CONF': 'expandable_segments:True',
+        }, clear=True):
+            for on_a5, pd in ((True, False), (True, True), (False, False), (False, True)):
+                with self.subTest(on_a5=on_a5, pd=pd):
+                    kwargs = dict(
+                        on_a5=on_a5, pd=pd,
+                        cudagraph_mode=self._FakeCUDAGraphMode.FULL_DECODE_ONLY,
+                    )
+                    if on_a5 and not pd:
+                        self._run_precision_consistency_validation(**kwargs)
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'cudagraph_mode'):
+                            self._run_precision_consistency_validation(**kwargs)
 
     def test_precision_strong_consistency_log_level_warns(self):
         mock_logger = MagicMock()
