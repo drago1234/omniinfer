@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 import os
 import re
-from contextlib import nullcontext
 from functools import partial
 from typing import Optional
 
@@ -26,7 +25,10 @@ from omni_npu.layers.fused_moe.config import FusedMoEQuantConfig, FusedMoEQuantD
 from omni_npu.layers.quantization.moe_apply import shared_expert_mlp
 from omni_npu.layers.fused_moe.fused_moe_method_base import NPUFusedMoEMethodBase
 from omni_npu.layers.fused_moe.layer import NPUFusedMoE
-from omni_npu.layers.fused_moe.shared_expert import activate_shared_expert_on_side_stream
+from omni_npu.layers.fused_moe.shared_expert import (
+    activate_shared_expert_on_side_stream,
+    shared_expert_core_limit,
+)
 from omni_npu.layers.mhc import cube_side_task_ops  # noqa: F401  registers cube-side ops
 from omni_npu.layers.utils import named_stream
 from omni_npu.model_config.config_loader.loader import model_extra_config
@@ -170,9 +172,10 @@ def apply_mxfp_experts(
         torch.npu.current_stream().wait_stream(method.shared_experts_stream)
         method.shared_experts_stream.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(method.shared_experts_stream):
-            shared_results = shared_experts.down_proj(
+            shared_result = shared_experts.down_proj(
                 {"x_mxfp8": shared_act, "pertoken_scale": shared_scale}
             )
+            shared_results = shared_result[0] if isinstance(shared_result, tuple) else shared_result
 
     swiglu_options = {}
     if swiglu_scale_alg is not None:
@@ -495,13 +498,23 @@ class _Mxfp8LinearMethodMixin:
     def process_weights_after_loading(self, layer):
         if getattr(layer.weight, "is_mxfp8_packed", False):
             return
+        if (
+            getattr(layer.weight, "_q_b_storage_released", False)
+            and layer.weight.numel() == 0
+        ):
+            return
         weight, scale = _pack_mxfp8_weight(layer.weight.data,
                                            layer.weight_scale.data)
+        weight = torch_npu.npu_format_cast(
+            weight,
+            torch_npu.Format.FRACTAL_NZ,
+        )
         layer.weight.data = weight
         layer.weight_scale.data = scale
         set_weight_attrs(layer.weight, {
             "is_weight_transposed": True,
             "is_mxfp8_packed": True,
+            "is_mxfp8_weight_nz": True,
         })
         set_weight_attrs(layer.weight_scale, {"is_mxfp8_scale_packed": True})
 
@@ -547,6 +560,7 @@ class Mxfp8FCLinearMethod(_Mxfp8LinearMethodMixin, FlashCommLinearMethodBase):
         from omni_npu.v1.distributed.communication_op_ext import (
             layer_parallel_all_gather,
             layer_parallel_all2all_single,
+            layer_parallel_dp2tp_all2all,
         )
 
         layer_key = getattr(layer, "prefix", "") or ""
@@ -564,6 +578,25 @@ class Mxfp8FCLinearMethod(_Mxfp8LinearMethodMixin, FlashCommLinearMethodBase):
         elif x_transform == "ALL2ALL":
             x_scale = layer_parallel_all2all_single(x_scale, layer.layer_name_inside_block, "x", x_dim)
             x_fp8 = layer_parallel_all2all_single(x_fp8, layer.layer_name_inside_block, "x", x_dim)
+        elif x_transform == "DP2TPAll2All":
+            x_fp8 = layer_parallel_dp2tp_all2all(x_fp8, layer.layer_name_inside_block, "x", x_dim)
+            x_scale = layer_parallel_all_gather(x_scale, layer.layer_name_inside_block, "x", 0)
+            from omni_npu.v1.distributed.parallel_state_ext import (
+                get_layer_parallel_rank, get_layer_parallel_world_size)
+            ws = get_layer_parallel_world_size(layer.layer_name_inside_block, "x")
+            r = get_layer_parallel_rank(layer.layer_name_inside_block, "x")
+
+            scale_group_dim = x_scale.ndim - 2
+            assert x_scale.shape[scale_group_dim] % ws == 0, (
+                f"MXFP8 scale groups {x_scale.shape[scale_group_dim]} "
+                f"must be divisible by layer-parallel world size {ws}"
+            )
+            groups_per_rank = x_scale.shape[scale_group_dim] // ws
+            x_scale = x_scale.narrow(
+                scale_group_dim,
+                r * groups_per_rank,
+                groups_per_rank,
+            ).contiguous()
 
         # FlashComm linears need the same Cube-side task hooks as regular
         # Mxfp8LinearMethod. In particular, attention o_proj is a
@@ -589,10 +622,6 @@ class Mxfp8MlpMethod(FusedMLPMethodBase):
 
     def __init__(self, quant_config: Mxfp8Config):
         self.quant_config = quant_config
-        self.should_limit_core = (
-            model_extra_config.task_config.graph_mode == "acl_graph"
-            and on_ascend950()
-        )
 
     def process_weights_after_loading(self, layer):
         # gate_up_proj / down_proj are Mxfp8FCLinear submodules; their own
@@ -602,15 +631,10 @@ class Mxfp8MlpMethod(FusedMLPMethodBase):
     def apply_quant(self, x, x_transform=None, stream_label=None):
         from omni_npu.v1.layers.utils import get_npu_execution_type
 
-        core_limit_ctx = (
-            torch.npu.npugraph_ex.scope.limit_core_num(0, 8)
-            if self.should_limit_core
-            else nullcontext()
-        )
-
         with get_npu_execution_type(stream_label):
-            with core_limit_ctx:
-                x_fp8, x_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn, scale_alg=1)
+            x_fp8, x_scale = torch_npu.npu_dynamic_mx_quant(
+                x, dst_type=torch.float8_e4m3fn, scale_alg=1
+            )
         return x_fp8, x_scale
 
     def apply_part1_gate_up_on_stream(self, layer, x, stream_label=None):
@@ -623,21 +647,14 @@ class Mxfp8MlpMethod(FusedMLPMethodBase):
     def apply_part2_activation_on_stream(self, layer, gate_up, stream_label=None):
         from omni_npu.v1.layers.utils import get_npu_execution_type
 
-        core_limit_ctx = (
-            torch.npu.npugraph_ex.scope.limit_core_num(0, 8)
-            if self.should_limit_core
-            else nullcontext()
-        )
-
         with get_npu_execution_type(stream_label):
-            with core_limit_ctx:
-                # silu+quant
-                x_fp8, x_scale = torch_npu.npu_swiglu_mx_quant(
-                    gate_up,
-                    activate_left=True,
-                    dst_type=torch.float8_e4m3fn,
-                    scale_alg=1
-                )
+            # silu+quant
+            x_fp8, x_scale = torch_npu.npu_swiglu_mx_quant(
+                gate_up,
+                activate_left=True,
+                dst_type=torch.float8_e4m3fn,
+                scale_alg=1
+            )
             x = {"x_mxfp8": x_fp8, "pertoken_scale": x_scale}
         return x
 
@@ -667,6 +684,11 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.shared_experts_stream = named_stream("sub_stream")
+        self.enable_agrs_finalize_metadata_overlap = getattr(
+            model_extra_config.operator_opt_config,
+            "enable_agrs_finalize_metadata_overlap",
+            False,
+        )
 
         self.n_routed_experts = layer.moe_config.num_experts
         self.prefix = layer.layer_name
@@ -826,7 +848,16 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
             x_slice = x_slice[start:end]
 
         if layer.gate is not None:
-            router_logits, _ = layer.gate(x_slice)
+            gate_weight = getattr(layer.gate, "weight", None)
+            gate_in_fp32 = (
+                model_extra_config.operator_opt_config.router_gating_in_fp32
+                or (
+                    gate_weight is not None
+                    and gate_weight.dtype == torch.float32
+                )
+            )
+            gate_input = x_slice.float() if gate_in_fp32 else x_slice
+            router_logits, _ = layer.gate(gate_input)
         else:
             assert router_logits is not None, "Expected gate or router_logits must be provided."
             if is_need_slice:
@@ -881,6 +912,17 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         prepare_permute_result = self.apply_prepare_permute(strategy_impl, layer, x_slice, topk_ids)
 
         use_grouped_matmul_finalize_routing = (strategy == "agrs" and prepare_permute_result.row_idx_type == 1)
+        finalize_metadata = None
+        overlap_metadata = (
+            strategy == "agrs"
+            and getattr(self, "enable_agrs_finalize_metadata_overlap", False)
+        )
+        if overlap_metadata:
+            self.shared_experts_stream.wait_stream(cur_stream)
+            with torch.npu.stream(self.shared_experts_stream):
+                finalize_metadata = self.prepare_finalize_metadata(
+                    strategy_impl, layer, topk_weights, prepare_permute_result
+                )
         output = self.apply_experts(
             layer=layer,
             prepare_permute_result=prepare_permute_result,
@@ -890,42 +932,73 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
 
         shared_output = None
         schedule = model_extra_config.operator_opt_config.shared_expert_parallel_schedule
-        if multi_stream and schedule == "with_routed_experts_cv":
-            # Shared experts already ran on the side stream interleaved with the
-            # routed-experts compute/vector path inside apply_experts; just unpack.
-            output, shared_output = output  # output of self.apply_experts is a tuple
-        elif multi_stream:
-            # default with_finalize: launch shared experts on the side stream so
-            # they overlap apply_unpermute_finalize below.
-            if shared_experts is not None:
-                cur_stream = torch.npu.current_stream()
+        shared_after_finalize = (
+            overlap_metadata
+            and shared_experts is not None
+            and multi_stream
+            and schedule == "with_finalize"
+        )
+
+        if not shared_after_finalize:
+            if multi_stream and schedule == "with_routed_experts_cv":
+                # Shared experts already ran on the side stream interleaved with the
+                # routed-experts compute/vector path inside apply_experts; just unpack.
+                output, shared_output = output  # output of self.apply_experts is a tuple
+            elif multi_stream:
+                # default with_finalize: launch shared experts on the side stream so
+                # they overlap apply_unpermute_finalize below.
+                if shared_experts is not None:
+                    cur_stream = torch.npu.current_stream()
+                    self.shared_experts_stream.wait_stream(cur_stream)
+                    with torch.npu.stream(self.shared_experts_stream):
+                        with shared_expert_core_limit(strategy == "dispatch_combine"):
+                            if shared_experts.gate_up_proj.tp_size > 1:
+                                shared_output = shared_experts(hidden_states)
+                            else:
+                                shared_output = shared_experts(x_slice)
+            else:
+                # Multi-stream disabled — run shared experts synchronously on the
+                # main stream. Schedule is ignored.
+                if shared_experts is not None:
+                    if shared_experts.gate_up_proj.tp_size > 1:
+                        shared_output = shared_experts(hidden_states)
+                    else:
+                        shared_output = shared_experts(x_slice)
+
+            if enable_prefetch:
+                self.shared_experts_stream.wait_stream(cur_stream)
+                with torch.npu.stream(self.shared_experts_stream):
+                    self.model_prefetch.prefetch("next_attn", shared_output, layer=layer)
+            shared_expert_callback = None
+        else:
+            def launch_shared_expert_after_finalize():
+                nonlocal shared_output
+                # FinalizeRouting is already submitted on the main stream. Make the
+                # shared stream depend on it, then overlap shared experts with RS.
                 self.shared_experts_stream.wait_stream(cur_stream)
                 with torch.npu.stream(self.shared_experts_stream):
                     if shared_experts.gate_up_proj.tp_size > 1:
                         shared_output = shared_experts(hidden_states)
                     else:
                         shared_output = shared_experts(x_slice)
-        else:
-            # Multi-stream disabled — run shared experts synchronously on the
-            # main stream. Schedule is ignored.
-            if shared_experts is not None:
-                if shared_experts.gate_up_proj.tp_size > 1:
-                    shared_output = shared_experts(hidden_states)
-                else:
-                    shared_output = shared_experts(x_slice)
+                    if enable_prefetch:
+                        self.model_prefetch.prefetch(
+                            "next_attn", shared_output, layer=layer
+                        )
+            shared_expert_callback = launch_shared_expert_after_finalize
 
-        if enable_prefetch:
-            self.shared_experts_stream.wait_stream(cur_stream)
-            with torch.npu.stream(self.shared_experts_stream):
-                self.model_prefetch.prefetch("next_attn", shared_output, layer=layer)
+        if overlap_metadata:
+            cur_stream.wait_stream(self.shared_experts_stream)
 
         routed_output = self.apply_unpermute_finalize(
-            strategy_impl, 
-            layer, 
-            output, 
-            topk_ids, 
-            topk_weights, 
+            strategy_impl,
+            layer,
+            output,
+            topk_ids,
+            topk_weights,
             prepare_permute_result,
+            finalize_metadata=finalize_metadata,
+            post_finalize_callback=shared_expert_callback,
         )
 
         if multi_stream or enable_prefetch:

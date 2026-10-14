@@ -739,8 +739,9 @@ def test_mlp_apply_quant_rejects_invalid_prequantized_mapping(hifloat8_module):
         method.apply_quant({"x_int8": torch.zeros(2, 4, dtype=torch.int8)})
 
 
+@pytest.mark.parametrize("tuple_output", [False, True])
 def test_moe_apply_experts_with_routed_experts_cv_returns_tuple(
-    hifloat8_module, mock_torch_npu, monkeypatch
+    hifloat8_module, mock_torch_npu, monkeypatch, tuple_output
 ):
     """Cover apply_experts side-stream branch when shared_expert_parallel_schedule == 'with_routed_experts_cv'."""
     main_stream = _patch_npu_streams(monkeypatch)
@@ -757,6 +758,8 @@ def test_moe_apply_experts_with_routed_experts_cv_returns_tuple(
         act_fn=MagicMock(side_effect=lambda x: x),
         down_proj=MagicMock(return_value=torch.full((2, 4), 9.0, dtype=torch.bfloat16)),
     )
+    if tuple_output:
+        shared_experts.down_proj.return_value = (shared_experts.down_proj.return_value, None)
     layer = moe_layer(
         w13_weight=torch.zeros(2, 4, 8, dtype=torch.uint8),
         w13_weight_scale=torch.ones(2, 8, dtype=torch.float32),
@@ -900,12 +903,14 @@ def _build_apply_method(hifloat8_module, monkeypatch):
 @pytest.mark.parametrize("with_shared", [False, True])
 @pytest.mark.parametrize("tp_size", [1, 2])
 @pytest.mark.parametrize("strategy", ["agrs", "all2all", "dispatch_combine"])
+@pytest.mark.parametrize("custom_model", [False, True])
 def test_moe_apply_non_ep_a5_uses_hifloat_tp_path(
-    hifloat8_module, monkeypatch, with_shared, tp_size, strategy
+    hifloat8_module, monkeypatch, with_shared, tp_size, strategy, custom_model
 ):
     # use_ep lives on layer.moe_config.moe_parallel_config under vLLM 0.25, and
     # the shared MLP on layer._shared_experts._layer (not the runner wrapper).
     _patch_npu_streams(monkeypatch)
+    monkeypatch.setenv("VLLM_PLUGINS", "omni_custom_models" if custom_model else "omni_npu_patches")
     method = _build_apply_method(hifloat8_module, monkeypatch)
     method.tp_size = tp_size
     method.tp_rank = tp_size - 1
@@ -950,11 +955,61 @@ def test_moe_apply_non_ep_a5_uses_hifloat_tp_path(
     if with_shared:
         shared_mlp.assert_called_once_with(hidden_states)
         wrapper.assert_not_called()
-        shared_out, total = result
+        shared_out, model_output = result
         assert torch.equal(shared_out, shared_mlp.return_value)
-        assert torch.equal(total, routed + shared_mlp.return_value)
+        # Built-in Pangu adds shared_out in its caller; custom models consume
+        # the combined second result directly. Both must add it exactly once.
+        total = model_output if custom_model else model_output + shared_out
+        assert torch.equal(total, routed + shared_out)
     else:
         assert result is routed
+
+
+@pytest.mark.parametrize("schedule", ["with_finalize", "with_routed_experts_cv"])
+def test_hifloat_tp_executes_real_expert_pipeline_without_agrs_events(
+    hifloat8_module, mock_torch_npu, monkeypatch, schedule
+):
+    _patch_npu_streams(monkeypatch)
+    config = hifloat8_module.model_extra_config
+    monkeypatch.setattr(config, "dtype", torch.bfloat16, raising=False)
+    monkeypatch.setattr(config.operator_opt_config, "shared_expert_parallel_schedule", schedule)
+    monkeypatch.setattr(config.operator_opt_config, "enable_moe_init_routing_v2", True, raising=False)
+    prepare = _make_module(monkeypatch, "omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize")
+    # This is the TP result contract: no AGRS shared-event or gate-up fields.
+    prepare.PreparePermuteResult = lambda **kw: SimpleNamespace(avg_tokens_per_expert=None, **kw)
+    prepare._uses_hifloat_activation = lambda cfg: cfg.use_hifloat8_w8a8
+    prepare._uses_mxfp_activation = lambda cfg: False
+    module_path = Path(__file__).resolve().parents[3] / "omni/layers/fused_moe/fused_moe.py"
+    spec = importlib.util.spec_from_file_location("hifloat_tp_pipeline_under_test", module_path)
+    fused = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fused)
+    monkeypatch.setattr(fused, "torch_npu", mock_torch_npu)
+    routed = torch.full((3, 4), 3.0, dtype=torch.bfloat16)
+    mock_torch_npu.npu_moe_init_routing_v2 = MagicMock(return_value=(
+        torch.ones(3, 4, dtype=torch.bfloat16), torch.arange(3), torch.tensor([3]), None,
+    ))
+    mock_torch_npu.npu_moe_finalize_routing = MagicMock(side_effect=lambda x, **kw: x.squeeze(0))
+    mock_torch_npu.npu_grouped_matmul.side_effect = [[torch.ones(3, 8)], [routed]]
+    method = hifloat8_module.Hifloat8MoEMethod.__new__(hifloat8_module.Hifloat8MoEMethod)
+    method.shared_experts_stream = _DummyStream()
+    method.moe_quant_config = SimpleNamespace(use_hifloat8_w8a8=True)
+    experts = SimpleNamespace(
+        global_num_experts=1, quant_method=method, quant_config=object(),
+        activation=SimpleNamespace(value="silu"), w13_weight=torch.ones(1), w2_weight=torch.ones(1),
+        w13_weight_scale=torch.ones(1), w2_weight_scale=torch.ones(1),
+    )
+    layer = as_moe_runner(experts, use_ep=False)
+    activate_shared = MagicMock(side_effect=AssertionError("TP must not consume AGRS shared metadata"))
+    monkeypatch.setattr(hifloat8_module, "activate_shared_expert_on_side_stream", activate_shared)
+
+    output = fused.fused_experts_tp(
+        layer, torch.ones(3, 4), torch.zeros(3, 1, dtype=torch.int32), torch.ones(3, 1),
+    )
+
+    assert torch.equal(output, routed)
+    assert mock_torch_npu.npu_grouped_matmul.call_count == 2
+    mock_torch_npu.npu_moe_finalize_routing.assert_called_once()
+    activate_shared.assert_not_called()
 
 
 def test_moe_apply_with_routed_experts_cv_unpacks_tuple(
@@ -1166,6 +1221,60 @@ def test_moe_apply_experts_default_with_finalize_no_shared_path(
     assert result.shape == (4, 4)
     layer.shared_experts.act_fn.assert_not_called()
     layer.shared_experts.down_proj.assert_not_called()
+
+
+@pytest.mark.parametrize("shared_tp", [1, 2])
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_agrs_overlap_launches_shared_between_finalize_and_reduce_scatter(
+    hifloat8_module, mock_torch_npu, monkeypatch, shared_tp, prefetch
+):
+    main_stream = _patch_npu_streams(monkeypatch)
+    config = hifloat8_module.model_extra_config.operator_opt_config
+    monkeypatch.setattr(config, "shared_expert_parallel_schedule", "with_finalize")
+    monkeypatch.setattr(config, "shared_expert_multi_stream", True)
+    monkeypatch.setattr(config, "enable_prefetch", prefetch, raising=False)
+    method = _build_apply_method(hifloat8_module, monkeypatch)
+    method.enable_agrs_finalize_metadata_overlap = True
+    method.model_prefetch = MagicMock()
+    events = []
+    metadata = object()
+
+    def prepare(*args):
+        events.append("metadata")
+        return metadata
+
+    def experts(**kwargs):
+        events.append("experts")
+        return torch.zeros(2, 4, dtype=torch.bfloat16)
+
+    def shared(x):
+        events.append("shared")
+        return x * 3
+
+    def finalize(*args, finalize_metadata=None, post_finalize_callback=None, **kwargs):
+        assert finalize_metadata is metadata
+        assert main_stream.wait_stream_calls[-1] is method.shared_experts_stream
+        events.append("finalize")
+        post_finalize_callback()
+        events.append("reduce_scatter")
+        return torch.zeros(2, 4, dtype=torch.bfloat16)
+
+    method.prepare_finalize_metadata = MagicMock(side_effect=prepare)
+    method.apply_experts = MagicMock(side_effect=experts)
+    method.apply_unpermute_finalize = MagicMock(side_effect=finalize)
+    shared_experts = MagicMock(side_effect=shared)
+    shared_experts.gate_up_proj = SimpleNamespace(tp_size=shared_tp)
+    layer = moe_layer(
+        gate=lambda x: (torch.zeros(x.shape[0], 4), None), shared_experts=shared_experts,
+    )
+    output = method.apply(
+        layer=layer, hidden_states=torch.ones(2, 4, dtype=torch.bfloat16),
+        router_logits=None, top_k=1, renormalize=False,
+    )
+    assert events == ["metadata", "experts", "finalize", "shared", "reduce_scatter"]
+    shared_experts.assert_called_once()
+    assert isinstance(output, tuple)
+    assert method.model_prefetch.prefetch.call_count == (2 if prefetch else 0)
 
 
 def _set_cube_side_tasks(hifloat8_module, tasks):

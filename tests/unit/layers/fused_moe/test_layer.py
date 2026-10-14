@@ -421,7 +421,12 @@ def test_apply_slices_and_gathers_on_all2all(layer_module, monkeypatch):
 
 
 @pytest.mark.unit
-def test_apply_sorts_topk_when_precision_strong_consistency(layer_module, monkeypatch):
+@pytest.mark.parametrize("on_ascend950", [False, True])
+def test_apply_sorts_topk_when_precision_strong_consistency(
+    layer_module, monkeypatch, on_ascend950
+):
+    # The A3 path restores a deterministic expert order after gating; the A5
+    # path computes routing in fp32 inside select_experts and keeps its order.
     module, _, context_holder = layer_module
     context_holder.attn_metadata = {}
     unsorted_ids = torch.tensor([[3, 1], [2, 0]], dtype=torch.int32)
@@ -429,6 +434,7 @@ def test_apply_sorts_topk_when_precision_strong_consistency(layer_module, monkey
     method = _make_unquantized_apply_method(
         module, monkeypatch, strategy="all2all", stub_select_experts=False
     )
+    method.on_ascend950 = on_ascend950
     _stub_select_experts(
         module,
         monkeypatch,
@@ -450,10 +456,14 @@ def test_apply_sorts_topk_when_precision_strong_consistency(layer_module, monkey
 
     topk_ids = method.apply_prepare_permute.call_args.args[3]
     topk_weights = method.apply_prepare_permute.call_args.kwargs["options"].topk_weights
-    assert torch.equal(topk_ids, torch.tensor([[1, 3], [0, 2]], dtype=torch.int32))
-    assert torch.allclose(
-        topk_weights, torch.tensor([[0.3, 0.7], [0.4, 0.6]], dtype=torch.float32)
-    )
+    if on_ascend950:
+        assert torch.equal(topk_ids, unsorted_ids)
+        assert torch.allclose(topk_weights, unsorted_weights)
+    else:
+        assert torch.equal(topk_ids, torch.tensor([[1, 3], [0, 2]], dtype=torch.int32))
+        assert torch.allclose(
+            topk_weights, torch.tensor([[0.3, 0.7], [0.4, 0.6]], dtype=torch.float32)
+        )
 
 
 @pytest.mark.unit
@@ -1261,3 +1271,94 @@ def test_capture_fires_when_layer_has_no_config(layer_module, bound_capturer):
     layer_id, captured = bound_capturer.calls[0]
     assert layer_id == 11
     torch.testing.assert_close(captured, topk_ids)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_select_experts_ascend950_precision_consistency_routes_in_fp32(
+    layer_module, monkeypatch, renormalize
+):
+    module, torch_npu, context_holder = layer_module
+    context_holder.attn_metadata = {}
+    monkeypatch.setattr(module, "on_ascend950", lambda: True)
+    monkeypatch.setattr(
+        module.model_extra_config.operator_opt_config,
+        "enable_precision_strong_consistency",
+        True,
+    )
+    torch_npu.npu_moe_gating_top_k.reset_mock()
+    router_logits = torch.tensor([[0.1, 2.0, -1.0, 0.5], [1.5, -0.5, 0.3, 0.2]])
+    bias = torch.tensor([0.0, -3.0, 0.0, 0.0])
+
+    topk_weights, topk_ids = module.NPUFusedMoE.select_experts(
+        router_logits=router_logits,
+        top_k=2,
+        use_grouped_topk=True,
+        renormalize=renormalize,
+        topk_group=1,
+        num_expert_group=1,
+        routed_scaling_factor=2.0,
+        e_score_correction_bias=bias,
+    )
+
+    # The bias only steers selection; weights come from the unbiased scores.
+    scores = torch.sigmoid(router_logits.float())
+    _, expected_ids = torch.topk(scores + bias, k=2, dim=-1)
+    expected_weights = torch.gather(scores, 1, expected_ids)
+    if renormalize:
+        expected_weights = expected_weights / (expected_weights.sum(-1, keepdim=True) + 1e-20)
+    torch_npu.npu_moe_gating_top_k.assert_not_called()
+    assert topk_ids.dtype == torch.int32
+    assert torch.equal(topk_ids, expected_ids.int())
+    torch.testing.assert_close(topk_weights, expected_weights * 2.0)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("on_a5, consistency", [(False, True), (True, False)])
+def test_select_experts_grouped_uses_gating_kernel_outside_a5_consistency(
+    layer_module, monkeypatch, on_a5, consistency
+):
+    module, torch_npu, context_holder = layer_module
+    context_holder.attn_metadata = {}
+    monkeypatch.setattr(module, "on_ascend950", lambda: on_a5)
+    monkeypatch.setattr(
+        module.model_extra_config.operator_opt_config,
+        "enable_precision_strong_consistency",
+        consistency,
+    )
+    torch_npu.npu_moe_gating_top_k.reset_mock()
+
+    module.NPUFusedMoE.select_experts(
+        router_logits=torch.zeros(2, 4),
+        top_k=1,
+        use_grouped_topk=True,
+        renormalize=False,
+        topk_group=1,
+        num_expert_group=1,
+    )
+
+    torch_npu.npu_moe_gating_top_k.assert_called_once()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_select_experts_negative_bias_cannot_escape_selected_group(layer_module, monkeypatch, renormalize):
+    module, _, context_holder = layer_module
+    context_holder.attn_metadata = {}
+    monkeypatch.setattr(module, "on_ascend950", lambda: True)
+    monkeypatch.setattr(module.model_extra_config.operator_opt_config, "enable_precision_strong_consistency", True)
+    # Both groups have negative corrected scores. Zero masking would select
+    # an expert outside the chosen group for each of these tokens.
+    router_logits = torch.tensor([[0.0, 0.0, -2.0, -2.0], [-2.0, -2.0, 0.0, 0.0]])
+    bias = torch.tensor([-0.6, -0.7, -0.8, -0.9])
+    weights, ids = module.NPUFusedMoE.select_experts(
+        router_logits=router_logits, top_k=2, use_grouped_topk=True,
+        renormalize=renormalize, topk_group=1, num_expert_group=2,
+        routed_scaling_factor=2.0, e_score_correction_bias=bias,
+    )
+    expected_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    assert torch.equal(ids, expected_ids)
+    expected_weights = torch.sigmoid(router_logits.float()).gather(1, expected_ids.long())
+    if renormalize:
+        expected_weights /= expected_weights.sum(-1, keepdim=True)
+    torch.testing.assert_close(weights, expected_weights * 2.0)

@@ -147,6 +147,8 @@ class NPUWorker(Worker):
 
             # Initialize the model best practice configs.
             load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
+            from omni_npu.model_config.config_loader import loader as _omni_loader
+            _enable_batch_invariant_determinism(_omni_loader.model_extra_config)
 
             # OMNI-CONF worker-scope snapshot (solution doc §3.3): full dump
             # on local_rank 0, hash-only elsewhere (cross-rank drift signal).
@@ -163,7 +165,6 @@ class NPUWorker(Worker):
 
             # Run declarative validation after the summary so startup errors
             # can be compared with the emitted configuration.
-            from omni_npu.model_config.config_loader import loader as _omni_loader
             from omni_npu.configs.validators import (
                 ValidationContext,
                 validate_all,
@@ -622,6 +623,12 @@ class NPUWorker(Worker):
             # capture_model() normally consumes the flag on entry; clear any
             # residual if it failed before consume or was bypassed.
             consume_aclgraph_recapture()
+
+
+def _enable_batch_invariant_determinism(extra_config) -> None:
+    """On A5, mhc_pre is batch-invariant only at deterministic level 3."""
+    if on_ascend950() and extra_config.operator_opt_config.use_batch_invariant_op:
+        torch_npu.npu.set_deterministic_level(3)
 
 
 def _needs_dp_local_rank_offset(parallel_config) -> bool:

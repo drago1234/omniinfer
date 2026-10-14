@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import math
 from collections.abc import Callable
 
 import torch
@@ -37,6 +38,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from omni_npu.v1.distributed.communication_op_ext import layer_parallel_all_gather
 from omni_npu.v1.distributed.parallel_state_ext import get_layer_parallel_group
 
 logger = init_logger(__name__)
@@ -97,6 +99,49 @@ from omni_npu.v1.utils import on_ascend950
 
 npu_fused_infer_attention_sink_metadata: CrossLayerSharedOp | None = None
 npu_ai_infra_attention_pioneer_metadata: CrossLayerSharedOp | None = None
+
+
+def _a5_sink_attention_kwargs(num_heads, scaling, sink_number):
+    """Common A5 sink-only attention options for MLA and DSA."""
+    return {
+        "key_sink": None,
+        "key_rope_sink": None,
+        "value_sink": None,
+        "num_heads": num_heads,
+        "softmax_scale": scaling,
+        "pre_tokens": 2147483647,
+        "next_tokens": 2147483647,
+        "input_layout": "TND",
+        "num_key_value_heads": 1,
+        "sparse_mode": 4,
+        "block_size": sink_number,
+        "softmax_lse_flag": True,
+        "return_softmax_max_sum": True,
+    }
+
+
+def _prepare_sink_consistency_metadata(layer, query, kv_cache, q_cumlens, kv_lens):
+    """Validate consistency mode and normalize shared MLA metadata inputs."""
+    options = model_extra_config.operator_opt_config
+    if not options.use_noncontiguous_kv or not options.enable_precision_strong_consistency:
+        raise AssertionError(
+            f"use_noncontiguous_kv ({options.use_noncontiguous_kv}) "
+            f"and enable_precision_strong_consistency ({options.enable_precision_strong_consistency}) "
+            "must be both True."
+        )
+    q_cumlens = q_cumlens.to(torch.int64)
+    kv_lens = kv_lens.to(torch.int64)
+    window_size = layer.sliding_window - 1 if layer.sliding_window is not None else NPUMLAImpl.MAX_WINDOW_SIZE
+    NPUMLAImpl.ensure_decode_attn_mask()
+    metadata = {
+        "num_heads_q": layer.num_local_heads,
+        "num_heads_kv": 1,
+        "head_dim_qk": query.shape[-1],
+        "head_dim_v": kv_cache[0].shape[-1],
+        "actual_seq_lengths": q_cumlens,
+        "actual_seq_lengths_kv": kv_lens,
+    }
+    return metadata, window_size
 
 
 def _uses_flashcomm(layer) -> bool:
@@ -290,6 +335,7 @@ class MomeAttentionMixin:
             if (
                 self.noncontiguous_kv
                 and getattr(self, "use_mome_inplace_update", False)
+                and not model_extra_config.operator_opt_config.enable_precision_strong_consistency
             ):
                 self._apply_mome(
                     kv[:, :L],
@@ -331,6 +377,9 @@ class MomeAttentionMixin:
                 out = get_tp_group().all_gather(out, dim=1)
             out = self._apply_mome(out, 2, get_mome_args)
             if self.o_proj.requires_input_partition():
+                if self.o_proj.tp_size > self.tp_size:
+                    out = layer_parallel_all_gather(
+                        out, self.o_proj.layer_name_inside_block, "x", dim=0)
                 out = split_tensor_along_last_dim(out, num_partitions=self.o_proj.tp_size)
                 out = out[self.o_proj.tp_rank].contiguous()
         elif self.kv_b_proj.tp_size > 1 and not self.o_proj.requires_input_partition():
@@ -453,12 +502,13 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         assert num_heads % tp_size == 0
         self.num_local_heads = num_heads // tp_size
 
-        self.scaling = self.qk_head_dim**-0.5
+        self.scaling = 1 / math.sqrt(self.qk_head_dim)
         self.max_position_embeddings = max_position_embeddings
         self.quant_symbol = quant_config is not None
         self.prefix = prefix
         self.layer_idx = extract_layer_index(prefix)
         self.is_pd_disagg = getattr(vllm_config, "kv_transfer_config", None) is not None
+        self.tp_size = tp_size
         scheduler_cfg = getattr(vllm_config, "scheduler_config", None)
         cache_cfg = getattr(vllm_config, "cache_config", None)
         task_cfg = getattr(model_extra_config, "task_config", None)
@@ -1036,6 +1086,8 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         kv_lens: torch.Tensor,
         block_table: torch.Tensor,
         num_actual_tokens: int,
+        *,
+        on_a5: bool = False,
     ) -> torch.Tensor:
         """Precision-strong-consistency sink attention core.
 
@@ -1050,34 +1102,44 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             block_table: Block table for the paged KV cache.
             num_actual_tokens: Number of valid query tokens; slice bound for query
                 slicing and the merged output write-back.
+            on_a5: Select the Ascend950 pioneer attention kernels.
 
         Returns:
             Merged attention output in TND layout, [T, N, kv_lora_rank].
         """
-        if not model_extra_config.operator_opt_config.use_noncontiguous_kv \
-            or not model_extra_config.operator_opt_config.enable_precision_strong_consistency:
-            raise AssertionError(
-                f"use_noncontiguous_kv ({model_extra_config.operator_opt_config.use_noncontiguous_kv}) "
-                f"and enable_precision_strong_consistency "
-                f"({model_extra_config.operator_opt_config.enable_precision_strong_consistency}) "
-                "must be both True.")
+        common_metadata, window_size = _prepare_sink_consistency_metadata(
+            self, query, kv_cache, q_cumlens, kv_lens
+        )
+        run_attention = (
+            self._run_a5_sink_consistency_attention
+            if on_a5 else self._run_legacy_sink_consistency_attention
+        )
+        normal, sink = run_attention(
+            query[:num_actual_tokens], query_rope[:num_actual_tokens],
+            kv_cache, block_table, common_metadata, window_size,
+        )
 
-        q_cumlens = q_cumlens.to(torch.int64)
-        kv_lens = kv_lens.to(torch.int64)
-        if self.sliding_window is not None:
-            window_size = self.sliding_window - 1
-        else:
-            window_size = NPUMLAImpl.MAX_WINDOW_SIZE
-        NPUMLAImpl.ensure_decode_attn_mask()
+        # merge normal and sink
+        attn_output = torch.zeros(
+            (query.shape[0], self.num_local_heads, self.kv_lora_rank),
+            dtype=query.dtype,
+            device=query.device,
+        )
+        attn_output[:num_actual_tokens], _, _ = ops.apply_FA_rescale_forward(
+            *normal, *sink)
+
+        return attn_output
+
+    def _run_legacy_sink_consistency_attention(
+        self, query, query_rope, kv_cache, block_table, common_metadata, window_size
+    ):
+        """Run the legacy kernels and return output/max/sum for normal and sink attention."""
+        q_cumlens = common_metadata["actual_seq_lengths"]
+        kv_lens = common_metadata["actual_seq_lengths_kv"]
 
         # normal metadata
         meta_data_args = {
-            "num_heads_q": self.num_local_heads,
-            "num_heads_kv": 1,
-            "head_dim_qk": query.shape[-1],
-            "head_dim_v": kv_cache[0].shape[-1],
-            "actual_seq_lengths": q_cumlens,
-            "actual_seq_lengths_kv": kv_lens,
+            **common_metadata,
             "sparse_mode": 4,
             "pre_tokens": window_size,
             "next_tokens": 0,
@@ -1091,8 +1153,8 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
 
         # normal output and lse
         kwargs = self._build_decode_sink_fia_kwargs(
-            query[:num_actual_tokens],
-            query_rope[:num_actual_tokens],
+            query,
+            query_rope,
             kv_cache,
             q_cumlens,
             kv_lens,
@@ -1106,18 +1168,14 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             "return_softmax_max_sum": True,
             "meta_data": meta_data,
         })
-        output_normal, lse_normal, smax_normal, ssum_normal = (
+        output_normal, _, smax_normal, ssum_normal = (
             torch.ops.custom.npu_fused_infer_attention_sink_v2(**kwargs))
 
         # sink metadata
         sink_kv_cumlens = torch.arange(1, q_cumlens.numel() + 1,
             dtype=q_cumlens.dtype, device=q_cumlens.device) * self.param_sink_number
         meta_data_args_sink = {
-            "num_heads_q": self.num_local_heads,
-            "num_heads_kv": 1,
-            "head_dim_qk": query.shape[-1],
-            "head_dim_v": kv_cache[0].shape[-1],
-            "actual_seq_lengths": q_cumlens,
+            **common_metadata,
             "actual_seq_lengths_kv": sink_kv_cumlens,
             "sparse_mode": 0,
             "input_layout": "TND",
@@ -1131,10 +1189,10 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         sink_compressed_kv = self.attn.sink_compressed_kv.repeat(q_cumlens.numel(), 1).unsqueeze(1)
         sink_k_pe = self.attn.sink_k_pe.repeat(q_cumlens.numel(), 1).unsqueeze(1)
         kwargs_sink = {
-            "query": query[:num_actual_tokens],
+            "query": query,
             "key": sink_compressed_kv,
             "value": sink_compressed_kv,
-            "query_rope": query_rope[:num_actual_tokens],
+            "query_rope": query_rope,
             "key_rope": sink_k_pe,
             "num_query_heads": self.num_local_heads,
             "num_key_value_heads": 1,
@@ -1148,18 +1206,98 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             "return_softmax_max_sum": True,
             "meta_data": meta_data_sink,
         }
-        output_sink, lse_sink, smax_sink, ssum_sink = torch.ops.custom.npu_fused_infer_attention_sink_v2(**kwargs_sink)
+        output_sink, _, smax_sink, ssum_sink = torch.ops.custom.npu_fused_infer_attention_sink_v2(**kwargs_sink)
 
-        # merge normal and sink
-        attn_output = torch.zeros(
-            (query.shape[0], self.num_local_heads, self.kv_lora_rank),
-            dtype=query.dtype,
-            device=query.device,
+        return (output_normal, smax_normal, ssum_normal), (output_sink, smax_sink, ssum_sink)
+
+    def _run_a5_sink_consistency_attention(
+        self, query, query_rope, kv_cache, block_table, common_metadata, window_size
+    ):
+        """Run the A5 kernels and return output/max/sum for normal and sink attention."""
+        q_cumlens = common_metadata["actual_seq_lengths"]
+        kv_lens = common_metadata["actual_seq_lengths_kv"]
+
+        # normal metadata
+        meta_data_args = {
+            **common_metadata,
+            "batch_size": q_cumlens.numel(),
+            "sparse_mode": 4,
+            "pre_tokens": window_size,
+            "next_tokens": 0,
+            "input_layout": "TND",
+            "rope_head_dim": query_rope.shape[-1],
+            "block_size": kv_cache[0].size(-2),
+            "soc_version": "ascend950",
+        }
+
+        meta_data = torch.ops.custom.npu_ai_infra_attention_pioneer_metadata(**meta_data_args)
+
+        # normal output and lse
+        output_normal, _, smax_normal, ssum_normal = torch.ops.custom.npu_ai_infra_attention_pioneer_v2(
+                            query,
+                            kv_cache[0],
+                            kv_cache[0],
+                            meta_data,
+                            block_table=block_table,
+                            atten_mask=NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
+                            actual_seq_lengths=q_cumlens,
+                            actual_seq_lengths_kv=kv_lens,
+                            query_rope=query_rope,
+                            key_rope=kv_cache[1],
+                            key_sink=None,
+                            key_rope_sink=None,
+                            value_sink=None,
+                            num_heads=self.num_local_heads,
+                            softmax_scale=self.scaling,
+                            pre_tokens=window_size,
+                            next_tokens=0,
+                            input_layout="TND",
+                            num_key_value_heads=1,
+                            sparse_mode=4,
+                            block_size=kv_cache[0].size(-2),
+                            softmax_lse_flag=True,
+                            return_softmax_max_sum=True,
+                        )
+
+        # sink metadata
+        sink_kv_cumlens = torch.full_like(q_cumlens, self.param_sink_number)
+        meta_data_args_sink = {
+            **common_metadata,
+            "actual_seq_lengths_kv": sink_kv_cumlens,
+            "sparse_mode": 4,
+            "input_layout": "TND",
+            "rope_head_dim": query_rope.shape[-1],
+            "block_size": self.param_sink_number,
+            "pre_tokens": 2147483647,
+            "next_tokens": 2147483647,
+            "sink_number": 0,
+            "soc_version": "ascend950",
+        }
+        meta_data_sink = torch.ops.custom.npu_ai_infra_attention_pioneer_metadata(**meta_data_args_sink)
+
+        # sink output and lse
+        sink_compressed_kv = self.attn.sink_compressed_kv.unsqueeze(0).expand(q_cumlens.numel(), -1, -1).contiguous()
+        sink_k_pe = self.attn.sink_k_pe.unsqueeze(0).expand(q_cumlens.numel(), -1, -1).contiguous()
+        block_table_sink = torch.zeros(
+            (q_cumlens.numel(), 1), dtype=torch.int32, device=sink_compressed_kv.device
         )
-        attn_output[:num_actual_tokens], _, _ = ops.apply_FA_rescale_forward(
-            output_normal, smax_normal, ssum_normal, output_sink, smax_sink, ssum_sink)
+        output_sink, _, smax_sink, ssum_sink = torch.ops.custom.npu_ai_infra_attention_pioneer_v2(
+                            query,
+                            sink_compressed_kv,
+                            sink_compressed_kv,
+                            meta_data_sink,
+                            block_table=block_table_sink,
+                            atten_mask=NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
+                            actual_seq_lengths=q_cumlens,
+                            actual_seq_lengths_kv=sink_kv_cumlens,
+                            query_rope=query_rope,
+                            key_rope=sink_k_pe,
+                            **_a5_sink_attention_kwargs(
+                                self.num_local_heads, self.scaling, self.param_sink_number
+                            ),
+                        )
 
-        return attn_output
+        return (output_normal, smax_normal, ssum_normal), (output_sink, smax_sink, ssum_sink)
 
     @staticmethod
     def _as_cumlens_list(cumlens) -> list[int] | None:
@@ -1209,6 +1347,14 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         if seq_lens_list is None:
             seq_lens_list = self._as_cumlens_list(seq_lens)
         if not q_cumlens_list or not seq_lens_list:
+            return kv_a, k_pe, q_cumlens
+
+        # CPU metadata only: avoid cache reshaping and per-request tensor
+        # slicing when every request starts at position zero.
+        if len(q_cumlens_list) == len(seq_lens_list) and all(
+            seq_len == q_end - (q_cumlens_list[i - 1] if i else 0)
+            for i, (q_end, seq_len) in enumerate(zip(q_cumlens_list, seq_lens_list))
+        ):
             return kv_a, k_pe, q_cumlens
 
         nope_cache, rope_cache = kv_cache[:2]
@@ -1544,7 +1690,21 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         else:
             window_size = NPUMLAImpl.MAX_WINDOW_SIZE
 
-        if block_table is None:  # not PA
+        if model_extra_config.operator_opt_config.enable_precision_strong_consistency:
+            # normal + sink FA calls and merge, shared with the prefill consistency path
+            out = self._apply_sink_attention_consistency_core(
+                query=q_nope,
+                query_rope=q_pe,
+                kv_cache=self.attn.kv_cache,
+                q_cumlens=q_cumlens,
+                kv_lens=kv_lens,
+                block_table=block_table,
+                num_actual_tokens=valid_tok,
+                on_a5=True,
+            )
+            out = out.transpose(0, 1)  # TND -> NTD
+            return out
+        elif block_table is None:  # not PA
             assert values is not None
             assert None not in [sink_k_nope, sink_k_pe, sink_v]
             q_cumlens_i64 = self._lengths_to_i64(q_cumlens, q_nope.device)
@@ -2202,7 +2362,22 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         if not self.ena_sp:
             x = self._maybe_quant(x)
         use_prefill_absorb = self.mla_absorb
-        if use_prefill_absorb and (not self.on_ascend950 or self.sliding_window is None):
+        check_swa_absorb_limit = use_prefill_absorb and self.on_ascend950 and self.sliding_window is not None
+        if check_swa_absorb_limit and attn_metadata is not None:
+            # Global, unpadded scheduled query tokens (not cached context or
+            # per-rank x length). Missing CPU metadata keeps the old route.
+            query_lens = getattr(attn_metadata, "query_cumlens_list", None)
+            if query_lens is not None and len(query_lens) > 0:
+                absorb_max_tokens = getattr(
+                    model_extra_config.operator_opt_config,
+                    "swa_prefill_absorb_max_tokens",
+                    8 * 1024,
+                )
+                use_prefill_absorb = (
+                    absorb_max_tokens > 0
+                    and query_lens[-1] < absorb_max_tokens
+                )
+        if use_prefill_absorb or model_extra_config.operator_opt_config.use_batch_invariant_op:
             return self._forward_prefill_absorb_pa(x, cos, sin, get_mome_args, attn_metadata)
         return self._forward_prefill_standard(x, cos, sin, get_mome_args, attn_metadata)
 
@@ -2226,19 +2401,33 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             kv_cache = None
 
         q = self.q_a_proj(x)[0]  # TD
+        mome_sp_q_applied = False
         if self.ena_sp and self.use_mome:
-            q = sp_manager.ag_tokens(q)  # TD
-        q = self._maybe_mome_q(q, get_mome_args)  # TD
+            mome_sp_q_applied = self._apply_mome_prefill_sp(
+                q, 0, inplace=True,
+            )
+        if not mome_sp_q_applied:
+            if self.ena_sp:
+                q = sp_manager.ag_tokens(q)
+            q = self._maybe_mome_q(q, get_mome_args)  # TD
         q = self.q_a_layernorm(q)  # TD
-        if self.ena_sp and not self.use_mome:
+        if self.ena_sp and mome_sp_q_applied:
             q = sp_manager.ag_tokens(q)  # TD
         q_nope, q_pe = self._q_absorb(q, cos, sin)  # TND
 
         kv = self.kv_a_proj_with_mqa(x)[0]  # TD
+        mome_sp_kv_applied = False
+        if self.ena_sp and self.use_mome:
+            mome_sp_kv_applied = self._apply_mome_prefill_sp(
+                kv[:, :self.kv_lora_rank], 1, inplace=True,
+            )
         if self.ena_sp:
             kv = sp_manager.ag_tokens(kv)  # TD
-        kv = self._maybe_mome_kv(kv, get_mome_args)  # TD
-        self._kv_norm_rope_cache(kv, cos, sin, attn_metadata, kv_cache)
+        if not mome_sp_kv_applied:
+            kv = self._maybe_mome_kv(kv, get_mome_args)  # TD
+        self._kv_norm_rope_cache(
+            kv, cos, sin, attn_metadata, kv_cache
+        )
 
         out = self._apply_attention(
             q_nope,
@@ -2251,7 +2440,16 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             metadata_caller="prefill_absorb",
         )  # -> NTD
         out = self._post_attn_absorb(out)  # NTD -> T,ND
-        out = self._maybe_mome_out(out, get_mome_args)
+        # Restore V channels before TP-heads -> SP-tokens redistribution.
+        return self._finish_prefill(out, x, sp_manager, get_mome_args)
+
+    def _finish_prefill(self, out, x, sp_manager, get_mome_args):
+        """Redistribute V channels, project, then restore the local token count."""
+        mome_sp_out = self._apply_mome_out_prefill_sp(out, sp_manager)
+        if mome_sp_out is not None:
+            out = mome_sp_out
+        else:
+            out = self._maybe_mome_out(out, get_mome_args)
 
         if sp_manager and self.o_proj.tp_size > 1:
             out = sp_manager.align_tokens(out)
@@ -2325,7 +2523,9 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             kv = sp_manager.ag_tokens(kv)  # TD
         if not mome_sp_kv_applied:
             kv = self._maybe_mome_kv(kv, get_mome_args)  # TD
-        kv_a, k_pe = self._kv_norm_rope_cache(kv, cos, sin, attn_metadata, kv_cache)  # T1D
+        kv_a, k_pe = self._kv_norm_rope_cache(
+            kv, cos, sin, attn_metadata, kv_cache
+        )  # T1D
         kv_a, k_pe = kv_a.squeeze(1), k_pe.squeeze(1)  # TD
         kv_a, k_pe, kv_cumlens = self._prepend_chunked_prefill_context(
             kv_a,
@@ -2373,17 +2573,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             metadata_caller="prefill",
         ).view(-1, N * V)  # [T, ND]
 
-        mome_sp_out = self._apply_mome_out_prefill_sp(out, sp_manager)
-        if mome_sp_out is not None:
-            out = mome_sp_out
-        else:
-            out = self._maybe_mome_out(out, get_mome_args)  # fit o_proj.tp_size
-        if sp_manager and self.o_proj.tp_size > 1:
-            out = sp_manager.align_tokens(out)
-        out = self._apply_o_proj(out)  # T,ND -> TD
-        if sp_manager and out.size(0) != x.size(0):
-            out = sp_manager.slice_tokens(out)
-        return out
+        return self._finish_prefill(out, x, sp_manager, get_mome_args)
 
 
 @eager_break_during_capture
