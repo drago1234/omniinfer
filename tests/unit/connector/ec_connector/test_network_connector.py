@@ -2977,3 +2977,29 @@ class TestStartLoadCachesEdgeCases:
         with patch.object(c, '_get_connector_metadata', return_value=wrong_meta):
             with pytest.raises(TypeError, match="ECNetworkConnectorMetadata"):
                 c.start_load_caches({})
+
+
+# =================== Tests: request_finished =================== #
+
+class TestRequestFinished:
+    def test_producer_returns_endpoints_and_cleans_duplicate_metadata(
+            self, producer_scheduler_connector):
+        connector = producer_scheduler_connector
+        endpoint = "tcp://127.0.0.1:5000"
+        connector.meta.add_mm_hash("h1", endpoint)
+        connector.meta.add_mm_hash("h1", endpoint)
+
+        delay_free, params = connector.request_finished(MockRequest("req", ["h1", "h1"]))
+
+        assert delay_free is False
+        assert params == {"mm_hash_endpoints": {"h1": endpoint}}
+        assert connector.meta.mm_hashes == []
+        assert connector.meta.mm_hash_endpoints == {}
+
+    def test_consumer_does_not_return_transfer_params(self, consumer_worker_connector):
+        delay_free, params = consumer_worker_connector.request_finished(
+            MockRequest("req", ["h1"])
+        )
+
+        assert delay_free is False
+        assert params is None
