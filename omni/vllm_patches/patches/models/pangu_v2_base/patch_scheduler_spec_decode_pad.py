@@ -348,6 +348,8 @@ class PanguV2SpecDecodePadPatch(VLLMPatch):
                     # Get locally-cached tokens.
                     if (
                         self.connector is not None
+                        # omni-npu: offload must assemble hits through the cache manager.
+                        and not getattr(self.kv_cache_manager, "_omni_is_offloading_connector", False)
                         and self.has_mamba_layers
                         and isinstance(
                             self.kv_cache_manager.coordinator,
@@ -474,11 +476,8 @@ class PanguV2SpecDecodePadPatch(VLLMPatch):
                     if (
                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
                         and num_new_tokens == 1
-                        and (scheduled_running_reqs and not prefill_scheduled)
-                        # omni-npu: a fresh decode request must not be
-                        # padded to the full spec-decode width; the extra
-                        # dummy draft slots break the NPU graph step.
-                        and not envs.OMNI_DISABLE_SPEC_DECODE_PAD
+                        and not prefill_scheduled
+                        and (scheduled_running_reqs or num_computed_tokens > 0)
                     ):
                         num_new_tokens = 1 + self.num_spec_tokens
                         if (

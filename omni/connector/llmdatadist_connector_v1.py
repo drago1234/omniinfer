@@ -185,7 +185,7 @@ class LLMDataDistConnector(KVConnectorBase_V1, SupportsHMA):
 
 class PrefillScheduler:
     POLL_INTERVAL = 0.2
-    TIMEOUT_WAIT_PULL_DONE = 600.0
+    TIMEOUT_WAIT_PULL_DONE = 3600.0
 
     def __init__(self, vllm_config: VllmConfig):
         self.parallel = desc = ParallelDesc(vllm_config)

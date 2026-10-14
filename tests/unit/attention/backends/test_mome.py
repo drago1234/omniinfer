@@ -665,9 +665,32 @@ class TestComputePrefixCachingBlockIndices(unittest.TestCase):
 
         self.assertEqual(int(lct[0].item()), 2)
 
-    def test_spec_decode_prefill_branch_when_computed_not_exceeds_prompt(self):
+    def test_spec_decode_mtp_branch_when_computed_equals_prompt(self):
         """
-        With num_spec>0 and num_computed <= num_prompt_tokens, falls back to
+        With num_spec>0 and num_computed == num_prompt_tokens (first decode
+        step after a full prefill that also drafted), the MTP formula
+        applies: num_accepted_tokens is meaningful there, so the physical
+        high-water mark is used instead of the simple formula.  Block-aligned
+        computed tokens make the two formulas disagree.
+        """
+        b = self._make_builder(num_spec=2)
+        # num_computed=16 == num_prompt=16, num_accepted=2, block_size=8
+        # MTP:    ceil((16-2+2+1)/8)-1 = ceil(17/8)-1 = 3-1 = 2
+        # simple: ceil(16/8)-1 = 1  (what the pre-">=" code returned)
+        common = self._make_common(num_computed=[16], seq_lens=[18])
+        num_accepted = torch.tensor([2], dtype=torch.int32)
+        num_prompt = torch.tensor([16], dtype=torch.int32)
+
+        lct, _, _ = b._compute_prefix_caching_block_indices(
+            common, mome_block_size=8,
+            num_accepted_tokens=num_accepted, num_prompt_tokens=num_prompt,
+        )
+
+        self.assertEqual(int(lct[0].item()), 2)
+
+    def test_spec_decode_prefill_branch_when_computed_below_prompt(self):
+        """
+        With num_spec>0 and num_computed < num_prompt_tokens, falls back to
         the simple formula ceil(num_computed / B) - 1 (no MTP adjustment).
         """
         b = self._make_builder(num_spec=2)
@@ -691,7 +714,7 @@ class TestComputePrefixCachingBlockIndices(unittest.TestCase):
         """
         b = self._make_builder(num_spec=2, is_decode_node=True)
         # num_computed=8 (block-aligned), num_prompt=10, block_size=8
-        # Without decode-node override: ceil(8/8)-1 = 0  (num_computed<=num_prompt path)
+        # Without decode-node override: ceil(8/8)-1 = 0  (num_computed<num_prompt path)
         # With decode-node override:    ceil(9/8)-1 = 1  (num_computed < num_prompt path)
         common = self._make_common(num_computed=[8], seq_lens=[12])
         num_accepted = torch.tensor([2], dtype=torch.int32)
@@ -707,12 +730,12 @@ class TestComputePrefixCachingBlockIndices(unittest.TestCase):
     def test_mixed_batch_mtp_and_prefill_reqs(self):
         """
         Mixed batch: req0 has num_computed > num_prompt (MTP branch),
-        req1 has num_computed <= num_prompt (simple branch). Verifies torch.where
+        req1 has num_computed < num_prompt (simple branch). Verifies torch.where
         selects the correct formula per request independently.
         """
         b = self._make_builder(num_spec=2)
         # req0: 16>10 → ceil((16-2+2+1)/8)-1 = ceil(17/8)-1 = 3-1 = 2
-        # req1:  8<=10 → ceil(8/8)-1 = 0
+        # req1:  8<10 → ceil(8/8)-1 = 0
         common = self._make_common(num_computed=[16, 8], seq_lens=[20, 12])
         num_accepted = torch.tensor([2, 2], dtype=torch.int32)
         num_prompt = torch.tensor([10, 10], dtype=torch.int32)
