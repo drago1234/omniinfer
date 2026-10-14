@@ -124,6 +124,18 @@ class LLMDataDistConnector(KVConnectorBase_V1, SupportsHMA):
             raise TypeError("_connector_metadata must be Metadata")
         return self.worker.get_finished(self._connector_metadata)
 
+    def poll_decode_completions(self) -> tuple[set[str] | None, set[int]]:
+        """Poll D completions after a control step has cleared its metadata.
+
+        DecodeWorker's completion queue is independent of model-step metadata.
+        Keep failures beside completed IDs so the scheduler processes invalid
+        blocks before promoting a request. This never starts another pull.
+        """
+        if self.is_prefill or self.worker is None:
+            return None, set()
+        _, receiving = self.worker.get_finished(None)
+        return receiving, self.worker.get_block_ids_with_load_errors()
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         if self.worker is None:
             return set()
@@ -422,6 +434,9 @@ class DecodeWorker:
         self.pull_done = queue.Queue()
         self.send_pull_done = queue.Queue()
         self._invalid_block_ids: set[int] = set()
+        # Failures snapshotted by get_finished, returned by the next error query.
+        self._drained_invalid_block_ids: set[int] = set()
+        # Guards failed blocks and pull_done together so one drain sees both.
         self._invalid_lock = threading.Lock()
         self.looping = True
         kv_transfer.maybe_selftest()  # OMNI_METRICS_KV_TRANSFER_SELFTEST=1 时注入合成失败，端到端自测
@@ -491,12 +506,14 @@ class DecodeWorker:
                     )
             if failed_blocks:
                 kv_transfer.record_failure("pull")
-                with self._invalid_lock:
-                    self._invalid_block_ids |= failed_blocks
             # A failed pull must also leave WAITING_FOR_REMOTE_KVS. The invalid
             # block IDs let the scheduler recompute or fail the request based
-            # on kv_load_failure_policy.
-            self.pull_done.put(req_id)            # local
+            # on kv_load_failure_policy. Publish both under one lock: if they
+            # landed in different drains, the completion could reach the
+            # scheduler before its failure and promote a request on bad KV.
+            with self._invalid_lock:
+                self._invalid_block_ids |= failed_blocks
+                self.pull_done.put(req_id)        # local
             self.send_pull_done.put(pull.done())  # remote
 
         def handle_exception(future):
@@ -514,14 +531,20 @@ class DecodeWorker:
 
     def get_finished(self, metadata: Metadata):
         recv_done = set()  # req_ids
-        while not self.pull_done.empty():
-            recv_done.add(self.pull_done.get())
+        # Snapshot failures together with the completions they belong to.
+        with self._invalid_lock:
+            while not self.pull_done.empty():
+                recv_done.add(self.pull_done.get_nowait())
+            self._drained_invalid_block_ids |= self._invalid_block_ids
+            self._invalid_block_ids = set()
         return None, recv_done  # only recv
 
     def get_block_ids_with_load_errors(self) -> set[int]:
+        # Only failures drained by get_finished; later ones wait for their
+        # completion so the pair is always reported in the same output.
         with self._invalid_lock:
-            invalid_block_ids = self._invalid_block_ids
-            self._invalid_block_ids = set()
+            invalid_block_ids = self._drained_invalid_block_ids
+            self._drained_invalid_block_ids = set()
         return invalid_block_ids
 
 

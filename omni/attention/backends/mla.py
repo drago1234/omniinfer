@@ -598,7 +598,9 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         slot_mapping_2d = None
         cached_during_capture = None
 
-        def get_slot_mapping_2d():
+        def get_slot_mapping_2d(layer_idx=-1):
+            # CLA's shared batch splitter passes a layer index; MLA shares
+            # the same conversion across layers regardless of that index.
             nonlocal slot_mapping_2d, cached_during_capture
 
             capturing = get_forward_context().capturing

@@ -17,6 +17,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 PATCH_PATH = (
     next(p for p in Path(__file__).resolve().parents if (p / "omni" / "vllm_patches").is_dir())
     / "omni/vllm_patches/patches/common/patch_health.py"
@@ -31,6 +33,7 @@ from unit.vllm_patch.patches.patch_test_utils import (  # noqa: E402
     PatchCallRecorder as _Recorder,
     StubVLLMPatch as _VLLMPatch,
     install_named_module as _module,
+    preserved_sys_modules,
     run_standalone_tests,
     silent_logger,
 )
@@ -39,6 +42,13 @@ from unit.vllm_patch.patches.patch_test_utils import (  # noqa: E402
 # --------------------------------------------------------------------------
 # stubs
 # --------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _restore_sys_modules_after_test():
+    """Keep the offline vLLM/FastAPI stubs local to each test."""
+    with preserved_sys_modules():
+        yield
 
 
 class _JSONResponse:

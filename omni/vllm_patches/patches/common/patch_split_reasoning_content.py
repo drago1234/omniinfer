@@ -293,7 +293,11 @@ def _maybe_split_sse_line(line: str, tokenizer=None) -> list[str] | None:
     #   reasoning half is a synthetic re-presentation that emits no
     #   additional tokens, so duplicating either would cause clients
     #   that concatenate per-chunk traces to double-count.
-    for _trailing in ("finish_reason", "logprobs", "stop_reason", "token_ids"):
+    # - ``routed_experts``: routing rows belong to the original engine step,
+    #   not to both synthetic SSE halves.
+    for _trailing in (
+        "finish_reason", "logprobs", "stop_reason", "token_ids", "routed_experts"
+    ):
         if _trailing in choice0:
             reasoning_choice[_trailing] = None
 

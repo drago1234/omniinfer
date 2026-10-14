@@ -31,6 +31,13 @@ def _stub_fused_moe_deps(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(torch, "npu", SimpleNamespace(config=SimpleNamespace()), raising=False)
     if not hasattr(torch.npu, "config"):
         torch.npu.config = SimpleNamespace()
+    if not hasattr(torch.npu, "is_available"):
+        monkeypatch.setattr(
+            torch.npu,
+            "is_available",
+            lambda: False,
+            raising=False,
+        )
     if not hasattr(torch.npu.config, "allow_internal_format"):
         try:
             torch.npu.config.allow_internal_format = False
@@ -39,6 +46,11 @@ def _stub_fused_moe_deps(monkeypatch: pytest.MonkeyPatch) -> None:
     if not hasattr(torch.npu, "Event"):
         try:
             torch.npu.Event = type("Event", (), {})
+        except Exception:
+            pass
+    if not hasattr(torch.npu, "Stream"):
+        try:
+            torch.npu.Stream = type("Stream", (), {})
         except Exception:
             pass
     if not hasattr(torch.npu, "current_stream"):
@@ -81,6 +93,7 @@ def _stub_fused_moe_deps(monkeypatch: pytest.MonkeyPatch) -> None:
         dtype=torch.bfloat16,
         operator_opt_config=SimpleNamespace(
             shared_expert_parallel_schedule="with_finalize",
+            enable_moe_init_routing_v2=False,
             decode_moe_dispatch_combine=False,
             enable_moe_agrs=False,
             enable_moe_allreduce=False,

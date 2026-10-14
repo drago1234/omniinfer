@@ -361,6 +361,7 @@ def test_init_cross_layer_shared_ops_uses_expected_buffers(monkeypatch):
     fake = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
     fake.on_ascend950 = True
     fake._metadata_pre_tokens = (511, 1023)
+    fake.use_gpt_oss_sink = False  # the native-sink buffer is reserved only with sinks
 
     fake._init_cross_layer_shared_ops()
 
@@ -410,7 +411,7 @@ def test_build_mome_conv_sets_state_and_constructs_attention(monkeypatch):
     assert fake.cache_dtype_str is None
     assert constructed["kernel_size"] == 7
     assert constructed["num_spec_tokens"] == 3
-    assert constructed["prefix"] == "layer0.conv"
+    assert constructed["prefix"] == "layer0.attn.mome"
     assert constructed["vllm_config"] is vllm_config
     assert isinstance(fake.conv, FakeMome)
 
@@ -1454,6 +1455,7 @@ class TestNPUDeepseekMLAAttention:
                 torch.zeros(T0, 1, 1, R, **env.cfg_bf16),
                 torch.zeros(T0, 1, 1, R, **env.cfg_bf16),
                 "test_layer",
+                "test_layer.attn",
             )
             assert out.shape == (T, D)
 
@@ -1714,6 +1716,8 @@ def test_apply_standard_attention_resolves_dict_attn_metadata():
     fake = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
     fake.prefix = "test_layer"
     fake.scaling = 1.0
+    fake.sliding_window = None  # an unwindowed layer stays on plain causal attention
+    fake.use_gpt_oss_sink = False
     fake.attn = SimpleNamespace(impl=SimpleNamespace(SHARE_MASK_TRIL_SPARSE=None))
 
     inner_meta = SimpleNamespace(max_query_len=5)
@@ -1746,6 +1750,7 @@ def test_apply_standard_attention_resolves_dict_attn_metadata():
             kv_lens=torch.tensor([T]),
             block_table=None,
             num_tokens=T,
+            num_actual_tokens=T,
             layer_name="test_layer",
         )
 
@@ -2864,3 +2869,353 @@ def test_import_guard_both_custom_ops_importable():
 # Allow running directly
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.unit
+def test_reserve_adds_only_missing_callers():
+    from omni_npu.attention.backends.utils import CrossLayerSharedOp
+
+    shared = CrossLayerSharedOp(
+        op=MagicMock(), shape=(4,), dtype=torch.int32, callers=(("decode", 1),), device="cpu"
+    )
+    first = shared._buffers[("decode", 1)]
+    shared.reserve((("decode", 1), ("cla_decode", 1)))
+    assert set(shared._buffers) == {("decode", 1), ("cla_decode", 1)}
+    assert shared._buffers[("decode", 1)] is first  # an existing caller keeps its buffer
+
+
+def _mome_out_host(o_proj_wants_partition):
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    host = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
+    host.use_mome = False
+    host.kv_b_proj = SimpleNamespace(tp_size=2)
+    host.o_proj = SimpleNamespace(requires_input_partition=lambda: o_proj_wants_partition)
+    return host
+
+
+@pytest.mark.unit
+def test_maybe_mome_out_gathers_only_for_an_unsharded_o_proj():
+    """Without MoME nothing else widens the heads an unsharded o_proj expects."""
+    from omni_npu.v1.layers.attention import npu_mla as mla_mod
+
+    gathered = torch.ones(2, 8)
+    group = SimpleNamespace(world_size=2, all_gather=MagicMock(return_value=gathered))
+    with patch.object(mla_mod, "get_tp_group", return_value=group):
+        assert _mome_out_host(False)._maybe_mome_out(torch.ones(2, 4), None) is gathered
+        group.all_gather.assert_called_once()
+
+        group.all_gather.reset_mock()
+        kept = torch.ones(2, 4)
+        assert _mome_out_host(True)._maybe_mome_out(kept, None) is kept
+        group.all_gather.assert_not_called()
+
+
+@pytest.mark.unit
+def test_absorb_helpers_take_an_injected_weight():
+    """A CLA layer's local branch absorbs the same q/out with its own weights."""
+    from omni_npu.v1.layers.attention import npu_mla as mla_mod
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    host = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
+    host.attn = SimpleNamespace(W_UK_T=torch.zeros(1), W_UV=torch.zeros(1))
+    host.num_local_heads, host.kv_lora_rank, host.v_head_dim = 2, 3, 4
+    seen = {}
+
+    def record_kw(**kwargs):
+        seen["w_uk_t"] = kwargs["weight"]
+        return torch.zeros(1, 2, 3)
+
+    with patch.object(mla_mod.torch_npu, "npu_transpose_batchmatmul", record_kw):
+        host._q_nope_absorb(torch.zeros(1, 2, 3), w_uk_t=torch.ones(1))
+    assert torch.equal(seen["w_uk_t"], torch.ones(1))  # the injected one, not impl's
+
+    def record_pos(_x, weight, **_kwargs):
+        seen["w_uv"] = weight
+        return torch.zeros(2, 1, 4)
+
+    with patch.object(mla_mod.torch_npu, "npu_transpose_batchmatmul", record_pos):
+        host._post_attn_absorb(torch.zeros(2, 1, 3), w_uv=torch.ones(1))
+    assert torch.equal(seen["w_uv"], torch.ones(1))
+
+    # A plain layer injects nothing, so both fall back to the attention layer.
+    with patch.object(mla_mod.torch_npu, "npu_transpose_batchmatmul", record_kw):
+        host._q_nope_absorb(torch.zeros(1, 2, 3))
+    assert seen["w_uk_t"] is host.attn.W_UK_T
+    with patch.object(mla_mod.torch_npu, "npu_transpose_batchmatmul", record_pos):
+        host._post_attn_absorb(torch.zeros(2, 1, 3))
+    assert seen["w_uv"] is host.attn.W_UV
+
+
+@pytest.mark.unit
+def test_init_cross_layer_shared_ops_reserves_the_native_sink_buffer():
+    """The native-sink kernel reads a metadata buffer of its own."""
+    from omni_npu.v1.layers.attention import npu_mla as mla_mod
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    reserved = []
+    for rescale, expect in ((False, True), (True, False)):
+        host = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
+        host.on_ascend950 = False
+        host.use_gpt_oss_sink = True
+        host.use_gpt_oss_sink_rescale = rescale
+        host._metadata_pre_tokens = {511}
+        host._reserve_gpt_oss_fia_metadata = lambda callers: reserved.append(callers)
+        with patch.object(mla_mod, "npu_fused_infer_attention_sink_metadata", MagicMock()):
+            host._init_cross_layer_shared_ops()
+        assert bool(reserved) is expect
+        if expect:
+            assert set(reserved[0]) == {
+                ("decode", 511), ("prefill_absorb", 511), ("prefill", 511),
+            }
+            reserved.clear()
+
+
+def _fia_sink_host(use_sink, rescale):
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    host = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
+    host.scaling, host.kv_lora_rank = 0.5, 6
+    host.sliding_window = 512
+    host.is_fa_metadata_producer = True
+    host.use_gpt_oss_sink = use_sink
+    host.use_gpt_oss_sink_rescale = rescale
+    host.gpt_oss_sink = torch.zeros(2) if use_sink else None
+    host.num_local_heads = 2
+    return host
+
+
+_FIA_SINK_ARGS = dict(
+    q_nope=torch.zeros(3, 2, 6), q_pe=torch.zeros(3, 2, 2),
+    nope_cache=torch.zeros(4, 8, 6), rope_cache=torch.zeros(4, 8, 2),
+    block_size=8, block_table=torch.zeros(2, 4, dtype=torch.int32),
+    q_cumlens=torch.tensor([3]), kv_lens=torch.tensor([8]),
+    num_tokens=3, num_actual_tokens=3, metadata_caller="decode", layer_name="l",
+)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("batch_invariant", (False, True))
+def test_apply_fia_sink_pa_attention_picks_the_kernel_the_config_asks_for(batch_invariant):
+    """A sink goes to the kernel or to the rescale; a sinkless layer to neither."""
+    from omni_npu.v1.layers.attention import npu_mla as mla_mod
+
+    native = MagicMock(return_value=torch.zeros(2, 3, 6))
+    sink_op = MagicMock(return_value=(torch.zeros(2, 3, 6), torch.zeros(3, 2, 1)))
+    tiling = MagicMock()
+    with patch.object(mla_mod.model_extra_config.operator_opt_config, "use_batch_invariant_op", batch_invariant), \
+         patch.object(mla_mod.NPUMLAImpl, "SHARE_MASK_TRIL_SPARSE", None, create=True), \
+         patch.object(mla_mod, "get_forward_context",
+                      return_value=SimpleNamespace(capturing=False)), \
+         patch.object(mla_mod, "npu_fused_infer_attention_sink_metadata", tiling), \
+         patch.object(torch.npu, "get_stream_limit",
+                      return_value={"cube_core_num": 24, "vector_core_num": 48}), \
+         patch.object(torch.ops.custom, "npu_fused_infer_attention_sink", sink_op, create=True):
+        host = _fia_sink_host(use_sink=True, rescale=False)
+        host._apply_gpt_oss_fia_native = native
+        host._apply_fia_sink_pa_attention(**_FIA_SINK_ARGS)
+        assert native.called and not sink_op.called
+        assert native.call_args.args[0]["batch_invariant"] is batch_invariant
+
+        native.reset_mock()
+        host = _fia_sink_host(use_sink=True, rescale=True)
+        host._apply_gpt_oss_fia_native = native
+        host._rescale_gpt_oss_sink_output = MagicMock(side_effect=lambda out, *_a: out)
+        host._apply_fia_sink_pa_attention(**_FIA_SINK_ARGS)
+        assert sink_op.called and host._rescale_gpt_oss_sink_output.called and not native.called
+        assert sink_op.call_args.kwargs["batch_invariant"] is batch_invariant
+        assert tiling.call_args.args[0]["batch_invariant"] is batch_invariant
+
+        # A layer with no sink still needs this op for its window or head count.
+        native.reset_mock()
+        sink_op.reset_mock()
+        host = _fia_sink_host(use_sink=False, rescale=False)
+        host._apply_gpt_oss_fia_native = native
+        host._rescale_gpt_oss_sink_output = MagicMock()
+        host._apply_fia_sink_pa_attention(**_FIA_SINK_ARGS)
+        assert sink_op.called and not native.called
+        assert not host._rescale_gpt_oss_sink_output.called
+        assert sink_op.call_args.kwargs["return_softmax_lse"] is False
+        # The window reaches the kernel as a banded mask, not as a full one.
+        assert sink_op.call_args.kwargs["sparse_mode"] == 4
+        assert sink_op.call_args.kwargs["pre_tokens"] == 511
+
+
+def _standard_host(sliding_window, use_sink, rescale=False):
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    host = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
+    host.scaling, host.kv_lora_rank, host.num_local_heads = 0.5, 6, 2
+    host.sliding_window = sliding_window
+    host.prefix = "layer.0.self_attn"
+    host.is_fa_metadata_producer = True
+    host.use_gpt_oss_sink = use_sink
+    host.use_gpt_oss_sink_rescale = rescale
+    host.gpt_oss_sink = torch.zeros(2) if use_sink else None
+    host.attn = SimpleNamespace(impl=SimpleNamespace(SHARE_MASK_TRIL_SPARSE="mask"))
+    return host
+
+
+def _standard_args(**over):
+    args = dict(
+        q_nope=torch.zeros(3, 2, 6), q_pe=torch.zeros(3, 2, 2),
+        keys=(torch.zeros(3, 2, 6), torch.zeros(3, 2, 2)), values=None,
+        q_cumlens=torch.tensor([3]), kv_lens=torch.tensor([3]),
+        block_table=None, num_tokens=None, num_actual_tokens=3,
+        layer_name="l", metadata_caller="prefill",
+    )
+    args.update(over)
+    return args
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "sliding_window, max_query_len, expect_mode, expect_pre",
+    ((512, 4, 4, 511), (None, 4, 3, (1 << 31) - 1), (None, 1, 0, (1 << 31) - 1)),
+)
+def test_non_paged_attention_bands_the_mask_for_a_window(
+    sliding_window, max_query_len, expect_mode, expect_pre
+):
+    """A windowed layer must band the prefill mask, not attend over everything."""
+    from omni_npu.v1.layers.attention import npu_mla as mla_mod
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    host = _standard_host(sliding_window, use_sink=False)
+    op = MagicMock(return_value=(torch.zeros(3, 2, 6),))
+    ctx = SimpleNamespace(attn_metadata=SimpleNamespace(max_query_len=max_query_len),
+                          capturing=False)
+    with patch.object(mla_mod, "get_forward_context", return_value=ctx), \
+         patch.object(torch.ops.npu, "npu_fused_infer_attention_score", op, create=True):
+        NPUDeepseekMLAAttention._apply_standard_attention(host, **_standard_args())
+
+    assert op.call_args.kwargs["sparse_mode"] == expect_mode
+    assert op.call_args.kwargs["pre_tokens"] == expect_pre
+    assert op.call_args.kwargs["atten_mask"] == ("mask" if expect_mode in (3, 4) else None)
+    assert op.call_args.kwargs["softmax_lse_flag"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rescale", (False, True))
+def test_non_paged_attention_applies_a_sink_in_either_mode(rescale):
+    from omni_npu.v1.layers.attention import npu_mla as mla_mod
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    host = _standard_host(512, use_sink=True, rescale=rescale)
+    native = MagicMock(return_value=torch.ones(3, 2, 6))
+    host._apply_gpt_oss_fia_native = native
+    host._rescale_gpt_oss_sink_output = MagicMock(side_effect=lambda out, *_a: out)
+    op = MagicMock(return_value=(torch.zeros(3, 2, 6), torch.zeros(3, 2)))
+    ctx = SimpleNamespace(attn_metadata=None, capturing=False)
+    with patch.object(mla_mod, "get_forward_context", return_value=ctx), \
+         patch.object(torch.ops.npu, "npu_fused_infer_attention_score", op, create=True):
+        NPUDeepseekMLAAttention._apply_standard_attention(host, **_standard_args())
+
+    assert native.called is (not rescale)
+    assert op.called is rescale
+    assert host._rescale_gpt_oss_sink_output.called is rescale
+    if rescale:
+        assert op.call_args.kwargs["softmax_lse_flag"] is True
+
+
+@pytest.mark.unit
+def test_fia_sink_pa_attention_pads_the_native_output_to_the_captured_length():
+    from omni_npu.v1.layers.attention import npu_mla as mla_mod
+
+    host = _fia_sink_host(use_sink=True, rescale=False)
+    host._apply_gpt_oss_fia_native = MagicMock(return_value=torch.ones(2, 3, 6))
+    args = dict(_FIA_SINK_ARGS, num_tokens=5, num_actual_tokens=3)
+    with patch.object(mla_mod.NPUMLAImpl, "SHARE_MASK_TRIL_SPARSE", None, create=True), \
+         patch.object(mla_mod, "get_forward_context",
+                      return_value=SimpleNamespace(capturing=False)):
+        out = host._apply_fia_sink_pa_attention(**args)
+
+    assert out.shape == (2, 5, 6)  # NTD, padded from 3 to 5
+    torch.testing.assert_close(out[:, :3, :], torch.ones(2, 3, 6))
+    torch.testing.assert_close(out[:, 3:, :], torch.zeros(2, 2, 6))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("batch_invariant", (False, True))
+def test_fia_sink_pa_attention_defers_to_capture_without_aicpu_tiling(batch_invariant):
+    """Host-side tiling only reaches a captured graph through capture_graph_task."""
+    from omni_npu.v1.layers.attention import npu_mla as mla_mod
+
+    host = _fia_sink_host(use_sink=True, rescale=True)
+    host._rescale_gpt_oss_sink_output = MagicMock(side_effect=lambda out, *_a: out)
+    capture = MagicMock()
+    sink_op = MagicMock()
+    opt = SimpleNamespace(use_aicpu_fa_tiling=False, use_batch_invariant_op=batch_invariant)
+    with patch.object(mla_mod.NPUMLAImpl, "SHARE_MASK_TRIL_SPARSE", None, create=True), \
+         patch.object(mla_mod, "get_forward_context",
+                      return_value=SimpleNamespace(capturing=True)), \
+         patch.object(mla_mod, "model_extra_config",
+                      SimpleNamespace(operator_opt_config=opt)), \
+         patch.object(mla_mod, "npu_fused_infer_attention_sink_metadata", MagicMock()), \
+         patch.object(mla_mod, "capture_graph_task", capture), \
+         patch.object(torch.npu, "get_stream_limit",
+                      return_value={"cube_core_num": 24, "vector_core_num": 48}), \
+         patch.object(torch.ops.custom, "npu_fused_infer_attention_sink", sink_op, create=True):
+        out = host._apply_fia_sink_pa_attention(**_FIA_SINK_ARGS)
+
+    assert not sink_op.called  # the op runs inside the captured task, not here
+    assert capture.call_args.kwargs["op_kwargs"]["batch_invariant"] is batch_invariant
+    outs = capture.call_args.kwargs["out_tensors"]
+    assert [tuple(t.shape) for t in outs] == [(2, 3, 6), (3, 2, 1)]
+    assert outs[1].dtype == torch.float32 and not outs[1].any()  # zeroed for the rescale
+    assert host._rescale_gpt_oss_sink_output.called
+    assert out.shape == (2, 3, 6)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("q_head, expect_fia_sink", ((2, False), (3, True)))
+def test_paged_attention_picks_the_op_the_head_count_allows(q_head, expect_fia_sink):
+    """npu_fused_infer_attention_score takes only a power-of-two head count."""
+    from omni_npu.v1.layers.attention import npu_mla as mla_mod
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    host = _standard_host(None, use_sink=False)
+    host.num_local_heads = q_head
+    host._apply_fia_sink_pa_attention = MagicMock(return_value=torch.zeros(q_head, 3, 6))
+    fia_v1 = MagicMock(return_value=(torch.zeros(q_head, 3, 6),))
+    args = _standard_args(
+        q_nope=torch.zeros(3, q_head, 6), q_pe=torch.zeros(3, q_head, 2),
+        keys=(torch.zeros(4, 8, 6), torch.zeros(4, 8, 2)),
+        block_table=torch.zeros(2, 4, dtype=torch.int32), num_tokens=3,
+    )
+    with patch.object(mla_mod, "cache_fit_shape", lambda t, _l: t), \
+         patch.object(mla_mod.NPUMLAImpl, "ensure_decode_attn_mask", MagicMock()), \
+         patch.object(mla_mod.NPUMLAImpl, "SHARE_MASK_TRIL_SPARSE", None, create=True), \
+         patch.object(mla_mod, "get_forward_context",
+                      return_value=SimpleNamespace(capturing=False, attn_metadata=None)), \
+         patch.object(torch.ops.npu, "npu_fused_infer_attention_score", fia_v1, create=True):
+        NPUDeepseekMLAAttention._apply_standard_attention(host, **args)
+
+    assert host._apply_fia_sink_pa_attention.called is expect_fia_sink
+    assert fia_v1.called is (not expect_fia_sink)
+
+
+@pytest.mark.unit
+def test_paged_fast_path_defers_to_capture_when_capturing():
+    from omni_npu.v1.layers.attention import npu_mla as mla_mod
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    host = _standard_host(None, use_sink=False)
+    fia_v1 = MagicMock()
+    capture = MagicMock()
+    args = _standard_args(
+        keys=(torch.zeros(4, 8, 6), torch.zeros(4, 8, 2)),
+        block_table=torch.zeros(2, 4, dtype=torch.int32), num_tokens=3,
+    )
+    with patch.object(mla_mod, "cache_fit_shape", lambda t, _l: t), \
+         patch.object(mla_mod.NPUMLAImpl, "ensure_decode_attn_mask", MagicMock()), \
+         patch.object(mla_mod.NPUMLAImpl, "SHARE_MASK_TRIL_SPARSE", None, create=True), \
+         patch.object(mla_mod, "get_forward_context",
+                      return_value=SimpleNamespace(capturing=True, attn_metadata=None)), \
+         patch.object(mla_mod, "capture_graph_task", capture), \
+         patch.object(torch.ops.npu, "npu_fused_infer_attention_score", fia_v1, create=True):
+        out = NPUDeepseekMLAAttention._apply_standard_attention(host, **args)
+
+    assert not fia_v1.called  # the op runs inside the captured task
+    assert capture.call_args.kwargs["num_tokens"] == 3
+    assert [tuple(t.shape) for t in capture.call_args.kwargs["out_tensors"]] == [(2, 3, 6), (3,)]
+    assert out.shape == (2, 3, 6)

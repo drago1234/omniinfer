@@ -294,22 +294,19 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        # TODO: Support TP-only mode
         experts = layer.routed_experts
         shared_experts = (
             layer._shared_experts._layer if layer._shared_experts is not None else None
         )
         moe_parallel_config = layer.moe_config.moe_parallel_config
-        if not moe_parallel_config.use_ep:
-            return fused_experts_tp(
-                layer=layer,
-                x=x_slice,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-            )
 
         orig_num_tokens = hidden_states.shape[0]
-        strategy, strategy_impl = self.select_communication_strategy(orig_num_tokens)
+        # Only the EP path communicates, and select_communication_strategy
+        # instantiates a strategy object as a side effect. Stay out of it when
+        # there is no EP group to talk to.
+        strategy = strategy_impl = None
+        if moe_parallel_config.use_ep:
+            strategy, strategy_impl = self.select_communication_strategy(orig_num_tokens)
         is_sequence_parallel = layer.moe_config.is_sequence_parallel
         is_need_slice = (
             not model_extra_config.parall_config.ena_seq_parallel
@@ -345,7 +342,9 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
         cur_stream = torch_npu.npu.current_stream()
         if enable_prefetch:
             self._prefetch_on_sub_stream("moe", router_logits, layer, cur_stream)
-        if self.enable_round_pipeline_comm:
+        # Round-pipeline comm is an EP-side optimisation; without EP there are
+        # no round_pipeline_streams (num_nodes is 0 on a single card).
+        if moe_parallel_config.use_ep and self.enable_round_pipeline_comm:
             for idx in range(self.num_nodes):
                 self.round_pipeline_streams[idx].wait_stream(cur_stream)
             topk_stream = self.round_pipeline_streams[self.num_nodes - 1]
@@ -364,6 +363,39 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
                 routed_scaling_factor=routed_scaling_factor,
                 e_score_correction_bias=e_score_correction_bias,
             )
+
+        # TODO: Support TP-only mode
+        # This branch also covers single-card runs: ``use_ep`` is False whenever
+        # tp_size * dp_size == 1, even with enable_expert_parallel set. It must
+        # stay below select_experts -- topk_ids/topk_weights only exist from
+        # here on.
+        if not moe_parallel_config.use_ep:
+            routed_output = fused_experts_tp(
+                layer=layer,
+                x=x_slice,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            )
+            if is_need_slice:
+                routed_output = tensor_model_parallel_all_gather(
+                    routed_output, dim=0
+                )[:orig_num_tokens]
+            if shared_experts is None:
+                return routed_output
+
+            self.sub_stream.wait_stream(cur_stream)
+            with torch.npu.stream(self.sub_stream):
+                if shared_experts.gate_up_proj.tp_size > 1:
+                    # Shared experts with TP>1 require full hidden_states;
+                    # output is all-reduced below.
+                    shared_output = shared_experts(hidden_states)
+                else:
+                    shared_output = shared_experts(x_slice)
+            cur_stream.wait_stream(self.sub_stream)
+            if shared_experts.gate_up_proj.tp_size > 1:
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
+            return shared_output, routed_output
+
         if self.enable_eplb:
             if self.enable_best_ep:
                 topk_ids = self.planner.apply_best_load_balance(
@@ -527,6 +559,22 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
             expert_tokens, avg_tokens_per_expert, pertoken_scale,
         ) = unpack_apply_experts_state(layer, prepare_permute_result)
 
+        # Routed-expert metadata comes in two flavours. The EP path
+        # (all2all/agrs) publishes per-expert token counts, while the TP-only
+        # path (fused_experts_tp -> npu_moe_compute_expert_tokens) publishes
+        # the cumulative sum. group_list_type picks the interpretation: 1 is
+        # counts, 0 is cumulative -- feeding a cumsum as counts makes the GMM
+        # group sizes sum to far more rows than exist.
+        use_ep = moe_parallel_config.use_ep
+        group_list_type = int(use_ep)
+        # npu_dequant_swiglu_quant takes counts only for group_index, and walks
+        # past the token dim when handed a cumulative sum.
+        group_index = expert_tokens
+        if not use_ep and expert_tokens.numel() > 1:
+            group_index = torch.cat(
+                [expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]]
+            )
+
         if experts.quant_config is None:
             gate_up_proj = torch_npu.npu_grouped_matmul(
                 [hidden_states],
@@ -536,7 +584,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
                 split_item=3,
                 output_dtype=hidden_states.dtype,
                 group_type=0,
-                group_list_type=1,
+                group_list_type=group_list_type,
             )[0]
             intermediate_hidden_states = torch_npu.npu_swiglu(gate_up_proj)
             return torch_npu.npu_grouped_matmul(
@@ -547,7 +595,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
                 split_item=3,
                 output_dtype=hidden_states.dtype,
                 group_type=0,
-                group_list_type=1,
+                group_list_type=group_list_type,
             )[0]
 
         if pertoken_scale is None:
@@ -566,7 +614,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
             split_item=3,
             output_dtype=torch.int32,
             group_type=0,
-            group_list_type=1,
+            group_list_type=group_list_type,
             act_type=0,
         )[0]
         quant_scale = torch.ones(
@@ -582,7 +630,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
             "bias": getattr(layer, "w13_bias", None) if has_bias else None,
             "quant_offset": None,
             "quant_scale": quant_scale,
-            "group_index": expert_tokens,
+            "group_index": group_index,
             "activate_left": True,
             "quant_mode": 1,
         }
@@ -608,7 +656,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
             split_item=3,
             output_dtype=torch.bfloat16,
             group_type=0,
-            group_list_type=1,
+            group_list_type=group_list_type,
             tuning_config=avg_tokens_per_expert,
         )[0]
 

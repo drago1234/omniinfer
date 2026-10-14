@@ -32,7 +32,9 @@ def get_npu_mla_logical_weight(
         )
 
     logical_weight = weight
-    if getattr(weight, "is_weight_nz", False):
+    # Normalize FlashComm weights to ND before transpose/view.
+    # CANN 9.2 rejects non-contiguous internal-format views.
+    if weight.device.type == "npu" or getattr(weight, "is_weight_nz", False):
         if weight.is_meta:
             raise RuntimeError("cannot materialize an NPU NZ weight from meta")
         import torch_npu

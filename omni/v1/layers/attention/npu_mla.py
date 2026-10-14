@@ -7,6 +7,10 @@ import torch
 import torch_npu
 from torch import nn
 from transformers import PretrainedConfig
+from vllm.model_executor.layers.attention.kv_transfer_utils import (
+    maybe_transfer_kv_layer,
+)
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
@@ -43,6 +47,7 @@ except ImportError:
     logger.warning("AggregateConv has not being defined, skipping...")
 
 from omni_npu.attention.backends.mla import NPUMLAImpl, NPUMLAMetadata
+from omni_npu.v1.layers.attention.gpt_oss_sink import GptOssSinkMixin
 from omni_npu.attention import ops
 from omni_npu.attention.backends.utils import (
     CrossLayerSharedOp,
@@ -201,7 +206,7 @@ class MomeAttentionMixin:
             "state_shapes": self.mome_state_shapes,
             "quant_config": None,
             "vllm_config": vllm_config,
-            "prefix": f"{prefix}.conv",
+            "prefix": f"{prefix}.attn.mome",
         }
         self.conv = MomeAttention(**mome_kwargs)
 
@@ -328,6 +333,9 @@ class MomeAttentionMixin:
             if self.o_proj.requires_input_partition():
                 out = split_tensor_along_last_dim(out, num_partitions=self.o_proj.tp_size)
                 out = out[self.o_proj.tp_rank].contiguous()
+        elif self.kv_b_proj.tp_size > 1 and not self.o_proj.requires_input_partition():
+            assert self.kv_b_proj.tp_size == get_tp_group().world_size
+            out = get_tp_group().all_gather(out, dim=1)
         return out
 
     def _get_mome_prefill_sp_args(
@@ -412,7 +420,7 @@ class MomeAttentionMixin:
         return self._apply_o_proj(out)
 
 
-class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
+class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Module):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -684,6 +692,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
             )
             self._register_sink_params(config)
 
+        self._init_gpt_oss_sink(config)
         self._init_cross_layer_shared_ops()
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -771,6 +780,9 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
                 dtype=torch.int32,
                 callers=metadata_callers,
             )
+        if self.use_gpt_oss_sink and not self.use_gpt_oss_sink_rescale:
+            # The native-sink kernel reads a metadata buffer of its own.
+            self._reserve_gpt_oss_fia_metadata(metadata_callers)
         if npu_ai_infra_attention_pioneer_metadata is None and self.on_ascend950:
             npu_ai_infra_attention_pioneer_metadata = CrossLayerSharedOp(
                 op=torch.ops.custom.npu_ai_infra_attention_pioneer_metadata,
@@ -822,7 +834,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
             x = torch_npu.npu_rotary_mul(x, cos, sin)
         return x.view(shape)
 
-    def _q_absorb(
+    def _q_project(
         self,
         q_lora: torch.Tensor,  # TD
         cos: torch.Tensor,  # BNSD
@@ -839,18 +851,30 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
             q = self.q_b_proj(q_lora)[0].view(tok, -1, Q + R)  # TND
             q_nope, q_pe = torch.split(q, [Q, R], dim=-1)  # TND
         q_pe = self._apply_rope(q_pe, cos, sin)  # TND
-        q_nope = self._q_nope_absorb(q_nope)
-        return q_nope, q_pe  # TND, TND
+        return q_nope, q_pe  # TND, q_nope not yet absorbed
 
-    def _q_nope_absorb(self, q_nope: torch.Tensor) -> torch.Tensor:
-        """Project the non-RoPE query into the latent-KV space."""
+    def _q_absorb(
+        self,
+        q_lora: torch.Tensor,  # TD
+        cos: torch.Tensor,  # BNSD
+        sin: torch.Tensor,  # BNSD
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q_nope, q_pe = self._q_project(q_lora, cos, sin)
+        return self._q_nope_absorb(q_nope), q_pe  # TND, TND
+
+    def _q_nope_absorb(self, q_nope: torch.Tensor, w_uk_t: torch.Tensor | None = None) -> torch.Tensor:
+        """Project the non-RoPE query into the latent-KV space.
+
+        A CLA layer's local branch absorbs the same query with its own W_UK_T.
+        """
+        w_uk_t = self.attn.W_UK_T if w_uk_t is None else w_uk_t
         if q_nope.size(1) * q_nope.size(2) < 65536:
             args = {"input": q_nope, "perm_x1": (1, 0, 2)}
         else:  # perm_x1 only supports batch*k < 65536
             args = {"input": q_nope.transpose(0, 1)}
         return torch_npu.npu_transpose_batchmatmul(
             **args,  # TND -> NTD
-            weight=self.attn.W_UK_T,  # [Q, L]
+            weight=w_uk_t,  # [Q, L]
             perm_y=(1, 0, 2),  # NTD -> TND
         )
 
@@ -862,7 +886,10 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
         slots: torch.Tensor | NPUMLAMetadata | None,  # None for dummy_run
         kv_cache: tuple[torch.Tensor] | None,  # None for dummy_run
         fused_op: bool = True,
+        kv_a_layernorm: torch.nn.Module | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:  # k_nope: T1D, k_pe: T1D
+        # A CLA layer's local branch normalises with its own gamma.
+        kv_a_layernorm = self.kv_a_layernorm if kv_a_layernorm is None else kv_a_layernorm
         R, L = self.qk_rope_head_dim, self.kv_lora_rank
         slots_2d = getattr(slots, "slot_mapping_2d", None)
         slots = getattr(slots, "slot_mapping", slots)
@@ -878,7 +905,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
         if valid_cache and fused_op and self.noncontiguous_kv:
             k_pe, k_nope = torch.ops.custom.npu_ai_infra_kv_rmsnorm_rope_cache_v2(
                 latent_kv.view(-1, 1, 1, L + R),  # BNSD
-                self.kv_a_layernorm.weight,
+                kv_a_layernorm.weight,
                 cos,
                 sin,  # BNSD
                 slots,
@@ -886,7 +913,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
                 cache_fit_shape(nope_cache, "4D"),
                 k_rope_scale=None,
                 k_rope_offset=None,
-                epsilon=self.kv_a_layernorm.variance_epsilon,
+                epsilon=kv_a_layernorm.variance_epsilon,
                 cache_mode="PA_NZ" if (self.kv_nz and self.dtype != torch.float16) else "PA",
                 rotary_mode="half" if not self.rope_interleaved else "interleave",
                 quant_mode="none",
@@ -895,7 +922,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
         elif valid_cache and fused_op and self.rope_interleaved:
             _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
                 latent_kv.view(-1, 1, 1, L + R),  # BNSD
-                self.kv_a_layernorm.weight,
+                kv_a_layernorm.weight,
                 cos,
                 sin,  # BNSD
                 slots,
@@ -903,13 +930,13 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
                 cache_fit_shape(nope_cache, "4D"),
                 k_rope_scale=None,
                 k_rope_offset=None,
-                epsilon=self.kv_a_layernorm.variance_epsilon,
+                epsilon=kv_a_layernorm.variance_epsilon,
                 cache_mode="PA_NZ" if (self.kv_nz and self.dtype != torch.float16) else "PA",
                 is_output_kv=True,
             )  # -> [*, pg, 1, L], [*, pg, 1, R], BNSD, BNSD
         else:
             k_nope, k_pe = torch.split(latent_kv, [L, R], dim=-1)  # TD
-            k_nope = self.kv_a_layernorm(k_nope)  # TD
+            k_nope = kv_a_layernorm(k_nope)  # TD
             k_pe = self._apply_rope(k_pe, cos, sin)  # TD
             if valid_cache:
 
@@ -932,13 +959,15 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
                 update(k_pe, rope_cache)
         return k_nope.view(-1, 1, L), k_pe.view(-1, 1, R)
 
-    def _post_attn_absorb(self, out: torch.Tensor) -> torch.Tensor:
+    def _post_attn_absorb(self, out: torch.Tensor, w_uv: torch.Tensor | None = None) -> torch.Tensor:
+        # A CLA layer's local branch projects with its own W_UV.
+        w_uv = self.attn.W_UV if w_uv is None else w_uv
         N = self.num_local_heads
         L = self.kv_lora_rank
         V = self.v_head_dim
         return torch_npu.npu_transpose_batchmatmul(
             out.view(N, -1, L),  # NTD
-            self.attn.W_UV,
+            w_uv,
             perm_y=(1, 0, 2),
         ).reshape(-1, N * V)  # T,ND
 
@@ -1296,15 +1325,8 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
             )
         else:
             return self._apply_standard_attention(
-                q_nope,
-                q_pe,
-                keys,
-                values,
-                q_cumlens,
-                kv_lens,
-                block_table,
-                num_tokens,
-                layer_name,
+                q_nope, q_pe, keys, values, q_cumlens, kv_lens, block_table,
+                num_tokens, attn_metadata.num_tokens, layer_name, metadata_caller,
             )
 
     def _apply_sink_attention(
@@ -1657,6 +1679,119 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
             softmax_lse_flag=False,
         )[0]
 
+    def _apply_fia_sink_pa_attention(
+        self,
+        q_nope: torch.Tensor,  # TND, latent query
+        q_pe: torch.Tensor,  # TND, rope query
+        nope_cache: torch.Tensor,  # 3D paged latent cache
+        rope_cache: torch.Tensor,  # 3D paged rope cache
+        block_size: int,
+        block_table: torch.Tensor,
+        q_cumlens: torch.Tensor | list[int],  # a list unless AICPU tiling is on
+        kv_lens: torch.Tensor | list[int],
+        num_tokens: int,  # padded token count, sizes the output buffer
+        num_actual_tokens: int,  # valid token count, from the host-side metadata
+        metadata_caller: str,  # which shared tiling-metadata buffer to read
+        layer_name: str,
+    ) -> torch.Tensor:  # NTD
+        """Run the npu_fused_infer_attention_sink family over a paged cache.
+
+        A layer comes here for whatever the plain FIA cannot do -- a sliding
+        window, a head count that is not a power of two, a log-sum-exp -- so a
+        GPT-OSS sink is one reason among several, and may well be absent. When
+        there is one, use_gpt_oss_sink_rescale picks which kernel applies it.
+        """
+        q_head = q_nope.size(1)
+        window_size = self._to_metadata_pre_tokens(self.sliding_window)
+        caller_key = (metadata_caller, window_size)
+        # Slicing by q_cumlens[-1] would read a device tensor and break graph
+        # capture with a device-to-host sync, so use the host-side token count.
+        valid_tok = num_actual_tokens
+        q_cumlens = self._lengths_to_i64(q_cumlens, q_nope.device)
+        kv_lens = self._lengths_to_i64(kv_lens, q_nope.device)
+        kwargs = {
+            "query": q_nope[:valid_tok],
+            "key": nope_cache,
+            "value": nope_cache,
+            "query_rope": q_pe[:valid_tok],
+            "key_rope": rope_cache,
+            "num_query_heads": q_head,
+            "num_key_value_heads": 1,
+            "input_layout": "TND_NTD",
+            "atten_mask": NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
+            "sparse_mode": 4,
+            "pre_tokens": window_size,
+            "next_tokens": 0,
+            "softmax_scale": self.scaling,
+            "block_table": block_table,
+            "block_size": block_size,
+            "actual_seq_qlen": q_cumlens,
+            "actual_seq_kvlen": kv_lens,
+        }
+
+        if self.use_gpt_oss_sink:
+            kwargs["batch_invariant"] = model_extra_config.operator_opt_config.use_batch_invariant_op
+        if self.use_gpt_oss_sink and not self.use_gpt_oss_sink_rescale:
+            # The kernel applies the sink itself and builds tiling metadata of
+            # its own, so return before the FIA-sink metadata below.
+            pa_out = self._apply_gpt_oss_fia_native(
+                kwargs, self.gpt_oss_sink, caller_key, self.is_fa_metadata_producer,
+            )
+            if valid_tok == num_tokens:
+                return pa_out
+            out = q_nope.new_zeros(q_head, num_tokens, self.kv_lora_rank)  # NTD
+            out[:, :valid_tok, :] = pa_out
+            return out
+
+        # npu_fused_infer_attention_sink needs meta_data. Every layer with this window shares one buffer;
+        # the producer recomputes it and the rest read what it wrote.
+        stream_limit = torch.npu.get_stream_limit(torch.npu.current_stream())
+        kwargs["meta_data"] = npu_fused_infer_attention_sink_metadata(
+            {
+                "batch_invariant": kwargs.get("batch_invariant", False),
+                "num_heads_q": q_head,
+                "num_heads_kv": 1,
+                "head_dim_qk": q_nope.shape[-1],
+                "head_dim_v": nope_cache.shape[-1],
+                "actual_seq_lengths": q_cumlens,
+                "actual_seq_lengths_kv": kv_lens,
+                "sparse_mode": 4,
+                "pre_tokens": window_size,
+                "next_tokens": 0,
+                "input_layout": "TND", "input_layout_kv": "BnBsH",
+                "rope_head_dim": q_pe.shape[-1],
+                "k_sink_num": 0, "block_size": block_size,
+                "aic_core_num": stream_limit["cube_core_num"],
+                "aiv_core_num": stream_limit["vector_core_num"],
+            },
+            self.is_fa_metadata_producer,
+            caller_key,
+        )
+        kwargs["return_softmax_lse"] = self.use_gpt_oss_sink
+        out = q_nope.new_zeros(q_head, num_tokens, self.kv_lora_rank)  # NTD
+        # With AICPU tiling the op derives its tiling on device and is captured
+        # like any other op. Without it the tiling is computed on the host, which
+        # only reaches a captured graph through capture_graph_task -- and that
+        # needs every output allocated up front.
+        if (get_forward_context().capturing and not model_extra_config.operator_opt_config.use_aicpu_fa_tiling):
+            # Zeroed, not empty: the rescale below covers the padded tail too.
+            lse = q_nope.new_zeros((num_tokens, q_head, 1), dtype=torch.float32)
+            capture_graph_task(
+                op_desc=OP_FIA_SINK,
+                op_kwargs=kwargs,
+                out_tensors=[out, lse],
+                num_tokens=num_tokens,
+                layer_name=layer_name,
+            )
+            if self.use_gpt_oss_sink:
+                out = self._rescale_gpt_oss_sink_output(out, lse, self.gpt_oss_sink, "NTD")
+        else:
+            pa_out, pa_lse = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)
+            if self.use_gpt_oss_sink:
+                pa_out = self._rescale_gpt_oss_sink_output(pa_out, pa_lse, self.gpt_oss_sink, "NTD")
+            out[:, :valid_tok, :] = pa_out
+        return out
+
     def _apply_standard_attention(
         self,
         q_nope: torch.Tensor,  # TND
@@ -1666,8 +1801,8 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
         q_cumlens: torch.Tensor,
         kv_lens: torch.Tensor,
         block_table: torch.Tensor,
-        num_tokens: int,
-        layer_name: str,
+        num_tokens: int, num_actual_tokens: int, layer_name: str,
+        metadata_caller: str = "decode",
     ) -> torch.Tensor:  # TND(no_absorb) or NTD(absorb)
         valid_tok = q_cumlens[-1]
         q_head = q_nope.size(1)
@@ -1678,15 +1813,47 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
             if isinstance(metadata, dict):
                 metadata = metadata.get(f"{self.prefix}.attn")
             max_query_len = 1 if metadata is None else metadata.max_query_len
-            sparse_mode = 3 if max_query_len > 1 else 0
-            attn_mask = self.attn.impl.SHARE_MASK_TRIL_SPARSE if sparse_mode == 3 else None
+            if self.sliding_window is not None:
+                sparse_mode = 4
+                pre_tokens = self.sliding_window - 1
+            elif max_query_len > 1:
+                sparse_mode = 3
+                pre_tokens = (1 << 31) - 1
+            else:
+                sparse_mode = 0
+                pre_tokens = (1 << 31) - 1
+            attn_mask = self.attn.impl.SHARE_MASK_TRIL_SPARSE if sparse_mode in (3, 4) else None
             v_head = 1 if values is None else q_head
             value = k_nope if values is None else values
             assert value.dim() in [3, 4]
 
             assert num_tokens is None or num_tokens == q_nope.size(0)
             out = q_nope.new_zeros(*q_nope.shape[:2], value.size(-1))
-            out[:valid_tok] = torch.ops.npu.npu_fused_infer_attention_score(
+            if self.use_gpt_oss_sink and not self.use_gpt_oss_sink_rescale:
+                out[:valid_tok] = self._apply_gpt_oss_fia_native(
+                    {
+                        "query": q_nope[:valid_tok],
+                        "key": k_nope,
+                        "value": value,
+                        "query_rope": q_pe[:valid_tok],
+                        "key_rope": k_pe,
+                        "num_query_heads": q_head,
+                        "num_key_value_heads": v_head,
+                        "input_layout": "TND",
+                        "atten_mask": attn_mask,
+                        "sparse_mode": sparse_mode,
+                        "pre_tokens": pre_tokens,
+                        "next_tokens": 0,
+                        "softmax_scale": self.scaling,
+                        "actual_seq_qlen": q_cumlens,
+                        "actual_seq_kvlen": kv_lens,
+                    },
+                    self.gpt_oss_sink,
+                    (metadata_caller, self._to_metadata_pre_tokens(self.sliding_window)),
+                    self.is_fa_metadata_producer,
+                )
+                return out
+            score_out = torch.ops.npu.npu_fused_infer_attention_score(
                 q_nope[:valid_tok],
                 k_nope,
                 value,
@@ -1697,50 +1864,69 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
                 input_layout="TND",
                 atten_mask=attn_mask,
                 sparse_mode=sparse_mode,
+                pre_tokens=pre_tokens,
                 actual_seq_lengths=q_cumlens,
                 actual_seq_lengths_kv=kv_lens,
                 scale=self.scaling,
                 next_tokens=0,
-            )[0]  # -> TND
+                softmax_lse_flag=self.use_gpt_oss_sink,
+            )  # -> TND
+            attn_out = score_out[0]
+            if self.use_gpt_oss_sink:
+                attn_out = self._rescale_gpt_oss_sink_output(attn_out, score_out[1], self.gpt_oss_sink, "TND")
+            out[:valid_tok] = attn_out
         else:  # PA
             nope_cache, rope_cache = keys
             block_size = nope_cache.size(1)
             nope_cache = cache_fit_shape(nope_cache, "3D")
             rope_cache = cache_fit_shape(rope_cache, "3D")
             NPUMLAImpl.ensure_decode_attn_mask()
-            kwargs = {
-                "query": q_nope[:valid_tok],
-                "key": nope_cache,
-                "value": nope_cache,
-                "query_rope": q_pe[:valid_tok],
-                "key_rope": rope_cache,
-                "num_heads": q_head,
-                "num_key_value_heads": 1,
-                "input_layout": "TND_NTD",
-                "atten_mask": NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
-                "sparse_mode": 3,
-                "scale": self.scaling,
-                "antiquant_mode": 0,
-                "antiquant_scale": None,
-                "block_table": block_table,
-                "block_size": block_size,
-                "actual_seq_lengths": q_cumlens,
-                "actual_seq_lengths_kv": kv_lens,
-            }
-
             num_tokens = num_tokens or q_nope.size(0)
-            out = q_nope.new_zeros(q_head, num_tokens, self.kv_lora_rank)  # NTD
-            lse = q_nope.new_empty(num_tokens)  # [T]
-            if get_forward_context().capturing:
-                capture_graph_task(
-                    op_desc=OP_FIA_V1,
-                    op_kwargs=kwargs,
-                    out_tensors=[out, lse],
-                    num_tokens=num_tokens,
-                    layer_name=layer_name,
+            # npu_fused_infer_attention_score below takes only a power-of-two head
+            # count, has no sliding window and returns no log-sum-exp.
+            if (
+                q_head & (q_head - 1)  # not a power of two
+                or self.sliding_window is not None
+                or self.use_gpt_oss_sink
+            ):
+                out = self._apply_fia_sink_pa_attention(
+                    q_nope, q_pe, nope_cache, rope_cache, block_size, block_table,
+                    q_cumlens, kv_lens, num_tokens, num_actual_tokens,
+                    metadata_caller, layer_name,
                 )
             else:
-                out[:, :valid_tok, :] = torch.ops.npu.npu_fused_infer_attention_score(**kwargs)[0]
+                kwargs = {
+                    "query": q_nope[:valid_tok],
+                    "key": nope_cache,
+                    "value": nope_cache,
+                    "query_rope": q_pe[:valid_tok],
+                    "key_rope": rope_cache,
+                    "num_heads": q_head,
+                    "num_key_value_heads": 1,
+                    "input_layout": "TND_NTD",
+                    "atten_mask": NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
+                    "sparse_mode": 3,
+                    "scale": self.scaling,
+                    "antiquant_mode": 0,
+                    "antiquant_scale": None,
+                    "block_table": block_table,
+                    "block_size": block_size,
+                    "actual_seq_lengths": q_cumlens,
+                    "actual_seq_lengths_kv": kv_lens,
+                }
+
+                out = q_nope.new_zeros(q_head, num_tokens, self.kv_lora_rank)  # NTD
+                lse = q_nope.new_empty(num_tokens)  # [T]
+                if get_forward_context().capturing:
+                    capture_graph_task(
+                        op_desc=OP_FIA_V1,
+                        op_kwargs=kwargs,
+                        out_tensors=[out, lse],
+                        num_tokens=num_tokens,
+                        layer_name=layer_name,
+                    )
+                else:
+                    out[:, :valid_tok, :] = torch.ops.npu.npu_fused_infer_attention_score(**kwargs)[0]
         return out
 
     # ========================= forward =========================
@@ -1759,7 +1945,9 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
         a consumer ever needs the selection.
         """
         return (
-            torch.ops.vllm.npu_mla_forward(x, cos, sin, self.prefix),
+            torch.ops.vllm.npu_mla_forward(
+                x, cos, sin, self.prefix, self.attn.layer_name
+            ),
             topk_indices_buffer,
         )
 
@@ -1767,7 +1955,8 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
         self, x, cos, sin, residual, mhc_layer_name, task_key, topk_indices_buffer=None
     ):
         hidden_states, h_post, h_res = torch.ops.vllm.npu_mla_forward_mhc_deferred(
-            x, cos, sin, residual, self.prefix, mhc_layer_name, task_key
+            x, cos, sin, residual, self.prefix, mhc_layer_name, task_key,
+            self.attn.layer_name,
         )
         return (hidden_states, h_post, h_res), topk_indices_buffer
 
@@ -2197,17 +2386,20 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, torch.nn.Module):
         return out
 
 
+@eager_break_during_capture
+@maybe_transfer_kv_layer
 def npu_mla_forward(
     hs: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    module_name: str,
     layer_name: str,
 ) -> torch.Tensor:
     forward_context = get_forward_context()
-    self: NPUDeepseekMLAAttention = forward_context.no_compile_layers[layer_name]
+    self: NPUDeepseekMLAAttention = forward_context.no_compile_layers[module_name]
     attn_metadata: NPUMLAMetadata = forward_context.attn_metadata
     if isinstance(attn_metadata, dict):
-        attn_metadata = attn_metadata[f"{self.prefix}.attn"]
+        attn_metadata = attn_metadata[layer_name]
     p_slice, d_slice, has_prefill, has_decode = get_batch_desc(attn_metadata)
     prefill = getattr(attn_metadata, "prefill", None)  # None for dummy_run
     decode = getattr(attn_metadata, "decode", None)  # None for dummy_run
@@ -2245,6 +2437,7 @@ def npu_mla_forward_fake(
     hidden_states: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    module_name: str,
     layer_name: str,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
@@ -2255,14 +2448,15 @@ def npu_mla_forward_mhc_deferred(
     cos: torch.Tensor,
     sin: torch.Tensor,
     residual: torch.Tensor,
-    layer_name: str,
+    module_name: str,
     mhc_layer_name: str,
     task_key: str,
+    layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch next-layer MHC work between attention and the MLA epilog."""
     return call_attention_mhc_deferred(
         npu_mla_forward, hidden_states, cos, sin, residual,
-        layer_name, mhc_layer_name, task_key,
+        module_name, mhc_layer_name, task_key, layer_name,
     )
 
 

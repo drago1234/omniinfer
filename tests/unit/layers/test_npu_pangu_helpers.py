@@ -10,7 +10,7 @@ import torch
 
 import omni_npu.v1.layers.attention.npu_pangu as pangu_mod
 from omni_npu.attention.backends.dsa import NPUDSAMetadataBuilder
-from omni_npu.compilation.utils import OP_FIA_SINK, OP_FIA_V2
+from omni_npu.compilation.utils import OP_FIA_SINK
 from omni_npu.v1.layers.attention import npu_pangu_custom_ops as custom_ops_mod
 from omni_npu.v1.layers.attention.npu_pangu import (
     NPUPanguSparseAttention,
@@ -418,6 +418,9 @@ class TestPanguIndexShare(unittest.TestCase):
 
         layer = SimpleNamespace(
             prefix="model.layers.7.self_attn",
+            # attn_metadata is keyed by the inner attention name, which the
+            # layer registers as f"{prefix}.attn".
+            attn=SimpleNamespace(layer_name="model.layers.7.self_attn.attn"),
             cla_swa_attn_name="model.cla_swa_layers.40.attn",
             is_cla_reuse_layer=True,
             is_cp_layer=True,
@@ -446,7 +449,13 @@ class TestPanguIndexShare(unittest.TestCase):
         )
 
         with patch("omni_npu.v1.layers.attention.npu_pangu.get_forward_context", return_value=context):
-            output = npu_pangu_forward(hidden, torch.empty(0), torch.empty(0), "layer")
+            output = npu_pangu_forward(
+                hidden,
+                torch.empty(0),
+                torch.empty(0),
+                "layer",
+                "model.layers.7.self_attn.attn",
+            )
 
         torch.testing.assert_close(output, hidden + 1)
         self.assertIs(layer._forward_cla_prefill_cp.call_args.args[3], global_metadata)
@@ -469,7 +478,6 @@ class TestPanguMomeDisabled(unittest.TestCase):
         attention = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
         torch.nn.Module.__init__(attention)
         attention.use_mome = False
-        attention.enable_mome_sp = False
         attention.tp_size = 1
         attention.moe_comm_strategy = "allreduce"
         attention.num_heads = 1
@@ -593,7 +601,11 @@ class TestPanguGptOssSink(unittest.TestCase):
                 NPUPanguSparseAttention, "_apply_gpt_oss_fia", return_value=op_output
             ) as mock_fia,
         ):
-            output = attention._run_gpt_oss_fia({"query": query}, num_tokens=5, num_actual_tokens=3)
+            output = attention._run_gpt_oss_fia(
+                {"query": query}, num_tokens=5, num_actual_tokens=3,
+                layer_name="global_swa", metadata_caller="decode",
+                recompute_metadata=False,
+            )
 
         torch.testing.assert_close(output[:, :3], op_output)
         torch.testing.assert_close(output[:, 3:], torch.zeros(2, 2, 4))
@@ -601,39 +613,177 @@ class TestPanguGptOssSink(unittest.TestCase):
 
         attention.use_gpt_oss_sink_rescale = False
         attention.gpt_oss_sink = torch.tensor([0.25, -0.5], dtype=torch.float32)
+        attention.is_fa_metadata_producer = True
+        attention._fia_aic_core_num = 24
+        attention._fia_aiv_core_num = 48
         attention.attn = SimpleNamespace(layer_name="global_swa")
-        kwargs = {"query": query, "key_sink": torch.empty(0)}
+        metadata = torch.empty(1024, dtype=torch.int32)
+        kwargs = {
+            "query": query,
+            "key": torch.randn(1, 16, 4),
+            "value": torch.randn(1, 16, 4),
+            "query_rope": torch.randn(5, 2, 2),
+            "key_rope": torch.randn(1, 16, 2),
+            "num_query_heads": 2,
+            "num_key_value_heads": 1,
+            "input_layout": "TND_NTD",
+            "actual_seq_qlen": torch.tensor([5], dtype=torch.int32),
+            "actual_seq_kvlen": torch.tensor([5], dtype=torch.int32),
+            "block_table": torch.zeros(1, 1, dtype=torch.int32),
+            "block_size": 16,
+            "sparse_mode": 4,
+            "pre_tokens": 31,
+            "next_tokens": 0,
+        }
         native_output = torch.randn(2, 5, 4)
         with (
-            patch(
-                "omni_npu.v1.layers.attention.npu_pangu.get_forward_context",
-                return_value=SimpleNamespace(capturing=False),
-            ),
-            patch(
-                "torch_npu.npu_fused_infer_attention_score_v2",
-                return_value=(native_output, torch.empty(0)),
+            patch.object(
+                torch.ops.vllm,
+                "npu_pangu_gpt_oss_fia",
+                return_value=native_output,
+                create=True,
             ) as mock_native_fia,
+            patch(
+                "omni_npu.v1.layers.attention.npu_pangu.npu_ai_infra_flash_attention_metadata",
+                return_value=metadata,
+            ) as mock_metadata,
         ):
-            runtime_output = attention._apply_gpt_oss_fia(dict(kwargs))
+            runtime_output = attention._apply_gpt_oss_fia(
+                dict(kwargs), layer_name="global_swa", metadata_caller="decode",
+                recompute_metadata=True,
+            )
 
         self.assertIs(runtime_output, native_output)
         native_kwargs = mock_native_fia.call_args.kwargs
         self.assertIs(native_kwargs["query"], query)
-        torch.testing.assert_close(native_kwargs["learnable_sink"], attention.gpt_oss_sink)
-        self.assertNotIn("key_sink", native_kwargs)
+        self.assertIs(native_kwargs["meta_data"], metadata)
+        torch.testing.assert_close(native_kwargs["sinks"], attention.gpt_oss_sink)
+        self.assertEqual(native_kwargs["num_heads"], 2)
+        self.assertEqual(native_kwargs["input_layout"], "TND_NTD")
+        self.assertEqual(native_kwargs["block_size"], 16)
+        metadata_args, recompute, caller = mock_metadata.call_args.args
+        self.assertEqual(metadata_args["actual_seq_lengths"].dtype, torch.int64)
+        self.assertEqual(metadata_args["actual_seq_lengths_kv"].dtype, torch.int64)
+        self.assertEqual(native_kwargs["actual_seq_lengths"].dtype, torch.int64)
+        self.assertEqual(native_kwargs["actual_seq_lengths_kv"].dtype, torch.int64)
+        self.assertEqual(metadata_args["input_layout"], "TND")
+        self.assertEqual(metadata_args["input_layout_kv"], "BnBsH")
+        self.assertEqual(metadata_args["rope_head_dim"], 2)
+        self.assertEqual(metadata_args["block_size"], 16)
+        self.assertTrue(recompute)
+        self.assertEqual(caller, "decode")
+
+        direct_kwargs = dict(kwargs)
+        direct_kwargs.pop("block_table")
+        direct_kwargs.pop("block_size")
+        direct_kwargs["input_layout"] = "TND"
+        with patch(
+            "omni_npu.v1.layers.attention.npu_pangu.npu_ai_infra_flash_attention_metadata",
+            return_value=metadata,
+        ):
+            normalized = attention._add_gpt_oss_fia_metadata(
+                direct_kwargs, "prefill", recompute=True,
+            )
+        self.assertEqual(normalized["input_layout"], "TND")
+        self.assertIn("query_rope", normalized)
+        self.assertIn("key_rope", normalized)
+        self.assertNotIn("block_table", normalized)
+        self.assertNotIn("block_size", normalized)
+        self.assertNotIn("atten_mask", normalized)
 
         with (
+            patch.object(
+                torch.ops.vllm,
+                "npu_pangu_gpt_oss_fia",
+                return_value=native_output,
+                create=True,
+            ) as mock_native_fia,
             patch(
-                "omni_npu.v1.layers.attention.npu_pangu.get_forward_context",
-                return_value=SimpleNamespace(capturing=True),
+                "omni_npu.v1.layers.attention.npu_pangu.npu_ai_infra_flash_attention_metadata",
+                return_value=metadata,
             ),
-            patch("omni_npu.v1.layers.attention.npu_pangu.capture_graph_task") as mock_capture,
         ):
-            captured_output = attention._apply_gpt_oss_fia(dict(kwargs), output_shape=(2, 5, 4), num_tokens=5)
+            captured_output = attention._apply_gpt_oss_fia(
+                dict(kwargs), output_shape=(2, 5, 4), num_tokens=5,
+                layer_name="global_swa", metadata_caller="decode", recompute_metadata=True,
+            )
 
-        torch.testing.assert_close(captured_output, torch.zeros_like(captured_output))
-        self.assertIs(mock_capture.call_args.kwargs["op_desc"], OP_FIA_V2)
-        self.assertEqual(mock_capture.call_args.kwargs["num_tokens"], 5)
+        self.assertIs(captured_output, native_output)
+        mock_native_fia.assert_called_once()
+
+    def test_gpt_oss_fia_selects_sink_by_attention_layer(self):
+        attention = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
+        torch.nn.Module.__init__(attention)
+        attention.use_gpt_oss_sink_rescale = True
+        attention.gpt_oss_sink = torch.tensor([0.25, -0.5])
+        attention.gpt_oss_sink_swa = torch.tensor([0.75, 0.5])
+        attention.attn_cla_swa = SimpleNamespace(layer_name="cla_swa")
+        output = torch.empty(0)
+
+        with patch.object(attention, "_apply_gpt_oss_fia_rescale", return_value=output) as mock_fia:
+            self.assertIs(attention._apply_gpt_oss_fia(
+                {}, layer_name="global_swa", metadata_caller="decode",
+                recompute_metadata=False,
+            ), output)
+            self.assertIs(mock_fia.call_args.args[1], attention.gpt_oss_sink)
+
+            self.assertIs(attention._apply_gpt_oss_fia(
+                {}, layer_name="cla_swa", metadata_caller="cla_decode",
+                recompute_metadata=True,
+            ), output)
+            self.assertIs(mock_fia.call_args.args[1], attention.gpt_oss_sink_swa)
+
+    def test_gpt_oss_fia_opaque_wrapper_runtime_and_fake_shapes(self):
+        schema = str(torch.ops.vllm.npu_pangu_gpt_oss_fia.default._schema)
+        self.assertIn("Tensor? block_table=None", schema)
+        self.assertIn("float softmax_scale=1.", schema)
+        self.assertIn('str input_layout="TND"', schema)
+        self.assertIn("SymInt block_size=0", schema)
+
+        query = torch.randn(3, 2, 4)
+        key = torch.randn(1, 16, 4)
+        value = torch.randn(1, 16, 5)
+        metadata = torch.empty(1024, dtype=torch.int32)
+        seq_lens = torch.tensor([3], dtype=torch.int64)
+        sinks = torch.randn(2, dtype=torch.float32)
+        required_kwargs = {
+            "query": query,
+            "key": key,
+            "value": value,
+            "meta_data": metadata,
+            "actual_seq_lengths": seq_lens,
+            "actual_seq_lengths_kv": seq_lens,
+            "sinks": sinks,
+            "num_heads": 2,
+            "num_key_value_heads": 1,
+        }
+
+        fake_ntd = custom_ops_mod.npu_pangu_gpt_oss_fia_fake(
+            **required_kwargs, input_layout="TND_NTD", sparse_mode=4, block_size=16,
+        )
+        fake_tnd = custom_ops_mod.npu_pangu_gpt_oss_fia_fake(
+            **required_kwargs,
+        )
+        self.assertEqual(fake_ntd.shape, (2, 3, 5))
+        self.assertEqual(fake_tnd.shape, (3, 2, 5))
+
+        native_output = torch.randn(2, 3, 5)
+        with patch.object(
+            torch.ops.custom,
+            "npu_ai_infra_flash_attention",
+            return_value=(native_output, torch.empty(0), torch.empty(0), torch.empty(0)),
+            create=True,
+        ) as native_op:
+            output = custom_ops_mod.npu_pangu_gpt_oss_fia(
+                **required_kwargs, input_layout="TND_NTD", sparse_mode=4, block_size=16,
+            )
+
+        self.assertIs(output, native_output)
+        self.assertIs(native_op.call_args.args[3], metadata)
+        self.assertIs(native_op.call_args.kwargs["sinks"], sinks)
+        self.assertIsNone(native_op.call_args.kwargs["block_table"])
+        self.assertEqual(native_op.call_args.kwargs["softmax_scale"], 1.0)
+        self.assertEqual(native_op.call_args.kwargs["input_layout"], "TND_NTD")
 
     def test_fia_rescale_uses_ordinary_sink_attention_and_lse(self):
         attention = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
@@ -655,7 +805,6 @@ class TestPanguGptOssSink(unittest.TestCase):
             "input_layout": "TND_NTD",
             "actual_seq_qlen": torch.tensor([3]),
             "actual_seq_kvlen": torch.tensor([3]),
-            "key_sink": torch.empty(0),
         }
 
         with (
@@ -668,7 +817,10 @@ class TestPanguGptOssSink(unittest.TestCase):
                 return_value=(op_output, softmax_lse),
             ) as mock_fia,
         ):
-            output = attention._apply_gpt_oss_fia(kwargs)
+            output = attention._apply_gpt_oss_fia(
+                kwargs, layer_name="global_swa", metadata_caller="decode",
+                recompute_metadata=False,
+            )
 
         expected_scale = torch.sigmoid(softmax_lse.squeeze(-1) - attention.gpt_oss_sink.view(1, 2))
         torch.testing.assert_close(output, op_output * expected_scale.transpose(0, 1).unsqueeze(-1))
@@ -699,7 +851,9 @@ class TestPanguGptOssSink(unittest.TestCase):
             ) as mock_fia,
             patch("omni_npu.v1.layers.attention.npu_pangu.capture_graph_task") as mock_capture,
         ):
-            output = attention._apply_gpt_oss_fia_rescale(kwargs, torch.zeros(2), op_output.shape, 3, None, "decode")
+            output = attention._apply_gpt_oss_fia_rescale(
+                kwargs, torch.zeros(2), op_output.shape, 3, "global_swa", "decode", False,
+            )
 
         torch.testing.assert_close(output, op_output * 0.5)
         mock_fia.assert_called_once()
@@ -716,7 +870,7 @@ class TestPanguGptOssSink(unittest.TestCase):
             patch("omni_npu.v1.layers.attention.npu_pangu.capture_graph_task") as mock_capture,
         ):
             captured_output = attention._apply_gpt_oss_fia_rescale(
-                dict(kwargs), torch.zeros(2), op_output.shape, 3, "cla_swa", "cla_decode",
+                dict(kwargs), torch.zeros(2), op_output.shape, 3, "cla_swa", "cla_decode", True,
             )
 
         torch.testing.assert_close(captured_output, torch.zeros_like(captured_output))
@@ -751,7 +905,6 @@ class TestPanguGptOssSink(unittest.TestCase):
                 attn_metadata=metadata,
                 attention_layer=local_attention,
                 sliding_window=512,
-                learnable_sink=torch.zeros(2),
                 metadata_caller="cla_prefill",
                 recompute_metadata=True,
             )
@@ -808,10 +961,12 @@ class TestPanguGptOssSink(unittest.TestCase):
         attention.scaling = 0.125
         q_nope = torch.randn(2, 2, 4)
         q_pe = torch.randn(2, 2, 2)
-        kv_cache = (torch.randn(1, 2, 4), torch.randn(1, 2, 2))
+        kv_cache = (torch.randn(1, 2, 6), torch.randn(1, 2, 2))
         op_output = torch.ones(2, 2, 4)
         softmax_max = torch.tensor([[[0.5, 1.0], [-0.5, 0.25]]])
         softmax_sum = torch.tensor([[[2.0, 4.0], [1.5, 3.0]]])
+        query_cumlens = torch.tensor([2], dtype=torch.int32)
+        kv_lens = torch.tensor([2], dtype=torch.int32)
 
         with (
             patch.object(
@@ -828,7 +983,7 @@ class TestPanguGptOssSink(unittest.TestCase):
         ):
             output = attention._apply_gpt_oss_sfa(
                 q_nope, q_pe, kv_cache, torch.zeros(2, 1, 1, dtype=torch.int32),
-                torch.tensor([2]), torch.tensor([2]), torch.zeros(1, 1, dtype=torch.int32),
+                query_cumlens, kv_lens, torch.zeros(1, 1, dtype=torch.int32),
             )
 
         softmax_lse = (softmax_max + torch.log(softmax_sum)).squeeze(0)
@@ -837,6 +992,14 @@ class TestPanguGptOssSink(unittest.TestCase):
         op_kwargs = mock_pioneer.call_args.kwargs
         self.assertIs(op_kwargs["query"], q_nope)
         self.assertIs(op_kwargs["query_rope"], q_pe)
+        expected_cache = kv_cache[0][..., :q_nope.shape[-1]].unsqueeze(2)
+        torch.testing.assert_close(op_kwargs["key"], kv_cache[0].unsqueeze(2))
+        torch.testing.assert_close(op_kwargs["value"], expected_cache)
+        self.assertNotIn("key_rope", op_kwargs)
+        self.assertEqual(op_kwargs["key"].shape[-1], 6)
+        self.assertEqual(op_kwargs["value"].shape[-1], 4)
+        self.assertIs(op_kwargs["actual_seq_lengths_query"], query_cumlens)
+        self.assertIs(op_kwargs["actual_seq_lengths_kv"], kv_lens)
         self.assertTrue(op_kwargs["return_softmax_lse"])
         self.assertNotIn("batch_invariant", op_kwargs)
         self.assertEqual(op_kwargs["layout_kv"], "PA_BSND")
@@ -848,11 +1011,15 @@ class TestPanguGptOssSink(unittest.TestCase):
         attention = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
         attention.use_gpt_oss_sink_rescale = False
         attention.gpt_oss_sink = torch.tensor([0.5, -0.25], dtype=torch.float32)
+        attention.dummy_value_cache = torch.empty(1, 2, 1, 4)
         attention.scaling = 0.125
         q_nope = torch.randn(2, 2, 4)
         q_pe = torch.randn(2, 2, 2)
-        kv_cache = (torch.randn(1, 2, 4), torch.randn(1, 2, 2))
+        combined_cache = torch.randn(1, 2, 6)
+        kv_cache = (combined_cache,)
         op_output = torch.ones(2, 2, 4)
+        query_cumlens = torch.tensor([2], dtype=torch.int32)
+        kv_lens = torch.tensor([2], dtype=torch.int32)
 
         with (
             patch.object(
@@ -869,12 +1036,22 @@ class TestPanguGptOssSink(unittest.TestCase):
         ):
             output = attention._apply_gpt_oss_sfa(
                 q_nope, q_pe, kv_cache, torch.zeros(2, 1, 1, dtype=torch.int32),
-                torch.tensor([2]), torch.tensor([2]), torch.zeros(1, 1, dtype=torch.int32),
+                query_cumlens, kv_lens, torch.zeros(1, 1, dtype=torch.int32),
             )
 
         self.assertIs(output, op_output)
         op_kwargs = mock_legacy.call_args.kwargs
-        torch.testing.assert_close(op_kwargs["query"], torch.cat([q_nope, q_pe], dim=-1))
+        self.assertIs(op_kwargs["query"], q_nope)
+        self.assertIs(op_kwargs["query_rope"], q_pe)
+        expected_cache = combined_cache[..., :q_nope.shape[-1]].unsqueeze(2)
+        torch.testing.assert_close(op_kwargs["key"], combined_cache.unsqueeze(2))
+        torch.testing.assert_close(op_kwargs["value"], expected_cache)
+        self.assertEqual(op_kwargs["value"].untyped_storage().data_ptr(), combined_cache.untyped_storage().data_ptr())
+        self.assertEqual(op_kwargs["key"].shape[-1], 6)
+        self.assertEqual(op_kwargs["value"].shape[-1], 4)
+        self.assertNotIn("key_rope", op_kwargs)
+        self.assertIs(op_kwargs["actual_seq_lengths_query"], query_cumlens)
+        self.assertIs(op_kwargs["actual_seq_lengths_kv"], kv_lens)
         self.assertIs(op_kwargs["sinks"], attention.gpt_oss_sink)
         mock_pioneer.assert_not_called()
 
@@ -894,8 +1071,8 @@ class TestPanguGptOssSink(unittest.TestCase):
         kv_cache = (torch.randn(1, 4, 2), torch.randn(1, 4, 1))
         topk_indices = torch.zeros(4, 1, dtype=torch.int32)
         metadata = SimpleNamespace(
-            query_cumlens=torch.tensor([2]),
-            seq_lens=torch.tensor([2]),
+            query_cumlens=torch.tensor([2], dtype=torch.int32),
+            seq_lens=torch.tensor([2], dtype=torch.int32),
             block_table=torch.zeros(1, 1, dtype=torch.int32),
         )
         attn_metadata = SimpleNamespace(prefill=metadata, decode=None)
@@ -1122,6 +1299,8 @@ class TestPanguCLA(unittest.TestCase):
                 regular_fc2_output = hidden + 2
                 layer = SimpleNamespace(
                     prefix="model.layers.7.self_attn",
+                    # attn_metadata is keyed by the inner attention name.
+                    attn=SimpleNamespace(layer_name="model.layers.7.self_attn.attn"),
                     cla_swa_attn_name="model.cla_swa_layers.40.attn",
                     is_cla_reuse_layer=True,
                     is_cp_layer=False,
@@ -1144,7 +1323,13 @@ class TestPanguCLA(unittest.TestCase):
                 )
 
                 with patch("omni_npu.v1.layers.attention.npu_pangu.get_forward_context", return_value=context):
-                    output = npu_pangu_forward(hidden, torch.empty(0), torch.empty(0), "layer")
+                    output = npu_pangu_forward(
+                        hidden,
+                        torch.empty(0),
+                        torch.empty(0),
+                        "layer",
+                        "model.layers.7.self_attn.attn",
+                    )
 
                 if use_mome:
                     torch.testing.assert_close(output, regular_fc2_output)
@@ -1821,10 +2006,13 @@ class TestPanguFAMetadataIsolation(unittest.TestCase):
 
         attention = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
         attention.on_ascend950 = True
+        attention.use_gpt_oss_sink = True
+        attention.use_gpt_oss_sink_rescale = False
         attention.hf_config = SimpleNamespace()
         fake_ops = SimpleNamespace(
             _npu_fused_infer_attention_sink_metadata=object(),
             npu_ai_infra_attention_pioneer_metadata=object(),
+            npu_ai_infra_flash_attention_metadata=object(),
         )
         with patch.object(pangu_mod, "CrossLayerSharedOp", FakeSharedOp), \
                 patch.object(
@@ -1833,13 +2021,19 @@ class TestPanguFAMetadataIsolation(unittest.TestCase):
                 patch.object(
                     pangu_mod, "npu_ai_infra_attention_pioneer_metadata", None
                 ), \
+                patch.object(
+                    pangu_mod, "npu_ai_infra_flash_attention_metadata", None
+                ), \
                 patch.object(pangu_mod.torch.ops, "custom", fake_ops, create=True):
             attention._init_cross_layer_shared_ops()
 
-        self.assertEqual(len(created), 2)
+        self.assertEqual(len(created), 3)
         self.assertEqual(created[0]["callers"], _FA_CALLERS)
         self.assertEqual(created[1]["callers"], _FA_CALLERS)
         self.assertEqual(created[1]["shape"], (1024,))
+        self.assertEqual(created[2]["callers"], _FA_CALLERS)
+        self.assertIs(created[2]["op"], fake_ops.npu_ai_infra_flash_attention_metadata)
+        self.assertEqual(created[2]["shape"], (1024,))
 
     def test_kv_rmsnorm_rope_cache_kwargs_honor_rotary_mode(self):
         attention = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
@@ -2146,7 +2340,6 @@ def _bare_swa_attention(**attrs):
         use_gpt_oss_sink=False,
         param_sink_number=0,
         use_mome=False,
-        enable_mome_sp=False,
         use_mome_inplace_update=False,
         sharded_o_proj=False,
         is_cp_layer=False,
@@ -2251,7 +2444,7 @@ def _call_npu_pangu_forward_sp(attention, hidden):
     ctx = _prefill_sp_forward_ctx(attention)
     with patch.object(pangu_mod, "get_forward_context", return_value=ctx):
         return pangu_mod.npu_pangu_forward(
-            hidden, torch.zeros(4, 2), torch.zeros(4, 2), "layer"
+            hidden, torch.zeros(4, 2), torch.zeros(4, 2), "layer", "layer.attn"
         )
 
 
@@ -2372,7 +2565,7 @@ class TestPanguDSADecodeCustomOp(unittest.TestCase):
         )
 
         with patch.object(pangu_mod, "get_forward_context", return_value=context):
-            result = pangu_mod.npu_pangu_forward(hidden, cos, sin, "layer")
+            result = pangu_mod.npu_pangu_forward(hidden, cos, sin, "layer", "layer.attn")
 
         self.assertIs(result, hidden)
         self.assertTrue(torch.equal(result[:2], decoded))
@@ -2439,6 +2632,7 @@ class TestPanguSWASeqParallel(unittest.TestCase):
                     torch.zeros(4, 2),
                     torch.zeros(4, 2),
                     "layer",
+                    "layer.attn",
                 )
 
     def test_npu_pangu_forward_keeps_dsa_prefill(self):
@@ -2456,6 +2650,7 @@ class TestPanguSWASeqParallel(unittest.TestCase):
                 torch.zeros(4, 2),
                 torch.zeros(4, 2),
                 "layer",
+                "layer.attn",
             )
 
         attention._forward_prefill.assert_called_once()
@@ -2517,7 +2712,7 @@ class TestPanguSWASeqParallel(unittest.TestCase):
     def test_forward_prefill_sp_mome_inplace_and_prefetch(self):
         """MoME SP + sharded o_proj prefetch still returns local-token output."""
         attention = _bare_swa_attention(
-            use_mome=True, enable_mome_sp=True,
+            use_mome=True,
             use_mome_inplace_update=True, sharded_o_proj=True,
         )
         local = 3
@@ -2542,7 +2737,7 @@ class TestPanguSWASeqParallel(unittest.TestCase):
             pangu_mod.torch.npu, "stream", return_value=nullcontext()
         ):
             out = attention._forward_prefill_sp(
-                hidden, torch.zeros(6, 4), torch.zeros(6, 4), meta, object()
+                hidden, torch.zeros(6, 4), torch.zeros(6, 4), meta, SimpleNamespace(use_mome_sp=True)
             )
         self.assertEqual(tuple(out.shape), (local, 8))
         attention.o_proj.prefetch.assert_called_once()

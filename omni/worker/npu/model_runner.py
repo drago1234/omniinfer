@@ -9,6 +9,10 @@ never reaches it (pinned by test_mrv1_path_does_not_import_upstream_gpu_package)
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import torch
+
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
@@ -45,6 +49,41 @@ class NPUModelRunnerV2(GPUModelRunner):
         logger.info("[omni-npu/mrv2] building NPUModelRunnerV2")
         super().__init__(vllm_config, device)
 
+    def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+        """Load the model, then align its multimodal buffer with mHC output."""
+        super().load_model(load_dummy_weights, *args, **kwargs)
+        self._align_mhc_mm_embedding_width()
+
+    def _align_mhc_mm_embedding_width(self) -> None:
+        """Use the expanded mHC width for the V2 multimodal encoder buffer."""
+        hf_config = self.vllm_config.model_config.hf_config
+        if not (
+            getattr(hf_config, "use_mhc", False)
+            and hasattr(hf_config, "vision_config")
+        ):
+            return
+        num_streams = getattr(hf_config, "mhc_num_stream", 1)
+        if num_streams <= 1:
+            return
+
+        encoder_runner = getattr(
+            getattr(self, "model_state", None), "encoder_runner", None
+        )
+        inputs_embeds = getattr(encoder_runner, "inputs_embeds", None)
+        if inputs_embeds is None:
+            return
+        canonical_width = self.model_config.get_hidden_size()
+        expanded_width = canonical_width * num_streams
+        if inputs_embeds.shape[1] == expanded_width:
+            return
+        if inputs_embeds.shape[1] != canonical_width:
+            raise RuntimeError(
+                "[omni-npu/mrv2] cannot align multimodal embedding buffer: "
+                f"expected width {canonical_width} or {expanded_width}, "
+                f"got {inputs_embeds.shape[1]}"
+            )
+        encoder_runner.inputs_embeds = inputs_embeds.repeat(1, num_streams)
+
     def capture_model(self) -> int:
         """Guard the aicpu-tiling assumption around the upstream capture.
 
@@ -53,15 +92,39 @@ class NPUModelRunnerV2(GPUModelRunner):
         so this no longer wraps them -- MRv1 dropped its own mock.patch pair
         in the same change.
         """
-        from omni_npu.worker.npu.aclgraph_utils import (
-            assert_no_acl_tasks_registered,
-            ensure_graph_params,
-        )
+        from omni_npu.worker.npu.aclgraph_utils import ensure_graph_params
 
         ensure_graph_params(self.vllm_config.compilation_config)
-        captured = super().capture_model()
-        assert_no_acl_tasks_registered()
-        return captured
+        self._install_acl_task_refresh()
+        return super().capture_model()
+
+    def _install_acl_task_refresh(self) -> None:
+        """Pass runtime attention metadata to the outer graph manager."""
+        manager = self.cudagraph_manager
+        if manager is None or getattr(manager, "_omni_acl_refresh_installed", False):
+            return
+        original_prepare_attn = self.model_state.prepare_attn
+
+        def prepare_attn_and_track(*args, **kwargs):
+            metadata = original_prepare_attn(*args, **kwargs)
+            self._omni_runtime_attn_metadata = metadata
+            return metadata
+
+        self.model_state.prepare_attn = prepare_attn_and_track
+        self._omni_runtime_attn_metadata = None
+        manager._omni_acl_update_stream = torch.npu.Stream()
+
+        def acl_context_provider(desc):
+            return SimpleNamespace(
+                attn_metadata=self._omni_runtime_attn_metadata,
+                batch_descriptor=SimpleNamespace(
+                    num_tokens=desc.num_tokens,
+                    num_reqs=desc.num_reqs,
+                ),
+            )
+
+        manager._omni_acl_context_provider = acl_context_provider
+        manager._omni_acl_refresh_installed = True
 
     def prepare_inputs(self, scheduler_output, batch_desc):
         """Stash the step's cudagraph mode for prepare_attn.

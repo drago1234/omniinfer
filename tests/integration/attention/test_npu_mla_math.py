@@ -105,6 +105,7 @@ class DummyPrefillMeta:
     seq_lens: list[int]
     query_cumlens: list[int]
     max_query_len: int
+    num_tokens: int
     block_table: torch.Tensor | None = None
 
 
@@ -113,6 +114,7 @@ class DummyDecodeMeta:
     block_table: torch.Tensor
     seq_lens: list[int]
     query_cumlens: list[int]
+    num_tokens: int
 
 
 @dataclass
@@ -711,6 +713,7 @@ def test_npu_mla_prefill_matches_reference(
         seq_lens=[seq_len] * batch_size,
         query_cumlens=query_cumlens,
         max_query_len=seq_len,
+        num_tokens=query_cumlens[-1],
         block_table=block_table,
     )
     attn_metadata = DummyAttnMeta(
@@ -777,6 +780,7 @@ def test_npu_mla_decode_matches_reference(
         block_table=block_table,
         seq_lens=[seq_len] * batch_size,
         query_cumlens=list(range(1, batch_size + 1)),
+        num_tokens=batch_size,
     )
     attn_metadata = DummyAttnMeta(
         prefill=None,

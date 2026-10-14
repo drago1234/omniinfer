@@ -117,7 +117,6 @@ export VLLM_DP_MASTER_PORT=${MASTER_PORT}
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/lib64
 export HCCL_OP_RETRY_ENABLE=${HCCL_OP_RETRY_ENABLE:-"L0:0,L1:0,L2:0"}
 export HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT:-32000}
-export OMNI_VLLM_PATCHES_DIR=${OMNI_VLLM_PATCHES_DIR:-"low_latency"}
 export VLLM_PLUGINS=${VLLM_PLUGINS:-"omni-npu,omni_npu_patches,omni_custom_models"}
 npu=${npu:-16}
 export NUM_DIE_PER_MACH=${npu}

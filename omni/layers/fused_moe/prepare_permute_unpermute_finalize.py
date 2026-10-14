@@ -44,6 +44,13 @@ def _uses_mxfp_activation(moe_quant_config) -> bool:
     )
 
 
+def _uses_hifloat_activation(moe_quant_config) -> bool:
+    return bool(
+        moe_quant_config
+        and getattr(moe_quant_config, "use_hifloat8_w8a8", False)
+    )
+
+
 @dataclass(kw_only=True)
 class PreparePermuteResult:
     hidden_states_sorted_by_experts: torch.Tensor
@@ -162,11 +169,12 @@ class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
         max_num_deployed_expert = layer.routed_experts.w13_weight.shape[0] * self.ep_size
         moe_quant_config = getattr(layer.routed_experts.quant_method, "moe_quant_config", None)
         use_mxfp8 = _uses_mxfp_activation(moe_quant_config)
+        use_hifloat8 = _uses_hifloat_activation(moe_quant_config)
         # MXFP: route bf16 (the in-routing MX scale path of
         # npu_moe_init_routing_v2 is buggy on current torch_npu) and quantize
         # the expanded output to FP8 after re-routing.
         quant_mode = 1 if layer.routed_experts.quant_config is not None else -1
-        if use_mxfp8:
+        if use_mxfp8 or use_hifloat8:
             quant_mode = -1
 
         expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
@@ -182,7 +190,7 @@ class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
             row_idx_type=0,
             quant_mode=quant_mode,
         )
-        if use_mxfp8:
+        if use_mxfp8 or use_hifloat8:
             pertoken_scale = None
 
         tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
@@ -198,7 +206,7 @@ class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
             gathered_tokens, expanded_x, output_splits, input_splits, group=get_ep_group().device_group
         )
 
-        if layer.routed_experts.quant_config is None or use_mxfp8:
+        if layer.routed_experts.quant_config is None or use_mxfp8 or use_hifloat8:
             gathered_pertoken_scale = None
         else:
             gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0])
@@ -214,7 +222,14 @@ class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
             )
         )
 
-        if use_mxfp8:
+        if use_hifloat8:
+            hidden_states_sorted_by_experts = torch_npu.npu_dtype_cast(
+                hidden_states_sorted_by_experts,
+                torch_npu.hifloat8,
+            )
+            hidden_states_sorted_by_experts = hidden_states_sorted_by_experts.view(dtype=torch.int8)
+            gathered_pertoken_scale = None
+        elif use_mxfp8:
             hidden_states_sorted_by_experts, gathered_pertoken_scale = torch_npu.npu_dynamic_mx_quant(
                 hidden_states_sorted_by_experts, dst_type=torch.float8_e4m3fn, scale_alg=1
             )
@@ -329,7 +344,8 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                 row_idx_type = 1
             moe_quant_config = getattr(layer.routed_experts.quant_method, "moe_quant_config", None)
             use_mxfp = _uses_mxfp_activation(moe_quant_config)
-            if moe_quant_config and getattr(moe_quant_config, "use_hifloat8_w8a8", False):
+            use_hifloat8 = _uses_hifloat_activation(moe_quant_config)
+            if use_hifloat8:
                 x_hif8 = torch_npu.npu_dtype_cast(x, torch_npu.hifloat8)
                 x_quant = x_hif8.view(dtype=torch.int8)
                 x_scale = None
@@ -357,16 +373,21 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                     ready_to_dispatch_event.wait(self.side_stream)
                     if use_mxfp:
                         x_dict = {"x_mxfp8": x_quant_local, "pertoken_scale": x_scale_local}
+                    elif use_hifloat8:
+                        x_dict = {"x_hif8": x_quant_local}
                     else:
-                        x_dict = {"x_int8": x_int8, "pertoken_scale": x_scale}
+                        x_dict = {"x_int8": x_quant_local, "pertoken_scale": x_scale_local}
                     shared_output = layer._shared_experts._layer(x_dict)
                     shared_expert_finished_event.record()
             if self.enable_round_pipeline_comm:
-                assert (
-                    options is not None and
-                    options.round_pipeline_streams is not None and
-                    options.topk_weights is not None
-                ), "topk_weights must be provided in options when enable_round_pipeline_comm is True."
+                if (
+                    options is None
+                    or options.round_pipeline_streams is None
+                    or options.topk_weights is None
+                ):
+                    raise ValueError(
+                        "round_pipeline_comm requires round_pipeline_streams and topk_weights."
+                    )
                 
                 with torch.npu.stream(options.round_pipeline_streams[self.num_nodes - 1]):
                     topk_weights = options.topk_weights
@@ -434,7 +455,7 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                                 "pertoken_scale": x_scale_local,
                             }
                         )
-                    elif moe_quant_config and getattr(moe_quant_config, "use_hifloat8_w8a8", False):
+                    elif use_hifloat8:
                         shared_expert_gate_up = layer._shared_experts._layer.gate_up_proj({"x_hif8": x_quant_local})
                     else:
                         raise NotImplementedError(
@@ -461,7 +482,7 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                 row_idx_type=row_idx_type,
             )
         moe_quant_config = getattr(layer.routed_experts.quant_method, "moe_quant_config", None)
-        if moe_quant_config is not None and getattr(moe_quant_config, "use_hifloat8_w8a8", False):
+        if _uses_hifloat_activation(moe_quant_config):
             # init routing output dirty dynamic_scale even its input scale=None
             dynamic_scale = None
         return AGRSPreparePermuteResult(
@@ -714,12 +735,29 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
         topk_ids: torch.Tensor,
         options: Optional[PreparePermuteOptions] = None,
     ) -> DispatchCombinePreparePermuteResult:
-        quant_mode = 2 if layer.routed_experts.quant_config is not None else 0
-        moe_quant_config = getattr(layer.routed_experts.quant_method, "moe_quant_config", None)
+        quant_method = getattr(layer.routed_experts, "quant_method", None)
+        moe_quant_config = getattr(quant_method, "moe_quant_config", None)
         use_mxfp8 = _uses_mxfp_activation(moe_quant_config)
-
-        if use_mxfp8:
+        use_hifloat8 = _uses_hifloat_activation(moe_quant_config)
+        quant_config = getattr(quant_method, "quant_config", None)
+        enable_mxfp8_comm_quant = bool(
+            quant_config
+            and getattr(quant_config, "enable_mxfp8_comm_quant", False)
+        )
+        dispatch_quant_kwargs = {}
+        if use_mxfp8 and enable_mxfp8_comm_quant:
+            if not on_ascend950():
+                raise RuntimeError(
+                    "MXFP8 communication quantization requires Ascend 950"
+                )
+            quant_mode = 4
+            # quant_mode=4 selects MX dynamic quantization. Explicitly set the
+            # payload dtype; otherwise torch_npu allocates expand_x as INT8.
+            dispatch_quant_kwargs["y_dtype"] = torch.float8_e4m3fn
+        elif use_mxfp8 or use_hifloat8:
             quant_mode = 0
+        else:
+            quant_mode = 2 if layer.routed_experts.quant_config is not None else 0
 
         output = torch_npu.npu_moe_distribute_dispatch_v2(
             x=x,
@@ -734,13 +772,15 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
             ep_world_size=self.ep_size,
             ep_rank_id=self.ep_rank,
             x_active_mask=self._get_mc2_mask(topk_ids.shape[0]),
+            **dispatch_quant_kwargs,
         )
 
         expand_x, dynamic_scale, expand_idx, expert_token_nums, ep_recv_counts, tp_recv_counts = output[0:6]
-
-        # leaves activations unquantized for MXFP8; apply_experts
-        # will quantize when scale is None
-        if use_mxfp8:
+        if use_hifloat8:
+            expand_x = torch_npu.npu_dtype_cast(expand_x, torch_npu.hifloat8)
+            expand_x = expand_x.view(dtype=torch.int8)
+            dynamic_scale = None
+        elif use_mxfp8 and not enable_mxfp8_comm_quant:
             dynamic_scale = None
 
         return DispatchCombinePreparePermuteResult(

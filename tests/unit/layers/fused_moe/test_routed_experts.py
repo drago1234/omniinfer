@@ -310,7 +310,7 @@ def _make_experts(module, *, enable_eplb=False, tp_rank=0):
         moe_parallel_config=SimpleNamespace(enable_eplb=enable_eplb),
     )
     experts.local_num_experts = 2
-    experts.quant_method = SimpleNamespace(planner=MagicMock(), moe_layer_idx=0)
+    experts.quant_method = SimpleNamespace(moe_layer_idx=0)
     experts.moe_layer_idx = 0
 
     def _identity_expert_id(eid):
@@ -500,15 +500,15 @@ def test_weight_loader_skips_non_local_expert(layer_module):
 
 
 @pytest.mark.unit
-def test_weight_loader_eplb_remaps_expert_id(layer_module):
-    """Under eplb, a non-local expert short-circuits before scale loading."""
+def test_weight_loader_skips_expert_not_on_this_rank(layer_module):
+    """A non-local expert (expert map gives -1) short-circuits before scale loading."""
     module = layer_module
-    experts, load_calls = _make_experts(module, enable_eplb=True)
+    experts, load_calls = _make_experts(module)
 
-    def _expert_not_on_rank(*_a, **_kw):
-        return (False, 0)
+    def _expert_not_local(_expert_id):
+        return -1
 
-    experts.quant_method.planner.is_expert_on_current_rank = _expert_not_on_rank
+    experts._map_global_expert_id_to_local_expert_id = _expert_not_local
     param = _channel_param(2, 1, 4)
     assert _load_aux_weight(
         experts,
@@ -590,7 +590,8 @@ def test_npu_moe_forward_and_shared_dispatch(layer_module, monkeypatch):
     out = module.npu_moe_forward(hidden, logits, "moe.0")
     assert torch.equal(out, torch.full((2, 4), 7.0))
     assert applied.call_args.kwargs["layer"] is layer
-    assert applied.call_args.kwargs["enable_eplb"] is False
+    assert applied.call_args.kwargs["hidden_states"] is hidden
+    assert applied.call_args.kwargs["router_logits"] is logits
 
     layer.shared_experts = object()
     shared_out = module.npu_moe_forward_shared(hidden, logits, "moe.0")
@@ -635,19 +636,15 @@ def test_runner_maybe_init_modular_kernel_is_noop(layer_module):
 
 
 @pytest.mark.unit
-def test_weight_loader_eplb_remaps_local_expert(layer_module):
-    """When eplb reports the expert is local, the loader remaps and loads the scale."""
+def test_weight_loader_loads_local_expert(layer_module):
+    """A local expert is addressed through the expert map and its scale is loaded."""
     module = layer_module
-    experts, load_calls = _make_experts(module, enable_eplb=True)
+    experts, load_calls = _make_experts(module)
 
-    def _expert_on_current_rank(*_a, **_k):
-        return (True, 1)
+    def _expert_local(_expert_id):
+        return 1
 
-    def _identity_expert_id(eid):
-        return eid
-
-    experts.quant_method.planner.is_expert_on_current_rank = _expert_on_current_rank
-    experts._map_global_expert_id_to_local_expert_id = _identity_expert_id
+    experts._map_global_expert_id_to_local_expert_id = _expert_local
     param = _channel_param(4, 1, 4)
     result = _load_aux_weight(
         experts,

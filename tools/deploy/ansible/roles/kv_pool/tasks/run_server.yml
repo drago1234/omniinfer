@@ -33,13 +33,13 @@
         fail_msg: The Prefill KV pool profile must be a mapping.
 
     - name: Install the KV pool module before starting Prefill.
-      ansible.builtin.include_tasks: "{{ kv_pool_repo_root }}/kv_pool/deploy/install_kv_pool.yml"
+      ansible.builtin.include_tasks: "{{ kv_pool_repo_root }}/Pangu-FusionPool/kv_pool/deploy/install_kv_pool.yml"
       vars:
         kv_pool_install_container: "{{ ACTUAL_DOCKER_NAME_P }}"
 
     - name: Render the KV pool runtime fragment.
       ansible.builtin.template:
-        src: "{{ kv_pool_repo_root }}/kv_pool/deploy/_kv_pool_runtime.sh.j2"
+        src: "{{ kv_pool_repo_root }}/Pangu-FusionPool/kv_pool/deploy/_kv_pool_runtime.sh.j2"
         dest: "$SCRIPTS_PATH/kv_pool_runtime.sh"
         mode: '0750'
 
@@ -77,13 +77,13 @@
 
     - name: Install the KV pool module into the Decode container.
       ansible.builtin.include_tasks:
-        file: "{{ kv_pool_repo_root }}/kv_pool/deploy/install_kv_pool.yml"
+        file: "{{ kv_pool_repo_root }}/Pangu-FusionPool/kv_pool/deploy/install_kv_pool.yml"
       vars:
         kv_pool_install_container: "{{ ACTUAL_DOCKER_NAME_D }}"
 
     - name: Render the KV pool runtime fragment for Decode.
       ansible.builtin.template:
-        src: "{{ kv_pool_repo_root }}/kv_pool/deploy/_kv_pool_runtime.sh.j2"
+        src: "{{ kv_pool_repo_root }}/Pangu-FusionPool/kv_pool/deploy/_kv_pool_runtime.sh.j2"
         dest: "$SCRIPTS_PATH/kv_pool_runtime.sh"
         mode: '0750'
 

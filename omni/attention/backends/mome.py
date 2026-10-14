@@ -114,7 +114,9 @@ class NPUMomeAttentionMetadata:
     block_idx_first_scheduled_token: torch.Tensor | None = None  # shape: [batch,]
     block_idx_last_scheduled_token: torch.Tensor | None = None  # shape: [batch,]
 
-    conv_sp_meta = None
+    # Per-step decision owned by the builder, shared by all model paths.
+    use_mome_sp: bool = False
+    conv_sp_meta: tuple | None = None
 
 
 class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
@@ -621,11 +623,10 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 block_idx_last_scheduled_token=block_idx_last_scheduled_token[:num_decodes] if apc_enabled else None,
             )
 
-        if (
-            num_prefills > 0
-            and num_decodes == 0
-            and model_extra_config.operator_opt_config.enable_mome_sp
-        ):
+        attn_metadata.use_mome_sp = self._should_build_mome_sp(
+            num_prefills, num_decodes, num_actual_tokens
+        )
+        if attn_metadata.use_mome_sp:
             attn_metadata.conv_sp_meta = self._build_for_sp(
                 seq_cumlens=common_attn_metadata.query_start_loc_cpu,
                 num_computed=common_attn_metadata.num_computed_tokens_cpu,
@@ -635,6 +636,18 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
 
         return attn_metadata
+
+    @staticmethod
+    def _should_build_mome_sp(num_prefills: int, num_decodes: int, num_actual_tokens: int) -> bool:
+        # Use unpadded query tokens shared by all TP ranks, not prompt/context
+        # length or the local shard size. Mixed/decode batches keep their path.
+        config = model_extra_config.operator_opt_config
+        return (
+            config.enable_mome_sp
+            and num_prefills > 0
+            and num_decodes == 0
+            and num_actual_tokens >= config.mome_sp_token_threshold
+        )
 
     def build_for_drafting(
         self,

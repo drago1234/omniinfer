@@ -696,6 +696,7 @@ def _mock_mla_attention(
             **kwargs,
         ):
             super().__init__()
+            self.layer_name = prefix
             impl = SimpleNamespace()
             self.W_UK_T = torch.zeros(
                 num_heads,
@@ -740,7 +741,9 @@ def _mock_mla_attention(
             self.sink_populated = True
 
     with (
-        patch(f"{DSA_MODULE}.NPUMLAAttention", MockMLAAttention),
+        # A sink-less DSA layer builds NPUDSAAttention so its page covers the
+        # indexer key.
+        patch(f"{DSA_MODULE}.NPUDSAAttention", MockMLAAttention),
         patch(
             "vllm.model_executor.layers.attention.static_sink_attention."
             "StaticSinkMLAAttention",
@@ -2168,7 +2171,7 @@ def test_npu_dsa_forward_fake_returns_matching_hidden_and_topk_shapes():
     hidden = torch.zeros(3, 16)
     topk = torch.zeros(3, 1, 8, dtype=torch.int32)
     out, out_topk = npu_dsa_forward_fake(
-        hidden, torch.zeros(3, 1, 64), torch.zeros(3, 1, 64), "layer", topk
+        hidden, torch.zeros(3, 1, 64), torch.zeros(3, 1, 64), "layer", topk, "layer.attn"
     )
     assert out.shape == hidden.shape
     assert out.dtype == hidden.dtype
@@ -2209,6 +2212,339 @@ def test_prefill_cp_allows_omnicache_before_building_cp_metadata():
     sp_manager.cp_attn_meta.assert_called_once()
 
 
+def _cp_helper_host(use_mome=False, partition=False):
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    calls = []
+    host = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    host.use_mome = use_mome
+    host.q_a_proj = lambda x: (calls.append("q_a_proj") or x,)
+    host._maybe_mome_q = lambda q, args: calls.append(("mome_q", args)) or q
+    host.q_a_layernorm = lambda q: calls.append("q_a_layernorm") or q
+    host.o_proj = SimpleNamespace(requires_input_partition=lambda: partition)
+    host._apply_o_proj = lambda out: calls.append("o_proj") or out
+    sp = SimpleNamespace(**{
+        name: (lambda name: lambda t: calls.append(name) or t)(name)
+        for name in ("ag_tokens", "cp_slice", "sp_to_cp", "sp_to_tp", "cp_to_sp")
+    })
+    return host, sp, calls
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("use_mome, mome_sp", ((False, False), (True, False), (True, True)))
+def test_cp_q_lora_moves_the_down_projection_to_the_cp_layout(use_mome, mome_sp):
+    host, sp, calls = _cp_helper_host(use_mome=use_mome)
+    host._apply_mome_prefill_sp = MagicMock(return_value=mome_sp)
+    x = torch.zeros(3, 4)
+    assert host._cp_q_lora(x, sp, "mome args") is x
+    middle = ["ag_tokens", ("mome_q", "mome args"), "cp_slice"] if use_mome and not mome_sp else ["sp_to_cp"]
+    assert calls == ["q_a_proj", *middle, "q_a_layernorm"]
+    if use_mome:
+        host._apply_mome_prefill_sp.assert_called_once_with(x, 0, inplace=True)
+    else:
+        host._apply_mome_prefill_sp.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("partition", (False, True))
+def test_cp_o_proj_returns_this_ranks_sp_tokens(partition):
+    host, sp, calls = _cp_helper_host(partition=partition)
+    x = torch.zeros(4, 6)
+    assert host._cp_o_proj(x, sp) is x
+    assert calls == [*(["sp_to_tp"] if partition else []), "o_proj", "cp_to_sp"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("with_topk", (False, True))
+def test_cp_mome_sp_output_keeps_the_topk_return_contract(with_topk):
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    x = torch.zeros(2, 4)
+    cp_out, sp_out = torch.ones(2, 6), torch.full((2, 4), 2.0)
+    topk = torch.tensor([[[7]], [[9]]], dtype=torch.int32) if with_topk else None
+    sp = SimpleNamespace(slice_tokens=lambda t, cached: t, ag_tokens=lambda t: t)
+    host = SimpleNamespace(
+        q_b_proj=SimpleNamespace(tp_size=1), kv_b_proj=SimpleNamespace(tp_size=1),
+        ena_sp=True, ena_kvsp=False, noncontiguous_kv=True, use_mome=True,
+        skip_topk=True, sharded_o_proj=False, kv_lora_rank=2,
+        _cp_attention_metadata=lambda manager: (None, None, None),
+        _cp_rotary_rows=lambda manager, cos, sin: (cos, sin),
+        _cp_q_lora=lambda x, manager, args: x,
+        _q_absorb=lambda q, cos, sin: (q, q),
+        kv_a_proj_with_mqa=lambda x: (x,),
+        _apply_mome_prefill_sp=MagicMock(return_value=True),
+        _kv_norm_rope_cache=MagicMock(),
+        _apply_sink_offset=lambda indices: indices,
+        _apply_attn_absorb=MagicMock(return_value=cp_out),
+        _post_attn_absorb=lambda out: out,
+        _apply_mome_out_prefill_sp=MagicMock(return_value=sp_out),
+    )
+    with patch.object(torch.npu, "current_stream", return_value="main"), \
+         patch(DSA_MODULE + ".named_stream", return_value="side"), \
+         patch(DSA_MODULE + ".DummySPManager", return_value=sp):
+        output, next_topk = NPUDeepseekSparseAttention._forward_prefill_cp(
+            host, x, x, x, SimpleNamespace(sp_manager=sp), (None, None), topk,
+        )
+    assert output is sp_out and next_topk is topk
+    host._apply_attn_absorb.assert_called_once()
+    assert host._apply_attn_absorb.call_args.args[4] is topk
+    host._apply_mome_out_prefill_sp.assert_called_once_with(cp_out, sp)
+
+
 # Allow running directly
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def _absorb_host(use_sink, rescale):
+    """A sparse attention stripped down to what _apply_attn_absorb reads."""
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    host = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    host.noncontiguous_kv = True
+    host.param_sink_number = 0
+    host.kv_lora_rank = 4
+    host.scaling = 0.5
+    host.use_gpt_oss_sink = use_sink
+    host.use_gpt_oss_sink_rescale = rescale
+    host.gpt_oss_sink = torch.zeros(2)
+    host.num_local_heads = 2
+    return host
+
+
+def _absorb_args():
+    return dict(
+        q_nope=torch.zeros(3, 2, 4), q_pe=torch.zeros(3, 2, 2),
+        q_cumlens=torch.tensor([3], **cfg_i32), kv_lens=torch.tensor([8], **cfg_i32),
+        topk_idx=torch.zeros(3, 1, 8, **cfg_i32),
+        block_table=torch.zeros(1, 4, **cfg_i32),
+        kv_cache=(torch.zeros(1, 8, 6),),
+        attn_metadata=SimpleNamespace(),
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("batch_invariant", (False, True))
+def test_sinkless_sparse_attention_hands_the_sink_to_the_kernel(batch_invariant):
+    """Without rescale the sparse kernel takes the sink logit itself."""
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    plain = MagicMock(return_value=(torch.ones(3, 2, 4),))
+    with patch.object(dsa_mod.model_extra_config.operator_opt_config, "use_batch_invariant_op", batch_invariant), \
+         patch.object(torch.ops.custom, "npu_ai_infra_sparse_flash_attention", plain, create=True):
+        NPUDeepseekSparseAttention._apply_attn_absorb(
+            _absorb_host(True, False), **_absorb_args()
+        )
+    assert torch.equal(plain.call_args.kwargs["sinks"], torch.zeros(2))
+    assert plain.call_args.kwargs["batch_invariant"] is batch_invariant
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("batch_invariant", (False, True))
+def test_sinkless_sparse_attention_rebuilds_the_sink_from_the_lse(batch_invariant):
+    """With rescale the pioneer kernel returns softmax max/sum instead."""
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    pioneer = MagicMock(
+        return_value=(torch.ones(3, 2, 4), torch.zeros(1, 3, 2), torch.ones(1, 3, 2))
+    )
+    host = _absorb_host(True, True)
+    rescaled = []
+    host._rescale_gpt_oss_sink_output = lambda out, lse, sink, layout: rescaled.append(layout) or out
+    with patch.object(dsa_mod.model_extra_config.operator_opt_config, "use_batch_invariant_op", batch_invariant), patch.object(
+        torch.ops.custom, "npu_ai_infra_sparse_flash_attention_pioneer", pioneer, create=True
+    ):
+        NPUDeepseekSparseAttention._apply_attn_absorb(host, **_absorb_args())
+    assert pioneer.call_args.kwargs["return_softmax_lse"] is True
+    assert "sinks" not in pioneer.call_args.kwargs  # this kernel has none
+    assert rescaled == ["TND"]
+    assert pioneer.call_args.kwargs["batch_invariant"] is batch_invariant
+
+
+@pytest.mark.unit
+def test_npu_dsa_attention_takes_the_dsa_page_and_the_npu_absorb_weights():
+    """Swapping the bases would silently drop one of the two.
+
+    The patch machinery can hand out more than one NPUMLAAttention object, so
+    compare where each method resolves from rather than the objects themselves.
+    """
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDSAAttention
+
+    mro = [c.__name__ for c in NPUDSAAttention.__mro__]
+    assert mro.index("NPUMLAAttention") < mro.index("DSAAttention")
+    assert NPUDSAAttention.process_weights_after_loading.__qualname__ == (
+        "NPUMLAAttention.process_weights_after_loading"
+    )
+    assert NPUDSAAttention.get_kv_cache_spec.__qualname__ == "DSAAttention.get_kv_cache_spec"
+    assert NPUDSAAttention.get_attn_backend.__qualname__ == "DSAAttention.get_attn_backend"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rescale", (False, True))
+def test_enhance_fallback_refuses_a_sink_in_either_mode(rescale):
+    """npu_sparse_flash_attention_enhance takes no sink, so say so loudly."""
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    host = _absorb_host(True, rescale)
+    host.noncontiguous_kv = False  # the fallback path
+    with pytest.raises(NotImplementedError, match="takes no sink logit"):
+        NPUDeepseekSparseAttention._apply_attn_absorb(host, **_absorb_args())
+
+
+@pytest.mark.unit
+def test_unpacked_local_cache_writes_its_two_parts_separately():
+    """A CLA layer's local cache keeps nope and RoPE apart while the model's are packed."""
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    host = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    host.qk_rope_head_dim, host.kv_lora_rank = 2, 4
+    host.noncontiguous_kv = True
+    host.on_ascend950 = False
+    host.rope_interleaved = False
+    host.kv_a_layernorm = lambda x: x
+    host._apply_rope = lambda x, _c, _s: x
+    slots = SimpleNamespace(
+        slot_mapping=torch.zeros(3, **cfg_i32), slot_mapping_2d=torch.zeros(3, 2, **cfg_i32)
+    )
+    kv_cache = (torch.zeros(1, 8, 4), torch.zeros(1, 8, 2))
+    update = MagicMock()
+    opt = SimpleNamespace(enable_kv_rmsnorm_rope_cache=False)
+    with patch.object(dsa_mod, "model_extra_config", SimpleNamespace(operator_opt_config=opt)), \
+         patch.object(torch.ops.custom, "npu_ai_infra_scatter_block_update_", update, create=True):
+        host._kv_norm_rope_cache(
+            torch.zeros(3, 6), torch.zeros(3, 2), torch.zeros(3, 2), slots, kv_cache,
+            packed_kv=False,
+        )
+    assert update.call_count == 2  # one call per part, not one concatenated write
+    assert update.call_args_list[0].args[0] is kv_cache[0]
+    assert update.call_args_list[1].args[0] is kv_cache[1]
+
+
+@pytest.mark.unit
+def test_dsa_absorb_helpers_take_an_injected_weight():
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    host = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    host.attn = SimpleNamespace(W_UK_T=torch.zeros(256, 256), W_UV=torch.zeros(1))
+    host.num_local_heads, host.kv_lora_rank, host.v_head_dim = 2, 3, 4
+    seen = {}
+
+    def record_kw(**kwargs):
+        seen["w_uk_t"] = kwargs["weight"]
+        return torch.zeros(1, 2, 3)
+
+    with patch.object(dsa_mod.torch_npu, "npu_transpose_batchmatmul", record_kw):
+        host._q_nope_absorb(torch.zeros(1, 2, 3), w_uk_t=torch.ones(128, 128))
+    assert seen["w_uk_t"].shape == (128, 128)  # the injected one, not impl's
+
+    def record_pos(**kwargs):
+        seen["w_uv"] = kwargs["weight"]
+        return torch.zeros(1, 2, 4)
+
+    with patch.object(dsa_mod.torch_npu, "npu_transpose_batchmatmul", record_pos):
+        host._post_attn_absorb(torch.zeros(1, 2, 3), w_uv=torch.ones(1))
+    assert torch.equal(seen["w_uv"], torch.ones(1))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "model_type, sink_len, expect_rms",
+    (
+        ("openpangu_v3", 0, True),
+        ("openpangu_v2", 128, True),
+        ("pangu_ultra_moe", 0, True),  # the name does not start with openpangu
+        ("deepseek_v3", 128, False),  # the family decides, not the sink count
+    ),
+)
+def test_indexer_key_norm_follows_the_model_family(model_type, sink_len, expect_rms):
+    """param_sink_number stood in for "is Pangu" until V3 set it to zero."""
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import Indexer
+
+    config = SimpleNamespace(
+        model_type=model_type, index_topk=2048, index_n_heads=4, index_head_dim=128,
+        qk_rope_head_dim=64, rms_norm_eps=1e-5,
+    )
+    opt = SimpleNamespace(enable_precision_strong_consistency=False)
+    rms, layer = MagicMock(), MagicMock()
+    with patch.object(dsa_mod, "model_extra_config", SimpleNamespace(operator_opt_config=opt)), \
+         patch.object(dsa_mod, "ReplicatedFlashCommLinear", MagicMock()), \
+         patch.object(dsa_mod, "RMSNorm", rms), patch.object(dsa_mod, "LayerNorm", layer), \
+         patch.object(dsa_mod, "on_ascend950", lambda: False), \
+         patch.object(Indexer, "_build_index_cache", MagicMock(), create=True):
+        try:
+            Indexer(None, config, 1536, 384, None, None, sink_len, "p")
+        except Exception:
+            pass  # the rest of __init__ needs a real vllm config; the norm choice is made first
+    assert rms.called is expect_rms
+    assert layer.called is (not expect_rms)
+
+
+@pytest.mark.unit
+def test_sinkless_sparse_attention_leaves_the_sink_out_entirely():
+    """A model without sinks calls the same op with no sinks argument."""
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    host = _absorb_host(False, False)
+    op = MagicMock(return_value=(torch.zeros(3, 2, 4),))
+    with patch.object(torch.ops.custom, "npu_ai_infra_sparse_flash_attention", op, create=True):
+        NPUDeepseekSparseAttention._apply_attn_absorb(host, **_absorb_args())
+
+    assert "sinks" not in op.call_args.kwargs
+    assert "return_softmax_lse" not in op.call_args.kwargs
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dummy", (False, True))
+def test_cp_page_gather_keeps_both_gathers_on_the_cache_stream(dummy):
+    from contextlib import nullcontext
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    cache = None if dummy else ("latent", "rope", "indexer")
+    calls = []
+    manager = SimpleNamespace(ag_pages=lambda c, seperate: (lambda: calls.append(c) or c,))
+    sub_stream = MagicMock()
+    with patch.object(torch.npu, "stream", side_effect=lambda stream: nullcontext()) as stream:
+        out = NPUDeepseekSparseAttention._cp_gather_cache_pages(manager, cache, "main", sub_stream)
+    expected = (None, None) if dummy else ("latent", "rope")
+    assert out == expected and calls == list(expected)
+    sub_stream.wait_stream.assert_called_once_with("main")
+    stream.assert_called_once_with(sub_stream)
+
+
+@pytest.mark.unit
+def test_cp_attention_metadata_uses_one_layout_for_lengths_pages_and_rope():
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    manager = SimpleNamespace(cp_attn_meta=lambda: ("q", "kv", "packed", "pages"),
+                              cp_slice=MagicMock(side_effect=lambda t, cached: (t, cached)))
+    assert NPUDeepseekSparseAttention._cp_attention_metadata(manager) == ("q", "kv", "pages")
+    assert not manager.cp_slice.called  # metadata must not move rotary work earlier
+    assert NPUDeepseekSparseAttention._cp_rotary_rows(manager, "cos rows", "sin rows") == (
+        ("cos rows", "cos"), ("sin rows", "sin"))
+
+
+@pytest.mark.unit
+def test_dsa_cp_prepares_sp_rotary_rows_before_cp_rotary_rows():
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    calls = []
+    host = SimpleNamespace(
+        q_b_proj=SimpleNamespace(tp_size=1), kv_b_proj=SimpleNamespace(tp_size=1),
+        ena_sp=True, ena_kvsp=False, noncontiguous_kv=True,
+        _cp_attention_metadata=lambda sp: calls.append("metadata") or (None, None, None),
+        _cp_rotary_rows=lambda sp, cos, sin: calls.append("cp rotary") or (cos, sin),
+        _cp_q_lora=MagicMock(side_effect=RuntimeError("stop before projection")),
+    )
+    manager = SimpleNamespace(slice_tokens=lambda x, cached: calls.append("sp " + cached) or x)
+    meta = SimpleNamespace(sp_manager=manager)
+    with patch.object(torch.npu, "current_stream", return_value="main"), \
+         patch(DSA_MODULE + ".named_stream", return_value="side"), \
+         patch(DSA_MODULE + ".DummySPManager", return_value=manager):
+        with pytest.raises(RuntimeError, match="stop before projection"):
+            NPUDeepseekSparseAttention._forward_prefill_cp(host, None, "cos", "sin", meta, (None, None))
+    assert calls == ["metadata", "sp cos", "sp sin", "cp rotary"]

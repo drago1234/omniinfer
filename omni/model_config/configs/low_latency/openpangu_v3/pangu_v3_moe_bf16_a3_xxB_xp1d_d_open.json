@@ -16,6 +16,6 @@
         "num_extra_reserved_blocks": 0,
         "disable_npu_top_k_top_p_sample": false,
         "optimize_first_chunk": true,
-        "use_gpt_oss_sink_rescale": true
+        "use_gpt_oss_sink_rescale": false
     }
 }

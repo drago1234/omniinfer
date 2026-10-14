@@ -47,10 +47,10 @@
           -exec rm -rf -- '{}' + &&
           docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/.'
           "${DOCKER_NAME_P}:{{ container_workspace }}/omniinfer/" &&
-          if [ -d '{{ ansible_env.CODE_PATH }}/Pangu-FusionComm' ]; then
+          if [ -d '{{ ansible_env.CODE_PATH }}/Pangu-Fusion' ]; then
           docker exec "$DOCKER_NAME_P" rm -rf
-          '{{ container_workspace }}/omniinfer/components/Pangu-FusionComm' &&
-          docker cp '{{ ansible_env.CODE_PATH }}/Pangu-FusionComm'
+          '{{ container_workspace }}/omniinfer/components/Pangu-Fusion' &&
+          docker cp '{{ ansible_env.CODE_PATH }}/Pangu-Fusion'
           "${DOCKER_NAME_P}:{{ container_workspace }}/omniinfer/components/";
           fi
         decode: >-
@@ -62,17 +62,33 @@
           -exec rm -rf -- '{}' + &&
           docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/.'
           "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/" &&
-          if [ -d '{{ ansible_env.CODE_PATH }}/Pangu-FusionComm' ]; then
+          if [ -d '{{ ansible_env.CODE_PATH }}/Pangu-Fusion' ]; then
           docker exec "$DOCKER_NAME_D" rm -rf
-          '{{ container_workspace }}/omniinfer/components/Pangu-FusionComm' &&
-          docker cp '{{ ansible_env.CODE_PATH }}/Pangu-FusionComm'
+          '{{ container_workspace }}/omniinfer/components/Pangu-Fusion' &&
+          docker cp '{{ ansible_env.CODE_PATH }}/Pangu-Fusion'
           "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/components/";
           fi
+        proxy: >-
+          if [ -d '{{ ansible_env.CODE_PATH }}/Pangu-FusionComm' ]; then
+          docker exec "$DOCKER_NAME_C" mkdir -p
+          '{{ container_workspace }}/omniinfer/components' &&
+          docker exec "$DOCKER_NAME_C" rm -rf
+          '{{ container_workspace }}/omniinfer/components/omni-proxy' &&
+          docker cp '{{ ansible_env.CODE_PATH }}/omni-proxy'
+          "${DOCKER_NAME_C}:{{ container_workspace }}/omniinfer/components/";
+          fi
+
+    pip_install_profile:
+      proxy: >-
+        docker exec -w
+        '{{ container_workspace }}/omniinfer/components/omni-proxy/omni_proxy'
+        "$DOCKER_NAME_C" bash build.sh --skip-extras                 
 
     run_server_prefill_profile:
       kv_pool:
         global_segment_size_gb: 64
       prepare_commands: |-
+        export OMNI_WORKER_CPUSET_MAP=auto
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_ALL | replace(' ', '') | trim | quote }}
         export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=36000
         export VLLM_DISABLE_PYNCCL=1

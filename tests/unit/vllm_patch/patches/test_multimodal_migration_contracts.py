@@ -460,7 +460,8 @@ def _eagle_dummy_contract():
         dict(torch=torch, CUDAGraphMode=SimpleNamespace(NONE=0),
              PADDING_SLOT_ID=-1, NULL_BLOCK_ID=0,
              set_forward_context=contexts,
-             get_forward_context=lambda: SimpleNamespace(capturing=False)),
+             get_forward_context=lambda: SimpleNamespace(capturing=False),
+             _forward_draft_model=lambda proposer, **kwargs: proposer.model(**kwargs)),
         "EagleProposerPatch",
     )
     events = []

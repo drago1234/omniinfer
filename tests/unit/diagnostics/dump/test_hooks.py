@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Unit tests for the vllm-free role hooks (worker / engine / api)."""
+from types import SimpleNamespace
+
 import pytest
 
 from omni_npu.diagnostics.dump import engine_stats, hooks
@@ -51,6 +53,62 @@ class TestWorkerRank:
         for env in ("LOCAL_RANK", "RANK", "RANK_ID"):
             monkeypatch.delenv(env, raising=False)
         assert hooks.worker_rank(FakeWorker()) is None
+
+
+class TestWorkerStatsFn:
+    def test_reads_model_runner_exec_count(self):
+        class FakeModelRunner:
+            exec_count = 42
+
+        class FakeWorkerWithRunner:
+            model_runner = FakeModelRunner()
+
+        assert hooks.build_worker_stats_fn(FakeWorkerWithRunner())() == {"exec_count": 42}
+
+    def test_missing_model_runner_degrades(self):
+        stats = hooks.build_worker_stats_fn(object())()
+        assert str(stats["exec_count"]).startswith("ERROR:")
+
+    def test_missing_exec_count_degrades(self):
+        class FakeWorkerWithRunner:
+            model_runner = object()
+
+        stats = hooks.build_worker_stats_fn(FakeWorkerWithRunner())()
+        assert stats == {"exec_count": "ERROR:no exec_count attribute"}
+
+    def test_mtp_reports_independent_live_count(self):
+        runner = SimpleNamespace(
+            exec_count=12,
+            speculative_config=SimpleNamespace(method="mtp"),
+            drafter=SimpleNamespace(mtp_exec_count=4),
+        )
+        stats_fn = hooks.build_worker_stats_fn(SimpleNamespace(model_runner=runner))
+        assert stats_fn() == {"exec_count": 12, "mtp_exec_count": 4}
+        runner.drafter.mtp_exec_count += 1
+        assert stats_fn() == {"exec_count": 12, "mtp_exec_count": 5}
+
+    def test_non_mtp_dump_shape_unchanged(self):
+        runner = SimpleNamespace(
+            exec_count=3,
+            speculative_config=SimpleNamespace(method="eagle"),
+        )
+        assert hooks.build_worker_stats_fn(
+            SimpleNamespace(model_runner=runner)
+        )() == {"exec_count": 3}
+
+    @pytest.mark.parametrize("drafter", [None, object()])
+    def test_mtp_without_draft_count_reports_error(self, drafter):
+        runner = SimpleNamespace(
+            exec_count=3,
+            speculative_config=SimpleNamespace(method="mtp"),
+            drafter=drafter,
+        )
+        assert hooks.build_worker_stats_fn(
+            SimpleNamespace(model_runner=runner)
+        )() == {
+            "exec_count": 3,
+            "mtp_exec_count": "ERROR:no MTP drafter mtp_exec_count",
+        }
 
 
 class FakeSchedulerOutput:

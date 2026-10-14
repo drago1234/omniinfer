@@ -3,7 +3,7 @@
 
 import time
 from collections.abc import Iterable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from typing import TYPE_CHECKING, Optional, Union, Any, TypeAlias, cast
 
@@ -75,6 +75,7 @@ from omni_npu.compilation.acl_graph import (
     set_graph_params,
 )
 from omni_npu.configs import OmniAdditionalConfig
+from omni_npu.layers.fused_moe import routed_experts_handle
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.sample.sampler import NPUSamplerV1, ENABLE_NPU_PENALTY_CACHE
 from omni_npu.sample.rejection_sampler import NPURejectionSampler
@@ -331,9 +332,8 @@ class NPUModelRunner(GPUModelRunner):
         forward_context = get_forward_context()
         forward_context.capturing = False
         self._capture_dp_pad_target(forward_context)
-        if self.is_debugging_mode:
-            self.exec_count += 1
-            logger.debug(f"Executing model forward {self.exec_count=}")
+        self.exec_count += 1
+        logger.debug(f"Executing model forward {self.exec_count=}")
         return self.model(
             input_ids=input_ids,
             positions=positions,
@@ -827,6 +827,23 @@ class NPUModelRunner(GPUModelRunner):
                 if isinstance(layer, ACLGraphWrapper):
                     yield layer
 
+    @contextmanager
+    def synchronize_input_prep(self):
+        if self.prepare_inputs_event is None:
+            yield
+            return
+        # prepare_inputs_event is recorded on the compute stream. On NPU the
+        # non_blocking H2D is not on that stream, so the event completes while
+        # the DMA is still reading the pinned source and MoME can observe the
+        # GPU buffer early. Drain the device after the copies are queued and
+        # before the forward consumes them.
+        self.prepare_inputs_event.synchronize()
+        try:
+            yield
+        finally:
+            torch.npu.synchronize()
+            self.prepare_inputs_event.record()
+
     @torch.inference_mode()
     @model_output_decorator
     @maybe_dump_kv
@@ -1293,9 +1310,8 @@ class NPUModelRunner(GPUModelRunner):
                 # Idle DP ranks must use the same LMHead all-gather pad target
                 # as the active rank before entering dummy compute_logits.
                 self._capture_dp_pad_target(forward_context)
-                if self.is_debugging_mode:
-                    self.exec_count += 1
-                    logger.debug(f"Executing dummy forward {self.exec_count=}")
+                self.exec_count += 1
+                logger.debug(f"Executing dummy forward {self.exec_count=}")
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -1422,10 +1438,16 @@ class NPUModelRunner(GPUModelRunner):
     ) -> None:
         super().initialize_kv_cache(kv_cache_config, is_profiling)
 
-        # patch start
-        if self.model_config.enable_return_routed_experts:
-            self.init_routed_experts_capturer()
-        # patch end
+        # Capturer initialization follows this method in the worker lifecycle.
+
+    def _bind_routed_experts_capturer(self, capturer) -> None:
+        """Publish the capturer to the NPU fused-MoE layers.
+
+        Native routers use the parent binding. NPU MoE layers retrieve the
+        same capturer through ``routed_experts_handle``.
+        """
+        super()._bind_routed_experts_capturer(capturer)
+        routed_experts_handle.publish_capturer(capturer)
 
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
