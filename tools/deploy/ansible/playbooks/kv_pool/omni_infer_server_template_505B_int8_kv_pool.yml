@@ -26,6 +26,18 @@
 
     # Selecting this dedicated playbook enables the M service and P-side pool.
     enable_kv_pool: true
+    kv_pool_enable_store_events: false
+
+    # Requires the pool-aware Proxy and a Mooncake master built with ENABLE_KV_EVENTS.
+    # These are the measured INT8 settings; override them for other workloads.
+    omni_proxy_pool_aware: true
+    omni_proxy_schedule_algo: work_aware
+    omni_proxy_work_aware_short_threshold: 65536
+    omni_proxy_work_aware_service_floor_tokens: 4096
+    omni_proxy_pool_w_hbm: 100
+    omni_proxy_pool_w_local: 90
+    omni_proxy_pool_w_remote: 80
+    mooncake_enable_kv_events: "{{ enable_kv_pool | bool and omni_proxy_pool_aware | bool }}"
 
     run_docker_profile:
       shm_size: 1800g
@@ -242,6 +254,20 @@
         - --omni-proxy-decode-max-num-seqs 3
         - --omni-proxy-tokenizer-wide-affinity on
         - --omni-proxy-model-path {{ model_path | quote }}
+        - --omni-proxy-schedule-algo {{ omni_proxy_schedule_algo | quote }}
+        - --omni-proxy-work-aware-short-threshold {{ omni_proxy_work_aware_short_threshold if omni_proxy_schedule_algo == 'work_aware' else 0 }}
+        - --omni-proxy-work-aware-service-floor-tokens {{ omni_proxy_work_aware_service_floor_tokens if omni_proxy_schedule_algo == 'work_aware' else 0 }}
+        - >-
+          {% if enable_kv_pool | bool and omni_proxy_pool_aware | bool %}
+          --omni-proxy-pool-aware-scheduling on
+          --omni-proxy-pool-master-events {{ ((hostvars[groups['M'][0]].host_ip | default(hostvars[groups['M'][0]].ansible_host)) ~ ':' ~ (hostvars[groups['M'][0]].mooncake_kv_events_port | default(5599))) | quote }}
+          --omni-proxy-pool-master-admin {{ ((hostvars[groups['M'][0]].host_ip | default(hostvars[groups['M'][0]].ansible_host)) ~ ':' ~ ((hostvars[groups['M'][0]].mooncake_metadata_port | default(8081) | int) + 100)) | quote }}
+          --omni-proxy-pool-w-hbm {{ omni_proxy_pool_w_hbm }}
+          --omni-proxy-pool-w-local {{ omni_proxy_pool_w_local }}
+          --omni-proxy-pool-w-remote {{ omni_proxy_pool_w_remote }}
+          {% else %}
+          --omni-proxy-pool-aware-scheduling off
+          {% endif %}
 
   tasks:
     - ansible.builtin.import_role:
