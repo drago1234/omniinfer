@@ -6,6 +6,7 @@ import torch
 import torchair
 import torch_npu
 import torch.distributed as dist
+import omni_custom_ops  # noqa: F401
 from types import SimpleNamespace
 from collections import defaultdict
 
@@ -297,27 +298,27 @@ def quant_ffn(
     assert x_sc.dtype == torch.float
     hist = hist.to(torch.int64)
     if hasattr(experts, "w13_weight_int4_scale"):
-        return _quant_ffn_w4a8(experts, x_i8, x_sc, hist)
+        return w4a8_expert_ffn(experts, x_i8, x_sc, hist)
     return _quant_ffn_w8a8(experts, x_i8, x_sc, hist)
 
 
-def _quant_ffn_w4a8(
+def w4a8_expert_ffn(
     experts: NPUSharedFusedMoE,
-    x_i8: torch.Tensor,  # [T, D] int8
-    x_sc: torch.Tensor,  # [T] fp32
-    hist: torch.Tensor,  # [N] int64
+    x_i8: torch.Tensor,
+    token_scale: torch.Tensor,
+    group_list: torch.Tensor,
 ) -> torch.Tensor:
-    asym = experts.w13_weight_offset is not None
-
+    # W4A8 expert FFN: grouped_matmul → dequant_swiglu_quant → grouped_matmul
+    use_enk = experts._use_w4a8_enk
     h = _w4a8_grouped_matmul(
         x_i8,
         experts.w13_weight,
         experts.w13_weight_bias,
         experts.w13_weight_int4_scale,
-        experts.w13_weight_offset,
-        x_sc,
-        hist,
-        asym,
+        token_scale,
+        group_list,
+        offset=experts.w13_weight_offset,
+        use_enk=use_enk,
     )
     h, h_sc = torch_npu.npu_dequant_swiglu_quant(
         h,
@@ -326,7 +327,7 @@ def _quant_ffn_w4a8(
         bias=None,
         quant_scale=None,
         quant_offset=None,
-        group_index=hist,
+        group_index=group_list,
         activate_left=True,
         quant_mode=1,
     )
@@ -335,10 +336,10 @@ def _quant_ffn_w4a8(
         experts.w2_weight,
         experts.w2_weight_bias,
         experts.w2_weight_int4_scale,
-        experts.w2_weight_offset,
         h_sc,
-        hist,
-        asym,
+        group_list,
+        offset=experts.w2_weight_offset,
+        use_enk=use_enk,
     )
 
 
@@ -347,11 +348,33 @@ def _w4a8_grouped_matmul(
     weight,
     bias,
     scale,
-    offset,
     token_scale,
-    hist,
-    asym,
+    group_list,
+    *,
+    offset,
+    use_enk,
 ):
+    if use_enk:
+        assert offset is None, "W4A8 EnK does not support asymmetric offset."
+        if token_scale.dim() == 1:
+            token_scale = token_scale.unsqueeze(-1)
+        return torch.ops.custom.npu_ai_infra_grouped_matmul(
+            [x],
+            [weight],
+            bias=[bias],
+            scale=[scale],
+            offset=None,
+            per_token_scale=[token_scale],
+            group_list=group_list,
+            split_item=3,
+            group_type=0,
+            group_list_type=1,
+            act_type=0,
+            tuning_config=[0, 0, -1, 1],
+            output_dtype=torch.bfloat16,
+        )[0]
+
+    asym = offset is not None
     return torch_npu.npu_grouped_matmul(
         [x],
         [weight],
@@ -361,7 +384,7 @@ def _w4a8_grouped_matmul(
         antiquant_scale=None,
         antiquant_offset=None,
         per_token_scale=[token_scale.unsqueeze(-1) if asym else token_scale],
-        group_list=hist,
+        group_list=group_list,
         activation_input=None,
         activation_quant_scale=None,
         activation_quant_offset=None,

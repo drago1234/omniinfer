@@ -34,10 +34,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonPrefillMetadata,
     QueryLenSupport,
 )
-from vllm.v1.attention.backends.utils import (
-    get_dcp_local_seq_lens,
-    split_decodes_and_prefills,
-)
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -45,6 +42,7 @@ from omni_npu.connector.utils import TP_Convertor
 from omni_npu.attention.backends.utils import (
     SPManager,
     register_attention_backend,
+    split_decodes_and_prefills,
     _maybe_padded_raw_tensor_to_strided_caches,
 )
 from omni_npu.model_config.config_loader.loader import model_extra_config
@@ -752,12 +750,6 @@ class NPUMLAImpl(MLAAttentionImpl[NPUMLAMetadata]):
         self.sink_k_pe = sink_k_pe.unsqueeze(1)
         self.sink_compressed_kv = sink_compressed_kv.unsqueeze(1)
         self.sink_len = sink_compressed_kv.shape[0]
-
-    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
-        super().process_weights_after_loading(act_dtype)
-
-        self.W_UK_T = self.W_UK_T.contiguous()
-        self.W_UV = self.W_UV.contiguous()
 
     def do_kv_cache_update(
         self,

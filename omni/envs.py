@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     OMNI_HEALTH_HANG_SEC: int
     OMNI_METRICS_KV_TRANSFER_SELFTEST: bool
     OMNI_METRICS_WORKER_MEM_EVERY: int
+    OMNI_ENABLE_TTFT_STAGE_METRICS: bool
     OMNI_KV_DUMP_PATH: str
     OMNI_CUSTOM_MODEL_CONFIG_PATH: Optional[str]
     # Existing OMNI_ names
@@ -72,6 +73,8 @@ if TYPE_CHECKING:
     OMNI_DP_ROUND_ROBIN: bool
     OMNI_PD_BENCH_ALIGNED_DECODE_THRESHOLD: int
     OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE: bool
+    OMNI_PRECISION_STRONG_CONSISTENCY_CHECK_LEVEL: str
+    OMNI_KV_OFFLOAD_SHARDED_LOAD: bool
 
 
 def _as_bool(raw: str) -> bool:
@@ -106,6 +109,21 @@ def _as_int_or_default(raw: str, default: int, name: str) -> int:
             default,
         )
         return default
+
+
+def _as_check_level(raw: str, name: str) -> str:
+    """Validate a "check level" value, tolerant of typos: falls back to
+    "error" with a warning instead of raising."""
+    value = raw.strip().lower()
+    if value not in ("error", "log"):
+        logger.warning(
+            "Invalid value %r for environment variable %r; falling back to %r.",
+            raw,
+            name,
+            "error",
+        )
+        return "error"
+    return value
 
 
 def get_env_with_fallback(
@@ -451,6 +469,14 @@ env_variables: Dict[str, Callable[[], Any]] = {
     lambda: get_env_with_fallback(
         "OMNI_METRICS_WORKER_MEM_EVERY", None, 50, _as_int),
 
+    # Per-request scheduler/worker TTFT stage tracking. Completed records
+    # ride KVConnectorStats to the frontend. Default off: scheduler_cls wrap
+    # and [TTFT] logs stay out of the hot path until explicitly enabled.
+    # Consumer: diagnostics/metrics/stage_metrics.py:enabled.
+    "OMNI_ENABLE_TTFT_STAGE_METRICS":
+    lambda: get_env_with_fallback(
+        "OMNI_ENABLE_TTFT_STAGE_METRICS", None, False, _as_bool),
+
     # Enables KV-block hash dumping for cross-node consistency debugging.
     # Non-empty enables the maybe_dump_kv wrapper on NPUModelRunner.execute_model
     # and selects the output directory; a per-run subdirectory
@@ -576,6 +602,15 @@ env_variables: Dict[str, Callable[[], Any]] = {
     "OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE":
     lambda: get_env_with_fallback("OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE", None, False, _as_bool),
 
+    # Sharded DDR->NPU load for replicated KV layouts: each TP rank copies
+    # 1/tp of the blocks and the TP group all-gathers the rest. Off by
+    # default; when a deployment that turns it on does not qualify, every rank
+    # falls back to the plain load and startup logs
+    # "kv_offload sharded load: OFF (<reason>)". Must be the same on every rank.
+    # Consumers: v1/kv_offload/cpu/npu_worker.py:_make_sharded_load.
+    "OMNI_KV_OFFLOAD_SHARDED_LOAD":
+    lambda: get_env_with_fallback("OMNI_KV_OFFLOAD_SHARDED_LOAD", None, False, _as_bool),
+
     # =========================================================================
     # Benchmark gates (not for production serving)
     # =========================================================================
@@ -638,6 +673,25 @@ env_variables: Dict[str, Callable[[], Any]] = {
         20,
         lambda raw: _as_int_or_default(
             raw, 20, "OMNI_PD_BENCH_ALIGNED_DECODE_THRESHOLD"),
+    ),
+
+    # Controls how ModelOperatorOptConfig reacts when
+    # enable_precision_strong_consistency's prerequisite checks
+    # (HCCL_DETERMINISTIC="STRICT", PYTORCH_NPU_ALLOC_CONF, use_batch_invariant_op,
+    # compilation_config.cudagraph_mode == FULL) fail:
+    #   "error" -> raise ValueError and abort startup (default, safest).
+    #   "log"   -> emit a WARNING and continue running with the violated
+    #              precondition.
+    # Invalid values fall back to "error" with a warning.
+    # Consumers: model_config/config_loader/loader.py:490-521
+    # (_validate_precision_strong_consistency).
+    "OMNI_PRECISION_STRONG_CONSISTENCY_CHECK_LEVEL":
+    lambda: get_env_with_fallback(
+        "OMNI_PRECISION_STRONG_CONSISTENCY_CHECK_LEVEL",
+        None,
+        "error",
+        lambda raw: _as_check_level(
+            raw, "OMNI_PRECISION_STRONG_CONSISTENCY_CHECK_LEVEL"),
     ),
 }
 # end-env-vars-definition

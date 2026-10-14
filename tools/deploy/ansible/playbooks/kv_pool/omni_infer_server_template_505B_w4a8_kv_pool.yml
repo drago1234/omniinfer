@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 ---
-- name: Run PanguV2 505B INT8 2P1D Prefill, Decode, Proxy, and KV pool services.
+- name: Run PanguV2 505B w4a8 Prefill, Decode, Proxy, and KV pool services.
   # Dedicated KV pool scenario; inventory includes the M master.
   hosts: all
   any_errors_fatal: true
@@ -21,7 +21,7 @@
 
   vars:
     model: pangu-v2-505b
-    model_path: "/mnt/sfs_turbo/bucket-910c-6055/s00623235/models/505b/505b_w4a8"
+    model_path: "/mnt/sfs_turbo_new/bucket-910c-6055/s00623235/models/505b/505b_w4a8"
     enable_prefix_caching: true
 
     # Selecting this dedicated playbook enables the M service and P-side pool.
@@ -223,6 +223,7 @@
         - --omni-proxy-max-batch-num-token 49152
         - --omni-proxy-prefill-max-num-seqs 4
         - --omni-proxy-decode-max-num-seqs 3
+        - --omni-proxy-tokenizer-wide-affinity on
         - --omni-proxy-model-path {{ model_path | quote }}
 
   tasks:

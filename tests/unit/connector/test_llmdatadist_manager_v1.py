@@ -427,10 +427,51 @@ class TestDatadistEngine:
             # verify transfer_backend is set to hixl
             assert engine.cfg["transfer_backend"] == "hixl"
 
-    def test_init_decoder_without_hixl_backend(self, rank=7, port=10000):
-        """Decoder + no hixl: listen_ip_info is None (no binding)."""
+    def test_init_prefill_a3_hixl_backend(self, rank=7, port=10000):
+        """A3 (non-950) + llm_datadist >= 1.3: hixl backend with builtin
+        local_comm_res; prefill still binds the fixed port (priority over
+        hixl random port)."""
+        from omni_npu.connector.utils import get_local_ip
+        ip = get_local_ip()
         with (
             patch("omni_npu.connector.llmdatadist_manager_v1.on_ascend950", return_value=False),
+            _mock_parallel(tp=16, rank=rank),
+            _mock_llm_datadist() as get_instance,
+        ):
+            engine = DatadistEngine(port, is_prefill=True)
+            log, core = get_instance()
+            core._manual___init__(is_prefill=True)
+            # prefill branch takes priority: fixed port
+            core._manual_init(f"{ip}:{port + rank}")
+            log.compare_and_clear()
+            assert engine.cfg["transfer_backend"] == "hixl"
+            assert engine.cfg["local_comm_res"] == '{"version":"1.3"}'
+
+    def test_init_decoder_a3_hixl_backend(self, rank=7, port=10000):
+        """A3 (non-950) + llm_datadist >= 1.3 (LLMConfig has transfer_backend):
+        hixl backend with builtin local_comm_res, listen_ip_info uses port 0."""
+        from omni_npu.connector.utils import get_local_ip
+        ip = get_local_ip()
+        with (
+            patch("omni_npu.connector.llmdatadist_manager_v1.on_ascend950", return_value=False),
+            _mock_parallel(tp=16, rank=rank),
+            _mock_llm_datadist() as get_instance,
+        ):
+            engine = DatadistEngine(port, is_prefill=False)
+            log, core = get_instance()
+            core._manual___init__(is_prefill=False)
+            # hixl backend (non-prefill) branch: port 0
+            core._manual_init(f"{ip}:0")
+            log.compare_and_clear()
+            assert engine.cfg["transfer_backend"] == "hixl"
+            assert engine.cfg["local_comm_res"] == '{"version":"1.3"}'
+
+    def test_init_decoder_a5_no_local_comm_res(self, rank=7, port=10000):
+        """A5 (950) + local_comm_res not loaded (disabled / file missing):
+        no hixl backend even though llm_datadist supports it, no binding."""
+        with (
+            patch("omni_npu.connector.llmdatadist_manager_v1.on_ascend950", return_value=True),
+            patch.object(DatadistEngine, "_get_local_comm_res", return_value=""),
             _mock_parallel(tp=16, rank=rank),
             _mock_llm_datadist() as get_instance,
         ):
@@ -441,18 +482,23 @@ class TestDatadistEngine:
             log.compare_and_clear()
             # no hixl backend, transfer_backend should be None
             assert engine.cfg["transfer_backend"] is None
+            assert engine.cfg["local_comm_res"] == ""
 
     def test_register_unregister_sleep_weakup(self, cnt = 16, port=10000):
+        from omni_npu.connector.utils import get_local_ip
+        ip = get_local_ip()
         bufs = [torch.zeros(10, 100, dtype=torch.uint8)] * cnt
 
         with (
+            patch("omni_npu.connector.llmdatadist_manager_v1.on_ascend950", return_value=False),
             _mock_parallel(tp=16, rank=7),
             _mock_llm_datadist() as get_instance,
         ):
+            # A3 + llm_datadist >= 1.3: hixl backend, decoder listens on port 0
             engine = DatadistEngine(port, is_prefill=False)
             log, core = get_instance()
             core._manual___init__(is_prefill=False)
-            core._manual_init(ip_info=None)
+            core._manual_init(f"{ip}:0")
             log.compare_and_clear()
 
             cache_id = engine.register(bufs)
@@ -473,7 +519,7 @@ class TestDatadistEngine:
             log.compare_and_clear()
 
             engine.weakup()
-            core._manual_init(ip_info=None)
+            core._manual_init(f"{ip}:0")
             log.compare_and_clear()
 
     def test_pull_and_recycle(self, port=10000, cnt=16):

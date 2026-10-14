@@ -328,22 +328,26 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
             ):
                 row_idx_type = 1
             moe_quant_config = getattr(layer.routed_experts.quant_method, "moe_quant_config", None)
+            use_mxfp = _uses_mxfp_activation(moe_quant_config)
             if moe_quant_config and getattr(moe_quant_config, "use_hifloat8_w8a8", False):
                 x_hif8 = torch_npu.npu_dtype_cast(x, torch_npu.hifloat8)
                 x_quant = x_hif8.view(dtype=torch.int8)
                 x_scale = None
-            elif _uses_mxfp_activation(moe_quant_config):
-                # MXFP: route bf16 first, quant the expanded output below.
-                # The mxfp8 scale path through npu_moe_init_routing_v2 is broken
-                # on current torch_npu (see kernel_example/mxfp8_moe_init_routing.py),
-                # so we keep the pre-routing tensor in bf16 and call
-                # npu_dynamic_mx_quant on `expanded_x` after routing.
-                x_quant = x
-                x_scale = None
+            elif use_mxfp:
+                # MoeInitRoutingV3 is exposed through the v2 Python API.  With
+                # quant_mode=-1 it reorders MXFP data and E8M0 scales together,
+                # so quantize before the EP AllGather and avoid quantizing the
+                # top-k-expanded tensor.
+                x_quant, x_scale = torch_npu.npu_dynamic_mx_quant(
+                    x,
+                    dst_type=torch.float8_e4m3fn,
+                    scale_alg=1,
+                )
             else:
                 x_int8, x_scale = torch_npu.npu_dynamic_quant(x)
                 x_quant = x_int8
             x_quant_local = x_quant
+            x_scale_local = x_scale
             if (model_extra_config.operator_opt_config.shared_expert_multi_stream
                     and model_extra_config.operator_opt_config.shared_expert_parallel_schedule == "with_all_gather"):
                 ready_to_dispatch_event = torch.npu.Event()
@@ -351,7 +355,10 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                 ready_to_dispatch_event.record()
                 with torch.npu.stream(self.side_stream):
                     ready_to_dispatch_event.wait(self.side_stream)
-                    x_dict = {"x_int8": x_int8, "pertoken_scale": x_scale}
+                    if use_mxfp:
+                        x_dict = {"x_mxfp8": x_quant_local, "pertoken_scale": x_scale_local}
+                    else:
+                        x_dict = {"x_int8": x_int8, "pertoken_scale": x_scale}
                     shared_output = layer._shared_experts._layer(x_dict)
                     shared_expert_finished_event.record()
             if self.enable_round_pipeline_comm:
@@ -364,7 +371,15 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                 with torch.npu.stream(options.round_pipeline_streams[self.num_nodes - 1]):
                     topk_weights = options.topk_weights
                     if x_scale is not None:
-                        topk_cat = torch.cat((topk_weights, topk_ids.to(torch.float), x_scale.unsqueeze(-1)), dim=-1)
+                        if use_mxfp:
+                            x_scale_shape = x_scale.shape[1:]
+                            x_scale_dtype = x_scale.dtype
+                            x_scale_for_cat = x_scale.flatten(1).to(topk_weights.dtype)
+                        else:
+                            x_scale_for_cat = x_scale.unsqueeze(-1)
+                        topk_cat = torch.cat(
+                            (topk_weights, topk_ids.to(torch.float), x_scale_for_cat), dim=-1
+                        )
                     else:
                         topk_cat = torch.cat((topk_weights, topk_ids.to(torch.float)), dim=-1)
                 _local_size = get_npu_device_count()
@@ -376,10 +391,19 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                     dim=0
                 )
                 if x_scale is not None:
-                    gathered_topk_weights, gathered_topk_ids, x_scale = torch.split(
-                        topk_cat, [topk_weights.shape[-1], topk_ids.shape[-1], 1], dim=-1
+                    gathered_topk_weights, gathered_topk_ids, gathered_x_scale = torch.split(
+                        topk_cat,
+                        [
+                            topk_weights.shape[-1],
+                            topk_ids.shape[-1],
+                            x_scale_for_cat.shape[-1],
+                        ],
+                        dim=-1,
                     )
-                    x_scale = x_scale.squeeze(-1)
+                    if use_mxfp:
+                        x_scale = gathered_x_scale.to(x_scale_dtype).reshape(-1, *x_scale_shape)
+                    else:
+                        x_scale = gathered_x_scale.squeeze(-1)
                 else:
                     gathered_topk_weights, gathered_topk_ids = torch.split(
                         topk_cat, [topk_weights.shape[-1], topk_ids.shape[-1]], dim=-1
@@ -403,19 +427,11 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                     # the pre-allgather (local) tokens. Feeding the post-allgather
                     # x_quant here would produce (ep_size * local_N, H) rows,
                     # mismatching the routed path's post-reduce-scatter shape.
-                    if _uses_mxfp_activation(moe_quant_config):
-                        # x_quant_local is still bf16 here (mxfp8 routing-scale
-                        # is buggy so we route bf16 and quant after); quant once
-                        # on the side stream for shared_experts.gate_up_proj.
-                        shared_x_fp8, shared_x_scale = torch_npu.npu_dynamic_mx_quant(
-                            x_quant_local,
-                            dst_type=torch.float8_e4m3fn,
-                            scale_alg=1
-                        )
+                    if use_mxfp:
                         shared_expert_gate_up = layer._shared_experts._layer.gate_up_proj(
                             {
-                                "x_mxfp8": shared_x_fp8,
-                                "pertoken_scale": shared_x_scale,
+                                "x_mxfp8": x_quant_local,
+                                "pertoken_scale": x_scale_local,
                             }
                         )
                     elif moe_quant_config and getattr(moe_quant_config, "use_hifloat8_w8a8", False):
@@ -425,6 +441,8 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                             "with_routed_experts_cv schedule only supports hifloat8 or mxfp8 quant methods."
                         )
                     x_quant_local.record_stream(self.side_stream)
+                    if use_mxfp:
+                        x_scale_local.record_stream(self.side_stream)
                     shared_expert_finished_event.record()
 
             expanded_x, expanded_row_idx, expert_tokens, dynamic_scale = torch_npu.npu_moe_init_routing_v2(
@@ -443,15 +461,6 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                 row_idx_type=row_idx_type,
             )
         moe_quant_config = getattr(layer.routed_experts.quant_method, "moe_quant_config", None)
-        if _uses_mxfp_activation(moe_quant_config):
-            # npu_moe_init_routing_v2 mxfp8 scale handling is buggy on current
-            # torch_npu, so we routed bf16 above and quant the expanded output
-            # here.
-            expanded_x, dynamic_scale = torch_npu.npu_dynamic_mx_quant(
-                expanded_x,
-                dst_type=torch.float8_e4m3fn,
-                scale_alg=1
-            )
         if moe_quant_config is not None and getattr(moe_quant_config, "use_hifloat8_w8a8", False):
             # init routing output dirty dynamic_scale even its input scale=None
             dynamic_scale = None

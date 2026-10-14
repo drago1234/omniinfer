@@ -76,6 +76,7 @@
         export OMNI_VLLM_PATCHES_DIR="low_latency"
         export OMNI_VLLM_PATCHES="ALL"
         export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+        export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
         export RAY_CGRAPH_get_timeout=7200
         export OMNI_PIGGYBACK_INPUT_IDS=1
         export OMNI_SKIP_DECODE_TOKENIZE=0

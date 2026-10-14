@@ -490,11 +490,83 @@ def test_agrs_prepare_permute_hifloat8_uses_cast_without_scale(prepare_module):
     assert torch.equal(result.hidden_states_sorted_by_experts, expanded_x)
 
 
-def test_agrs_prepare_permute_mxfp8_routes_bf16_then_quants_expanded(prepare_module):
-    """mxfp8 keeps x in bf16 through npu_moe_init_routing_v2 and runs
-    npu_dynamic_mx_quant on `expanded_x` after routing (workaround for the
-    buggy mxfp8 scale path through routing)."""
+@pytest.mark.parametrize(
+    ("use_mxfp8_w8a8", "use_mxfp4_w4a8"),
+    [(True, False), (False, True)],
+)
+def test_agrs_prepare_permute_mxfp_quants_before_all_gather(
+    prepare_module,
+    use_mxfp8_w8a8,
+    use_mxfp4_w4a8,
+):
+    """MXFP activations are quantized locally and gathered with E8M0 scales."""
     module, stubs = prepare_module
+    layer = _moe_layer(
+        global_num_experts=4,
+        local_num_experts=2,
+        ep_size=stubs.ep_group.world_size,
+        quant_config=object(),
+        quant_method=SimpleNamespace(
+            moe_quant_config=SimpleNamespace(
+                use_hifloat8_w8a8=False,
+                use_mxfp8_w8a8=use_mxfp8_w8a8,
+                use_mxfp4_w4a8=use_mxfp4_w4a8,
+            ),
+        ),
+        top_k=1,
+        w13_weight=torch.zeros(2, 1, 1),
+    )
+    x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+    topk_ids = torch.zeros(2, 1, dtype=torch.int32)
+    local_x_fp8 = torch.zeros(2, 2, dtype=torch.int8)
+    local_scale = torch.full((2, 1), 3, dtype=torch.uint8)
+    routed_x_fp8 = torch.ones(4, 2, dtype=torch.int8)
+    routed_scale = torch.ones(4, 1, dtype=torch.uint8)
+    stubs.torch_npu.npu_dynamic_mx_quant.return_value = (local_x_fp8, local_scale)
+    stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
+        routed_x_fp8,
+        torch.arange(4, dtype=torch.int32),
+        torch.ones(2, dtype=torch.int32),
+        routed_scale,
+    )
+
+    handler = module.AGRSPrepPmtAndUnpmtFinal(layer)
+    result = handler.prepare_permute(layer=layer, x=x, topk_ids=topk_ids)
+
+    # Quantized exactly once, on the local (pre-all_gather) tokens.
+    stubs.torch_npu.npu_dynamic_mx_quant.assert_called_once()
+    quant_args, quant_kwargs = stubs.torch_npu.npu_dynamic_mx_quant.call_args
+    assert torch.equal(quant_args[0], x)
+    assert quant_kwargs["dst_type"] is torch.float8_e4m3fn
+    assert quant_kwargs["scale_alg"] == 1
+    route_args, route_kwargs = stubs.torch_npu.npu_moe_init_routing_v2.call_args
+    assert torch.equal(route_args[0], torch.cat([local_x_fp8, local_x_fp8], dim=0))
+    assert torch.equal(route_kwargs["scale"], torch.cat([local_scale, local_scale], dim=0))
+    assert route_kwargs["quant_mode"] == -1
+    # The routing output already carries FP8 data and reordered scales.
+    assert result.hidden_states_sorted_by_experts is routed_x_fp8
+    assert result.dynamic_scale is routed_scale
+
+
+def test_agrs_prepare_permute_mxfp8_round_pipeline_preserves_scale(prepare_module, monkeypatch):
+    """Round-pipeline metadata packing restores the E8M0 scale bytes/layout."""
+    module, stubs = prepare_module
+    monkeypatch.setattr(
+        module.model_extra_config.operator_opt_config, "enable_round_pipeline_comm", True
+    )
+    monkeypatch.setattr(module, "get_npu_device_count", lambda: 1)
+    monkeypatch.setattr(stubs.torch_npu.npu, "get_device_name", lambda _: "Ascend910B")
+
+    class _NoopCtx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(stream=lambda _stream: _NoopCtx()), raising=False
+    )
     layer = _moe_layer(
         global_num_experts=4,
         local_num_experts=2,
@@ -509,42 +581,45 @@ def test_agrs_prepare_permute_mxfp8_routes_bf16_then_quants_expanded(prepare_mod
         top_k=1,
         w13_weight=torch.zeros(2, 1, 1),
     )
-    x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
-    topk_ids = torch.zeros(2, 1, dtype=torch.int32)
-    expanded_x_bf16 = torch.full((2, 2), 7.0, dtype=torch.float32)
-    expanded_row_idx = torch.tensor([0, 1], dtype=torch.int32)
-    expert_tokens = torch.tensor([1, 1], dtype=torch.int32)
-    dirty_dynamic_scale = torch.ones(2, dtype=torch.float32)
-
-    expanded_x_fp8 = torch.zeros(2, 2, dtype=torch.int8)
-    expanded_scale = torch.full((2, 2 // 32 + 1,), 3, dtype=torch.uint8)
-
+    x = torch.ones(2, 2)
+    topk_ids = torch.tensor([[0], [1]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.25], [0.75]], dtype=torch.float32)
+    local_x_fp8 = torch.zeros(2, 2, dtype=torch.int8)
+    local_scale = torch.tensor([[[119, 120]], [[121, 122]]], dtype=torch.uint8)
+    routed_x_fp8 = torch.ones(4, 2, dtype=torch.int8)
+    routed_scale = torch.ones(4, 1, 2, dtype=torch.uint8)
+    stubs.torch_npu.npu_dynamic_mx_quant.return_value = (local_x_fp8, local_scale)
     stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
-        expanded_x_bf16,
-        expanded_row_idx,
-        expert_tokens,
-        dirty_dynamic_scale,
+        routed_x_fp8,
+        torch.arange(4, dtype=torch.int32),
+        torch.ones(4, dtype=torch.int32),
+        routed_scale,
     )
-    stubs.torch_npu.npu_dynamic_mx_quant.return_value = (expanded_x_fp8, expanded_scale)
 
+    def gather_two(tensors, **_kwargs):
+        x_quant, metadata = tensors
+        return torch.cat([x_quant, x_quant], dim=0), torch.cat([metadata, metadata], dim=0)
+
+    monkeypatch.setattr(module, "all_gather_round_pipeline_two_tensor", gather_two)
+    options = module.PreparePermuteOptions(
+        topk_weights=topk_weights,
+        round_pipeline_streams=[object(), object()],
+    )
     handler = module.AGRSPrepPmtAndUnpmtFinal(layer)
-    result = handler.prepare_permute(layer=layer, x=x, topk_ids=topk_ids)
+    result = handler.prepare_permute(layer=layer, x=x, topk_ids=topk_ids, options=options)
 
-    # Routing got the bf16 x (gathered via the EP all_gather stub) with scale=None
-    _, kwargs = stubs.torch_npu.npu_moe_init_routing_v2.call_args
-    assert kwargs["scale"] is None
-    # Post-routing quant fired on expanded_x_bf16, returned expanded_x_fp8 + scale.
-    stubs.torch_npu.npu_dynamic_mx_quant.assert_called_once()
-    quant_args, _ = stubs.torch_npu.npu_dynamic_mx_quant.call_args
-    assert torch.equal(quant_args[0], expanded_x_bf16)
-    assert torch.equal(result.hidden_states_sorted_by_experts, expanded_x_fp8)
-    assert torch.equal(result.dynamic_scale, expanded_scale)
-
+    route_args, route_kwargs = stubs.torch_npu.npu_moe_init_routing_v2.call_args
+    assert torch.equal(route_args[0], torch.cat([local_x_fp8, local_x_fp8], dim=0))
+    assert torch.equal(route_args[1], torch.cat([topk_ids, topk_ids], dim=0))
+    assert torch.equal(route_kwargs["scale"], torch.cat([local_scale, local_scale], dim=0))
+    assert route_kwargs["scale"].dtype == torch.uint8
+    assert route_kwargs["scale"].shape == (4, 1, 2)
+    assert torch.equal(result.hidden_states_sorted_by_experts, routed_x_fp8)
+    assert torch.equal(result.dynamic_scale, routed_scale)
 
 def test_agrs_prepare_permute_cv_mxfp8_quants_on_side_stream(prepare_module, monkeypatch):
     """with_routed_experts_cv + mxfp8: gate_up_proj is launched on the side
-    stream with a freshly mx-quantised payload, then expanded_x is quantised
-    post-routing."""
+    stream with the payload quantised before the EP all_gather."""
     module, stubs = prepare_module
     monkeypatch.setattr(
         module.model_extra_config.operator_opt_config,
@@ -602,7 +677,6 @@ def test_agrs_prepare_permute_cv_mxfp8_quants_on_side_stream(prepare_module, mon
     local_n = 2
     x = torch.zeros(local_n, 8, dtype=torch.float32)
     topk_ids = torch.zeros(local_n, 1, dtype=torch.int32)
-    expanded_x_bf16 = torch.zeros(local_n, 8, dtype=torch.float32)
     expanded_row_idx = torch.tensor([0, 1], dtype=torch.int32)
     expert_tokens = torch.tensor([1, 1], dtype=torch.int32)
     # Side-stream mx-quant must run on the LOCAL (pre-allgather) tokens
@@ -611,36 +685,32 @@ def test_agrs_prepare_permute_cv_mxfp8_quants_on_side_stream(prepare_module, mon
     side_scale = torch.zeros(local_n, 8 // 32 + 1, dtype=torch.uint8)
     post_fp8 = torch.ones(local_n, 8, dtype=torch.int8)
     post_scale = torch.ones(local_n, 8 // 32 + 1, dtype=torch.uint8)
-    stubs.torch_npu.npu_dynamic_mx_quant.side_effect = [
-        (side_fp8, side_scale),
-        (post_fp8, post_scale),
-    ]
+    stubs.torch_npu.npu_dynamic_mx_quant.return_value = (side_fp8, side_scale)
     stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
-        expanded_x_bf16,
+        post_fp8,
         expanded_row_idx,
         expert_tokens,
-        torch.zeros(local_n),
+        post_scale,
     )
 
     handler = module.AGRSPrepPmtAndUnpmtFinal(layer)
     result = handler.prepare_permute(layer=layer, x=x, topk_ids=topk_ids)
 
-    # Side-stream quant + gate_up_proj launched with the mxfp8 dict payload.
+    # gate_up_proj on the side stream reuses the local pre-all_gather quant.
     gate_up_proj.assert_called_once()
     dict_arg = gate_up_proj.call_args.args[0]
     assert isinstance(dict_arg, dict)
     assert torch.equal(dict_arg["x_mxfp8"], side_fp8)
     assert torch.equal(dict_arg["pertoken_scale"], side_scale)
     assert result.shared_expert_gate_up is shared_gate_up
-    # Both mx_quants happened (side stream + post-routing).
-    assert stubs.torch_npu.npu_dynamic_mx_quant.call_count == 2
-    # First call (side stream) must receive the LOCAL bf16 tensor — not the
-    # ep_size×local_N gathered tensor. Regression guard for the EP>1 shape
-    # mismatch where shared_output had ep_size×local_N rows.
-    side_call_input = stubs.torch_npu.npu_dynamic_mx_quant.call_args_list[0].args[0]
-    assert side_call_input.shape[0] == local_n
+    # A single quant on LOCAL tokens serves both paths; regression guard for
+    # the EP>1 shape mismatch where shared_output had ep_size*local_N rows.
+    stubs.torch_npu.npu_dynamic_mx_quant.assert_called_once()
+    quant_call = stubs.torch_npu.npu_dynamic_mx_quant.call_args
+    assert quant_call.args[0].shape[0] == local_n
+    assert quant_call.kwargs["scale_alg"] == 1
     assert torch.equal(result.hidden_states_sorted_by_experts, post_fp8)
-
+    assert torch.equal(result.dynamic_scale, post_scale)
 
 def test_agrs_prepare_permute_cv_unsupported_quant_raises(prepare_module, monkeypatch):
     """with_routed_experts_cv only supports hif8 and mxfp8; any other quant
@@ -1938,3 +2008,159 @@ def test_agrs_prepare_permute_default_finalize_no_shared_gate_up(prepare_module)
     assert result.shared_expert_gate_up is None
     assert result.shared_expert_finished_event is None
     layer.shared_experts.gate_up_proj.assert_not_called()
+
+
+def test_agrs_prepare_permute_int8_round_pipeline_keeps_single_scale_column(
+    prepare_module, monkeypatch
+):
+    """The int8 per-token scale still travels as one metadata column."""
+    module, stubs = prepare_module
+    monkeypatch.setattr(
+        module.model_extra_config.operator_opt_config, "enable_round_pipeline_comm", True
+    )
+    monkeypatch.setattr(module, "get_npu_device_count", lambda: 1)
+    monkeypatch.setattr(stubs.torch_npu.npu, "get_device_name", lambda _: "Ascend910B")
+
+    class _NoopCtx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(stream=lambda _stream: _NoopCtx()), raising=False
+    )
+    layer = _moe_layer(
+        global_num_experts=4,
+        local_num_experts=2,
+        ep_size=stubs.ep_group.world_size,
+        quant_config=object(),
+        quant_method=SimpleNamespace(
+            moe_quant_config=SimpleNamespace(
+                use_hifloat8_w8a8=False,
+                use_mxfp8_w8a8=False,
+            ),
+        ),
+        top_k=1,
+        w13_weight=torch.zeros(2, 1, 1),
+    )
+    x = torch.ones(2, 2)
+    topk_ids = torch.tensor([[0], [1]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.25], [0.75]], dtype=torch.float32)
+    local_x_int8 = torch.zeros(2, 2, dtype=torch.int8)
+    local_scale = torch.tensor([0.5, 2.0], dtype=torch.float32)
+    stubs.torch_npu.npu_dynamic_quant.return_value = (local_x_int8, local_scale)
+    stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
+        torch.ones(4, 2, dtype=torch.int8),
+        torch.arange(4, dtype=torch.int32),
+        torch.ones(4, dtype=torch.int32),
+        torch.ones(4, dtype=torch.float32),
+    )
+    gathered = {}
+
+    def gather_two(tensors, **_kwargs):
+        x_quant, metadata = tensors
+        gathered["metadata"] = metadata
+        return torch.cat([x_quant, x_quant], dim=0), torch.cat([metadata, metadata], dim=0)
+
+    monkeypatch.setattr(module, "all_gather_round_pipeline_two_tensor", gather_two)
+    options = module.PreparePermuteOptions(
+        topk_weights=topk_weights,
+        round_pipeline_streams=[object(), object()],
+    )
+    module.AGRSPrepPmtAndUnpmtFinal(layer).prepare_permute(
+        layer=layer, x=x, topk_ids=topk_ids, options=options
+    )
+
+    # weights | ids | scale: exactly one scale column per token.
+    assert gathered["metadata"].shape == (2, 3)
+    route_kwargs = stubs.torch_npu.npu_moe_init_routing_v2.call_args.kwargs
+    assert torch.equal(route_kwargs["scale"], torch.cat([local_scale, local_scale]))
+
+
+@pytest.mark.parametrize("use_mxfp", [True, False])
+def test_agrs_prepare_permute_with_all_gather_feeds_shared_mlp_quantized_input(
+    prepare_module, monkeypatch, use_mxfp
+):
+    """with_all_gather: the side-stream shared MLP gets the local quantized input."""
+    module, stubs = prepare_module
+    monkeypatch.setattr(
+        module.model_extra_config.operator_opt_config,
+        "shared_expert_multi_stream", True, raising=False,
+    )
+    monkeypatch.setattr(
+        module.model_extra_config.operator_opt_config,
+        "shared_expert_parallel_schedule", "with_all_gather", raising=False,
+    )
+
+    class _DummyEvent:
+        def record(self):
+            pass
+
+        def wait(self, _stream):
+            pass
+
+    class _NoopCtx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            Event=_DummyEvent,
+            stream=lambda _s: _NoopCtx(),
+            get_device_name=lambda _: "Ascend910C",
+        ),
+        raising=False,
+    )
+    shared_mlp = MagicMock(return_value=torch.zeros(2, 2))
+    layer = _moe_layer(
+        global_num_experts=4,
+        local_num_experts=2,
+        ep_size=stubs.ep_group.world_size,
+        quant_config=object(),
+        quant_method=SimpleNamespace(
+            moe_quant_config=SimpleNamespace(
+                use_hifloat8_w8a8=False,
+                use_mxfp8_w8a8=use_mxfp,
+            ),
+        ),
+        top_k=1,
+        w13_weight=torch.zeros(2, 1, 1),
+        shared_experts=shared_mlp,
+    )
+    x = torch.ones(2, 2)
+    local_x = torch.zeros(2, 2, dtype=torch.int8)
+    local_scale = (
+        torch.ones(2, 1, 2, dtype=torch.uint8) if use_mxfp else torch.ones(2)
+    )
+    if use_mxfp:
+        stubs.torch_npu.npu_dynamic_mx_quant.return_value = (local_x, local_scale)
+    else:
+        stubs.torch_npu.npu_dynamic_quant.return_value = (local_x, local_scale)
+    stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
+        torch.ones(2, 2, dtype=torch.int8),
+        torch.arange(2, dtype=torch.int32),
+        torch.ones(2, dtype=torch.int32),
+        local_scale,
+    )
+
+    module.AGRSPrepPmtAndUnpmtFinal(layer).prepare_permute(
+        layer=layer,
+        x=x,
+        topk_ids=torch.tensor([[0], [1]], dtype=torch.int32),
+        options=module.PreparePermuteOptions(
+            topk_weights=torch.tensor([[1.0], [1.0]])
+        ),
+    )
+
+    x_dict = shared_mlp.call_args.args[0]
+    key = "x_mxfp8" if use_mxfp else "x_int8"
+    assert set(x_dict) == {key, "pertoken_scale"}
+    assert x_dict[key] is local_x
+    assert x_dict["pertoken_scale"] is local_scale

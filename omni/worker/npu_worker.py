@@ -55,6 +55,7 @@ from omni_npu.compilation.acl_graph import (
 from omni_npu.v1.utils import on_ascend950
 from omni_npu.profiler.wrapper import NpuProfilerWrapper
 import omni_npu.envs as omni_envs
+from omni_npu.diagnostics.metrics import stage_metrics
 
 logger = init_logger(__name__)
 
@@ -122,12 +123,18 @@ class NPUWorker(Worker):
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
             # available memory
+            # world_ranks is an omni-rl extension carried on init_worker: a
+            # rollout replica's communication world covers only a subset of
+            # the training world's ranks. Dropping it here silently builds
+            # the model-parallel groups on the default full world, so
+            # collectives wait on ranks that belong to another replica.
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
                 self.distributed_init_method,
                 self.local_rank,
                 current_platform.dist_backend,
+                world_ranks=self.world_ranks,
             )
 
             # Initialize the model best practice configs.
@@ -256,18 +263,21 @@ class NPUWorker(Worker):
         peak_activation = after_profile.torch_peak - before_profile.torch_peak
 
         total = after_profile.total_memory
+        kv_offload_reserved = _kv_offload_reserved_bytes(self.vllm_config)
         available = int(
             total * self.cache_config.gpu_memory_utilization
             - weights_memory
             - peak_activation
             - non_torch_increase
+            - kv_offload_reserved
         )
 
         logger.info(
             f"Available KV cache memory: {GiB(available):.2f} GiB "
             f"(total={GiB(total):.2f}, util={self.cache_config.gpu_memory_utilization}, "
             f"weights={GiB(weights_memory):.2f}, peak_torch_activation_during_profile_run={GiB(peak_activation):.2f}, "
-            f"non_torch_memory_increase_during_profile_run={GiB(non_torch_increase):.2f})"
+            f"non_torch_memory_increase_during_profile_run={GiB(non_torch_increase):.2f}, "
+            f"kv_offload_reserved={GiB(kv_offload_reserved):.2f})"
         )
         return max(available, 0)
 
@@ -424,7 +434,9 @@ class NPUWorker(Worker):
             intermediate_tensors = IntermediateTensors(tensor_dict)
         else:
             intermediate_tensors = None
+        started = stage_metrics.mark_forward_start(self.model_runner)
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        stage_metrics.stamp_sync_forward(self.model_runner, output, started)
 
         if isinstance(
             output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
@@ -446,6 +458,11 @@ class NPUWorker(Worker):
                 self.profiler.stop()
                 self.profile_finished = True
         return res
+
+    def sample_tokens(self, grammar_output):
+        output = super().sample_tokens(grammar_output)
+        stage_metrics.stamp_async_forward(self.model_runner, output)
+        return output
 
     def sleep(self, level: int = 1) -> None:
         if self.is_full_async_rl:
@@ -606,6 +623,25 @@ def _needs_dp_local_rank_offset(parallel_config) -> bool:
         # so local_rank is shard-local and must not be offset by the DP rank.
         return False
     return True
+
+
+def _kv_offload_reserved_bytes(vllm_config: VllmConfig) -> int:
+    """Device bytes the NPU KV offload takes after the KV cache is allocated.
+
+    Only the sharded load holds any (see sharded_load_reserved_bytes); 0 when
+    NPUOffloadingConnector is not configured, alone or inside MultiConnector.
+    """
+    kv = vllm_config.kv_transfer_config
+    if kv is None:
+        return 0
+    extra = kv.kv_connector_extra_config or {}
+    names = {kv.kv_connector}
+    names.update(c.get("kv_connector") for c in extra.get("connectors", ()) if isinstance(c, dict))
+    if "NPUOffloadingConnector" not in names:
+        return 0
+    from omni_npu.v1.kv_offload.cpu.npu_worker import sharded_load_reserved_bytes
+
+    return sharded_load_reserved_bytes(vllm_config.parallel_config.tensor_parallel_size)
 
 
 def _patch_npu_triton_capabilities() -> None:

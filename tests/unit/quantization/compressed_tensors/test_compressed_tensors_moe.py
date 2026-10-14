@@ -206,6 +206,7 @@ def _operator_opt_config(**overrides):
         "enable_round_pipeline_comm": False,
         "shared_expert_multi_stream": False,
         "gmm_autotiling": False,
+        "use_w4a8_enk_gmm": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -591,6 +592,7 @@ def test_w4a8_process_asymmetric_weights_builds_bias_and_scales_offset(
     assert torch.equal(layer.w2_weight_bias, expected_bias)
     assert torch.equal(layer.w13_weight_offset, expected_offset)
     assert torch.equal(layer.w2_weight_offset, expected_offset)
+    assert layer._use_w4a8_enk is False
 
 
 def test_w4a8_process_symmetric_weights_skips_offset_rewrite(compressed_moe_module):
@@ -622,8 +624,91 @@ def test_w4a8_process_symmetric_weights_skips_offset_rewrite(compressed_moe_modu
 
     assert layer.w13_weight_offset is None
     assert layer.w2_weight_offset is None
+    assert layer._use_w4a8_enk is False
     assert layer.w13_weight.shape[1] == 8
     assert layer.w2_weight.shape[1] == 8
+
+
+def _w4a8_packed_layer(packed):
+    scale_one = torch.tensor([1.0]).view(torch.int32).to(torch.int64).item()
+    n = packed.shape[1] * 2
+    return SimpleNamespace(
+        w13_weight=torch.nn.Parameter(packed.clone(), requires_grad=False),
+        w2_weight=torch.nn.Parameter(packed.clone(), requires_grad=False),
+        w13_weight_int4_scale=torch.nn.Parameter(
+            torch.full((1, 1, n), scale_one, dtype=torch.int64), requires_grad=False
+        ),
+        w2_weight_int4_scale=torch.nn.Parameter(
+            torch.full((1, 1, n), scale_one, dtype=torch.int64), requires_grad=False
+        ),
+        w13_weight_bias=torch.nn.Parameter(torch.zeros(1, n), requires_grad=False),
+        w2_weight_bias=torch.nn.Parameter(torch.zeros(1, n), requires_grad=False),
+        w13_weight_offset=None,
+        w2_weight_offset=None,
+    )
+
+
+def test_pack_w4a8_enk_nz_interleaves_nibbles(compressed_moe_module):
+    """Checkpoint (E, N/2, K) int8 packs to EnK NZ (E, K, N/8) int32."""
+    formats = []
+
+    def _cast(tensor, fmt):
+        formats.append(fmt)
+        return tensor
+
+    compressed_moe_module.torch_npu.npu_format_cast = _cast
+    packed = torch.tensor(
+        [[[0x01, 0x23], [0x45, 0x67], [0x10, 0x32], [0x54, 0x76]]],
+        dtype=torch.int8,
+    )
+
+    out = compressed_moe_module._pack_w4a8_enk_nz(packed)
+
+    assert formats == [29]
+    assert out.dtype == torch.int32
+    assert tuple(out.shape) == (1, 2, 1)
+    assert torch.equal(
+        out, torch.tensor([[[1685397553], [1969500448]]], dtype=torch.int32)
+    )
+
+
+def test_w4a8_process_symmetric_enk_packs_nz_weights(compressed_moe_module):
+    """Symmetric W4A8 with the EnK switch packs both projections and skips transpose."""
+    compressed_moe_module.model_extra_config.operator_opt_config.use_w4a8_enk_gmm = True
+    method_cls = compressed_moe_module.NPUCompressedTensorsW4A8Int4MoEMethod
+    method = method_cls.__new__(method_cls)
+    method.asymmetric_quant = False
+    packed = torch.tensor(
+        [[[0x01, 0x23], [0x45, 0x67], [0x10, 0x32], [0x54, 0x76]]],
+        dtype=torch.int8,
+    )
+    layer = _w4a8_packed_layer(packed)
+    expected = compressed_moe_module._pack_w4a8_enk_nz(packed)
+
+    method.process_weights_after_loading(layer)
+
+    assert layer._use_w4a8_enk is True
+    assert torch.equal(layer.w13_weight, expected)
+    assert torch.equal(layer.w2_weight, expected)
+
+
+def test_w4a8_process_asymmetric_ignores_enk_switch(compressed_moe_module):
+    """Asymmetric W4A8 keeps the transposed int32 layout when the EnK switch is on."""
+    compressed_moe_module.model_extra_config.operator_opt_config.use_w4a8_enk_gmm = True
+    method_cls = compressed_moe_module.NPUCompressedTensorsW4A8Int4MoEMethod
+    method = method_cls.__new__(method_cls)
+    method.asymmetric_quant = True
+    packed = torch.arange(32, dtype=torch.int8).view(1, 4, 8)
+    layer = _w4a8_packed_layer(packed)
+    layer.w13_weight_offset = torch.nn.Parameter(torch.ones(1, 1, 8), requires_grad=False)
+    layer.w2_weight_offset = torch.nn.Parameter(torch.ones(1, 1, 8), requires_grad=False)
+    transposed = packed.transpose(1, 2).contiguous().view(torch.int32)
+
+    method.process_weights_after_loading(layer)
+
+    assert layer._use_w4a8_enk is False
+    assert torch.equal(layer.w13_weight, transposed)
+    assert torch.equal(layer.w2_weight, transposed)
 
 
 def test_w4a8_quant_config_forwards_weight_offsets(compressed_moe_module):

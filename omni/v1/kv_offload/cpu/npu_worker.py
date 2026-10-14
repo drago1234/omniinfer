@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import queue
+import socket
 import threading
 import time
 from collections import deque
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch_npu
 
 from vllm.logger import init_logger
@@ -27,10 +29,21 @@ from vllm.v1.kv_offload.base import (
     OffloadingWorker,
     TransferResult,
 )
-from vllm.distributed.parallel_state import get_node_count, get_world_group
+from vllm.distributed.parallel_state import (
+    get_node_count,
+    get_tp_group,
+    get_world_group,
+)
 
+from omni_npu import envs
 from omni_npu.v1.kv_offload.cpu.npu_shared_offload_region import (
     NPUSharedOffloadRegion,
+)
+from omni_npu.v1.kv_offload.cpu.sharded_load import (
+    ShardedLoadExecutor,
+    ShardedPlan,
+    ShardMeta,
+    device_footprint_bytes,
 )
 
 logger = init_logger(__name__)
@@ -149,6 +162,10 @@ class Transfer:
     batch_dst: torch.Tensor | None = None
     batch_sizes: torch.Tensor | None = None
     wait_event: torch.npu.Event | None = None
+    # Freed only when the stream passes end_event: the sharded load's row
+    # indices are still being read after transfer_async returns.
+    shard_keepalive: list | None = None
+    wait_event: torch.npu.Event | None = None
 
 
 @dataclass
@@ -182,7 +199,8 @@ class NpuSingleDirectionOffloadingHandler:
         kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
         npu_to_cpu: bool,
         mmap_region: NPUSharedOffloadRegion | None = None,
-        rotate_store_writers: bool = False
+        rotate_store_writers: bool = False,
+        sharded_executor: ShardedLoadExecutor | None = None,
     ):
         if not npu_tensors or len(npu_tensors) != len(cpu_tensors):
             raise ValueError(
@@ -229,7 +247,12 @@ class NpuSingleDirectionOffloadingHandler:
         self._rotate_store_writers = rotate_store_writers
         self._local_world_rank = get_world_group().local_rank
         self._local_world_size = get_world_group().world_size // get_node_count()
- 
+        # Only loads are sharded; stores already split the writers by CPU block.
+        # Gate on the bool; the executor is only touched at plan/run/min_blocks.
+        self._sharded_executor = None if npu_to_cpu else sharded_executor
+        self.enable_sharded_load = self._sharded_executor is not None
+        self._shard_refusal_logged = False
+
         self._transfer_events: dict[int, torch.npu.Event] = {}
         self._transfers: deque[Transfer] = deque()
         self._transfers_by_id: dict[int, Transfer] = {}
@@ -352,6 +375,7 @@ class NpuSingleDirectionOffloadingHandler:
         group_data_refs: list[CanonicalKVCacheRef],
         src_logical_blocks_to_skip: int,
         dst_logical_blocks_to_skip: int,
+        shard_meta: ShardMeta | None = None,
     ) -> int:
         """Write one group's copy descriptors into preallocated int64 buffers."""
         if group_size <= 0 or not group_data_refs:
@@ -384,6 +408,10 @@ class NpuSingleDirectionOffloadingHandler:
                 + (dst_subs % dst_factor) * page_size
             )
             sizes[sl] = page_size
+            if shard_meta is not None:
+                shard_meta.tensor_idx[sl] = int(data_ref.tensor_idx)
+                shard_meta.cpu_block[sl] = src_blocks
+                shard_meta.npu_block[sl] = dst_blocks
             offset += n
         return offset
 
@@ -464,7 +492,8 @@ class NpuSingleDirectionOffloadingHandler:
         block_indices,
         num_src_blocks: int,
         num_dst_blocks: int,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        with_shard_meta: bool = False,
+    ) -> tuple:
         """Build all-group src/dst/size descriptor arrays without Python ops."""
         max_ops = 0
         for group_size, group_data_refs in zip(
@@ -475,6 +504,11 @@ class NpuSingleDirectionOffloadingHandler:
         src_ptrs = np.empty(max_ops, dtype=np.int64)
         dst_ptrs = np.empty(max_ops, dtype=np.int64)
         sizes = np.empty(max_ops, dtype=np.int64)
+        shard_meta = (
+            ShardMeta(*(np.empty(max_ops, dtype=np.int64) for _ in range(3)))
+            if with_shard_meta
+            else None
+        )
         offset = 0
 
         def _fill(
@@ -497,6 +531,7 @@ class NpuSingleDirectionOffloadingHandler:
                 group_data_refs,
                 src_skip,
                 dst_skip,
+                shard_meta,
             )
 
         self._for_each_planned_group(
@@ -504,6 +539,13 @@ class NpuSingleDirectionOffloadingHandler:
             num_src_blocks, num_dst_blocks,
             None if max_ops <= 0 else _fill,
         )
+        if shard_meta is not None:
+            return (
+                src_ptrs[:offset],
+                dst_ptrs[:offset],
+                sizes[:offset],
+                ShardMeta(*(m[:offset] for m in shard_meta)),
+            )
         return src_ptrs[:offset], dst_ptrs[:offset], sizes[:offset]
 
     def _recycle_transfer(self, transfer: Transfer) -> TransferResult:
@@ -542,11 +584,17 @@ class NpuSingleDirectionOffloadingHandler:
             dst_spec=dst_spec,
             wait_event=wait_event,
         )
-        self._ensure_submit_thread()
+        if not self.enable_sharded_load:
+            self._ensure_submit_thread()
         with self._lock:
             if job_id in self._queued or job_id in self._transfers_by_id:
                 raise ValueError(f"duplicate offload job_id {job_id}")
             self._queued[job_id] = job
+        if self.enable_sharded_load:
+            # Stay on the submitting thread: the submit thread can run ahead of
+            # the other ranks without bound and deadlock their all-gathers.
+            self.transfer_async(job_id, src_spec, dst_spec, wait_event=wait_event)
+            return True
         self._submit_queue.put(job)
         return True
 
@@ -627,16 +675,24 @@ class NpuSingleDirectionOffloadingHandler:
                 f"{len(self.kv_cache_groups_data_refs)}"
             )
 
-        src_ptrs, dst_ptrs, op_sizes = self._plan_transfer_descriptors(
+        planned = self._plan_transfer_descriptors(
             src_blocks,
             dst_blocks,
             group_sizes,
             block_indices,
             num_src_blocks,
             num_dst_blocks,
+            with_shard_meta=self.enable_sharded_load,
         )
+        src_ptrs, dst_ptrs, op_sizes = planned[:3]
+        shard_meta = planned[3] if self.enable_sharded_load else None
         num_ops = int(op_sizes.size)
         num_bytes = int(op_sizes.sum()) if num_ops else 0
+        shard_plan = None
+        if shard_meta is not None and num_ops:
+            shard_plan = self._plan_sharded(
+                job_id, num_src_blocks, src_ptrs, op_sizes, shard_meta
+            )
 
         stream = self._stream
         start_event, end_event = self._pop_timing_events()
@@ -691,10 +747,16 @@ class NpuSingleDirectionOffloadingHandler:
             )
 
         start_mono = time.monotonic()
+        shard_keepalive = None
         with self._activate_transfer_stream(stream):
             start_event.record(stream)
             if num_ops:
-                if swap_fn is not None:
+                if shard_plan is not None:
+                    shard_keepalive = self._sharded_executor.run(
+                        shard_plan, src_ptrs, shard_meta.npu_block,
+                        self.dst_tensors, self._h2d,
+                    )
+                elif swap_fn is not None:
                     batch_src = torch.from_numpy(np.ascontiguousarray(src_ptrs))
                     batch_dst = torch.from_numpy(np.ascontiguousarray(dst_ptrs))
                     batch_sizes = torch.from_numpy(np.ascontiguousarray(op_sizes))
@@ -715,6 +777,7 @@ class NpuSingleDirectionOffloadingHandler:
             batch_src=batch_src,
             batch_dst=batch_dst,
             batch_sizes=batch_sizes,
+            shard_keepalive=shard_keepalive,
             wait_event=wait_event,
         )
         with self._lock:
@@ -724,6 +787,44 @@ class NpuSingleDirectionOffloadingHandler:
             self._queued.pop(job_id, None)
             self._cv.notify_all()
         return True
+
+    def _plan_sharded(
+        self,
+        job_id: int,
+        num_src_blocks: int,
+        src_ptrs: np.ndarray,
+        op_sizes: np.ndarray,
+        shard_meta: ShardMeta,
+    ) -> ShardedPlan | None:
+        """Sharded plan for one load job, or None to use the plain load.
+
+        Every rank sees the same job and takes the same branch here; a rank
+        that went plain while the others shard would hang their all-gather.
+        """
+        if num_src_blocks < self._sharded_executor.min_blocks:
+            return None
+        why: list[str] = []
+        plan = self._sharded_executor.plan(
+            shard_meta.tensor_idx, op_sizes, shard_meta.cpu_block,
+            shard_meta.npu_block, src_ptrs, why
+        )
+        if plan is None and not self._shard_refusal_logged:
+            self._shard_refusal_logged = True
+            logger.warning(
+                "kv_offload sharded load: job=%s uses the plain load (%s); "
+                "later refusals are not logged",
+                job_id,
+                "; ".join(why) or "nothing to shard",
+            )
+        return plan
+
+    def _h2d(self, srcs: np.ndarray, dsts: np.ndarray, sizes: np.ndarray) -> None:
+        self._swap_blocks_batch(
+            torch.from_numpy(np.ascontiguousarray(srcs, dtype=np.int64)),
+            torch.from_numpy(np.ascontiguousarray(dsts, dtype=np.int64)),
+            torch.from_numpy(np.ascontiguousarray(sizes, dtype=np.int64)),
+            _DIRECTION_H2D,
+        )
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
@@ -780,6 +881,193 @@ class NpuSingleDirectionOffloadingHandler:
         if self._mmap_region is not None:
             self._mmap_region.cleanup()
             self._mmap_region = None
+
+
+# One all-gather of the sharded load, in MiB. The staging buffers and the
+# scatter workspace scale with this and come out of the KV cache budget
+# (340 MiB at tp16); under the claw trace on a TP16 505B prefill, 32 loaded as
+# fast as 256.
+_SHARDED_CHUNK_MB = 32
+# Load jobs with fewer CPU blocks than this, summed over KV groups, stay on the
+# plain load: below it the TTFT gain was not measurable.
+_SHARDED_MIN_BLOCKS = 48
+# Device bytes to reserve for the group's communicator. Not a setting handed to
+# HCCL - the group asks for nothing and inherits HCCL_BUFFSIZE like the model's
+# own groups - but what building it was measured to cost: 229-232 MiB per rank
+# on a TP16 505B prefill, read from mem_get_info around new_group.
+_SHARDED_COMM_RESERVE_MB = 240
+
+# Slack asked for on top of the sharded load's memory before it is allocated.
+_STAGING_HEADROOM = 1.5
+
+# Named explicitly so a torch_npu whose OutOfMemoryError stops deriving from
+# RuntimeError still degrades instead of failing the boot on one rank.
+_ALLOC_FAILED = (
+    RuntimeError,
+    MemoryError,
+    getattr(torch.npu, "OutOfMemoryError", RuntimeError),
+)
+
+
+def _free_device_bytes(device: torch.device) -> int | None:
+    """Free bytes on ``device``, or None when the runtime cannot tell."""
+    try:
+        free, _total = torch.npu.mem_get_info(device.index or 0)
+        return int(free)
+    except (AttributeError, RuntimeError) as exc:  # pragma: no cover - torch_npu has it
+        logger.warning(
+            "kv_offload sharded load: cannot read free NPU memory (%s); "
+            "skipping the staging check",
+            exc,
+        )
+        return None
+
+
+def sharded_load_reserved_bytes(tp_size: int) -> int:
+    """Device bytes to take out of the KV cache budget for the sharded load.
+
+    It is built after the KV cache; without this its memory would come out of
+    the (1 - gpu_memory_utilization) margin that runtime activations need.
+    """
+    if not envs.OMNI_KV_OFFLOAD_SHARDED_LOAD or tp_size <= 1:
+        return 0
+    return device_footprint_bytes(
+        _SHARDED_CHUNK_MB << 20, tp_size, _SHARDED_COMM_RESERVE_MB << 20
+    )
+
+
+def _sharded_hccl_options(group_name: str):
+    """Options for one of the sharded load's process groups.
+
+    The communicator's scratch is left alone: it inherits HCCL_BUFFSIZE like
+    every other group here. One rank of the group sends chunk/world bytes per
+    all-gather (2 MiB at tp16, chunk 32), well under the 100 MiB the prefill
+    pods set, and no measurement ever showed a reason to override it.
+    """
+    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    # AI_CPU: the prefill forward runs on AIV and the load's all-gather overlaps
+    # it, so driving the group from AI_CPU leaves the vector cores to the model.
+    options.hccl_config = {
+        "group_name": group_name,
+        "hccl_op_expansion_mode": 2,
+    }
+    return options
+
+
+def _make_sharded_load(
+    replicated: bool, device: torch.device
+) -> ShardedLoadExecutor | None:
+    """Build the sharded load executor, or return None to keep the plain load.
+
+    Every rank runs this while building its worker, and it creates HCCL groups,
+    so all ranks must take the same branch: local refusals are agreed on with
+    all_reduce(MIN) first, because a rank that skips new_group hangs the rest.
+
+    Gates that make the group useless (env off, TP size 1) return before any
+    collective: building the domain would pay HCCL's device footprint for nothing.
+    """
+    if not envs.OMNI_KV_OFFLOAD_SHARDED_LOAD:
+        return None
+    tp = get_tp_group()
+    # No second rank to gather with: skip the domain entirely and save its HBM.
+    if tp.world_size <= 1:
+        return None
+    world = get_world_group()
+    me = dist.get_rank()
+    members: list = [None] * world.world_size
+    dist.all_gather_object(
+        members, (tuple(tp.ranks), socket.gethostname()), group=world.cpu_group
+    )
+    reasons = []
+    if not replicated:
+        reasons.append("KV layout is not replicated")
+    if _get_swap_blocks_batch() is None:
+        reasons.append("_swap_blocks_batch extension missing")
+    if any(members[r][1] != members[me][1] for r in tp.ranks):
+        # Each host has its own CPU pool; across hosts the all-gather would
+        # move over the network what every rank can copy from its own pool.
+        reasons.append("TP group spans hosts")
+    need = sharded_load_reserved_bytes(tp.world_size)
+    free = _free_device_bytes(device)
+    if free is not None and free < need * _STAGING_HEADROOM:
+        reasons.append(
+            "sharded load needs %d MiB plus %.1fx slack but only %d MiB is free"
+            % (need >> 20, _STAGING_HEADROOM, free >> 20)
+        )
+    ok = torch.tensor([0 if reasons else 1], dtype=torch.int32)
+    dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=world.cpu_group)
+    if int(ok.item()) == 0:
+        logger.warning(
+            "kv_offload sharded load: OFF (%s)",
+            "; ".join(reasons) or "refused on another rank",
+        )
+        return None
+
+    shard_group = None
+    shard_group_name = None
+    for ranks in sorted({m[0] for m in members}):
+        # Same name on every member of the group, different between groups.
+        name = "kv_offload_sharded_load_%d" % ranks[0]
+        group = dist.new_group(
+            list(ranks),
+            backend="hccl",
+            pg_options=_sharded_hccl_options(name),
+        )
+        if ranks == tuple(tp.ranks):
+            shard_group, shard_group_name = group, name
+
+    def allgather(out, inp):
+        return dist.all_gather_into_tensor(
+            out, inp, group=shard_group, async_op=True
+        )
+
+    executor = ShardedLoadExecutor(
+        rank=tp.rank_in_group,
+        world=tp.world_size,
+        chunk_bytes=_SHARDED_CHUNK_MB << 20,
+        min_blocks=_SHARDED_MIN_BLOCKS,
+        device=device,
+        allgather_async=allgather,
+    )
+    allocated = torch.tensor([1], dtype=torch.int32)
+    try:
+        executor.allocate()
+    except _ALLOC_FAILED as exc:
+        # A failure here has to become a refusal: raising would take down the boot
+        # on one rank and hang the others in the all_reduce below.
+        logger.warning(
+            "kv_offload sharded load: staging of %d MiB did not fit (%s)",
+            need >> 20,
+            exc,
+        )
+        allocated[0] = 0
+    dist.all_reduce(allocated, op=dist.ReduceOp.MIN, group=world.cpu_group)
+    if int(allocated.item()) == 0:
+        # Some rank failed after the free-memory check passed. Nobody probes, so
+        # no rank is left waiting in the collective.
+        logger.warning(
+            "kv_offload sharded load: OFF (staging did not fit on every rank); "
+            "the plain load is used"
+        )
+        return None
+    executor.probe()
+    # Device error tags name HCCL's own communicator id, so log it with the group.
+    comm = "unavailable"
+    try:
+        comm = shard_group._get_backend(device).get_hccl_comm_name(dist.get_rank())
+    except Exception as exc:  # noqa: BLE001
+        comm = "unavailable(%s)" % type(exc).__name__
+    logger.info(
+        "kv_offload sharded load: ON tp=%d rank=%d chunk=%dMB min_blocks=%d "
+        "group=%s comm=%s",
+        executor.world,
+        executor.rank,
+        _SHARDED_CHUNK_MB,
+        executor.min_blocks,
+        shard_group_name,
+        comm,
+    )
+    return executor
 
 
 class NPUCPUOffloadingWorker(OffloadingWorker):
@@ -871,6 +1159,9 @@ class NPUCPUOffloadingWorker(OffloadingWorker):
             block_size_factor=block_size_factor,
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             npu_to_cpu=False,
+            sharded_executor=_make_sharded_load(
+                rotate_store_writers, npu_tensors[0].device
+            ),
         )
 
     def submit_store(

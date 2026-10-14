@@ -358,8 +358,8 @@ def _prepare_high_performance_weights(layer) -> None:
         w_uk, w_uv = kv_weight.split(
             [layer.qk_nope_head_dim, layer.v_head_dim], dim=-1,
         )
-        layer.attn.impl.W_UK_T = w_uk.permute(1, 2, 0).contiguous()
-        layer.attn.impl.W_UV = w_uv.transpose(0, 1).contiguous()
+        layer.attn.W_UK_T = w_uk.permute(1, 2, 0).contiguous()
+        layer.attn.W_UV = w_uv.transpose(0, 1).contiguous()
 
         if layer.param_sink_number > 0:
             sink_compressed_kv = layer.kv_a_layernorm(
@@ -477,6 +477,9 @@ def build_metadata(layer, vllm_config, reqs, num_blocks: int,
         # bound directly (mla_attention.py build asserts it for prefills);
         # the deprecated _seq_lens_cpu fallback no longer satisfies it.
         seq_lens_cpu_upper_bound=seq_lens,
+        # kv_producer sets treat_short_extends_as_decodes=False, and vLLM then
+        # requires this CPU mask. These harness requests are still prefilling.
+        is_prefilling=torch.ones(num_reqs, dtype=torch.bool),
     )
     common._seq_lens_cpu = seq_lens
     common._num_computed_tokens_cpu = num_computed_cpu

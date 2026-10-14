@@ -27,6 +27,12 @@ default_config_path = os.path.normpath(os.path.join(os.path.abspath(__file__), '
 MoECommStrategyType = Literal["allreduce", "allgather_reducescatter", "dispatch_combine", "all2allv"]
 
 
+def _report_precision_consistency_violation(message: str):
+    if envs.OMNI_PRECISION_STRONG_CONSISTENCY_CHECK_LEVEL == "error":
+        raise ValueError(message)
+    logger.warning(f"[WARNING] {message}")
+
+
 def load_model_extra_config(model_config, vllm_config, scheduler_config):
     model_name, quant_type = parse_hf_config(model_config.hf_config)
     is_pd_disaggregation = False
@@ -81,7 +87,7 @@ def load_model_extra_config(model_config, vllm_config, scheduler_config):
         enable_pd_elastic_scaling=enable_pd_elastic_scaling,
         enable_omni_cache=enable_omni_cache
     )
-    _validate_config(vllm_config.additional_config)
+    _validate_config(vllm_config)
     _print_model_config()
 
 
@@ -208,9 +214,9 @@ class ModelOperatorOptConfig:
     enable_mome_sp: bool = False # prefill only, support prefix cache
     mome_sp_allgather_multi_stream: bool = True # Whether MoME-SP cache-state AllGather runs on a side stream
     optimize_first_chunk: bool = False # Whether turn off PA (non-absorb mode) and use MoME SP for the first chunk
+    use_w4a8_enk_gmm: bool = False # W4A8 MoE EnK 优化，仅对称量化，默认关闭
 
     def __post_init__(self):
-
         # Check the dependencies of use_prefetch and prefetch_Mb
         if not self.enable_prefetch:
             self.expert_gate_up_prefetch = 0
@@ -483,11 +489,46 @@ def _get_best_practice_config(task_config):
     return _loader_configs_data(best_practice_model_config_path)
 
 
-def _validate_config(additional_config):
+def _validate_precision_strong_consistency(vllm_config):
+    operator_opt_config = model_extra_config.operator_opt_config
+    if not operator_opt_config.enable_precision_strong_consistency:
+        return
+
+    hccl_deterministic = os.environ.get("HCCL_DETERMINISTIC")
+    if hccl_deterministic != "STRICT":
+        _report_precision_consistency_violation(
+            'enable_precision_strong_consistency requires HCCL_DETERMINISTIC="STRICT", '
+            f"but got {hccl_deterministic!r}"
+        )
+    pytorch_npu_alloc_conf = os.environ.get("PYTORCH_NPU_ALLOC_CONF", "")
+    if pytorch_npu_alloc_conf != "expandable_segments:True":
+        _report_precision_consistency_violation(
+            "enable_precision_strong_consistency requires PYTORCH_NPU_ALLOC_CONF to be "
+            f'"expandable_segments:True", but got {pytorch_npu_alloc_conf!r}'
+        )
+    if not operator_opt_config.use_batch_invariant_op:
+        _report_precision_consistency_violation(
+            "enable_precision_strong_consistency requires use_batch_invariant_op to be True, "
+            f"but got {operator_opt_config.use_batch_invariant_op}"
+        )
+    if model_extra_config.task_config.is_prefill_node:
+        return
+
+    from vllm.config.compilation import CUDAGraphMode
+    cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+    if cudagraph_mode != CUDAGraphMode.FULL:
+        _report_precision_consistency_violation(
+            "enable_precision_strong_consistency requires compilation_config.cudagraph_mode "
+            f"to be CUDAGraphMode.FULL, but got {cudagraph_mode}"
+        )
+
+
+def _validate_config(vllm_config):
     global model_extra_config
     apply_eager_mode_config(model_extra_config)
-    apply_omni_cache(additional_config)
+    apply_omni_cache(vllm_config.additional_config)
     apply_seq_parallel(model_extra_config)
+    _validate_precision_strong_consistency(vllm_config)
 
 
 def _print_model_config():

@@ -643,7 +643,7 @@ class TestSPCtrl:
 
 @pytest.mark.unit
 class TestCPReorg:
-    """cp_reorg：sp_to_cp / cp_to_sp / sp_to_tp（不测 sp_ctrl 的 slice/ag）。"""
+    """cp_reorg：sp_to_cp / cp_to_sp / sp_to_tp / tp_to_sp。"""
 
     def _run_cp_case(
         self,
@@ -784,6 +784,42 @@ class TestCPReorg:
 
     def test_sp_to_tp_large_d(self):
         self._run_sp_to_tp_case(T=3, D=8)
+
+    def _run_tp_to_sp_case(self, T: int, D: int, ranks: int = 4) -> None:
+        full = torch.arange(T * ranks * D).view(T * ranks, D)
+        inputs = {
+            rank: full + rank * full.numel()
+            for rank in range(ranks)
+        }
+        sp = TaskDist(ranks=ranks)
+        results: dict[int, torch.Tensor] = {}
+
+        def task():
+            utils = importlib.import_module(MODULE)
+            mgr = utils.SPManager(utils.get_tp_group())
+            rank = sp.thread_local.rank
+            results[rank] = mgr.tp_to_sp(inputs[rank]).clone()
+
+        with _utils_env():
+            sp.run(task)
+
+        for rank in range(ranks):
+            token_slice = slice(rank * T, (rank + 1) * T)
+            golden = torch.cat(
+                [inputs[src][token_slice] for src in range(ranks)],
+                dim=1,
+            )
+            assert results[rank].shape == (T, ranks * D)
+            assert torch.equal(results[rank], golden)
+
+    def test_tp_to_sp_basic(self):
+        self._run_tp_to_sp_case(T=4, D=2)
+
+    def test_tp_to_sp_short_t(self):
+        self._run_tp_to_sp_case(T=1, D=4)
+
+    def test_tp_to_sp_d1(self):
+        self._run_tp_to_sp_case(T=8, D=1)
 
 
 # =========================
@@ -1079,11 +1115,15 @@ def _causal_conv_ref(
     prefix: torch.Tensor,
     cumlens: torch.Tensor,
     inplace: bool = False,
+    max_query_len: int | None = None,
 ) -> torch.Tensor:
     assert x.dim() == 2 and w.dim() == 2 and states.dim() == 3
     K, D = w.shape
     bs = cumlens.numel() - 1
-    assert states.shape[0] == bs and states.size(1) >= K and states.size(2) == D
+    assert states.shape[0] == bs and states.size(1) >= K - 1 and states.size(2) == D
+    assert max_query_len == max(
+        int(cumlens[i + 1] - cumlens[i]) for i in range(bs)
+    )
     y = x if inplace else x.clone()
     for b in range(bs):
         s = int(cumlens[b].item())
@@ -1173,7 +1213,7 @@ def test_scheme_conv_sp_stages_metadata_with_non_blocking_copy():
     assert len(async_to_calls) == 4
     assert all(args == (target_device,) for args, _ in async_to_calls)
 
-    (send_idx, _, _), (prefix, cumlens, reorg_idx), _, _ = metadata
+    (send_idx, _, _), (prefix, cumlens, reorg_idx, _), _, _ = metadata
     assert send_idx.dtype == torch.int32
     assert prefix.dtype == torch.int32
     assert cumlens.dtype == torch.int32
@@ -1195,8 +1235,10 @@ def test_conv_sp_allgather_stream_is_configurable(multi_stream):
     )
     metadata = (
         (torch.empty(0, dtype=torch.long), [0], [0]),
-        (torch.tensor([0]), torch.tensor([0, 2]), torch.arange(4)),
-        (2, 2, 2, 2, group),
+        # conv_meta: prefix, cumlens, reorg_idx, max_query_len
+        (torch.tensor([0]), torch.tensor([0, 2]), torch.arange(4), 2),
+        # batch_meta: batch_size, state_len, kernel_size, conv_state_len, sp_len, group
+        (2, 2, 2, 2, 2, group),
         None,
     )
 

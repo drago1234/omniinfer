@@ -1,5 +1,6 @@
 {% set hugepage_enabled = kv_offload_config.get('hugepage_enabled', false) | bool -%}
 {% set cpu_bytes_to_use = kv_offload_config.get('cpu_bytes_to_use', 0) | int -%}
+{% set sharded_load_enabled = kv_offload_config.get('sharded_load', false) | bool -%}
 {% set connector = common_profile.kv_connector -%}
 {% set parallel_size_token = '__KV_PARALLEL_SIZE__' -%}
 {% set port_token = '__OMNI_LLMDATADIST_ZMQ_PORT__' -%}
@@ -13,6 +14,8 @@
 } -%}
 export OMNI_KV_OFFLOAD_HUGEPAGE={{ hugepage_enabled | ternary('1', '0') }}
 export OMNI_KV_OFFLOAD_HUGEPAGE_SIZE="${OMNI_KV_OFFLOAD_HUGEPAGE_SIZE:-2097152}"
+{# 分片 DDR 载入：每卡只读 1/tp，卡间 all-gather 拼齐。默认关，playbook 里写 sharded_load: true 才开。 #}
+export OMNI_KV_OFFLOAD_SHARDED_LOAD={{ sharded_load_enabled | ternary('1', '0') }}
 {% if hugepage_enabled %}
 SETUP_HUGETLBFS={{ (container_workspace ~ '/omniinfer/tools/deploy/start_server/setup_hugetlbfs.sh') | quote }}
 KV_OFFLOAD_SETUP_LOG="${LOG_PATH}/{{ inventory_hostname }}/kv_offload_setup.log"

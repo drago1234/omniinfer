@@ -76,7 +76,6 @@ from omni_npu.v1.layers.attention.weight_utils import run_post_weight_load
 from omni_npu.v1.layers.logits_processor import NPULogitsProcessor
 from omni_npu.v1.layers.vocab_parallel_embedding import NPUParallelLMHead, NPUVocabParallelEmbedding
 from omni_npu.v1.utils import on_ascend910b, on_ascend950
-
 from .utils import (
     _has_mla_config,
     _normalize_rope_parameters,
@@ -89,6 +88,7 @@ from .utils import (
     rerouting,
     quant_ffn,
     finalize_routing,
+    w4a8_expert_ffn,
 )
 
 
@@ -353,8 +353,6 @@ class OpenPanguV2MOE(nn.Module):
         self._is_quant = self.experts.w13_weight.dtype == torch.int8
 
         self._is_w4a8 = hasattr(self.experts, "w13_weight_int4_scale")
-        self._is_w4a8_weight_asymmetric = getattr(self.experts, "w13_weight_offset", None) is not None
-
         self.gmm_fr_token_threshold = model_extra_config.operator_opt_config.gmm_fr_token_threshold
         self.moe_dispatch_combine_max_batch_size = (
             model_extra_config.operator_opt_config.moe_dispatch_combine_max_batch_size
@@ -503,7 +501,10 @@ class OpenPanguV2MOE(nn.Module):
             if self._is_graph_mode
             else nullcontext()
         ):
-            ENABLE_GMM_FR = hidden_states.shape[0] <= self.gmm_fr_token_threshold
+            ENABLE_GMM_FR = (
+                hidden_states.shape[0] <= self.gmm_fr_token_threshold
+                and not self._is_w4a8
+            )
 
             # Step 1: gating_topk - Select top-k experts
             router_logits, _ = (self.gate(hidden_states_fp32) if hidden_states_fp32 is not None
@@ -585,107 +586,20 @@ class OpenPanguV2MOE(nn.Module):
                         support_multi_stream=False,
                     )
                 if self._is_w4a8:
-                    # GMM1: int8 x int4 -> bf16 (int4 dequant and zero point inlined)
-                    asym = self._is_w4a8_weight_asymmetric
-                    gate_up_proj_output = torch_npu.npu_grouped_matmul(
-                        [sorted_tokens],
-                        [self.experts.w13_weight],
-                        bias=[self.experts.w13_weight_bias],
-                        scale=[self.experts.w13_weight_int4_scale],
-                        offset=[self.experts.w13_weight_offset] if asym else None,
-                        antiquant_scale=None,
-                        antiquant_offset=None,
-                        per_token_scale=[expanded_activation_scale.unsqueeze(-1) if asym
-                                         else expanded_activation_scale],
-                        group_list=expert_tokens,
-                        activation_input=None,
-                        activation_quant_scale=None,
-                        activation_quant_offset=None,
-                        split_item=3,
-                        group_type=0,
-                        group_list_type=1,
-                        act_type=0,
-                        tuning_config=None,
-                        output_dtype=torch.bfloat16,
-                    )[0]  # gate_up_proj_output: bf16 [T, 2I]
-
-                    # npu_dequant_swiglu_quant: bf16 -> int8 (swiglu + requant)
-                    intermediate_h, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
-                        x=gate_up_proj_output,
-                        weight_scale=None,
-                        activation_scale=None,
-                        bias=None,
-                        quant_offset=None,
-                        quant_scale=None,
-                        group_index=expert_tokens,
-                        activate_left=True,
-                        quant_mode=1,
-                    )  # intermediate_h: int8 [T, I], pertoken_scale: fp32 [T]
-
-                    if not ENABLE_GMM_FR:
-                        # --- GMM2: int8 x int4 -> bf16 ---
-                        down_proj_output = torch_npu.npu_grouped_matmul(
-                            [intermediate_h],
-                            [self.experts.w2_weight],
-                            bias=[self.experts.w2_weight_bias],
-                            scale=[self.experts.w2_weight_int4_scale],
-                            offset=[self.experts.w2_weight_offset] if asym else None,
-                            antiquant_scale=None,
-                            antiquant_offset=None,
-                            per_token_scale=[pertoken_scale.unsqueeze(-1) if asym else pertoken_scale],
-                            group_list=expert_tokens,
-                            activation_input=None,
-                            activation_quant_scale=None,
-                            activation_quant_offset=None,
-                            split_item=3,
-                            group_type=0,
-                            group_list_type=1,
-                            act_type=0,
-                            tuning_config=None,
-                            output_dtype=torch.bfloat16,
-                        )[0]  # down_proj_output: bf16 [T, H]
-
-                        moe_output = torch_npu.npu_moe_finalize_routing(
-                            down_proj_output.unsqueeze(1),
-                            None, None, None,
-                            topk_weights.to(torch.float32),
-                            expanded_x_idx,
-                            topk_ids,
-                            drop_pad_mode=3,
-                        )
-                    else:
-                        # --- GMM2 + finalize_routing fused into one operator (gmmfr) ---
-                        range1 = torch.arange(
-                            0, expanded_x_idx.shape[0], dtype=torch.int32, device=hidden_states.device
-                        )
-                        range2 = range1 * torch.empty((1), dtype=torch.int32, device=hidden_states.device).fill_(991)
-                        mask = (range1 >= torch.sum(expert_tokens)).to(torch.int32)
-                        expanded_x_idx += range2 * mask
-                        expanded_x_idx = expanded_x_idx % expanded_x_idx.shape[0]
-                        expanded_x_idx = torch.clamp(expanded_x_idx, min=0, max=expanded_x_idx.shape[0] - 1)
-                        sorted_topk_weight = torch.index_select(topk_weights.reshape(-1), 0, expanded_x_idx)
-                        sorted_topk_weight = sorted_topk_weight.to(torch.float32)
-                        row_index = torch.floor(torch.div(expanded_x_idx, topk_ids.shape[-1])).to(torch.int64)
-                        shared_input_fake = torch.zeros(
-                            (hidden_states.shape[0], hidden_states.shape[1]),
-                            dtype=torch.bfloat16,
-                            device=hidden_states.device,
-                        )
-
-                        moe_output = torch_npu.npu_grouped_matmul_finalize_routing(
-                            intermediate_h,
-                            self.experts.w2_weight,
-                            expert_tokens,
-                            scale=self.experts.w2_weight_int4_scale,
-                            bias=self.experts.w2_weight_bias,
-                            offset=self.experts.w2_weight_offset if asym else None,
-                            pertoken_scale=pertoken_scale,
-                            shared_input=shared_input_fake,
-                            logit=sorted_topk_weight,
-                            row_index=row_index,
-                            output_bs=hidden_states_int8.shape[0],
-                            group_list_type=1,
-                        ).to(torch.bfloat16)
+                    down_proj_output = w4a8_expert_ffn(
+                        self.experts,
+                        sorted_tokens,
+                        expanded_activation_scale,
+                        expert_tokens,
+                    )
+                    moe_output = torch_npu.npu_moe_finalize_routing(
+                        down_proj_output.unsqueeze(1),
+                        None, None, None,
+                        topk_weights.to(torch.float32),
+                        expanded_x_idx,
+                        topk_ids,
+                        drop_pad_mode=3,
+                    )
                 else:
                     # Step 3: Int8 group_matmul - First matmul (gate_up projection) -> int32
                     gate_up_proj_output = torch_npu.npu_grouped_matmul(
@@ -1077,63 +991,9 @@ class OpenPanguV2MOE(nn.Module):
                 expand_x = expand_x.view(-1, expand_x.shape[-1])
 
             if self._is_w4a8:
-                # GMM1: int8 x int4 -> bf16 (int4 dequant and zero point inlined)
-                asym = self._is_w4a8_weight_asymmetric
-                gate_up_proj = torch_npu.npu_grouped_matmul(
-                    [expand_x],
-                    [self.experts.w13_weight],
-                    bias=[self.experts.w13_weight_bias],
-                    scale=[self.experts.w13_weight_int4_scale],
-                    offset=[self.experts.w13_weight_offset] if asym else None,
-                    antiquant_scale=None,
-                    antiquant_offset=None,
-                    per_token_scale=[dynamic_scale.unsqueeze(-1) if asym else dynamic_scale],
-                    group_list=expert_tokens,
-                    activation_input=None,
-                    activation_quant_scale=None,
-                    activation_quant_offset=None,
-                    split_item=3,
-                    group_type=0,
-                    group_list_type=1,
-                    act_type=0,
-                    tuning_config=None,
-                    output_dtype=torch.bfloat16,
-                )[0]  # gate_up_proj: bf16 [T, 2I]
-
-                # npu_dequant_swiglu_quant: bf16 -> int8 (swiglu + requant)
-                intermediate_h, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
-                    x=gate_up_proj,
-                    weight_scale=None,
-                    activation_scale=None,
-                    bias=None,
-                    quant_offset=None,
-                    quant_scale=None,
-                    group_index=expert_tokens,
-                    activate_left=True,
-                    quant_mode=1,
-                )  # intermediate_h: int8 [T, I], pertoken_scale: fp32 [T]
-
-                # GMM2: int8 x int4 -> bf16
-                down_proj_output = torch_npu.npu_grouped_matmul(
-                    [intermediate_h],
-                    [self.experts.w2_weight],
-                    bias=[self.experts.w2_weight_bias],
-                    scale=[self.experts.w2_weight_int4_scale],
-                    offset=[self.experts.w2_weight_offset] if asym else None,
-                    antiquant_scale=None,
-                    antiquant_offset=None,
-                    per_token_scale=[pertoken_scale.unsqueeze(-1) if asym else pertoken_scale],
-                    group_list=expert_tokens,
-                    activation_input=None,
-                    activation_quant_scale=None,
-                    activation_quant_offset=None,
-                    split_item=3,
-                    group_type=0,
-                    group_list_type=1,
-                    act_type=0,
-                    tuning_config=None,
-                    output_dtype=torch.bfloat16,
-                )[0]  # down_proj_output: bf16 [T, H]
+                down_proj_output = w4a8_expert_ffn(
+                    self.experts, expand_x, dynamic_scale, expert_tokens
+                )
             else:
                 gate_up_proj = torch_npu.npu_grouped_matmul(
                     [expand_x],
@@ -1408,65 +1268,12 @@ class OpenPanguV2MOE(nn.Module):
         # Step 6: grouped_matmul + activation + grouped_matmul - Expert computation
         if self._is_quant:
             if self._is_w4a8:
-                # GMM1: int8 x int4 -> bf16 (int4 dequant and zero point inlined)
-                asym = self._is_w4a8_weight_asymmetric
-                gate_up_proj_output = torch_npu.npu_grouped_matmul(
-                    [hidden_states_sorted],
-                    [self.experts.w13_weight],
-                    bias=[self.experts.w13_weight_bias],
-                    scale=[self.experts.w13_weight_int4_scale],
-                    offset=[self.experts.w13_weight_offset] if asym else None,
-                    antiquant_scale=None,
-                    antiquant_offset=None,
-                    per_token_scale=[gathered_pertoken_scale.unsqueeze(-1) if asym
-                                     else gathered_pertoken_scale],
-                    group_list=tokens_per_local_expert,
-                    activation_input=None,
-                    activation_quant_scale=None,
-                    activation_quant_offset=None,
-                    split_item=3,
-                    group_type=0,
-                    group_list_type=1,
-                    act_type=0,
-                    tuning_config=None,
-                    output_dtype=torch.bfloat16,
-                )[0]  # gate_up_proj_output: bf16 [T, 2I]
-
-                # npu_dequant_swiglu_quant: bf16 -> int8 (swiglu + requant)
-                intermediate_h, pertoken_scale_down = torch_npu.npu_dequant_swiglu_quant(
-                    x=gate_up_proj_output,
-                    weight_scale=None,
-                    activation_scale=None,
-                    bias=None,
-                    quant_offset=None,
-                    quant_scale=None,
-                    group_index=tokens_per_local_expert,
-                    activate_left=True,
-                    quant_mode=1,
-                )  # intermediate_h: int8 [T, I], pertoken_scale_down: fp32 [T]
-
-                # GMM2: int8 x int4 -> bf16
-                down_proj_output = torch_npu.npu_grouped_matmul(
-                    [intermediate_h],
-                    [self.experts.w2_weight],
-                    bias=[self.experts.w2_weight_bias],
-                    scale=[self.experts.w2_weight_int4_scale],
-                    offset=[self.experts.w2_weight_offset] if asym else None,
-                    antiquant_scale=None,
-                    antiquant_offset=None,
-                    per_token_scale=[pertoken_scale_down.unsqueeze(-1) if asym
-                                     else pertoken_scale_down],
-                    group_list=tokens_per_local_expert,
-                    activation_input=None,
-                    activation_quant_scale=None,
-                    activation_quant_offset=None,
-                    split_item=3,
-                    group_type=0,
-                    group_list_type=1,
-                    act_type=0,
-                    tuning_config=None,
-                    output_dtype=torch.bfloat16,
-                )[0]  # down_proj_output: bf16 [T, H]
+                down_proj_output = w4a8_expert_ffn(
+                    self.experts,
+                    hidden_states_sorted,
+                    gathered_pertoken_scale,
+                    tokens_per_local_expert,
+                )
             else:            
                 # INT8 path: gate_up projection -> int32 output
                 gate_up_proj_output = torch_npu.npu_grouped_matmul(

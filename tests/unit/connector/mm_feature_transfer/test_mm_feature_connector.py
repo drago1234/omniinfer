@@ -4,9 +4,13 @@ import os
 import pickle
 import json
 import time
+import shutil
+import sqlite3
+import asyncio
 from unittest.mock import MagicMock, patch, call, ANY
 
 import pytest
+import torch
 from vllm.multimodal.processing import PromptUpdateDetails
 from vllm.multimodal.processing.processor import ResolvedPromptUpdate
 
@@ -25,6 +29,9 @@ def mock_meta():
     meta.get_total_used.return_value = 0
     meta.get_eviction_candidates.return_value = []
     meta.delete_old_features.return_value = []
+    # Removal re-checks the refcount before deleting a feature directory; an unset
+    # MagicMock would compare as "still referenced" and skip every eviction.
+    meta.get_refcount.return_value = 0
     return meta
 
 
@@ -165,14 +172,18 @@ class TestHasItem:
 
 # -------------------- Tests for save_item_with_updates --------------------
 class TestSaveItemWithUpdates:
-    def test_save_already_exists_skips(self, connector, mock_mm_item, real_prompt_updates):
-        """If feature directory already exists, skip saving."""
+    def test_save_already_published_skips(self, connector, mock_mm_item, real_prompt_updates):
+        """A feature that is already fully published (metadata.json present) is skipped.
+
+        The check is the completeness marker, not the bare directory: a directory left
+        behind by a partial write must not block re-saving the feature.
+        """
         mm_hash = "existing"
         feature_dir = connector._get_feature_dir(mm_hash)
         os.makedirs(feature_dir, exist_ok=True)
+        with open(os.path.join(feature_dir, "metadata.json"), "w") as f:
+            json.dump({"modality": "image", "tensor_keys": []}, f)
         connector.save_item_with_updates(mm_hash, mock_mm_item, real_prompt_updates)
-        # No new files created, no add_feature
-        assert os.path.exists(feature_dir)
         connector._meta_mock.add_feature.assert_not_called()
 
     @patch("safetensors.torch.save_file")
@@ -180,28 +191,38 @@ class TestSaveItemWithUpdates:
     @patch("pickle.dump")
     def test_save_successful(self, mock_pickle_dump, mock_open, mock_save_file, 
                              connector, mock_mm_item, real_prompt_updates):
-        """Normal save flow: create dir, save tensors (skip excluded), metadata, pickle, register."""
+        """Normal save flow: write into a staging dir, register, then publish atomically."""
         mm_hash = "newhash"
-        # Mock _estimate_size to return fixed value
-        connector.save_item_with_updates(mm_hash, mock_mm_item, real_prompt_updates)
+        # Call save() directly instead of going through save_item_with_updates(), whose
+        # fire-and-forget scheduling would let the mocks expire before the body runs.
+        metadata, tensors, updates = connector.prepare(mock_mm_item, real_prompt_updates)
+        asyncio.run(connector.save(mm_hash, metadata, tensors, updates))
 
         feature_dir = connector._get_feature_dir(mm_hash)
-        time.sleep(1)
+        opened = [c.args[0] for c in mock_open.call_args_list if c.args]
+        metadata_path = next(p for p in opened if p.endswith("metadata.json"))
+        prompt_path = next(p for p in opened if p.endswith("prompt_updates.pkl"))
+        tensor_path = mock_save_file.call_args_list[0].args[1]
+
+        # Everything is written into a staging dir next to the final one; the final dir
+        # only holds the published result.
+        staging_dir = os.path.dirname(metadata_path)
+        assert staging_dir.startswith(feature_dir + ".staging-")
+        assert os.path.dirname(prompt_path) == staging_dir
+        assert os.path.dirname(tensor_path) == staging_dir
         assert os.path.exists(feature_dir)
 
         # Check tensors saved: only "image_tensor", not "address"
         expected_tensor_calls = [
-            call({"image_tensor": ANY}, os.path.join(feature_dir, "image_tensor.safetensors")),
+            call({"image_tensor": ANY}, os.path.join(staging_dir, "image_tensor.safetensors")),
         ]
         mock_save_file.assert_has_calls(expected_tensor_calls, any_order=True)
         assert mock_save_file.call_count == 1
 
-        # Check metadata writing
-        # open called for metadata.json and prompt_updates.pkl
-        # We'll just verify metadata content via the json.dump call
-        # In practice, we'd capture the write calls; but we can check that open was called with correct paths.
-        mock_open.assert_any_call(os.path.join(feature_dir, "metadata.json"), "w")
-        mock_open.assert_any_call(os.path.join(feature_dir, "prompt_updates.pkl"), "wb")
+        # Check metadata writing: metadata.json is the completeness marker, written last
+        mock_open.assert_any_call(os.path.join(staging_dir, "metadata.json"), "w")
+        mock_open.assert_any_call(os.path.join(staging_dir, "prompt_updates.pkl"), "wb")
+        assert opened.index(metadata_path) > opened.index(prompt_path)
 
         # Check pickle dump called
         mock_pickle_dump.assert_called_once()
@@ -380,3 +401,178 @@ class TestCleanupByTTL:
         with patch("time.time", return_value=1000):
             connector._cleanup_by_ttl()
         connector._meta_mock.delete_old_features.assert_called_once_with(900)
+
+
+# -------------------- Tests for atomic publish / atomic removal --------------------
+class TestAtomicPublishAndRemoval:
+    """A feature must never be observable in a partial state.
+
+    `has_item()` only checks for metadata.json while `load()` also needs every tensor and
+    prompt_updates.pkl, and a removal is not atomic either (rmtree deletes file by file),
+    so a reader could otherwise observe a half-written / half-deleted directory.
+    """
+
+    @staticmethod
+    def _save(connector, mm_hash):
+        metadata = {"modality": "image", "tensor_keys": ["image"], "field_types": {}}
+        tensors = {"image": torch.zeros(2, 4)}
+        asyncio.run(connector.save(mm_hash, metadata, tensors, []))
+
+    def test_saved_feature_is_complete_when_it_becomes_visible(self, connector, monkeypatch):
+        """Publishing happens once, with every file already in place."""
+        connector.is_consumer = True
+        mm_hash = "atomic"
+        feature_dir = connector._get_feature_dir(mm_hash)
+        published = []
+
+        real_replace = os.replace
+
+        def spy_replace(src, dst):
+            published.append((sorted(os.listdir(src)), os.path.exists(dst)))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", spy_replace)
+        monkeypatch.setattr(connector, "is_profile_run", lambda: False)
+
+        self._save(connector, mm_hash)
+
+        assert published == [
+            (["image.safetensors", "metadata.json", "prompt_updates.pkl"], False)
+        ]
+        # has_item() -> True implies the feature is loadable.
+        assert connector.has_item(mm_hash) is True
+        assert connector.load_item_with_updates(mm_hash) is not None
+
+    def test_failed_save_leaves_no_partial_feature(self, connector, monkeypatch):
+        """A save that fails halfway must not publish anything."""
+        connector.is_consumer = True
+        mm_hash = "failed"
+        feature_dir = connector._get_feature_dir(mm_hash)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("pickle failed")
+
+        monkeypatch.setattr(pickle, "dump", boom)
+        monkeypatch.setattr(connector, "is_profile_run", lambda: False)
+
+        self._save(connector, mm_hash)
+
+        assert not os.path.exists(feature_dir)
+        assert sorted(os.listdir(connector.storage_path)) == []
+
+    def test_removal_renames_the_directory_before_deleting_it(self, connector, monkeypatch):
+        """The directory is gone from its own name before rmtree starts deleting files."""
+        mm_hash = "evict"
+        feature_dir = connector._get_feature_dir(mm_hash)
+        os.makedirs(feature_dir, exist_ok=True)
+        with open(os.path.join(feature_dir, "x.safetensors"), "w") as f:
+            f.write("dummy")
+
+        observed = []
+        real_rmtree = shutil.rmtree
+
+        def spy_rmtree(path, *args, **kwargs):
+            observed.append((os.path.exists(feature_dir), os.path.basename(path)))
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(shutil, "rmtree", spy_rmtree)
+        connector._remove_feature_dir(mm_hash)
+
+        assert len(observed) == 1
+        gone_from_own_name, deleted_name = observed[0]
+        assert gone_from_own_name is False
+        assert deleted_name.startswith(mm_hash + ".evicting-")
+        assert not os.path.exists(feature_dir)
+
+    def test_removal_skips_a_referenced_feature(self, connector):
+        """A feature that a reader just took a reference on is not removed."""
+        mm_hash = "referenced"
+        feature_dir = connector._get_feature_dir(mm_hash)
+        os.makedirs(feature_dir, exist_ok=True)
+        connector._meta_mock.get_refcount.return_value = 1
+
+        connector._remove_feature_dir(mm_hash)
+
+        assert os.path.exists(feature_dir)
+
+    def test_removal_of_a_missing_feature_is_a_noop(self, connector):
+        connector._remove_feature_dir("does-not-exist")  # must not raise
+
+
+# -------------------- Tests for the error branches of save / removal --------------------
+class TestErrorBranches:
+    @staticmethod
+    def _save(connector, mm_hash):
+        metadata = {"modality": "image", "tensor_keys": ["image"], "field_types": {}}
+        tensors = {"image": torch.zeros(2, 4)}
+        asyncio.run(connector.save(mm_hash, metadata, tensors, []))
+
+    def test_save_ignores_a_row_that_is_already_registered(self, connector, monkeypatch):
+        """An IntegrityError from add_feature (row already there) must not fail the save."""
+        connector.is_consumer = True
+        mm_hash = "already-registered"
+        monkeypatch.setattr(connector, "is_profile_run", lambda: False)
+        connector._meta_mock.add_feature.side_effect = sqlite3.IntegrityError("duplicate")
+
+        self._save(connector, mm_hash)
+
+        assert connector.has_item(mm_hash) is True
+        assert connector.load_item_with_updates(mm_hash) is not None
+
+    def test_save_replaces_a_leftover_directory(self, connector, monkeypatch):
+        """A leftover directory (e.g. from a killed save) is replaced by the new feature."""
+        connector.is_consumer = True
+        mm_hash = "leftover"
+        feature_dir = connector._get_feature_dir(mm_hash)
+        os.makedirs(feature_dir, exist_ok=True)
+        with open(os.path.join(feature_dir, "stale.safetensors"), "w") as f:
+            f.write("stale")
+        monkeypatch.setattr(connector, "is_profile_run", lambda: False)
+
+        self._save(connector, mm_hash)
+
+        assert sorted(os.listdir(feature_dir)) == sorted(
+            ["image.safetensors", "metadata.json", "prompt_updates.pkl"]
+        )
+
+    def test_removal_proceeds_when_the_refcount_cannot_be_read(self, connector):
+        """A failing refcount lookup only warns; the feature is still removed."""
+        mm_hash = "refcount-error"
+        feature_dir = connector._get_feature_dir(mm_hash)
+        os.makedirs(feature_dir, exist_ok=True)
+        connector._meta_mock.get_refcount.side_effect = RuntimeError("DB error")
+
+        connector._remove_feature_dir(mm_hash)
+
+        assert not os.path.exists(feature_dir)
+
+    def test_removal_gives_up_when_another_cleanup_thread_renamed_first(self, connector, monkeypatch):
+        """Losing the rename race is not an error, and nothing is deleted afterwards."""
+        mm_hash = "rename-race"
+        feature_dir = connector._get_feature_dir(mm_hash)
+        os.makedirs(feature_dir, exist_ok=True)
+
+        def lose_the_race(*args, **kwargs):
+            raise FileNotFoundError("already renamed by another thread")
+
+        removed = []
+        monkeypatch.setattr(os, "rename", lose_the_race)
+        monkeypatch.setattr(shutil, "rmtree", lambda path, *a, **k: removed.append(path))
+
+        connector._remove_feature_dir(mm_hash)
+
+        assert removed == []
+        assert os.path.exists(feature_dir)
+
+    def test_eviction_warns_when_nothing_is_evictable(self, connector):
+        """Above the high watermark but no candidates: warn and leave the cache alone."""
+        connector.max_bytes = 100
+        connector.high_water_ratio = 0.85
+        connector.low_water_ratio = 0.70
+        connector._meta_mock.get_total_used.return_value = 90
+        connector._meta_mock.get_eviction_candidates.return_value = []
+
+        connector._evict_if_needed()
+
+        connector._meta_mock.get_eviction_candidates.assert_called_once()
+        connector._meta_mock.delete_feature.assert_not_called()

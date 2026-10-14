@@ -388,7 +388,11 @@ def test_build_mome_conv_sets_state_and_constructs_attention(monkeypatch):
         def __init__(self, **kwargs):
             constructed.update(kwargs)
 
-    monkeypatch.setattr(mla_mod, "MomeAttention", FakeMome, raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.npumome",
+        SimpleNamespace(MomeAttention=FakeMome),
+    )
     fake = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
     fake.q_lora_rank = 16
     fake.kv_lora_rank = 32
@@ -433,47 +437,6 @@ def test_static_sink_attn_base_kwargs_include_sink_len():
     assert kwargs["sink_len"] == 128
     assert kwargs["cache_config"] == "cache"
     assert kwargs["quant_config"] == "quant"
-
-
-@pytest.mark.unit
-def test_absorb_kv_b_weights_derives_uk_uv_layout():
-    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
-
-    fake = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
-    impl = SimpleNamespace(W_UK_T=None)
-    fake.attn = SimpleNamespace(impl=impl)
-    fake.num_local_heads = 2
-    fake.qk_nope_head_dim = 4
-    fake.v_head_dim = 4
-    fake.kv_lora_rank = 8
-    weight = torch.arange(16 * 8, dtype=torch.float32).view(16, 8)
-    fake.kv_b_proj = SimpleNamespace(weight=weight)
-
-    fake.absorb_kv_b_weights()
-
-    assert impl.W_UK_T.shape == (2, 4, 8)
-    assert impl.W_UV.shape == (2, 8, 4)
-    fake.absorb_kv_b_weights()
-    assert impl.W_UK_T.shape == (2, 4, 8)
-
-
-@pytest.mark.unit
-def test_absorb_kv_b_weights_noops_without_impl_or_wrong_shape():
-    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
-
-    fake = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
-    fake.attn = SimpleNamespace(impl=None)
-    fake.absorb_kv_b_weights()
-
-    impl = SimpleNamespace(W_UK_T=None)
-    fake.attn = SimpleNamespace(impl=impl)
-    fake.num_local_heads = 2
-    fake.qk_nope_head_dim = 4
-    fake.v_head_dim = 4
-    fake.kv_lora_rank = 8
-    fake.kv_b_proj = SimpleNamespace(weight=torch.zeros(3, 3))
-    fake.absorb_kv_b_weights()
-    assert impl.W_UK_T is None
 
 
 @pytest.mark.unit
@@ -892,11 +855,14 @@ def _mock_mome():
             return x
 
     import omni_npu.v1.layers.attention.npu_mla as mla_mod
-    mla_mod.AggregateConv = MockAggregateConv
-    mla_mod.MomeAttention = MockMomeAttention
-    yield
-    mla_mod.AggregateConv = None
-    mla_mod.MomeAttention = None
+    mome_module = SimpleNamespace(MomeAttention=MockMomeAttention)
+    with patch.dict(
+        sys.modules,
+        {"vllm.model_executor.layers.npumome": mome_module},
+    ):
+        mla_mod.AggregateConv = MockAggregateConv
+        yield
+        mla_mod.AggregateConv = None
 
 
 @contextmanager
@@ -934,8 +900,8 @@ def _mock_mla_attention(
                 kv_lora_rank, num_heads, qk_nope_head_dim + v_head_dim
             )
             w_uk, w_uv = w.split([qk_nope_head_dim, v_head_dim], dim=-1)
-            impl.W_UK_T = w_uk.permute(1, 2, 0).contiguous()
-            impl.W_UV = w_uv.transpose(0, 1).contiguous()
+            self.W_UK_T = w_uk.permute(1, 2, 0).contiguous()
+            self.W_UV = w_uv.transpose(0, 1).contiguous()
             impl.SHARE_MASK_TRIL_SPARSE = None
             self.impl = impl
             self.sink_k_pe = torch.zeros((128, qk_rope_head_dim), dtype=torch.bfloat16)
@@ -963,13 +929,15 @@ def _mock_mla_attention(
             self.impl.sink_compressed_kv = compressed_kv
 
     with (
-        patch(f"{MLA_MODULE}.MLAAttention", MockMLAAttention),
-        # patch(f"vllm.model_executor.layers.attention.static_sink_attention.StaticSinkMLAAttention", MockMLAAttention),
+        patch(f"{MLA_MODULE}.NPUMLAAttention", MockMLAAttention),
+        patch(
+            "vllm.model_executor.layers.attention.static_sink_attention."
+            "StaticSinkMLAAttention",
+            MockMLAAttention,
+            create=True,
+        ),
     ):
-        import omni_npu.v1.layers.attention.npu_mla as mla_mod
-        mla_mod.StaticSinkMLAAttention = MockMLAAttention
         yield
-        mla_mod.StaticSinkMLAAttention = None
 
 
 @contextmanager
@@ -1141,6 +1109,7 @@ def _mock_model_extra_config(
                 enable_precision_strong_consistency=False,
                 enable_multi_stream=False,
                 split_q_up_in_multistream=False,
+                enable_mome_sp=False,
             ),
         ),
     ):

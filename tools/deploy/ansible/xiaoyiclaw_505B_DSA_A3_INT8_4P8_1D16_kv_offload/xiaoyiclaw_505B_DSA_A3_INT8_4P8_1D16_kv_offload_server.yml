@@ -62,6 +62,9 @@
         hugepage_enabled: true
         cpu_bytes_to_use: 1099511627776  # 1 TiB
         eviction_policy: arc  # arc or lru
+        # 分片 DDR 载入：每卡只从 DDR 读 1/tp，卡间 all-gather 拼齐；不满足条件时各卡一致退回原路径。
+        # 特性默认关，这里只是把开关摆出来；要开改成 true。
+        sharded_load: false
       prepare_commands: |-
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_ALL | replace(' ', '') | trim | quote }}
         export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=36000

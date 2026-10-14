@@ -17,6 +17,7 @@
         "use_mhc_fusion_op": false,
         "use_mega_mhc_fusion_op": true,
         "use_mome_inplace_update": true,
+        "use_w4a8_enk_gmm": true,
         "split_q_up_in_multistream": false,
         "num_extra_reserved_blocks": 0,
         "disable_npu_top_k_top_p_sample": false,

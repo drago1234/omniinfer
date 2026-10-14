@@ -47,16 +47,22 @@ class DatadistEngine:
         if not (0 < port < 65536):
             raise ValueError(f"invalid port: {port}")
 
+        cfg = datadist.LLMConfig()
+
         hixl_backend = False
+        local_comm_res = ""
         if self.on_ascend950:
             # Load local_comm_res from JSON file for hixl backend
             local_comm_res = self._get_local_comm_res()
             if local_comm_res:
                 hixl_backend = True
-        else:
-            local_comm_res = ""  # do new_datadist_link
-
-        cfg = datadist.LLMConfig()
+        elif hasattr(cfg, "transfer_backend"):
+            # A3: version 1.3 -> EngineFactory 创建 HixlEngine (HixlCS)
+            # endpoint_list 不填则自动生成 roce(device) + hccs(device)
+            # 旧版本 llm_datadist 无 transfer_backend 属性：不启用 hixl 后端，
+            # local_comm_res 保持 ""，回退默认传输后端
+            local_comm_res = '{"version":"1.3"}'
+            hixl_backend = True
         cfg.device_id = self.local_rank
         cfg.sync_kv_timeout = self.SYNC_KV_TIMEOUT  # RoCE
         cfg.enable_remote_cache_accessible = True

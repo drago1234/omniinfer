@@ -315,31 +315,49 @@ class DiskMMFeatureConnector(BaseMMFeatureConnector):
             return False
 
     async def save(
-        self, 
-        mm_hash: str, 
+        self,
+        mm_hash: str,
         metadata: Dict[str, Any],
-        tensors: Dict[str, torch.Tensor], 
+        tensors: Dict[str, torch.Tensor],
         serialized_updates: List[Dict[str, Any]],
     ) -> None:
         feature_dir = self._get_feature_dir(mm_hash)
-        if os.path.exists(feature_dir):
+        # metadata.json is the completeness marker: has_item() only checks for it, while
+        # load() also needs every tensor and prompt_updates.pkl.
+        if os.path.exists(os.path.join(feature_dir, "metadata.json")):
             return
-        os.makedirs(feature_dir, exist_ok=True)
+
+        # Write into a staging dir and publish it atomically, so that a reader sees
+        # either no item or a complete one.
+        staging_dir = f"{feature_dir}.staging-{os.getpid()}-{threading.get_ident()}"
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
         try:
+            os.makedirs(staging_dir, exist_ok=True)
+
             estimated_size = self._estimate_size(tensors, serialized_updates)
 
             for key, tensor in tensors.items():
-                tensor_file = os.path.join(feature_dir, f"{key}.safetensors")
+                tensor_file = os.path.join(staging_dir, f"{key}.safetensors")
                 safetensors.torch.save_file({key: tensor}, tensor_file)
 
-            with open(os.path.join(feature_dir, "metadata.json"), "w") as f:
-                json.dump(metadata, f)
-
-            with open(os.path.join(feature_dir, "prompt_updates.pkl"), "wb") as f:
+            with open(os.path.join(staging_dir, "prompt_updates.pkl"), "wb") as f:
                 pickle.dump(serialized_updates, f)
 
-            self.meta.add_feature(mm_hash, estimated_size)
+            # Register the refcount row before publishing, so that the refcount taken by
+            # has_item() lands while the item is already visible (otherwise the item is
+            # unprotected from eviction for that whole window).
+            try:
+                self.meta.add_feature(mm_hash, estimated_size)
+            except sqlite3.IntegrityError:
+                logger.debug("MM feature %s already registered in metadata store", mm_hash)
+
+            with open(os.path.join(staging_dir, "metadata.json"), "w") as f:
+                json.dump(metadata, f)
+
+            if os.path.exists(feature_dir):
+                shutil.rmtree(feature_dir, ignore_errors=True)
+            os.replace(staging_dir, feature_dir)
 
             logger.debug(
                 "Saved feature and prompt updates for %s (modality: %s, %d tensors, size=%d bytes)",
@@ -347,6 +365,7 @@ class DiskMMFeatureConnector(BaseMMFeatureConnector):
             )
         except Exception as e:
             logger.error("Failed to save MM feature %s to connector: %s", mm_hash, e)
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
     def load(self, mm_hash: str):
         feature_dir = os.path.join(self.storage_path, mm_hash)
@@ -412,29 +431,55 @@ class DiskMMFeatureConnector(BaseMMFeatureConnector):
                 logger.exception("Background cleanup error: %s", e)
             time.sleep(self.cleanup_interval)
     
+    def _remove_feature_dir(self, mm_hash: str) -> None:
+        """Remove a feature directory without exposing a half-deleted one to readers.
+
+        rmtree() deletes file by file, so a reader can observe a directory whose
+        metadata.json is still there while some tensor has already been unlinked, and
+        fail to load it. Renaming the directory away first is atomic (and only one of
+        the cleanup threads can win it), so a reader sees either the complete directory
+        or none at all.
+        """
+        dir_path = self._get_feature_dir(mm_hash)
+        if not os.path.exists(dir_path):
+            return
+        # Skip if a reader just took a reference on it (has_item() bumps the refcount).
+        try:
+            if (self.meta.get_refcount(mm_hash) or 0) > 0:
+                logger.debug("Skip removing MM feature %s: still referenced", mm_hash)
+                return
+        except Exception as e:
+            logger.warning("Failed to read refcount of %s before removal: %s", mm_hash, e)
+
+        trash_dir = f"{dir_path}.evicting-{os.getpid()}-{time.monotonic_ns()}"
+        try:
+            os.rename(dir_path, trash_dir)
+        except OSError:
+            # Another cleanup thread already renamed/removed it.
+            return
+        shutil.rmtree(trash_dir, ignore_errors=True)
+
     def _evict_if_needed(self):
         """Check disk usage and evict refcount=0 items if above high watermark."""
         used = self.meta.get_total_used()
         if used <= self.max_bytes * self.high_water_ratio:
             return
-        
+
         # Need to evict down to low water mark
         target_bytes = self.max_bytes * self.low_water_ratio
         to_free = used - target_bytes
         if to_free <= 0:
             return
-        
+
         candidates = self.meta.get_eviction_candidates(to_free)
         if not candidates:
-            logger.warning("Disk usage high (%.1f%%), but no evictable items (all in use)", 
+            logger.warning("Disk usage high (%.1f%%), but no evictable items (all in use)",
                            100.0 * used / self.max_bytes)
             return
-        
+
         freed = 0
         for mm_hash, size in candidates:
-            dir_path = self._get_feature_dir(mm_hash)
-            if os.path.exists(dir_path):
-                shutil.rmtree(dir_path, ignore_errors=True)
+            self._remove_feature_dir(mm_hash)
             self.meta.delete_feature(mm_hash)
             freed += size
             if freed >= to_free:
@@ -446,9 +491,7 @@ class DiskMMFeatureConnector(BaseMMFeatureConnector):
         older_than = now - self.ttl_seconds
         hashes = self.meta.delete_old_features(older_than)
         for mm_hash in hashes:
-            dir_path = self._get_feature_dir(mm_hash)
-            if os.path.exists(dir_path):
-                shutil.rmtree(dir_path, ignore_errors=True)
+            self._remove_feature_dir(mm_hash)
         if hashes:
             logger.info("TTL cleanup removed %d old features", len(hashes))
 
