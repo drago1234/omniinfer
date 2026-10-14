@@ -24,6 +24,7 @@
         "enable_mome_sp": true,
         "mome_sp_token_threshold": 10240,
         "swa_prefill_absorb_max_tokens": 8192,
+        "use_quant_lightning_indexer_v2": true,
         "kv_nz": false,
         "merge_q_kv_conv": false,
         "use_aicpu_fa_tiling": true

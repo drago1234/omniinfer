@@ -118,6 +118,21 @@ class NPUDSABackend(AttentionBackend):
             shapes = ((576,), (128,))
             dtypes = (model_extra_config.dtype, model_extra_config.dtype)
 
+        # QLIv2 mode 3 stores four E8M0 scales for each 128-element key.
+        # The scale bits use uint8 storage because ScatterNdUpdate does not
+        # accept E8M0 destinations on current CANN versions.
+        use_qli_v2_mxfp8 = (
+            kv_cache_spec.cache_dtype_str == "hif8_ds_mla"
+            and getattr(
+                model_extra_config.operator_opt_config,
+                "use_quant_lightning_indexer_v2",
+                False,
+            )
+        )
+        if use_qli_v2_mxfp8:
+            shapes = (shapes[0], (1, 128), (1, 4))
+            dtypes = (dtypes[0], torch.float8_e4m3fn, torch.uint8)
+
         return _maybe_padded_raw_tensor_to_strided_caches(
             raw_tensor,
             num_blocks=num_blocks,
