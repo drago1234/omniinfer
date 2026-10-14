@@ -10,7 +10,7 @@
     LOG_PATH: /data/log_path
     LOG_PATH_IN_EXECUTOR: /data/log_path_in_executor
     CODE_PATH: /data/local_code_path
-    DOCKER_IMAGE_ID: "registry-cbu.huawei.com/omniai_omniinfer/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.5.0-omni_master-vllm-202609180014:0.0.1"
+    DOCKER_IMAGE_ID: "registry-cbu.huawei.com/omniai_omniinfer/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_master-vllm-202609291016:0.0.1"
     DOCKER_NAME_P: "docker_name_p"
     DOCKER_NAME_D: "docker_name_d"
     DOCKER_NAME_C: "docker_name_c"
@@ -77,9 +77,10 @@
         export HCCL_OP_RETRY_ENABLE="L0:0,L1:0,L2:0"
         export HCCL_OP_EXPANSION_MODE="AIV"
         export ASCEND_GLOBAL_LOG_LEVEL=3
-        export TASK_QUEUE_ENABLE=1
-        export OMNI_REUSE_PREFILLED_TOKENS=1
-        export OMNI_SKIP_DECODE_TOKENIZE=1
+        export TASK_QUEUE_ENABLE=2
+        # export OMNI_REUSE_PREFILLED_TOKENS=1
+        export OMNI_PIGGYBACK_INPUT_IDS=1
+        export OMNI_SKIP_DECODE_TOKENIZE=0
         # export TORCH_COMPILE_DISABLE=1
         export VLLM_MQ_MAX_CHUNK_BYTES_MB=100
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
@@ -94,7 +95,7 @@
         # export OMNI_PROFILE_SKIP_REQUESTS=3
         # EXTRA_ARGS="--profiler-config.profiler=torch --profiler-config.torch_profiler_dir ${VLLM_TORCH_PROFILER_DIR}"
         # EXTRA_ARGS="${EXTRA_ARGS} --profiler-config.torch_profiler_with_stack false"
-        EXTRA_ARGS="${EXTRA_ARGS} --no-disable-hybrid-kv-cache-manager --max-num-batched-tokens 32768"
+        EXTRA_ARGS="${EXTRA_ARGS} --no-disable-hybrid-kv-cache-manager --max-num-batched-tokens 4096"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-expert-parallel --max-num-seqs 4"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prompt-tokens-details --enable-chunked-prefill"
         EXTRA_ARGS="${EXTRA_ARGS} --dtype bfloat16 --enforce-eager"
@@ -115,7 +116,7 @@
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
         GPU_UTIL=0.92
       args:
-        - --max-model-len 202752
+        - --max-model-len 524288
         - --served-model-name {{ model | quote }}
         - '--additional-config ''{"enable_low_latency": true}'''
         - --gpu-util "${GPU_UTIL}"
@@ -129,7 +130,7 @@
         export HCCL_NPU_SOCKET_PORT_RANGE="auto"
         export DECODE_DATA_PARALLEL_SIZE={{ DECODE_SERVER_BY_GROUP | quote }}
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_BY_GROUP | replace(' ', '') | trim | quote }}
-        export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=300
+        export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=36000
         export VLLM_DISABLE_PYNCCL=1
         # export HCCL_BUFFSIZE=1200
         export HCCL_CONNECT_TIMEOUT=1800
@@ -138,8 +139,9 @@
         export HCCL_OP_RETRY_ENABLE="L0:0,L1:0,L2:0"
         export HCCL_OP_EXPANSION_MODE="AI_CPU"
         export ASCEND_GLOBAL_LOG_LEVEL=3
-        export OMNI_REUSE_PREFILLED_TOKENS=1
-        export OMNI_SKIP_DECODE_TOKENIZE=1
+        # export OMNI_REUSE_PREFILLED_TOKENS=1
+        export OMNI_PIGGYBACK_INPUT_IDS=1
+        export OMNI_SKIP_DECODE_TOKENIZE=0
         export VLLM_MQ_MAX_CHUNK_BYTES_MB=100
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_HYBRID_ATTN_GROUP_SIZE=18
@@ -166,7 +168,7 @@
         COMPILATION_CONFIG='{"mode": 3, "cudagraph_mode":"FULL", "cudagraph_capture_sizes":[16], "backend":"", "compile_sizes":[16]}'
         EXTRA_ARGS="${EXTRA_ARGS} --compilation-config ${COMPILATION_CONFIG}"
         EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
-        EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details --max-num-batched-tokens 16"
         # EXTRA_ARGS="${EXTRA_ARGS} --no-async-scheduling"
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-lopt --lopt-pool-size 16 --lopt-chunk-size 4096"
@@ -184,7 +186,7 @@
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
         GPU_UTIL=0.9
       args:
-        - --max-model-len 202752
+        - --max-model-len 524288
         - --served-model-name {{ model | quote }}
         - --tp 1
         - >-
@@ -215,7 +217,7 @@
         - --start-core-index 16
         - --subrequest-output-buffer-size 10M
         - --omni-proxy-pd-policy sequential
-        - --omni-proxy-max-batch-num-token 65536
+        - --omni-proxy-max-batch-num-token 4096
         - --omni-proxy-prefill-max-num-seqs 4
         - --omni-proxy-decode-max-num-seqs 4
 
