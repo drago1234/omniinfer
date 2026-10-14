@@ -382,11 +382,14 @@ class OpenAIServingChatFullAPCPatch(VLLMPatch):
             **kwargs: Any,
     ):
         last_num_cached: int | None = None
+        last_ec_transfer_params = None
 
         async def capture_num_cached():
             nonlocal last_num_cached
+            nonlocal last_ec_transfer_params
             async for res in result_generator:
                 last_num_cached = getattr(res, "num_cached_tokens", None)
+                last_ec_transfer_params = getattr(res, "ec_transfer_params", None)
                 yield res
 
         result = await _orig_chat_full(
@@ -396,6 +399,8 @@ class OpenAIServingChatFullAPCPatch(VLLMPatch):
 
         _set_named_finish_reason(request, result)
         _apply_apc_to_response(self, request, result, last_num_cached)
+        if last_ec_transfer_params is not None:
+            result.ec_transfer_params = last_ec_transfer_params
         return result
 
 
