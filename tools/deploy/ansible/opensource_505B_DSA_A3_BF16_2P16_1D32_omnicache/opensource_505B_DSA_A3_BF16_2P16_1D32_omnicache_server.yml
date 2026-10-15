@@ -183,6 +183,9 @@
         export RAY_CGRAPH_get_timeout=7200
         export OMNI_PIGGYBACK_INPUT_IDS=1
         export OMNI_SKIP_DECODE_TOKENIZE=0
+        export OMNI_CACHE_V2_A3_PREFILL_NATIVE=1
+        export OMNI_CACHE_V2_USE_NATIVE_ENGINE=1
+        export OMNI_CACHE_V2_USE_NATIVE_D2H_ENGINE=1
         EXTRA_ARGS="--no-disable-hybrid-kv-cache-manager --max-num-batched-tokens 4096"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-expert-parallel --max-num-seqs 4"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prompt-tokens-details --enable-chunked-prefill"
@@ -197,7 +200,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
         {% if enable_prefix_caching | bool %}
         EXTRA_ARGS="${EXTRA_ARGS} --mamba-block-size 128 --enable-prefix-caching"
-        export OMNI_CUSTOM_MODEL_CONFIG_PATH="low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_p_claw.json"
+        export OMNI_CUSTOM_MODEL_CONFIG_PATH="low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_p_omnicache_claw.json"
         {% else %}
         EXTRA_ARGS="${EXTRA_ARGS} --no-enable-prefix-caching"
         export OMNI_CUSTOM_MODEL_CONFIG_PATH="low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_p_claw_noapc.json"
@@ -266,7 +269,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
         {% if enable_prefix_caching | bool %}
         EXTRA_ARGS="${EXTRA_ARGS} --mamba-block-size 128 --enable-prefix-caching"
-        export OMNI_CUSTOM_MODEL_CONFIG_PATH="low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_d_claw.json"
+        export OMNI_CUSTOM_MODEL_CONFIG_PATH="low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_d_omnicache_claw.json"
         {% else %}
         EXTRA_ARGS="${EXTRA_ARGS} --no-enable-prefix-caching"
         export OMNI_CUSTOM_MODEL_CONFIG_PATH="low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_d_claw_noapc.json"
