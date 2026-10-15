@@ -1472,3 +1472,40 @@ def test_flashcomm_apply_runs_registered_cube_side_task(
     assert fwctx.additional_kwargs[hifloat8_module.CUBE_SIDE_TASKS_KEY] == {}
     mock_torch_npu.npu_quant_matmul.assert_called_once()
     assert out.dtype == layer.orig_dtype
+
+
+@pytest.mark.parametrize("force_balance", [None, False, True])
+@pytest.mark.parametrize("use_ep", [False, True])
+def test_moe_apply_forwards_force_load_balance(
+    hifloat8_module, monkeypatch, force_balance, use_ep
+):
+    _patch_npu_streams(monkeypatch)
+    method = _build_apply_method(hifloat8_module, monkeypatch)
+    method.on_ascend950 = True
+    opts = hifloat8_module.model_extra_config.operator_opt_config
+    monkeypatch.setattr(opts, "shared_expert_multi_stream", False)
+    monkeypatch.setattr(opts, "enable_prefetch", False, raising=False)
+    weights = torch.tensor([[0.7, 0.3], [0.6, 0.4]])
+    ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    select = MagicMock(return_value=(weights, ids))
+    monkeypatch.setattr(hifloat8_module.NPUFusedMoE, "select_experts", select)
+    layer = as_moe_runner(SimpleNamespace(gate=None), use_ep=use_ep)
+    if force_balance is not None:
+        layer.use_moe_force_load_balance = force_balance
+    method.apply_experts = MagicMock(return_value=torch.zeros(2, 4))
+    fused_tp = hifloat8_module.fused_experts_tp
+    fused_tp.return_value = torch.zeros(2, 4)
+
+    method.apply(
+        layer=layer, hidden_states=torch.ones(2, 4),
+        router_logits=torch.zeros(2, 4), top_k=2, renormalize=False,
+    )
+
+    assert select.call_args.kwargs["force_load_balance"] is (force_balance is True)
+    if use_ep:
+        assert method.apply_prepare_permute.call_args.args[3] is ids
+        assert method.apply_unpermute_finalize.call_args.args[3] is ids
+        assert method.apply_unpermute_finalize.call_args.args[4] is weights
+    else:
+        assert fused_tp.call_args.kwargs["topk_ids"] is ids
+        assert fused_tp.call_args.kwargs["topk_weights"] is weights

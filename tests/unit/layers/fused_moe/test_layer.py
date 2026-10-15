@@ -1362,3 +1362,24 @@ def test_select_experts_negative_bias_cannot_escape_selected_group(layer_module,
     if renormalize:
         expected_weights /= expected_weights.sum(-1, keepdim=True)
     torch.testing.assert_close(weights, expected_weights * 2.0)
+
+@pytest.mark.parametrize("force_balance", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 3, 10])
+def test_force_load_balance_preserves_gate_weights(
+    layer_module, monkeypatch, force_balance, num_tokens
+):
+    module, torch_npu, context_holder = layer_module
+    context_holder.attn_metadata = {}
+    monkeypatch.setattr(module, "on_ascend950", lambda: False)
+    weights = torch.rand(num_tokens, 2)
+    ids = torch.full((num_tokens, 2), 4, dtype=torch.int32)
+    torch_npu.npu_moe_gating_top_k.return_value = (weights, ids, None)
+    actual_weights, actual_ids = module.NPUFusedMoE.select_experts(
+        router_logits=torch.zeros(num_tokens, 5), top_k=2,
+        use_grouped_topk=True, renormalize=True,
+        topk_group=1, num_expert_group=1, force_load_balance=force_balance,
+    )
+    assert actual_weights is weights
+    expected = torch.arange(num_tokens * 2, dtype=torch.int32).view(num_tokens, 2) % 5
+    assert torch.equal(actual_ids, expected if force_balance else ids)
+    assert actual_ids.dtype == ids.dtype

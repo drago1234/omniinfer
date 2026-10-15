@@ -153,6 +153,7 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
             scoring_func=scoring_func,
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
+            force_load_balance=getattr(layer, "use_moe_force_load_balance", False),
         )
 
         if model_extra_config.operator_opt_config.enable_precision_strong_consistency and not self.on_ascend950:
@@ -398,6 +399,7 @@ class NPUFusedMoERunner(MoERunner):
         scoring_func: str = "softmax",
         routed_scaling_factor: Optional[torch.Tensor] = None,
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        force_load_balance: bool = False,
     ):
         attn_metadata = get_forward_context().attn_metadata
         if attn_metadata is None:
@@ -477,6 +479,14 @@ class NPUFusedMoERunner(MoERunner):
                 gating_output=router_logits, topk=top_k, renormalize=renormalize
             )
 
+        if force_load_balance:
+            # Preserve gate weights; This deliberately changes model routing.
+            topk_ids = (
+                torch.arange(
+                    topk_ids.numel(), device=topk_ids.device, dtype=topk_ids.dtype
+                ).view_as(topk_ids)
+                % router_logits.shape[-1]
+            )
         return topk_weights, topk_ids
 
     def set_eplb_state(

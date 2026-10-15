@@ -496,6 +496,7 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
             scoring_func=scoring_func,
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
+            force_load_balance=getattr(layer, "use_moe_force_load_balance", False),
         )
 
         if not use_ep:

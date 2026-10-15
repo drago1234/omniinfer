@@ -163,8 +163,9 @@ def test_forward_decode_routes_to_a5_multistream_when_stream_is_enabled():
 
 @pytest.mark.unit
 @pytest.mark.parametrize("split_q_up_in_multistream", [True, False])
+@pytest.mark.parametrize("quantized_input", [False, True])
 def test_forward_decode_a5_multistream_submits_three_stream_pipeline(
-    monkeypatch, split_q_up_in_multistream
+    monkeypatch, split_q_up_in_multistream, quantized_input
 ):
     from omni_npu.v1.layers.attention import npu_mla as mla_mod
     from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
@@ -222,10 +223,18 @@ def test_forward_decode_a5_multistream_submits_three_stream_pipeline(
         mark, "attention", torch.ones(1)
     )
 
-    with patch.object(torch.Tensor, "record_stream", return_value=None):
+    x = torch.zeros(2, 4)
+    if quantized_input:
+        x = {"x_int8": x.to(torch.int8), "pertoken_scale": torch.ones(2), "metadata": None}
+    recorded = []
+
+    def record_stream(tensor, stream):
+        recorded.append((tensor, stream))
+
+    with patch.object(torch.Tensor, "record_stream", new=record_stream):
         output = NPUDeepseekMLAAttention._forward_decode_multistream_a5(
             fake,
-            x=torch.zeros(2, 4),
+            x=x,
             cos=torch.zeros(2, 1, 1, 2),
             sin=torch.zeros(2, 1, 1, 2),
             attn_metadata=object(),
@@ -233,6 +242,8 @@ def test_forward_decode_a5_multistream_submits_three_stream_pipeline(
             get_mome_args=_empty_mome_args,
         )
 
+    inputs = [v for v in x.values() if isinstance(v, torch.Tensor)] if quantized_input else [x]
+    assert all(any(t is value and s is side_stream for t, s in recorded) for value in inputs)
     assert torch.equal(output, torch.ones(1))
     q_up_ops = (
         ["record", "q_b_nope"]
@@ -668,7 +679,10 @@ def _mock_torch_npu_stream():
     mock_npu.current_stream.return_value = MagicMock()
     mock_npu.Stream.return_value = MagicMock()
     mock_npu.stream.side_effect = lambda x: nullcontext()
-    with patch("torch.npu", mock_npu, create=True):
+    with (
+        patch("torch.npu", mock_npu, create=True),
+        patch.object(torch.Tensor, "npu", _identity),
+    ):
         yield
 
 
@@ -677,6 +691,8 @@ def _mock_misc(yarn_get_mscale_ret: float = 1.0):
     with (
         patch("vllm.logger.init_logger", return_value=MagicMock()),
         patch(f"{MLA_MODULE}.current_platform", MagicMock(device_type="cpu")),
+        patch(f"{MLA_MODULE}.npu_fused_infer_attention_sink_metadata", None),
+        patch(f"{MLA_MODULE}.npu_ai_infra_attention_pioneer_metadata", None),
         patch(f"{MLA_MODULE}.current_stream", MagicMock(), create=True),
         patch(f"{MLA_MODULE}.extract_layer_index", return_value=0),
         patch(f"{MLA_MODULE}.get_rope", return_value=None),
@@ -745,6 +761,10 @@ def _mock_torch_npu():
         k_nope = latent_kv.new_zeros(T, 1, 1, L)
         return k_pe, k_nope
 
+    def attention_pioneer(query, key, value, metadata, **kwargs):
+        assert metadata.shape == (1024,)
+        return fused_infer_attention_score(query, key, value, **kwargs)
+
     def kv_rmsnorm_rope_cache(latent_kv, weight, cos, sin, slot_mapping,
                               rope_cache, nope_cache, epsilon=1e-6, cache_mode="PA",
                               is_output_kv=True, **kwargs):
@@ -798,6 +818,10 @@ def _mock_torch_npu():
             _npu_fused_infer_attention_sink_metadata=MagicMock(
                 return_value=torch.zeros(1024, dtype=torch.int32)
             ),
+            npu_ai_infra_attention_pioneer_metadata=MagicMock(
+                return_value=torch.zeros(1024, dtype=torch.int32)
+            ),
+            npu_ai_infra_attention_pioneer=MagicMock(side_effect=attention_pioneer),
             npu_ai_infra_kv_rmsnorm_rope_cache_v2=MagicMock(side_effect=kv_rmsnorm_rope_cache_v2),
         ),
     ):
