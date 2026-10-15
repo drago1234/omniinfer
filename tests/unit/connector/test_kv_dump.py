@@ -20,6 +20,8 @@ from omni_npu.connector.kv_dump import (
     maybe_dump_kv,
     parse_remote_reqs,
     PrefillReq,
+    _diff_stat,
+    _log_mismatch,
 )
 
 KV_DUMP_MODULE = "omni_npu.connector.kv_dump"
@@ -386,6 +388,36 @@ class TestParseRemoteReqs:
         assert parse_remote_reqs(scheduler_output) == {}
 
 
+class TestDiffStat:
+
+    def test_equal(self):
+        a = torch.zeros(8, dtype=torch.uint8)
+        n, total, first = _diff_stat(a, a.clone())
+        assert (n, total, first) == (0, 8, -1)
+
+    def test_differs(self):
+        a = torch.zeros(8, dtype=torch.uint8)
+        b = torch.zeros(8, dtype=torch.uint8)
+        b[3] = 1
+        b[5] = 1
+        n, total, first = _diff_stat(a, b)
+        assert n == 2
+        assert total == 8
+        assert first == 3
+
+
+class TestLogMismatch:
+
+    def test_formats_block(self):
+        with patch(f"{KV_DUMP_MODULE}.logger.error") as mock_err:
+            _log_mismatch("DECODE BLOCK", "req0", ["full    = 2"], 3)
+        msg = mock_err.call_args[0][0]
+        assert "KV HASH MISMATCH :: DECODE BLOCK" in msg
+        assert "mismatch #3" in msg
+        assert "req_id  = req0" in msg
+        assert msg.count("!") > 100
+
+
 class TestMaybeDumpKv:
 
     def test_no_path_bypasses_dump(self):
@@ -393,7 +425,7 @@ class TestMaybeDumpKv:
             return "ok"
 
         with patch(f"{KV_DUMP_MODULE}._kv_dump_path", ""):
-            wrapped = maybe_dump_kv(execute_model)
+            wrapped = maybe_dump_kv("update")(execute_model)
             runner = MagicMock()
             sched = MagicMock()
             assert wrapped(runner, sched) == "ok"
@@ -414,7 +446,7 @@ class TestMaybeDumpKv:
 
         with patch(f"{KV_DUMP_MODULE}._kv_dump_path", "/tmp/kv_dump"):
             with patch(f"{KV_DUMP_MODULE}.Dump", return_value=mock_dump):
-                wrapped = maybe_dump_kv(execute_model)
+                wrapped = maybe_dump_kv("update")(execute_model)
 
                 runner = MagicMock()
                 sched = MagicMock()
@@ -437,13 +469,48 @@ class TestMaybeDumpKv:
 
         with patch(f"{KV_DUMP_MODULE}._kv_dump_path", "/tmp/kv_dump"):
             with patch(f"{KV_DUMP_MODULE}.Dump", return_value=mock_dump) as dump_cls:
-                wrapped = maybe_dump_kv(execute_model)
+                wrapped = maybe_dump_kv("update")(execute_model)
                 runner = MagicMock()
                 sched = MagicMock()
                 wrapped(runner, sched)
                 wrapped(runner, sched)
                 dump_cls.assert_called_once_with("/tmp/kv_dump")
                 assert mock_dump.update.call_count == 2
+
+    def test_invalid_stage_raises(self):
+        with pytest.raises(ValueError):
+            maybe_dump_kv("bogus")
+
+    def test_finish_stage_without_instance_noop(self):
+        def sample_tokens(self, *args, **kwargs):
+            return "sampled"
+
+        with patch(f"{KV_DUMP_MODULE}._kv_dump_path", "/tmp/kv_dump"):
+            wrapped = maybe_dump_kv("finish")(sample_tokens)
+            assert wrapped(MagicMock()) == "sampled"
+        assert "dump_prefill" not in maybe_dump_kv.__dict__
+
+    def test_finish_stage_calls_finish(self):
+        mock_dump = MagicMock()
+
+        def sample_tokens(self, *args, **kwargs):
+            return "sampled"
+
+        with patch(f"{KV_DUMP_MODULE}._kv_dump_path", "/tmp/kv_dump"):
+            maybe_dump_kv.__dict__["dump_prefill"] = mock_dump
+            wrapped = maybe_dump_kv("finish")(sample_tokens)
+            assert wrapped(MagicMock()) == "sampled"
+            mock_dump.finish.assert_called_once()
+
+    def test_finish_stage_no_path_bypasses(self):
+        def sample_tokens(self, *args, **kwargs):
+            return "sampled"
+
+        with patch(f"{KV_DUMP_MODULE}._kv_dump_path", ""):
+            maybe_dump_kv.__dict__["dump_prefill"] = MagicMock()
+            wrapped = maybe_dump_kv("finish")(sample_tokens)
+            assert wrapped(MagicMock()) == "sampled"
+            getattr(maybe_dump_kv, "dump_prefill").finish.assert_not_called()
 
 
 # =========================
@@ -468,10 +535,27 @@ class TestPrefillReq:
         assert req.block_set == {1, 2, 3}
         assert req.append_blocks(None) is req
 
-    def test_append_blocks_duplicate_raises(self):
+    def test_append_blocks_duplicate_recycles(self):
+        # 滑窗/Mome 回收后复用 block id: 旧位置置 null(0), 新块追加末尾, 不再抛错
         req = _make_prefill_req(block_ids=[[1, 2]])
-        with pytest.raises(ValueError):
-            req.append_blocks(([2],))
+        req.append_blocks(([2],))
+        assert req.recycled is True
+        assert req.blocks == [[1, 0, 2]]
+        assert req.block_set == {1, 2}
+
+    def test_append_blocks_normal_not_recycled(self):
+        req = _make_prefill_req(block_ids=[[1, 2]])
+        req.append_blocks(([3],))
+        assert req.recycled is False
+        assert req.blocks == [[1, 2, 3]]
+        assert req.block_set == {1, 2, 3}
+
+    def test_evict_found_and_missing(self):
+        req = _make_prefill_req(block_ids=[[1, 2], [3]])
+        req._evict(3)
+        assert req.blocks == [[1, 2], [0]]
+        req._evict(99)  # 不存在: 无副作用
+        assert req.blocks == [[1, 2], [0]]
 
     def test_append_blocks_none(self):
         req = _make_prefill_req(block_ids=[[1, 2]])
@@ -553,7 +637,7 @@ class TestDecodeReq:
         assert "layer0.0" in req.hist_hash
         req.update(130, None, groups, shapes, pg=128)
 
-    def test_check_toks_mismatch_raises(self):
+    def test_check_toks_mismatch_reports_and_updates(self):
         req = _make_decode_req(block_ids=[[0, 1, 2]])
         shapes = _make_shapes(num_blocks=4, block_elems=16)
         groups = _make_decode_groups(num_blocks=4, pg=128, block_elems=8)
@@ -562,8 +646,35 @@ class TestDecodeReq:
         full, rest, sect = req.hist_hash[name]
         # 篡改历史切片，使第二步 update 时 sect[:_rest] 与 hist 不一致
         req.hist_hash[name] = (full, rest, sect + 1)
-        with pytest.raises(ValueError):
-            req.update(130, None, groups, shapes, pg=128)
+        # 不再抛错: 报错 + 刷新基线 (n_mismatch 累计, hist_hash 更新为本次值)
+        req.update(130, None, groups, shapes, pg=128)
+        assert req.n_mismatch == 1
+        assert req.hist_hash[name][0] == 130 // 128
+        assert req.hist_hash[name][1] == 130 % 128
+
+    def test_check_blks_mismatch_reports_and_updates(self):
+        req = _make_decode_req(block_ids=[[0, 1, 2]])
+        shapes = _make_shapes(num_blocks=4, block_elems=16)
+        groups = _make_decode_groups(num_blocks=4)
+        req.update(128, None, groups, shapes)
+        assert req.n_mismatch == 0
+        assert req.hashed_blks == [0]
+        # 篡改上次的 block 哈希基线, 使下一步与当前块不一致
+        req.hashed_batch[0][0] = req.hashed_batch[0][0] + 1
+        req.update(129, None, groups, shapes)
+        assert req.n_mismatch == 1
+
+    def test_update_recycled_resets_baseline(self):
+        req = _make_decode_req(block_ids=[[0, 1]])
+        shapes = _make_shapes(num_blocks=4, block_elems=16)
+        groups = _make_decode_groups(num_blocks=4)
+        req.update(128, None, groups, shapes)
+        assert req.hashed_blks == [0]
+        # 复用已在表中的 block id(1) => recycled, 旧位置置 0 后新块追加, 基线重建
+        req.update(129, ([1],), groups, shapes)
+        assert req.recycled is True
+        assert req.blocks == [[0, 0, 1]]
+        assert req.block_set == {0, 1}
 
     def test_finalize_clears_batch(self):
         req = _make_decode_req(block_ids=[[0, 1, 2]])
@@ -619,6 +730,9 @@ class TestDump:
             with dump.update(runner, _make_scheduler_output_prefill(new_reqs=[new])):
                 pass
 
+            # prefill 的 dump 现在延后到 finish()（sample_tokens/MTP forward 之后）
+            assert not hasattr(dump.reqs["p0"], "data")
+            dump.finish()
             assert "p0" in dump.reqs
             assert "group0" in dump.reqs["p0"].data
             assert dump.rank == 2
@@ -698,4 +812,24 @@ class TestDump:
         path, items = mock_append.call_args[0]
         assert path == dump.path + "rank3.json"
         assert "req0" in items
+
+    def test_finish_dumps_prefill_and_clears_pending(self):
+        with _mock_world_group():
+            dump = _make_dump("/tmp/kv_dump")
+            runner = _make_model_runner(kv_role="kv_producer")
+            new = _make_new_request(req_id="p0", block_ids=[[0, 1]])
+            with dump.update(runner, _make_scheduler_output_prefill(new_reqs=[new])):
+                pass
+            assert dump.pending is True
+            dump.finish()
+            assert dump.pending is False
+            assert "group0" in dump.reqs["p0"].data
+            # 二次 finish 幂等, 不再重复 dump
+            dump.finish()
+            assert dump.pending is False
+
+    def test_finish_noop_when_not_pending(self):
+        dump = _make_dump("/tmp/kv_dump")
+        dump.finish()  # 未 register / 非 prefill: 直接返回
+        assert dump.pending is False
 
