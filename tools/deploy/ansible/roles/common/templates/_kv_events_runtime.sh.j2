@@ -1,0 +1,8 @@
+# PD prefix affinity: publish KV events for Proxy radix.
+# Skip if playbook already set --kv-events-config, or OMNI_ENABLE_KV_EVENTS=0.
+if [[ "${OMNI_ENABLE_KV_EVENTS:-1}" != "0" ]] \
+  && [[ " ${EXTRA_ARGS:-} " != *" --kv-events-config "* ]]; then
+  ENDPOINT_PORT=$((API_PORT + 100))
+  KV_EVENTS_CONFIG='{"enable_kv_cache_events":true,"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:'"${ENDPOINT_PORT}"'"}'
+  EXTRA_ARGS="${EXTRA_ARGS} --kv-events-config ${KV_EVENTS_CONFIG}"
+fi
