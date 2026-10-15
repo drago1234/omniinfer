@@ -884,6 +884,7 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
             scoring_func=scoring_func,
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
+            force_load_balance=getattr(layer, "use_moe_force_load_balance", False),
         )
 
         moe_parallel_config = layer.moe_config.moe_parallel_config

@@ -921,12 +921,17 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             and self.on_ascend950
             and self.dtype == torch.bfloat16
             and self.q_lora_rank is not None
-            and not self.skip_topk
             and not self.ena_kvsp
         )
         self.li_stream = (
             named_stream("dsa_li_stream")
-            if self.enable_a5_multistream
+            if self.enable_a5_multistream and not self.skip_topk
+            else None
+        )
+
+        self.shared_indexer_kv_stream = (
+            named_stream("dsa_shared_kv_stream")
+            if self.enable_a5_multistream and self.skip_topk
             else None
         )
 
@@ -1905,6 +1910,25 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                     "short_prefill": True if pd_mixed_flag == 2 else False,
                 }
 
+        q_cumlens = attn_metadata.query_cumlens.to(torch.int32)
+        kv_lens = attn_metadata.seq_lens.to(torch.int32)
+        blk_table = attn_metadata.block_table
+
+        can_decode_shared_indexer_multistream = (
+            self.skip_topk
+            and self.shared_indexer_kv_stream is not None
+        )
+        if can_decode_shared_indexer_multistream and not use_fused_mla_prolog and not self.ena_kvsp:
+            q_nope, q_pe = self._decode_prolog_multistream_a5(
+                x, cos, sin, attn_metadata, kv_cache, get_mome_args,
+                kv_stream=self.shared_indexer_kv_stream,
+            )
+            return self._finish_multistream_decode(
+                q_nope, q_pe, topk_indices_buffer[:x.shape[0]],
+                q_cumlens, kv_lens, blk_table,
+                kv_cache, attn_metadata, get_mome_args,
+            )
+
         can_decode_multistream = self.side_stream is not None and not self.skip_topk
         if can_decode_multistream and not use_fused_mla_prolog and not self.ena_kvsp:
             if self.li_stream is not None:
@@ -1916,9 +1940,6 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 topk_indices_buffer, pd_mixed_flag,
             )
         ki_cache, ki_scale_cache = self._get_li_caches(kv_cache)
-        q_cumlens = attn_metadata.query_cumlens.to(torch.int32)
-        kv_lens = attn_metadata.seq_lens.to(torch.int32)
-        blk_table = attn_metadata.block_table
 
         cur_stream = torch.npu.current_stream()
 
@@ -2122,29 +2143,6 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             next_topk_indices_buffer,
         )
 
-    @staticmethod
-    def _is_mxfp8_fc_linear(layer: torch.nn.Module) -> bool:
-        """Return whether ``layer`` consumes pre-quantized MXFP8 inputs."""
-        quant_method = getattr(layer, "quant_method", None)
-        return getattr(quant_method, "input_quant_format", None) == "mxfp8"
-
-    @classmethod
-    def _should_share_mxfp8_input(
-        cls, consumers: tuple[torch.nn.Module, ...]
-    ) -> bool:
-        """Only pre-quantize when it replaces at least two quant kernels."""
-        return sum(cls._is_mxfp8_fc_linear(layer) for layer in consumers) >= 2
-
-    @staticmethod
-    def _quantize_mxfp8_input(x: torch.Tensor) -> dict[str, torch.Tensor]:
-        x_mxfp8, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
-            x, dst_type=torch.float8_e4m3fn, scale_alg=1
-        )
-        return {
-            "x_mxfp8": x_mxfp8,
-            "pertoken_scale": pertoken_scale,
-        }
-
     def _forward_decode_multistream_a5(
         self,
         x: torch.Tensor,
@@ -2207,19 +2205,8 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
 
         # q_a -> q_b_nope/q_b -> absorb is the longest attention-Q path and
         # stays on main. wk starts concurrently on the LI stream.
-        share_x_mxfp8 = self._should_share_mxfp8_input(
-            (self.q_a_proj, self.kv_a_proj_with_mqa)
-        )
         with torch.npu.npugraph_ex.scope.limit_core_num(24, 48):
-            shared_x = (
-                self._quantize_mxfp8_input(x) if share_x_mxfp8 else x
-            )
-            q_lora = self.q_a_proj(shared_x)[0]
-        if share_x_mxfp8:
-            for value in shared_x.values():
-                value.record_stream(side_stream)
-        else:
-            shared_x.record_stream(side_stream)
+            q_lora = self.q_a_proj(x)[0]
         q_a_cube_done.record()
         with torch.npu.npugraph_ex.scope.limit_core_num(8, 32):
             q_lora = self._maybe_mome_q(q_lora, get_mome_args)
@@ -2282,7 +2269,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                         * self.indexer.softmax_scale
                     )
                 q_a_cube_done.wait(side_stream)
-                kv = self.kv_a_proj_with_mqa(shared_x)[0]
+                kv = self.kv_a_proj_with_mqa(x)[0]
             indexer_weights.record_stream(main_stream)
             with torch.npu.npugraph_ex.scope.limit_core_num(16, 32):
                 kv = self._maybe_mome_kv(kv, get_mome_args)

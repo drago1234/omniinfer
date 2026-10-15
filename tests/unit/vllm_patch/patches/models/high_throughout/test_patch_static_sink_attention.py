@@ -237,6 +237,29 @@ def test_static_sink_mla_c8_dsa_spec_doubles_block_and_pads_page(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("cache_dtype", ["auto", "hif8_ds_mla"])
+def test_shared_indexer_layer_keeps_dsa_cache_layout(monkeypatch, cache_dtype):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(index_head_dim=128)),
+        cache_config=SimpleNamespace(
+            block_size=16,
+            cache_dtype=cache_dtype,
+            mamba_page_size_padded=32768,
+        ),
+        quant_config=None,
+    )
+    shared_spec, _, _ = _static_sink_mla_spec(
+        monkeypatch, use_noncontiguous_kv=True, use_sparse=True,
+        indexer=None, vllm_config=config,
+    )
+    full_spec, _, _ = _static_sink_mla_spec(
+        monkeypatch, use_noncontiguous_kv=True, use_sparse=True,
+        indexer=SimpleNamespace(head_dim=128), vllm_config=config,
+    )
+    assert shared_spec == full_spec
+
+
+@pytest.mark.unit
 def test_static_sink_mla_get_kv_cache_spec_uses_sink_mla_otherwise(monkeypatch):
     spec, _kv_mod, sink_spec_mod = _static_sink_mla_spec(
         monkeypatch,

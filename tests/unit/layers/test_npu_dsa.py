@@ -96,37 +96,38 @@ def test_forward_decode_routes_to_a5_multistream_when_eligible():
 
 
 @pytest.mark.unit
-def test_a5_multistream_shares_only_reused_mxfp8_inputs(monkeypatch):
-    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
-    from omni_npu.v1.layers.attention.npu_dsa import (
-        NPUDeepseekSparseAttention,
-    )
+def test_shared_indexer_decode_uses_common_prolog_and_reuses_topk():
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
 
-    mxfp8_method = SimpleNamespace(input_quant_format="mxfp8")
-    mxfp8_a = SimpleNamespace(quant_method=mxfp8_method)
-    mxfp8_b = SimpleNamespace(quant_method=mxfp8_method)
-    bf16 = SimpleNamespace(quant_method=object())
-    raw = torch.zeros(2, 4)
-    x_mxfp8 = torch.ones(2, 4, dtype=torch.float8_e4m3fn)
-    scale = torch.ones(2, 1, dtype=torch.uint8)
-    dynamic_quant = MagicMock(return_value=(x_mxfp8, scale))
-    monkeypatch.setattr(
-        dsa_mod.torch_npu, "npu_dynamic_mx_quant", dynamic_quant
+    fake = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    fake.ena_sp = fake.sharded_o_proj = fake.ena_kvsp = False
+    fake.use_mlaprolog = False
+    fake.noncontiguous_kv = fake.use_mome = True
+    fake.skip_topk = True
+    fake.indexer = None
+    fake.shared_indexer_kv_stream = object()
+    fake._get_li_caches = MagicMock(return_value=(None, None))
+    q_nope, q_pe = torch.ones(2, 1, 4), torch.ones(2, 1, 2)
+    fake._decode_prolog_multistream_a5 = MagicMock(return_value=(q_nope, q_pe))
+    fake._finish_multistream_decode = MagicMock(return_value="shared")
+    metadata = SimpleNamespace(
+        query_cumlens=torch.tensor([2]), seq_lens=torch.tensor([16]),
+        block_table=torch.tensor([[0]]),
     )
-
-    assert not NPUDeepseekSparseAttention._should_share_mxfp8_input(
-        (mxfp8_a, bf16)
+    topk = torch.arange(24, dtype=torch.int32).view(3, 1, 8)
+    original = topk.clone()
+    output = fake._forward_decode(
+        torch.zeros(2, 4), torch.zeros(2), torch.zeros(2), metadata,
+        (None, None, None), topk,
     )
-    assert NPUDeepseekSparseAttention._should_share_mxfp8_input(
-        (mxfp8_a, mxfp8_b, bf16)
-    )
-
-    shared = NPUDeepseekSparseAttention._quantize_mxfp8_input(raw)
-    assert shared["x_mxfp8"] is x_mxfp8
-    assert shared["pertoken_scale"] is scale
-    dynamic_quant.assert_called_once_with(
-        raw, dst_type=torch.float8_e4m3fn, scale_alg=1
-    )
+    assert output == "shared"
+    assert fake._decode_prolog_multistream_a5.call_args.kwargs == {
+        "kv_stream": fake.shared_indexer_kv_stream,
+    }
+    args = fake._finish_multistream_decode.call_args.args
+    assert args[0] is q_nope and args[1] is q_pe
+    assert torch.equal(args[2], topk[:2])
+    assert torch.equal(topk, original)
 
 
 @pytest.mark.unit
@@ -226,11 +227,26 @@ def test_forward_decode_a5_multistream_runs_three_stream_pipeline(
     )
     kv_cache = (object(), object(), object())
 
+    raw = torch.zeros(2, 4)
+    quantize = MagicMock(side_effect=AssertionError("prolog must pass raw input"))
+    for name in ("npu_dynamic_mx_quant", "npu_dynamic_quant", "npu_dtype_cast"):
+        monkeypatch.setattr(dsa_mod.torch_npu, name, quantize)
+    linear_inputs = {}
+    def capture_input(name, original):
+        def project(value):
+            linear_inputs[name] = value
+            return original(value)
+        return project
+    fake.q_a_proj = capture_input("q", fake.q_a_proj)
+    fake.kv_a_proj_with_mqa = capture_input("kv", fake.kv_a_proj_with_mqa)
+    indexer.wk = capture_input("wk", indexer.wk)
+    indexer.weights_proj = capture_input("weights", indexer.weights_proj)
+
     with patch.object(torch.Tensor, "record_stream", return_value=None):
         output, next_topk_indices = (
             NPUDeepseekSparseAttention._forward_decode_multistream_a5(
                 fake,
-                x=torch.zeros(2, 4),
+                x=raw,
                 cos=torch.zeros(2, 1, 1, 2),
                 sin=torch.zeros(2, 1, 1, 2),
                 attn_metadata=metadata,
@@ -238,6 +254,11 @@ def test_forward_decode_a5_multistream_runs_three_stream_pipeline(
                 get_mome_args=_short_prefill_args,
             )
         )
+
+    assert linear_inputs["q"] is linear_inputs["kv"]
+    assert linear_inputs["wk"] is raw and linear_inputs["weights"] is raw
+    assert linear_inputs["q"] is raw
+    quantize.assert_not_called()
 
     assert torch.equal(output, torch.ones(2, 1, 4))
     assert torch.equal(

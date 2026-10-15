@@ -468,6 +468,91 @@ class MomeAttentionMixin:
         out = self._maybe_mome_out(out, get_mome_args)
         return self._apply_o_proj(out)
 
+    def _decode_prolog_multistream_a5(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_metadata,
+        kv_cache: tuple[torch.Tensor] | None,
+        get_mome_args: Callable[[], dict[str, bool]],
+        *,
+        kv_stream: torch.npu.Stream,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute absorbed Q and cache KV on three streams, then join on main."""
+        assert self.on_ascend950
+        assert self.side_stream is not None and kv_stream is not None
+
+        main_stream = torch.npu.current_stream()
+        side_stream = self.side_stream
+
+        input_ready = torch.npu.Event()
+        q_side_ready = torch.npu.Event()
+        kv_mome_ready = torch.npu.Event()
+        side_done = torch.npu.Event()
+        kv_cache_done = torch.npu.Event()
+
+        input_ready.record()
+        if isinstance(x, dict):
+            for value in x.values():
+                if isinstance(value, torch.Tensor):
+                    value.record_stream(side_stream)
+        else:
+            x.record_stream(side_stream)
+        for stream in (side_stream, kv_stream):
+            cos.record_stream(stream)
+            sin.record_stream(stream)
+
+        with torch.npu.npugraph_ex.scope.limit_core_num(24, 32):
+            q_lora = self.q_a_proj(x)[0]
+            q_lora = self._maybe_mome_q(q_lora, get_mome_args)
+            q_lora = self.q_a_layernorm(q_lora)
+
+        if self.split_q_up_in_multistream:
+            q_side_ready.record()
+            q_lora.record_stream(side_stream)
+            with torch.npu.npugraph_ex.scope.limit_core_num(24, 16):
+                q_nope = self.q_b_nope_proj(q_lora)[0].view(
+                    -1, self.num_local_heads, self.qk_nope_head_dim
+                )
+                q_nope = self._q_nope_absorb(q_nope)
+        else:
+            with torch.npu.npugraph_ex.scope.limit_core_num(24, 32):
+                q_nope, q_pe = self._project_and_split_q(q_lora)
+                q_pe.record_stream(side_stream)
+                q_side_ready.record()
+                q_nope = self._q_nope_absorb(q_nope)
+
+        with torch.npu.stream(side_stream):
+            input_ready.wait(side_stream)
+            with torch.npu.npugraph_ex.scope.limit_core_num(8, 32):
+                kv = self.kv_a_proj_with_mqa(x)[0]
+                kv = self._maybe_mome_kv(kv, get_mome_args)
+            kv.record_stream(kv_stream)
+            kv_mome_ready.record()
+
+            q_side_ready.wait(side_stream)
+            with torch.npu.npugraph_ex.scope.limit_core_num(8, 16):
+                if self.split_q_up_in_multistream:
+                    q_pe = self.q_b_pe_proj(q_lora)[0].view(
+                        -1, self.num_local_heads, self.qk_rope_head_dim
+                    )
+                q_pe = self._apply_rope(q_pe, cos, sin)
+            side_done.record()
+
+        with torch.npu.stream(kv_stream):
+            kv_mome_ready.wait(kv_stream)
+            with torch.npu.npugraph_ex.scope.limit_core_num(8, 32):
+                self._kv_norm_rope_cache(
+                    kv, cos, sin, attn_metadata, kv_cache
+                )
+            kv_cache_done.record()
+
+        side_done.wait(main_stream)
+        kv_cache_done.wait(main_stream)
+        q_pe.record_stream(main_stream)
+        return q_nope, q_pe
+
 
 class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Module):
     def __init__(
@@ -2267,80 +2352,11 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         kv_cache: tuple[torch.Tensor] | None,  # None for dummy_run
         get_mome_args: Callable[[], dict[str, bool]],
     ) -> torch.Tensor:
-        """Run the A5 SWA prolog on Q, KV, and KV-cache streams."""
-        assert self.on_ascend950
-        assert self.mla_kv_stream is not None
-
-        x = self._maybe_quant(x)
-        main_stream = torch.npu.current_stream()
-        side_stream = self.side_stream
-        kv_stream = self.mla_kv_stream
-
-        input_ready = torch.npu.Event()
-        q_side_ready = torch.npu.Event()
-        kv_mome_ready = torch.npu.Event()
-        side_done = torch.npu.Event()
-        kv_cache_done = torch.npu.Event()
-
-        input_ready.record()
-        if isinstance(x, dict):
-            for value in x.values():
-                if isinstance(value, torch.Tensor):
-                    value.record_stream(side_stream)
-        else:
-            x.record_stream(side_stream)
-        for stream in (side_stream, kv_stream):
-            cos.record_stream(stream)
-            sin.record_stream(stream)
-
-        with torch.npu.npugraph_ex.scope.limit_core_num(24, 32):
-            q_lora = self.q_a_proj(x)[0]
-            q_lora = self._maybe_mome_q(q_lora, get_mome_args)
-            q_lora = self.q_a_layernorm(q_lora)
-
-        if self.split_q_up_in_multistream:
-            q_side_ready.record()
-            q_lora.record_stream(side_stream)
-            with torch.npu.npugraph_ex.scope.limit_core_num(24, 16):
-                q_nope = self.q_b_nope_proj(q_lora)[0].view(
-                    -1, self.num_local_heads, self.qk_nope_head_dim
-                )
-                q_nope = self._q_nope_absorb(q_nope)
-        else:
-            with torch.npu.npugraph_ex.scope.limit_core_num(24, 32):
-                q_nope, q_pe = self._project_and_split_q(q_lora)
-                q_pe.record_stream(side_stream)
-                q_side_ready.record()
-                q_nope = self._q_nope_absorb(q_nope)
-
-        with torch.npu.stream(side_stream):
-            input_ready.wait(side_stream)
-            with torch.npu.npugraph_ex.scope.limit_core_num(8, 32):
-                kv = self.kv_a_proj_with_mqa(x)[0]
-                kv = self._maybe_mome_kv(kv, get_mome_args)
-            kv.record_stream(kv_stream)
-            kv_mome_ready.record()
-
-            q_side_ready.wait(side_stream)
-            with torch.npu.npugraph_ex.scope.limit_core_num(8, 16):
-                if self.split_q_up_in_multistream:
-                    q_pe = self.q_b_pe_proj(q_lora)[0].view(
-                        -1, self.num_local_heads, self.qk_rope_head_dim
-                    )
-                q_pe = self._apply_rope(q_pe, cos, sin)
-            side_done.record()
-
-        with torch.npu.stream(kv_stream):
-            kv_mome_ready.wait(kv_stream)
-            with torch.npu.npugraph_ex.scope.limit_core_num(8, 32):
-                self._kv_norm_rope_cache(
-                    kv, cos, sin, attn_metadata, kv_cache
-                )
-            kv_cache_done.record()
-
-        side_done.wait(main_stream)
-        kv_cache_done.wait(main_stream)
-        q_pe.record_stream(main_stream)
+        """Run the A5 SWA prolog, attention and epilog."""
+        q_nope, q_pe = self._decode_prolog_multistream_a5(
+            self._maybe_quant(x), cos, sin, attn_metadata, kv_cache,
+            get_mome_args, kv_stream=self.mla_kv_stream,
+        )
         return self._decode_attention(
             q_nope, q_pe, kv_cache, attn_metadata, get_mome_args
         )
