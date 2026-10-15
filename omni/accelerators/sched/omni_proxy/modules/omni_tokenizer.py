@@ -1,5 +1,6 @@
 import hashlib
 import os
+import sys
 import json
 import base64
 import pickle
@@ -91,7 +92,11 @@ def _normalize_messages_for_tool_template(messages: List[Dict[str, Any]]) -> Lis
         
         # --- Logic 1: Normalize tool_calls (usually in assistant messages) ---
         tool_calls = m2.get("tool_calls")
-        if tool_calls and isinstance(tool_calls, list):
+        if tool_calls is not None and not isinstance(tool_calls, list):
+            # Nonconforming client sent a single tool_call dict (or other scalar);
+            # wrap it so the template's {% for tc in m.tool_calls %} loop works.
+            tool_calls = [tool_calls]
+        if tool_calls:
             new_tool_calls = []
             for tc in tool_calls:
                 if not isinstance(tc, dict):
@@ -100,7 +105,7 @@ def _normalize_messages_for_tool_template(messages: List[Dict[str, Any]]) -> Lis
 
                 tc2 = dict(tc)
                 fn = tc2.get("function")
-                
+
                 # Handle function.arguments
                 if isinstance(fn, dict):
                     fn2 = dict(fn)
@@ -113,8 +118,11 @@ def _normalize_messages_for_tool_template(messages: List[Dict[str, Any]]) -> Lis
                             fn2["arguments"] = {}
                     elif not isinstance(args, dict):
                         fn2["arguments"] = {}
-                    
+
                     tc2["function"] = fn2
+                elif fn is None:
+                    # Missing function: synthesize minimal shape expected by templates
+                    tc2["function"] = {"name": tc2.get("name", ""), "arguments": {}}
 
                 # Handle direct arguments (rare case)
                 if "arguments" in tc2 and not isinstance(tc2.get("arguments"), dict):
@@ -328,7 +336,11 @@ def _apply_chat_template(
     if _looks_like_tool_template(tokenizer):
         messages = _normalize_messages_for_tool_template(messages)
     if hasattr(tokenizer, "apply_chat_template"):
-        # Try the most compatible calling conventions
+        # Try the most compatible calling conventions.
+        # positional matches transformers >= 4.53 (first param renamed to `conversation`);
+        # keep the legacy styles for older versions. Report the FIRST error so the real
+        # failure is not masked by the last style's TypeError.
+        first_err: Optional[Exception] = None
         last_err: Optional[Exception] = None
         for call_style in ("positional", "conversation_kw", "messages_kw"):
             try:
@@ -348,14 +360,16 @@ def _apply_chat_template(
                 if call_style == "messages_kw":
                     return tokenizer.apply_chat_template(messages=messages, **kwargs)
             except Exception as e:
+                if first_err is None:
+                    first_err = e
                 last_err = e
-        
+
         # If tool, do NOT invent a tools format; fallback will diverge from broadcast.
         if _looks_like_tool_template(tokenizer):
-            raise RuntimeError(f"tool apply_chat_template failed: {last_err}") from last_err
+            raise RuntimeError(f"tool apply_chat_template failed: {first_err}") from first_err
 
         # Non-tool: allow old fallback path
-        print(f"Tokenizer apply_chat_template failed: {last_err}")
+        print(f"Tokenizer apply_chat_template failed: {first_err}", file=sys.stderr)
     
     # vLLM's fallback: manually handle tools and multi-modal data
     processed_messages = messages.copy()
@@ -644,10 +658,36 @@ def _preprocess_chat_batch(
     results = []
     formatted_prompts = []
     multi_modal_data_list = []
-    
+
     # Phase 1: Template application (sequential to maintain exact vLLM behavior)
     for request in requests:
-        messages = request["messages"]
+        messages = request.get("messages")
+
+        if messages is None or not isinstance(messages, list) or len(messages) == 0:
+            # Legacy /v1/completions style body (top-level "prompt", no "messages"),
+            # or messages is empty/invalid. Tokenize the raw prompt text directly so
+            # APC prefix hashing still works; there is no chat template to apply.
+            prompt_text = request.get("prompt")
+            if isinstance(prompt_text, list):
+                prompt_text = "".join(
+                    p if isinstance(p, str) else str(p) for p in prompt_text
+                )
+            if not isinstance(prompt_text, str) or prompt_text == "":
+                print(
+                    f"batch_chat_encode: request has no usable messages/prompt, keys={list(request.keys())}",
+                    file=sys.stderr,
+                )
+                prompt_text = ""
+            formatted_prompts.append(prompt_text)
+            multi_modal_data_list.append(None)
+            results.append(PreprocessResult(
+                conversation=[],
+                prompt=prompt_text,
+                input_ids=[],
+                multi_modal_data=None
+            ))
+            continue
+
         add_generation_prompt = request.get("add_generation_prompt", True)
         tools, tool_choice = parse_tools_and_tool_choice(request)
         

@@ -208,8 +208,11 @@ static inline omni_req_t *omni_get_req(ngx_http_request_t *r)
 {
     omni_req_context_t *ctx = omni_get_req_ctx(r);
     if (ctx == NULL){
-        ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
-            "omni_get_req: Failed to get request context for a request that should have one, not a omni req.");
+        /* Non-omni requests (e.g. GET /v1/models, favicon) also hit this
+         * helper via access-log variable evaluation; only a debug-level
+         * event for those, NOT_FOUND is an expected outcome there. */
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "omni_get_req: no request context, not an omni req.");
         return NULL;
     }
     return ctx->req;
