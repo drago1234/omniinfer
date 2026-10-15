@@ -40,6 +40,14 @@ FORK_MARKERS = (
     "dummy draft slots",
 )
 
+# The fork additionally absorbs a later upstream fix (reworked pad branch:
+# `padded_num_tokens` + reserving `num_sampled_tokens_per_step` room near
+# max_model_len) that the pinned vendored vLLM revision (752a3a50) predates.
+# The drift test therefore cuts the whole pad branch out of both sides;
+# its behaviour is guarded by the test_spec_padding_* tests below instead.
+PAD_BRANCH_START = "# Pad new decode requests"
+PAD_BRANCH_END = "pad_spec_decode = True"
+
 # True when the file is executed as a script (patch_test_utils harness) instead
 # of collected by pytest; pytest.skip() aborts that harness.
 _STANDALONE = __name__ == "__main__"
@@ -330,12 +338,26 @@ def test_fork_matches_upstream_except_the_guard():
         # Drop the offloading-connector guard clause and the omni comment
         # lines so the fork can be diffed against upstream even when the
         # local vLLM checkout still carries the raw os.environ variant.
-        return [
+        lines = [
             line for line in lines
             if GUARD not in line
             and "_omni_is_offloading_connector" not in line
             and not any(m in line for m in FORK_MARKERS)
         ]
+        # Cut the whole pad branch from both sides: the fork carries the
+        # newer upstream rewrite (padded_num_tokens / max_model_len headroom)
+        # that the pinned vendored vLLM revision does not have yet.
+        try:
+            start = next(
+                i for i, line in enumerate(lines) if PAD_BRANCH_START in line
+            )
+            end = next(
+                i for i, line in enumerate(lines[start:], start)
+                if PAD_BRANCH_END in line
+            )
+        except StopIteration:
+            return lines
+        return lines[:start] + lines[end + 1:]
 
     assert normalized(Scheduler.schedule) == normalized(
         sched_mod.PanguV2SpecDecodePadPatch.schedule
@@ -566,6 +588,27 @@ def test_spec_padding_skipped_when_prefill_scheduled():
     # prefill_scheduled blocks the padding branch.
     assert output.num_scheduled_tokens == {"r0": 10, "w0": 1}
     assert output.scheduled_spec_decode_tokens == {}
+
+
+def test_spec_padding_near_max_model_len_keeps_unpadded():
+    running = _request("r0", num_tokens=5, num_computed_tokens=4)
+    # w0 is 1 token short of done: padding to 1 + 2 spec tokens plus the
+    # 1 sampled token per step would run past max_model_len.
+    waiting = _request("w0", num_tokens=6, num_computed_tokens=5)
+    fake = _FakeScheduler(
+        running=[running],
+        waiting=[waiting],
+        num_spec_tokens=2,
+        max_model_len=7,
+    )
+
+    output = _schedule(fake)
+
+    # The newer upstream rewrite keeps the unpadded 1-token decode instead
+    # of refusing to schedule: 5 + 3 + 1 > 7, so the pad branch is skipped.
+    assert output.num_scheduled_tokens == {"r0": 1, "w0": 1}
+    assert output.scheduled_spec_decode_tokens == {}
+    assert fake.kv_cache_manager.allocate_calls[-1][1] == 1
 
 
 def test_preemption_when_kv_blocks_unavailable():
