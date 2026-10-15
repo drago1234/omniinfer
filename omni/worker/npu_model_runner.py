@@ -829,7 +829,7 @@ class NPUModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     @model_output_decorator
-    @maybe_dump_kv
+    @maybe_dump_kv("update")
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -853,6 +853,7 @@ class NPUModelRunner(GPUModelRunner):
 
     @torch.inference_mode
     @model_output_decorator
+    @maybe_dump_kv("finish")
     def sample_tokens(self, grammar_output):
         with switch_torch_device():
             # Upstream sample_tokens calls drafter.dummy_run(num_tokens=1)
