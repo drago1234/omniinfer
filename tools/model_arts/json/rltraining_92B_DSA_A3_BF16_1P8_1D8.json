@@ -50,7 +50,7 @@
       "system_log_dump_enable": false,
       "unit_configs": [
         {
-          "cmd": "sleep infinity",
+          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/model_arts\n\nexport log_level_proxy=notice\nexport core_num=4\nexport start_core_index=16\nexport pd_policy=sequential\nexport max_num_batched_tokens=100000\n\nTORCH_DEVICE_BACKEND_AUTOLOAD=0 bash \"${SCRIPT_PATH}/proxy.sh\" \\\n  --omni-proxy-pd-policy sequential \\\n  --omni-proxy-max-batch-num-token 100000 \\\n  --omni-proxy-prefill-max-num-seqs 4 \\\n  --omni-proxy-decode-max-num-seqs 12 &&\n\nexport OMNI_NPU_PATCHES_DIR=pangu_v2_hybrid\nexport BASE_API_PORT=9000\nexport MASTER_PORT=8000\nexport HCCL_BUFFSIZE=300\nexport HCCL_SOCKET_IFNAME=\"${SOCKET_IFNAME:-eth0}\"\nexport gpu_util=0.8\nexport max_num_seqs=8\nexport max_num_batched_tokens=16384\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"/workspace/omniinfer/components/omni-npu/src/omni_npu/model_config/configs/high_throughout/openpangu_v2/openpangu_v2_92b_bf16_a3_1p1d_precision_consistency_p.json\"\nexport kv_transfer_config='{\"kv_buffer_device\":\"npu\",\"kv_connector\":\"LLMDataDistConnector\",\"kv_parallel_size\":1,\"kv_role\":\"kv_producer\",\"kv_rank\":0}'\n\nbash \"${SCRIPT_PATH}/prefill.sh\" \\\n  --dtype bfloat16 \\\n  --max-model-len 524288 \\\n  --max-num-seqs 8 \\\n  --max-num-batched-tokens 16384 \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --enable-prefix-caching \\\n  --block-size 128 \\\n  --enforce-eager \\\n  --enable-expert-parallel \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity",
           "codes": [],
           "count": 1,
           "custom_spec": {
@@ -112,7 +112,7 @@
           }
         },
         {
-          "cmd": "sleep infinity",
+          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/model_arts\n\nexport OMNI_NPU_PATCHES_DIR=pangu_v2_hybrid\nexport BASE_API_PORT=9100\nexport MASTER_PORT=8000\nexport HCCL_BUFFSIZE=300\nexport HCCL_EP_BUFFSIZE=300\nexport HCCL_SOCKET_IFNAME=\"${SOCKET_IFNAME:-eth0}\"\nexport gpu_util=0.8\nexport tp=1\nexport max_num_seqs=12\nexport max_num_batched_tokens=48\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"/workspace/omniinfer/components/omni-npu/src/omni_npu/model_config/configs/high_throughout/openpangu_v2/openpangu_v2_92b_bf16_a3_1p1d_precision_consistency_d.json\"\nexport kv_transfer_config='{\"kv_buffer_device\":\"npu\",\"kv_connector\":\"LLMDataDistConnector\",\"kv_parallel_size\":1,\"kv_role\":\"kv_consumer\"}'\n\nbash \"${SCRIPT_PATH}/decode.sh\" \\\n  --dtype bfloat16 \\\n  --max-model-len 524288 \\\n  --max-num-seqs 12 \\\n  --max-num-batched-tokens 48 \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --enable-expert-parallel \\\n  --disable-log-requests \\\n  --block-size 128 \\\n  --distributed-executor-backend mp \\\n  --enable-prefix-caching \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --compilation-config '{\"mode\":3,\"cudagraph_mode\":\"FULL\",\"cudagraph_capture_sizes\":[4,24,48],\"backend\":\"eager\",\"compile_sizes\":[4,24,48]}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity",
           "codes": [],
           "count": 1,
           "custom_spec": {
