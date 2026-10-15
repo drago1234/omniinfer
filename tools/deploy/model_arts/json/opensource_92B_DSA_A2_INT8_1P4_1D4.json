@@ -48,7 +48,7 @@
       "system_log_dump_enable": false,
       "unit_configs": [
         {
-          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/deploy/model_arts\n\nexport PYTHONHASHSEED=1234\nexport log_level_proxy=info\nexport core_num=4\nexport start_core_index=16\nexport pd_policy=sequential\nexport max_num_batched_tokens=100000\n\nTORCH_DEVICE_BACKEND_AUTOLOAD=0 bash \"${SCRIPT_PATH}/proxy.sh\" \\\n  --omni-proxy-max-batch-num-token 100000 \\\n  --omni-proxy-prefill-max-num-seqs 32 \\\n  --omni-proxy-decode-max-num-seqs 4 &&\n\nexport TASK_QUEUE_ENABLE=2\nexport HCCL_BUFFSIZE=20\nexport gpu_util=0.85\nexport max_num_seqs=32\nexport max_num_batched_tokens=65536\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_p_open.json\"\nexport kv_transfer_config='{\"kv_buffer_device\":\"npu\",\"kv_connector\":\"LLMDataDistConnector\",\"kv_parallel_size\":1,\"kv_role\":\"kv_producer\",\"kv_rank\":0}'\n\nbash \"${SCRIPT_PATH}/prefill.sh\" \\\n  --block-size 128 \\\n  --mamba-block-size 128 \\\n  --enable-prefix-caching \\\n  --enable-chunked-prefill \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --enable-prompt-tokens-details \\\n  --scheduling-policy priority \\\n  --trust-request-chat-template \\\n  --additional-config '{\"enable_low_latency\":true}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' \\\n  --enforce-eager && sleep infinity",
+          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/deploy/model_arts\n\nexport PYTHONHASHSEED=1234\nexport log_level_proxy=info\nexport core_num=4\nexport start_core_index=16\nexport pd_policy=sequential\nexport max_num_batched_tokens=100000\n\nTORCH_DEVICE_BACKEND_AUTOLOAD=0 bash \"${SCRIPT_PATH}/proxy.sh\" \\\n  --omni-proxy-max-batch-num-token 100000 \\\n  --omni-proxy-prefill-max-num-seqs 32 \\\n  --omni-proxy-decode-max-num-seqs 4 &&\n\nexport TASK_QUEUE_ENABLE=2\nexport HCCL_BUFFSIZE=20\nexport gpu_util=0.85\nexport max_num_seqs=32\nexport max_num_batched_tokens=16384\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_p_open.json\"\nexport kv_transfer_config='{\"kv_buffer_device\":\"npu\",\"kv_connector\":\"LLMDataDistConnector\",\"kv_parallel_size\":1,\"kv_role\":\"kv_producer\",\"kv_rank\":0}'\n\nbash \"${SCRIPT_PATH}/prefill.sh\" \\\n  --block-size 128 \\\n  --mamba-block-size 128 \\\n  --enable-prefix-caching \\\n  --enable-chunked-prefill \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --enable-prompt-tokens-details \\\n  --scheduling-policy priority \\\n  --trust-request-chat-template \\\n  --additional-config '{\"enable_low_latency\":true}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' \\\n  --enforce-eager && sleep infinity",
           "codes": [],
           "count": 1,
           "custom_spec": {
@@ -70,7 +70,7 @@
             "PROXY_PORT": "7710",
             "ENABLE_OMNI_CACHE": "0",
             "dtype": "bfloat16",
-            "max_model_len": "262144",
+            "max_model_len": "524288",
             "VLLM_DISABLE_PYNCCL": "1",
             "HCCL_CONNECT_TIMEOUT": "1800",
             "HCCL_EXEC_TIMEOUT": "1800",
@@ -125,7 +125,7 @@
             "PROXY_PORT": "7710",
             "ENABLE_OMNI_CACHE": "0",
             "dtype": "bfloat16",
-            "max_model_len": "262144",
+            "max_model_len": "524288",
             "VLLM_DISABLE_PYNCCL": "1",
             "HCCL_CONNECT_TIMEOUT": "1800",
             "HCCL_EXEC_TIMEOUT": "1800",
