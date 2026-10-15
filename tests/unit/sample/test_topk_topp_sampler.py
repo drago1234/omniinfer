@@ -26,6 +26,11 @@ class _DummyDefaultStream:
 
 @pytest.fixture
 def topk_mod(monkeypatch):
+    # Import vLLM dependencies before installing sampling-only stubs so this
+    # file can also run alone without depending on test collection order.
+    monkeypatch.setattr(torch_npu.npu, "get_device_name", lambda index=0: "Ascend910B2")
+    import omni_npu.sample.ops.topk_topp_sampler as mod
+
     fake_default_stream = _DummyDefaultStream()
     # Streams are dummied out in these tests; no-op Tensor.record_stream so
     # real tensors can flow through code that records cross-stream usage.
@@ -36,8 +41,6 @@ def topk_mod(monkeypatch):
     fake_aiter_ops.__spec__ = importlib.machinery.ModuleSpec("vllm._aiter_ops", loader=None)
     setattr(fake_aiter_ops, "rocm_aiter_ops", types.SimpleNamespace(is_enabled=lambda: False))
     monkeypatch.setitem(sys.modules, "vllm._aiter_ops", fake_aiter_ops)
-
-    import omni_npu.sample.ops.topk_topp_sampler as mod
 
     mod = importlib.reload(mod)
     monkeypatch.setattr(
@@ -318,15 +321,18 @@ def test_forward_npu_disable_bypass_path(topk_mod, monkeypatch, logprobs_mode, e
         assert logits_to_return.dtype == torch.float32
 
 
-def test_sampler_init_sets_npu_specific_attributes(topk_mod, monkeypatch):
+@pytest.mark.parametrize("device_name", ["Ascend910_9391", "Ascend950DT_9582"])
+def test_sampler_init_sets_npu_specific_attributes(topk_mod, monkeypatch, device_name):
     mod, fake_torch_npu, _ = topk_mod
+    from omni_npu.v1 import utils
+
+    monkeypatch.setattr(utils, "_npu_device_name", lambda: device_name)
     parent_called = {}
 
     def fake_parent_init(self, logprobs_mode):
         parent_called["logprobs_mode"] = logprobs_mode
 
     monkeypatch.setattr(mod.V1TopKTopPSampler, "__init__", fake_parent_init)
-    monkeypatch.setattr(mod, "on_ascend950", lambda: False)
 
     mock_sampler = types.SimpleNamespace(dsa_stream="stream_from_npu")
     sampler = mod.NPUTopKTopPSampler(logprobs_mode="processed_logits", sampler=mock_sampler)
