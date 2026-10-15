@@ -74,6 +74,10 @@ run_server_prefill_profile_defaults:
     eviction_policy: arc
   # 加载容器 .bashrc 后、调用 runner 前原样执行的 Bash 命令。
   prepare_commands: ""
+  # 是否由启动模板默认追加 --kv-events-config（API_PORT+100）。
+  # prepare_commands 已包含该参数时不会重复追加；不需要时可设 false 或
+  # OMNI_ENABLE_KV_EVENTS=0。
+  enable_kv_events: true
   # 多节点 Prefill 使用的执行后端；null 表示不追加后端参数。
   multi_node_backend: ray
   # 按列表顺序追加到 runner 的 CLI 参数。
@@ -97,6 +101,8 @@ run_server_decode_profile_defaults:
     eviction_policy: arc
   # 加载容器 .bashrc 后、调用 runner 前原样执行的 Bash 命令。
   prepare_commands: ""
+  # 同 Prefill：默认追加 --kv-events-config，供 Proxy radix / 前缀亲和。
+  enable_kv_events: true
   # 按列表顺序追加到 runner 的 CLI 参数。
   args: []
 # Playbook 只需在该字典中覆盖与默认值不同的字段。
