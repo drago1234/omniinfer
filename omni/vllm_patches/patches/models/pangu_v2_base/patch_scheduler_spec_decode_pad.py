@@ -8,10 +8,12 @@ Upstream ``Scheduler.schedule`` pads a brand new decode request from
 keeps a full CUDA graph. On NPU that padding injects dummy ``-1`` draft slots
 into the step and breaks it, so the branch is disabled by default.
 
-``schedule`` is forked verbatim from upstream vLLM (commit
-752a3a504485790a2e8491cacbb35c137339ad34). The only deviation is the extra
-``and not envs.OMNI_DISABLE_SPEC_DECODE_PAD`` clause marked with
-``# omni-npu:`` below. Keep this fork pinned to that upstream revision:
+``schedule`` is forked from upstream vLLM (commit
+752a3a504485790a2e8491cacbb35c137339ad34). Deviations: the omni-npu guard
+clauses marked with ``# omni-npu:`` below, plus the spec-decode pad branch,
+which is the newer upstream rewrite (``padded_num_tokens`` + reserving
+``num_sampled_tokens_per_step`` room near ``max_model_len``) that the pinned
+revision predates. Keep the rest of the fork pinned to that upstream revision:
 refresh it whenever the vendored vLLM is bumped.
 
 Set ``OMNI_DISABLE_SPEC_DECODE_PAD=0`` to restore the upstream behaviour.
@@ -479,14 +481,23 @@ class PanguV2SpecDecodePadPatch(VLLMPatch):
                         and not prefill_scheduled
                         and (scheduled_running_reqs or num_computed_tokens > 0)
                     ):
-                        num_new_tokens = 1 + self.num_spec_tokens
+                        padded_num_tokens = 1 + self.num_spec_tokens
+
+                        # Reserve room for the token(s) sampled by this step.
+                        # Near max_model_len, keep the original unpadded decode size.
                         if (
-                            num_new_tokens > token_budget
-                            or num_computed_tokens + num_new_tokens > self.max_model_len
+                            num_computed_tokens
+                            + padded_num_tokens
+                            + self.num_sampled_tokens_per_step
+                            <= self.max_model_len
                         ):
-                            # Prefer to not schedule than schedule un-padded here.
-                            break
-                        pad_spec_decode = True
+                            if padded_num_tokens > token_budget:
+                                # Prefer not to schedule an unpadded request when
+                                # the token budget cannot accommodate padding.
+                                break
+
+                            num_new_tokens = padded_num_tokens
+                            pad_spec_decode = True
 
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
