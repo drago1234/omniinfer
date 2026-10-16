@@ -986,6 +986,36 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     @torch.inference_mode()
+    def _dummy_sampler_run(self, hidden_states: torch.Tensor):
+        # MRv1 MTP block warmup needs draft probabilities for NPU rejection sampling.
+        config = self.speculative_config
+        if not (
+            config is not None
+            and config.method == "mtp"
+            and config.rejection_sample_method == "block"
+            and config.draft_sample_method == "probabilistic"
+        ):
+            return super()._dummy_sampler_run(hidden_states)
+
+        def add_dummy_draft_probs(_module, args, kwargs):
+            metadata, draft_probs, logits, sampling_metadata = args
+            draft_probs = torch.rand(
+                metadata.draft_token_ids.numel(),
+                logits.shape[-1],
+                dtype=torch.float32,
+                device=logits.device,
+            ).softmax(dim=-1)
+            return (metadata, draft_probs, logits, sampling_metadata), kwargs
+
+        handle = self.rejection_sampler.register_forward_pre_hook(
+            add_dummy_draft_probs, with_kwargs=True
+        )
+        try:
+            return super()._dummy_sampler_run(hidden_states)
+        finally:
+            handle.remove()
+
+    @torch.inference_mode()
     def _dummy_run(
         self,
         num_tokens: int,

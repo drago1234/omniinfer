@@ -677,3 +677,35 @@ class TestDraftSlotExecutionSize:
                 assert group_cm.block_table_tensor is tables[gid]
                 assert (group_cm is cm) == (gid == proposer.kv_cache_gid)
             assert set(per_layer) == {'base', 'other'}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("method,rejection,draft,upstream_enabled,expected_enabled", [
+    ("mtp", "block", "probabilistic", False, True),
+    ("mtp", "standard", "probabilistic", True, True),
+    ("mtp", "block", "greedy", False, False),
+    ("mtp", "block", "temperature_only", False, False),
+    ("mtp", "standard", "temperature_only", False, True),
+    ("eagle", "block", "probabilistic", False, False),
+    ("eagle3", "block", "probabilistic", False, False),
+    ("dflash", "block", "probabilistic", False, False),
+])
+def test_mtp_block_draft_probs_initialized_before_top_k(
+    monkeypatch, method, rejection, draft, upstream_enabled, expected_enabled,
+):
+    def original_init(proposer, **_kwargs):
+        proposer.method = method
+        proposer.speculative_config = SimpleNamespace(
+            rejection_sample_method=rejection, draft_sample_method=draft,
+        )
+        proposer._enable_probabilistic_draft_probs = upstream_enabled
+        proposer.draft_model_config = SimpleNamespace(hf_config=SimpleNamespace(n_predict=1))
+        proposer.num_speculative_tokens = 7
+
+    monkeypatch.setattr(eagle_mod, "EagleProposer_original_init", original_init)
+    monkeypatch.setattr(eagle_mod.omni_envs, "OMNI_DRAFT_TOP_K", 5)
+    proposer = SimpleNamespace()
+    EagleProposerPatch.__init__(proposer, SimpleNamespace(kv_transfer_config=None), torch.device("cpu"))
+    assert proposer._enable_probabilistic_draft_probs is expected_enabled
+    top_k_enabled = upstream_enabled or (method == "mtp" and rejection == "block" and draft == "probabilistic")
+    assert proposer._draft_top_k == (5 if top_k_enabled else None)

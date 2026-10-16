@@ -101,6 +101,13 @@ class EagleProposerPatch(VLLMPatch):
         EagleProposer_original_init(
             self, vllm_config=vllm_config, device=device, runner=runner
         )
+        # Collect MTP draft Q for NPU block rejection before configuring draft top-k.
+        if (
+            self.method == "mtp"
+            and self.speculative_config.rejection_sample_method == "block"
+            and self.speculative_config.draft_sample_method == "probabilistic"
+        ):
+            self._enable_probabilistic_draft_probs = True
         self._draft_top_k = omni_envs.OMNI_DRAFT_TOP_K if self._enable_probabilistic_draft_probs else None
         if self._draft_top_k is not None and self._draft_top_k < -1:
             raise ValueError("OMNI_DRAFT_TOP_K must be -1, 0, or a positive integer")
