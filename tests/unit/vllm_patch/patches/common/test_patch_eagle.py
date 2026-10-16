@@ -435,10 +435,9 @@ def _rebuild_proposer(groups, block_tables, *, kv_cache_gid):
 class TestRebuildPerGroupMetadataForStep:
     """``_rebuild_per_group_metadata_for_step`` writes slots into the live buffer.
 
-    The base group's ``slot_mapping`` is a slice of the runner's block-table
-    buffer, so the new slots have to be written *through* it and the leftover
-    tail padded -- rebinding the attribute to a shorter tensor would leave the
-    rest of the buffer holding the previous step's ids.
+    Each group's view covers this step's execution tokens, backed by its
+    persistent block-table buffer. Only padding within that view is consumed
+    by this step; storage beyond the view is not part of its metadata.
     """
 
     BUFFER_LEN = 8
@@ -455,7 +454,7 @@ class TestRebuildPerGroupMetadataForStep:
 
     def test_tail_of_the_live_buffer_is_padded(self):
         buf = torch.arange(self.BUFFER_LEN, dtype=torch.int64)
-        cm = SimpleNamespace(num_reqs=2, slot_mapping=buf)
+        cm = SimpleNamespace(num_reqs=2, num_actual_tokens=self.BUFFER_LEN, slot_mapping=buf)
         group = DraftAttnGroup(
             kv_cache_group_id=0, layer_names=["draft.0"], builder=_plain_builder(4)
         )
@@ -463,11 +462,12 @@ class TestRebuildPerGroupMetadataForStep:
         # and 1, gathered out of req 0's and req 1's row respectively.
         block_table = torch.tensor([[10, 11], [12, 13]], dtype=torch.int64)
         proposer = _rebuild_proposer([group], [block_table], kv_cache_gid=0)
+        proposer.runner.input_batch.block_table[0].slot_mapping.gpu = buf
 
         self._run(proposer, cm, [3, 5])
 
         # 10*4 + 3 = 43 and 13*4 + 1 = 53; the rest of the live buffer is padded
-        assert cm.slot_mapping is buf
+        assert cm.slot_mapping.data_ptr() == buf.data_ptr()
         assert cm.slot_mapping.tolist() == [43, 53, -1, -1, -1, -1, -1, -1]
 
     def test_accepted_count_only_rides_along_on_step1(self):
@@ -475,7 +475,7 @@ class TestRebuildPerGroupMetadataForStep:
         for token_index, expected in ((0, [1, 2]), (1, None)):
             builder = _fake_mome_builder()
             cm = SimpleNamespace(
-                num_reqs=2, slot_mapping=torch.arange(8, dtype=torch.int64)
+                num_reqs=2, num_actual_tokens=8, slot_mapping=torch.arange(8, dtype=torch.int64)
             )
             group = DraftAttnGroup(
                 kv_cache_group_id=0, layer_names=["draft.0"], builder=builder
@@ -626,3 +626,54 @@ def test_dummy_run_respects_prefill_single_step(monkeypatch, prefill_single_step
     EagleProposerPatch.dummy_run(fake, num_tokens=2)
     assert fake.model.call_count == expected_forwards
     assert fake.num_speculative_tokens == 7
+
+
+class TestDraftSlotExecutionSize:
+    @pytest.mark.parametrize('initial,execution,valid', [
+        (2048, 3, 3), (24, 3, 3), (8, 1, 1),
+        (2048, 8, 3), (24, 24, 3), (3, 3, 3),
+    ])
+    @pytest.mark.parametrize('uses_mrope', [False, True])
+    def test_each_group_uses_current_execution_view(self, initial, execution, valid, uses_mrope):
+        # Base group is deliberately group 1, with a different block size.
+        capacity = max(initial, execution) + 4
+        tables = [
+            torch.tensor([[10 + 10*i, 11 + 10*i, 12 + 10*i] for i in range(valid)]),
+            torch.tensor([[100 + 10*i, 101 + 10*i, 102 + 10*i] for i in range(valid)]),
+        ]
+        groups = [
+            DraftAttnGroup(kv_cache_group_id=1, layer_names=['base'], builder=_plain_builder(16), is_base=True),
+            DraftAttnGroup(kv_cache_group_id=0, layer_names=['other'], builder=_plain_builder(4)),
+        ]
+        proposer = _rebuild_proposer(groups, tables, kv_cache_gid=1)
+        proposer.uses_mrope = uses_mrope
+        buffers = [torch.full((capacity,), -7, dtype=torch.int64) for _ in tables]
+        for table, buffer in zip(proposer.runner.input_batch.block_table, buffers):
+            table.slot_mapping.gpu = buffer
+        cm = SimpleNamespace(num_reqs=valid, num_actual_tokens=execution, slot_mapping=buffers[1][:initial])
+        positions = torch.arange(valid, dtype=torch.int64) + 3
+        supplied_positions = torch.stack([positions]*3) if uses_mrope else positions
+        exceeds = torch.zeros(valid, dtype=torch.bool)
+        if valid > 1:
+            exceeds[-1] = True
+        per_layer = {}
+        # Repeated draft steps must keep storage addresses and group isolation.
+        for step in (0, 1):
+            EagleProposerPatch._rebuild_per_group_metadata_for_step(
+                proposer, cm, supplied_positions, exceeds, step, per_layer,
+            )
+            for group in groups:
+                gid = group.kv_cache_group_id
+                group_cm = group.builder.build_for_drafting.call_args.kwargs['common_attn_metadata']
+                size = group.builder.kv_cache_spec.block_size
+                ids = tables[gid].gather(1, (positions // size).view(-1, 1)).view(-1)
+                expected = ids * size + positions % size
+                expected.masked_fill_(exceeds, PADDING_SLOT_ID)
+                assert group_cm.slot_mapping.numel() == execution
+                assert group_cm.slot_mapping.data_ptr() == buffers[gid].data_ptr()
+                assert torch.equal(group_cm.slot_mapping[:valid], expected)
+                assert (group_cm.slot_mapping[valid:] == PADDING_SLOT_ID).all()
+                assert (buffers[gid][execution:] == -7).all()
+                assert group_cm.block_table_tensor is tables[gid]
+                assert (group_cm is cm) == (gid == proposer.kv_cache_gid)
+            assert set(per_layer) == {'base', 'other'}
