@@ -138,7 +138,9 @@ def test_sampler_routes_topk_topp_by_config(
     base_sampler = SimpleNamespace(
         logprobs_mode="raw_logits", dsa_stream=_DummyDefaultStream()
     )
-    sampler = mod.NPURejectionSampler(base_sampler)
+    sampler = mod.NPURejectionSampler(
+        base_sampler, SimpleNamespace(rejection_sample_method="standard")
+    )
     assert sampler.use_npu_sample is (not disable_npu_sample)
     assert sampler.dsa_stream is base_sampler.dsa_stream
 
@@ -685,7 +687,6 @@ def _build_npu_rejection_sampler(
     mod, monkeypatch, enable_mtp_invariant=False, sampler_multi_stream=True,
     rejection_sample_method="standard",
 ):
-    monkeypatch.setattr(mod, "on_ascend950", lambda: False)
     monkeypatch.setattr(
         mod,
         "model_extra_config",
