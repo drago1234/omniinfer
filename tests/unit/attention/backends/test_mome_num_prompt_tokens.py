@@ -229,6 +229,9 @@ def make_builder(*, num_spec=1, is_decode_node=False, enable_prefix_caching=True
     b.decode_cudagraph_max_bs = MAX_NUM_REQS
     b.use_full_cuda_graph = False
     b.kv_cache_spec = SimpleNamespace(block_size=MOME_BLOCK_SIZE)
+    # __init__ derives this from max_model_len / mome_block_size; the upper
+    # clamp of block_idx_last_computed_token reads it.
+    b.max_num_blocks = 1024 // MOME_BLOCK_SIZE
     b.cache_indices_tensor = torch.zeros((MAX_NUM_REQS, 8), dtype=torch.int32)
     b.num_computed_tokens = torch.zeros(MAX_NUM_REQS, dtype=torch.int32)
     b.num_accepted_tokens = torch.zeros(MAX_NUM_REQS, dtype=torch.int32)
@@ -344,6 +347,25 @@ class TestBlockIndexArithmetic(unittest.TestCase):
 # --------------------------------------------------------------------------
 # 2. how the builder resolves num_prompt_tokens
 # --------------------------------------------------------------------------
+
+
+    def test_block_index_is_clamped_to_max_num_blocks(self):
+        # The MTP physical high-water mark can point past the last block of
+        # the running cache (spec-decode padding near max_model_len); the
+        # upper clamp caps the index at max_num_blocks - 1 so the kernel
+        # never indexes out of bounds.
+        b = make_builder(num_spec=1)
+        b.max_num_blocks = 2
+        cm = FakeCommonAttentionMetadata(seq_lens=[14], query_lens=[2])
+        self.assertEqual(cm.compute_num_computed_tokens().tolist(), [12])
+
+        num_prompt_tokens = torch.tensor([8], dtype=torch.int32)
+        num_accepted = torch.tensor([1], dtype=torch.int32)
+        last_computed, _, _ = b._compute_prefix_caching_block_indices(
+            cm, MOME_BLOCK_SIZE, num_accepted, num_prompt_tokens
+        )
+        # physical: cdiv(12 - 1 + 1 + 1, 4) - 1 == 3 -> clamped to 1
+        self.assertEqual(last_computed.tolist(), [1])
 
 
 class TestNumPromptTokensResolution(unittest.TestCase):

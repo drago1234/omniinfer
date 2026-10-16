@@ -171,12 +171,11 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 self.decode_cudagraph_max_bs,
                 self.compilation_config.max_cudagraph_capture_size,
             )
-
+        self.max_num_blocks = cdiv(self.vllm_config.model_config.max_model_len, self.mome_block_size)
         # Allocate buffers for prefix caching support
         if self.vllm_config.cache_config.enable_prefix_caching:
-            max_num_blocks = cdiv(self.vllm_config.model_config.max_model_len, self.mome_block_size)
             self.cache_indices_tensor = torch.empty(
-                (self.decode_cudagraph_max_bs, max_num_blocks),
+                (self.decode_cudagraph_max_bs, self.max_num_blocks),
                 dtype=torch.int32,
                 device=device,
             )
@@ -253,9 +252,9 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         # which is <= block index of the last scheduled token
         block_idx_last_scheduled_token = cdiv(common_attn_metadata.seq_lens, mome_block_size) - 1
         # -1 in case it's non-computed and causes later issues with indexing
-        block_idx_last_computed_token = torch.clamp(block_idx_last_computed_token, min=0)
+        block_idx_last_computed_token = torch.clamp(block_idx_last_computed_token, min=0, max=self.max_num_blocks - 1)
         # -1 in the case we have a padded request (0 seq-len)
-        block_idx_last_scheduled_token = torch.clamp(block_idx_last_scheduled_token, min=0)
+        block_idx_last_scheduled_token = torch.clamp(block_idx_last_scheduled_token, min=0, max=self.max_num_blocks - 1)
 
         return (
             block_idx_last_computed_token,
