@@ -112,11 +112,11 @@ def test_scheduler_patch_keeps_pd_finish_notification_chain(pd, expert_patch):
     )
     scheduler.kv_cache_config = NS(kv_cache_groups=[NS(kv_cache_spec=NS(block_size=4))])
     scheduler._omni_pending_finish_outputs = [(0, pending)]
-    pd._original_update_from_output.return_value = expected
+    pd.SchedulerKvXferFinishedPatch._upstream_update_from_output.return_value = expected
     scheduled, runner = NS(num_scheduled_tokens={"req": 1}), NS()
     result = scheduler.update_from_output(scheduled, runner)
     assert result is expected
-    pd._original_update_from_output.assert_called_once_with(
+    pd.SchedulerKvXferFinishedPatch._upstream_update_from_output.assert_called_once_with(
         scheduler, scheduled, runner
     )
     assert result[0].outputs == [output, pending]
@@ -798,7 +798,9 @@ def test_request_output_add_preserves_native_behavior_and_routing(
             output.outputs[0] = incoming
 
     original = Mock(side_effect=native)
-    monkeypatch.setattr(expert_patch, "_original_add", original)
+    monkeypatch.setattr(
+        expert_patch.RequestOutputRoutedExpertsAggregationPatch, "_upstream_add", original
+    )
     aggregate = scenario != "replace"
     expert_patch.RequestOutputRoutedExpertsAggregationPatch.add(
         current, following, aggregate

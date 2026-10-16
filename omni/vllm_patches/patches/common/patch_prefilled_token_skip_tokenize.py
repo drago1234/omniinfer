@@ -47,7 +47,6 @@ from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 _original_chat_completion_full_generator = OpenAIServingChat.chat_completion_full_generator
 _original_preprocess_chat = OnlineRenderer.preprocess_chat
 _original_update_from_kv_xfer_finished = Scheduler._update_from_kv_xfer_finished
-_original_update_from_output = Scheduler.update_from_output
 _original_make_cached_request_data = Scheduler._make_cached_request_data
 _original_generate = AsyncLLM.generate
 
@@ -363,6 +362,13 @@ class SchedulerKvXferFinishedPatch(VLLMPatch):
         "_update_from_kv_xfer_finished", "update_from_output", "_make_cached_request_data",
     ]
 
+    _upstream_update_from_output = Scheduler.update_from_output
+
+    @classmethod
+    def apply(cls):
+        # Relay to other update_from_output wrappers instead of replacing them.
+        cls.apply_bypass_conflict("update_from_output")
+
     def _make_cached_request_data(
         self, running_reqs, resumed_reqs, num_scheduled_tokens,
         spec_decode_tokens, req_to_new_blocks,
@@ -413,7 +419,7 @@ class SchedulerKvXferFinishedPatch(VLLMPatch):
                 _finish_request_and_notify_client(self, request, finished_status)
 
     def update_from_output(self, scheduler_output, model_runner_output):
-        outputs = _original_update_from_output(self, scheduler_output, model_runner_output)
+        outputs = SchedulerKvXferFinishedPatch._upstream_update_from_output(self, scheduler_output, model_runner_output)
         drain_pending_finish_outputs(self, outputs)
         return outputs
 
