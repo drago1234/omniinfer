@@ -177,3 +177,31 @@ def test_inplace_passes_only_valid_slice_to_v2(mome_rl):
     assert out.shape == (4, 4)
     assert torch.equal(x[:4], torch.full((4, 4), 3.0))
     assert torch.count_nonzero(x[4:]) == 0
+
+
+@pytest.mark.parametrize("consistency", [False, True])
+def test_ascend950_precision_consistency_moves_residual_out_of_kernel(
+    mome_rl, monkeypatch, consistency
+):
+    # Strong consistency asks the kernel for the bare conv and adds the residual
+    # in torch, so the sum does not depend on the fused kernel's accumulation.
+    monkeypatch.setattr(
+        mome_rl.model_extra_config.operator_opt_config,
+        "enable_precision_strong_consistency",
+        consistency,
+    )
+    calls = {}
+
+    def fake(conv_x, weight, states, **kwargs):
+        calls["residual_connection"] = kwargs["residual_connection"]
+        return torch.full_like(conv_x, 5)
+
+    mome_rl.torch_npu.npu_fused_causal_conv1d = fake
+    mome_rl.torch_npu.npu_fused_causal_conv1d_v2 = MagicMock()
+    x = torch.ones(4, 3)
+    out = mome_rl.ColumnParallelMOMERL.forward(
+        _layer(), x, torch.zeros(1, 2, 3), _meta(4, 4), inplace=False
+    )
+
+    assert calls["residual_connection"] == (0 if consistency else 1)
+    assert torch.equal(out, torch.full_like(x, 6.0 if consistency else 5.0))

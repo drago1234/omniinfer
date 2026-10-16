@@ -177,6 +177,9 @@
         export HCCL_SOCKET_IFNAME=enp23s0f3
         export OMNI_CACHE_V2_ASYNC_PRODUCER=1
         # export OMNI_CACHE_V2_DIAGNOSTICS=3
+        export OMNI_CACHE_V2_A3_PREFILL_NATIVE=1
+        export OMNI_CACHE_V2_USE_NATIVE_ENGINE=1
+        export OMNI_CACHE_V2_USE_NATIVE_D2H_ENGINE=1
         EXTRA_ARGS="--no-disable-hybrid-kv-cache-manager"
         EXTRA_ARGS="${EXTRA_ARGS} --max-num-batched-tokens 65536"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-expert-parallel --max-num-seqs 3"
@@ -229,7 +232,7 @@
         export OMNI_VLLM_PATCHES="ALL"
         export ENABLE_DP_LB=false
         export OMNI_ENABLE_OMNI_CACHE=1
-        export OMNI_CUSTOM_MODEL_CONFIG_PATH="low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_d_open.json"
+        export OMNI_CUSTOM_MODEL_CONFIG_PATH="low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_d_omnicache_open.json"
         export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
         export VLLM_DISABLE_COMPILE_CACHE=1
         export TORCH_COMPILE_DISABLE=0

@@ -1,0 +1,32 @@
+{
+    "model_parallel_config": {
+        "ena_seq_parallel": true,
+        "ena_context_parallel": true,
+        "layer_parallel_config": {
+            "self_attn.o_proj": {
+                "tp_size_or_ranks": 1
+            },
+            "mlp.gate_up_proj": {
+                "tp_size_or_ranks": 1
+            },
+            "mlp.down_proj": {
+                "tp_size_or_ranks": 1
+            }
+        }
+    },
+    "operator_optimization_config": {
+        "use_noncontiguous_kv": true,
+        "enable_kv_rmsnorm_rope_cache": true,
+        "decode_moe_dispatch_combine": false,
+        "enable_moe_agrs": true,
+        "enable_agrs_finalize_metadata_overlap": true,
+        "shared_expert_multi_stream": true,
+        "enable_mome_sp": true,
+        "mome_sp_min_tokens": 10240,
+        "swa_prefill_absorb_max_tokens": 8192,
+        "use_quant_lightning_indexer_v2": true,
+        "kv_nz": false,
+        "merge_q_kv_conv": false,
+        "use_aicpu_fa_tiling": true
+    }
+}

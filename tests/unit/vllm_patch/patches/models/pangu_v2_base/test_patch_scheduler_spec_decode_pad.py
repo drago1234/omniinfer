@@ -13,8 +13,8 @@ Run with pytest or directly (``python test_patch_scheduler_spec_decode_pad.py``)
 """
 
 import inspect
+import re
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,20 +25,28 @@ from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus
 
-from omni_npu import envs
 from omni_npu.vllm_patches.patches.models.pangu_v2_base import (
     patch_scheduler_spec_decode_pad as sched_mod,
 )
 
 GUARD = "OMNI_DISABLE_SPEC_DECODE_PAD"
 
-# The fork deviates from upstream with a 3-line comment plus the guard clause;
-# the drift test strips them before diffing against upstream.
+# The fork deviates from upstream with omni-npu comment lines plus the
+# offloading-connector guard clause; the drift test strips them before
+# diffing against upstream.
 FORK_MARKERS = (
     "omni-npu:",
     "padded to the full spec-decode",
     "dummy draft slots",
 )
+
+# The fork additionally absorbs a later upstream fix (reworked pad branch:
+# `padded_num_tokens` + reserving `num_sampled_tokens_per_step` room near
+# max_model_len) that the pinned vendored vLLM revision (752a3a50) predates.
+# The drift test therefore cuts the whole pad branch out of both sides;
+# its behaviour is guarded by the test_spec_padding_* tests below instead.
+PAD_BRANCH_START = "# Pad new decode requests"
+PAD_BRANCH_END = "pad_spec_decode = True"
 
 # True when the file is executed as a script (patch_test_utils harness) instead
 # of collected by pytest; pytest.skip() aborts that harness.
@@ -50,29 +58,6 @@ _TESTS_ROOT = next(
 if str(_TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(_TESTS_ROOT))
 from unit.vllm_patch.patches.patch_test_utils import run_standalone_tests  # noqa: E402
-
-
-# --------------------------------------------------------------------------
-# env helper
-# --------------------------------------------------------------------------
-
-
-@contextmanager
-def _spec_pad_env(enabled: bool):
-    """Pin envs.OMNI_DISABLE_SPEC_DECODE_PAD and restore it afterwards."""
-    sentinel = object()
-    original = getattr(envs, GUARD, sentinel)
-    setattr(envs, GUARD, enabled)
-    try:
-        yield
-    finally:
-        if original is sentinel:
-            try:
-                delattr(envs, GUARD)
-            except AttributeError:
-                pass
-        else:
-            setattr(envs, GUARD, original)
 
 
 # --------------------------------------------------------------------------
@@ -314,9 +299,15 @@ def test_patch_targets_scheduler_schedule():
     assert sched_mod.PanguV2SpecDecodePadPatch._attr_names_to_apply == ["schedule"]
 
 
-def test_fork_disables_spec_decode_padding():
+def test_fork_pads_only_when_batch_or_history_exists():
     source = inspect.getsource(sched_mod.PanguV2SpecDecodePadPatch.schedule)
-    assert f"and not envs.{GUARD}" in source
+    # Padding must not fire for the very first fresh request of the engine
+    # (nothing running, nothing computed): the extra dummy draft slots break
+    # the NPU graph step.
+    assert "scheduled_running_reqs or num_computed_tokens > 0" in source
+    # Offloading connectors assemble prefix hits through the cache manager,
+    # so the locally-cached-tokens hybrid branch must be skipped for them.
+    assert "_omni_is_offloading_connector" in source
 
 
 def test_fork_matches_upstream_except_the_guard():
@@ -326,16 +317,86 @@ def test_fork_matches_upstream_except_the_guard():
         pytest.skip("Scheduler stub without upstream schedule()")
 
     def normalized(func):
-        lines = [line.rstrip() for line in inspect.getsource(func).splitlines()]
+        text = inspect.getsource(func)
+        # Canonicalize the intentionally-deviating pad condition: upstream
+        # keeps `scheduled_running_reqs` on a single line, the fork splits it
+        # to add the `num_computed_tokens > 0` arm.
+        text = re.sub(
+            r"\n\s*and not prefill_scheduled"
+            r"\n\s*and \(scheduled_running_reqs or num_computed_tokens > 0\)",
+            "\nPAD_CONDITION",
+            text,
+        )
+        text = re.sub(
+            r"\n\s*and \(scheduled_running_reqs and not prefill_scheduled\)",
+            "\nPAD_CONDITION",
+            text,
+        )
+        # Register the placeholder-width guard as an intentional deviation:
+        # both sides normalize to the same anchors so the rest of the fork
+        # still has to match upstream line by line.
+        text = re.sub(
+            r"num_pad_slots = min\(self\.num_spec_tokens, num_new_tokens - 1\)"
+            r".*?\] \* num_pad_slots",
+            "PLACEHOLDER_BLOCK",
+            text,
+            flags=re.S,
+        )
+        text = re.sub(
+            r"scheduled_spec_decode_tokens\[request_id\] = \["
+            r"\s*-1\s*\] \* self\.num_spec_tokens",
+            "PLACEHOLDER_BLOCK",
+            text,
+            flags=re.S,
+        )
+        text = re.sub(
+            r"max_slots = min\(num_scheduled_spec_tokens, num_new_tokens - 1\)"
+            r".*?\(\n\s+spec_token_ids\s*\n\s*\)",
+            "SPEC_REL_BLOCK",
+            text,
+            flags=re.S,
+        )
+        text = re.sub(
+            r"if len\(spec_token_ids\) > num_scheduled_spec_tokens:\s*"
+            r"spec_token_ids = spec_token_ids\[:num_scheduled_spec_tokens\]\s*"
+            r"scheduled_spec_decode_tokens\[request\.request_id\] = "
+            r"spec_token_ids",
+            "SPEC_REL_BLOCK",
+            text,
+            flags=re.S,
+        )
+        text = re.sub(
+            r"assert total_num_scheduled_tokens >= 0, \(.*?\n\s*\)\n",
+            "",
+            text,
+            flags=re.S,
+        )
+        lines = [line.rstrip() for line in text.splitlines()]
         while lines and not lines[-1].strip():
             lines.pop()
-        # Drop the guard clause and its comment so the fork can be diffed
-        # against upstream even when the local vLLM checkout still carries the
-        # raw os.environ variant.
-        return [
+        # Drop the offloading-connector guard clause and the omni comment
+        # lines so the fork can be diffed against upstream even when the
+        # local vLLM checkout still carries the raw os.environ variant.
+        lines = [
             line for line in lines
-            if GUARD not in line and not any(m in line for m in FORK_MARKERS)
+            if GUARD not in line
+            and "_omni_is_offloading_connector" not in line
+            and not any(m in line for m in FORK_MARKERS)
         ]
+        # Cut the whole pad branch from both sides: the fork carries the
+        # newer upstream rewrite (padded_num_tokens / max_model_len headroom)
+        # that the pinned vendored vLLM revision does not have yet.
+        try:
+            start = next(
+                i for i, line in enumerate(lines) if PAD_BRANCH_START in line
+            )
+            end = next(
+                i for i, line in enumerate(lines[start:], start)
+                if PAD_BRANCH_END in line
+            )
+        except StopIteration:
+            return lines
+        return lines[:start] + lines[end + 1:]
 
     assert normalized(Scheduler.schedule) == normalized(
         sched_mod.PanguV2SpecDecodePadPatch.schedule
@@ -473,31 +534,46 @@ def test_resumed_preempted_request_is_reported_as_cached():
     assert [req.request_id for req in resumed] == ["w0"]
 
 
-def test_spec_padding_disabled_by_default():
+def test_spec_padding_applied_for_waiting_request_with_running_batch():
     running = _request("r0", num_tokens=5, num_computed_tokens=4)
-    # Fresh decode request: exactly one token left to compute.
+    # First decode after a chunked prefill: exactly one token left.
     waiting = _request("w0", num_tokens=6, num_computed_tokens=5)
     fake = _FakeScheduler(running=[running], waiting=[waiting], num_spec_tokens=2)
 
-    with _spec_pad_env(True):
-        output = _schedule(fake)
+    output = _schedule(fake)
 
-    # The omni guard keeps the fresh decode at 1 token (upstream pads to 3).
-    assert output.num_scheduled_tokens == {"r0": 1, "w0": 1}
-    assert output.scheduled_spec_decode_tokens == {}
-
-
-def test_spec_padding_applied_when_opted_out():
-    running = _request("r0", num_tokens=5, num_computed_tokens=4)
-    waiting = _request("w0", num_tokens=6, num_computed_tokens=5)
-    fake = _FakeScheduler(running=[running], waiting=[waiting], num_spec_tokens=2)
-
-    with _spec_pad_env(False):
-        output = _schedule(fake)
-
-    assert output.num_scheduled_tokens["w0"] == 3
-    assert output.scheduled_spec_decode_tokens["w0"] == [-1, -1]
+    # Padding only happens in the waiting loop: the running decode stays at
+    # 1 token, the waiting request is padded via the `scheduled_running_reqs`
+    # arm of the condition.
+    assert output.num_scheduled_tokens == {"r0": 1, "w0": 3}
+    assert output.scheduled_spec_decode_tokens == {"w0": [-1, -1]}
     assert fake.kv_cache_manager.allocate_calls[-1][1] == 3
+
+
+def test_spec_padding_applied_for_computed_request_without_running_reqs():
+    # The `num_computed_tokens > 0` arm: a request whose KV history was
+    # already computed/loaded (e.g. resumed after a remote KV transfer) is
+    # padded even when nothing else is running.
+    waiting = _request("w0", num_tokens=6, num_computed_tokens=5)
+    fake = _FakeScheduler(waiting=[waiting], num_spec_tokens=2)
+
+    output = _schedule(fake)
+
+    assert output.num_scheduled_tokens == {"w0": 3}
+    assert output.scheduled_spec_decode_tokens == {"w0": [-1, -1]}
+    assert fake.kv_cache_manager.allocate_calls[-1][1] == 3
+
+
+def test_spec_padding_skipped_for_fresh_first_request():
+    # Nothing running and nothing computed yet: the very first request of
+    # the engine stays un-padded so no dummy draft slots are scheduled.
+    waiting = _request("w0", num_tokens=1)
+    fake = _FakeScheduler(waiting=[waiting], num_spec_tokens=2)
+
+    output = _schedule(fake)
+
+    assert output.num_scheduled_tokens == {"w0": 1}
+    assert output.scheduled_spec_decode_tokens == {}
 
 
 def test_spec_padding_breaks_when_budget_insufficient():
@@ -510,10 +586,10 @@ def test_spec_padding_breaks_when_budget_insufficient():
         max_num_scheduled_tokens=2,
     )
 
-    with _spec_pad_env(False):
-        output = _schedule(fake)
+    output = _schedule(fake)
 
-    # Upstream prefers not scheduling at all over scheduling un-padded.
+    # r0 schedules un-padded, then the padded w0 no longer fits the budget:
+    # upstream prefers not scheduling at all over scheduling un-padded.
     assert output.num_scheduled_tokens == {"r0": 1}
     assert len(fake.waiting) == 1
 
@@ -528,8 +604,7 @@ def test_spec_padding_skipped_when_dynamic_sd_lookup_active():
         dynamic_sd_lookup=[3, 3, 3],
     )
 
-    with _spec_pad_env(False):
-        output = _schedule(fake)
+    output = _schedule(fake)
 
     assert output.num_scheduled_tokens == {"r0": 1, "w0": 1}
     # Dynamic SD selects K by batch size instead of the padded width.
@@ -547,12 +622,110 @@ def test_spec_padding_skipped_when_prefill_scheduled():
     waiting = _request("w0", num_tokens=6, num_computed_tokens=5)
     fake = _FakeScheduler(running=[running], waiting=[waiting], num_spec_tokens=2)
 
-    with _spec_pad_env(False):
-        output = _schedule(fake)
+    output = _schedule(fake)
 
-    # prefill_scheduled blocks the padding branch even when opted out.
+    # prefill_scheduled blocks the padding branch.
     assert output.num_scheduled_tokens == {"r0": 10, "w0": 1}
     assert output.scheduled_spec_decode_tokens == {}
+
+
+def test_spec_padding_near_max_model_len_keeps_unpadded():
+    running = _request("r0", num_tokens=5, num_computed_tokens=4)
+    # w0 is 1 token short of done: padding to 1 + 2 spec tokens plus the
+    # 1 sampled token per step would run past max_model_len.
+    waiting = _request("w0", num_tokens=6, num_computed_tokens=5)
+    fake = _FakeScheduler(
+        running=[running],
+        waiting=[waiting],
+        num_spec_tokens=2,
+        max_model_len=7,
+    )
+
+    output = _schedule(fake)
+
+    # The newer upstream rewrite keeps the unpadded 1-token decode instead
+    # of refusing to schedule: 5 + 3 + 1 > 7, so the pad branch is skipped.
+    assert output.num_scheduled_tokens == {"r0": 1, "w0": 1}
+    assert output.scheduled_spec_decode_tokens == {}
+    assert fake.kv_cache_manager.allocate_calls[-1][1] == 1
+
+
+def test_pad_placeholder_clamped_when_threshold_shrinks_accounting():
+    # Regression: the pad decision sizes num_new_tokens to 1 + num_spec_tokens,
+    # but a later long_prefill_token_threshold shrink must shrink the dummy
+    # placeholder with it, otherwise update_scheduler_for_invalid_drafts()
+    # (num_scheduled_tokens -= len(placeholder) - valid_k) drives the
+    # accounted count below zero and the negative total kills the worker.
+    running = _request("r0", num_tokens=5, num_computed_tokens=4)
+    waiting = _request("w0", num_tokens=6, num_computed_tokens=5)
+    fake = _FakeScheduler(
+        running=[running],
+        waiting=[waiting],
+        num_spec_tokens=2,
+        scheduler_config=SimpleNamespace(
+            long_prefill_token_threshold=2,
+            enable_chunked_prefill=False,
+        ),
+    )
+
+    output = _schedule(fake)
+
+    # Pad decides 1+2=3 tokens, the threshold shrinks the account to 2, so
+    # the placeholder may claim at most 2-1=1 slot (upstream wrote 2).
+    assert output.num_scheduled_tokens == {"r0": 1, "w0": 2}
+    assert output.scheduled_spec_decode_tokens == {"w0": [-1]}
+
+
+def test_pad_placeholder_dropped_when_accounting_shrinks_to_one():
+    # When the shrink eats all headroom no placeholder may be written at all:
+    # even a single dummy slot would trim the accounted count to zero.
+    running = _request("r0", num_tokens=5, num_computed_tokens=4)
+    waiting = _request("w0", num_tokens=6, num_computed_tokens=5)
+    fake = _FakeScheduler(
+        running=[running],
+        waiting=[waiting],
+        num_spec_tokens=2,
+        scheduler_config=SimpleNamespace(
+            long_prefill_token_threshold=1,
+            enable_chunked_prefill=False,
+        ),
+    )
+
+    output = _schedule(fake)
+
+    assert output.num_scheduled_tokens == {"r0": 1, "w0": 1}
+    assert output.scheduled_spec_decode_tokens == {}
+
+
+def test_running_spec_placeholder_clamped_to_accounted_tokens():
+    # A running request whose placeholder backlog outgrows the accounted
+    # tokens (e.g. the context window filled up) gets its placeholder
+    # clamped to num_new_tokens - 1 instead of scheduling an over-wide
+    # dummy batch that trims the count to zero.
+    running = _request(
+        "r0",
+        num_tokens=5,
+        num_computed_tokens=5,
+        spec_token_ids=[7, 8, 9],
+    )
+    running.num_tokens_with_spec = 8
+    fake = _FakeScheduler(running=[running])
+
+    output = _schedule(fake)
+
+    # num_new_tokens = 8 - 5 = 3: the stale 3-slot backlog would trim the
+    # account to zero (3 scheduled - 3 placeholder), so it is clamped to 2.
+    assert output.num_scheduled_tokens == {"r0": 3}
+    assert output.scheduled_spec_decode_tokens == {"r0": [7, 8]}
+
+
+def test_negative_total_guard_is_registered():
+    source = inspect.getsource(sched_mod.PanguV2SpecDecodePadPatch.schedule)
+    # The scheduler must fail locally on a negative total (with per-request
+    # counts) instead of leaking it to the worker's
+    # `assert total_num_scheduled_tokens > 0`.
+    assert "total_num_scheduled_tokens >= 0" in source
+    assert "per-request counts" in source
 
 
 def test_preemption_when_kv_blocks_unavailable():
@@ -1005,6 +1178,51 @@ def test_waiting_encoder_budget_exhausted_breaks():
 
     assert output.num_scheduled_tokens == {}
 
+
+
+@pytest.mark.parametrize("mome_hit", [0, 1280])
+def test_offload_hybrid_missing_mome_waits_for_load(mome_hit):
+    from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+
+    waiting = _request("missing-mome", num_tokens=1536)
+    fake = _FakeScheduler(waiting=[waiting], has_mamba_layers=True)
+    manager = fake.kv_cache_manager
+    manager._omni_is_offloading_connector = True
+    coordinator = HybridKVCacheCoordinator.__new__(HybridKVCacheCoordinator)
+    coordinator.find_longest_cache_hit_per_group = (
+        lambda *_: ("uneven-hits", [1408, mome_hit, 1408])
+    )
+    manager.coordinator = coordinator
+    lookups = []
+    loads = []
+
+    def get_computed(request):
+        lookups.append(request.request_id)
+        request.local_computed_tokens_per_group = (1408, mome_hit, 1408)
+        return _BlockIds([]), mome_hit
+
+    manager.get_computed_blocks = get_computed
+    fake.connector = SimpleNamespace(
+        get_num_new_matched_tokens=lambda request, local: (
+            1408 - local, local < 1408
+        ),
+        update_state_after_alloc=lambda request, blocks, external: loads.append(external),
+    )
+
+    output = _schedule(fake)
+
+    # FA hits do not make a missing MOME history safe to read. The request
+    # must wait for the missing group's load before any local forward.
+    assert output.num_scheduled_tokens == {}
+    assert lookups == ["missing-mome"]
+    assert loads == [1408 - mome_hit]
+    assert waiting.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert waiting.num_computed_tokens == 1408
+    assert waiting in fake._inflight_prefills
+    allocation = manager.allocate_calls[0][2]
+    assert allocation["delay_cache_blocks"] is True
+    assert allocation["num_new_computed_tokens"] == mome_hit
+    assert allocation["num_external_computed_tokens"] == 1408 - mome_hit
 
 if __name__ == "__main__":
     run_standalone_tests(globals())

@@ -1093,6 +1093,42 @@ class TestPanguUltraMoeFusedMhcBranches(unittest.TestCase):
 
 
 class TestOpenPanguMoEPostWeightLoad(unittest.TestCase):
+    def _load_indexer(self, indexer_type, present=False):
+        model = ultra_mod.OpenPanguMoEModel.__new__(ultra_mod.OpenPanguMoEModel)
+        nn.Module.__init__(model)
+        model.config = SimpleNamespace(
+            tie_word_embeddings=False, n_routed_experts=0,
+            num_hidden_layers=1, num_nextn_predict_layers=0,
+            indexer_types=[indexer_type],
+        )
+        model.num_redundant_experts = 0
+        name = "model.layers.0.self_attn.indexer.weights_proj.weight"
+        parameter = nn.Parameter(torch.zeros(2, 2))
+        with patch.object(model, "named_parameters", return_value=[(name, parameter)] if present else []), \
+                patch.object(ultra_mod, "fused_moe_make_expert_params_mapping", return_value=[]), \
+                patch.object(ultra_mod, "is_pp_missing_parameter", return_value=False), \
+                patch.object(ultra_mod, "mark_split_q_up_params_loaded"), \
+                patch.object(model, "post_weight_load"):
+            loaded = model.load_weights([(name, torch.ones(2, 2))])
+        return name, loaded, parameter
+
+    def test_skips_absent_shared_indexer_weights(self):
+        _, loaded, _ = self._load_indexer("shared")
+        self.assertEqual(loaded, set())
+
+    def test_missing_full_indexer_weight_follows_unmatched_weight_policy(self):
+        # Develop now warns and skips unmatched weights (including CLA reuse
+        # projections); only shared-indexer weights are skipped before this check.
+        with patch.object(ultra_mod.logger, "warning") as warn:
+            name, loaded, _ = self._load_indexer("full")
+        self.assertEqual(loaded, set())
+        self.assertIn(name, warn.call_args.args[0])
+
+    def test_loads_present_full_indexer_weight(self):
+        name, loaded, parameter = self._load_indexer("full", present=True)
+        self.assertEqual(loaded, {name})
+        torch.testing.assert_close(parameter, torch.ones(2, 2))
+
     def test_moe_post_weight_load_delegates_to_run_post_weight_load(self):
         model = ultra_mod.OpenPanguMoEModel.__new__(
             ultra_mod.OpenPanguMoEModel

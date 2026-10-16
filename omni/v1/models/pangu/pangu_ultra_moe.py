@@ -2,6 +2,7 @@
 # Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 from collections.abc import Callable, Iterable
+import os
 from typing import cast
 
 import torch
@@ -54,7 +55,10 @@ from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.layers.mhc.mhc_rl import NPUmHCRL
 from omni_npu.plugin_decorators import post_model_forward_decorator
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
-from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+from omni_npu.v1.layers.attention.npu_dsa import (
+    NPUDeepseekSparseAttention,
+    _skip_topk_for_layer,
+)
 from omni_npu.v1.layers.attention.npu_cla import (
     NPUDeepseekMLACLAAttention,
     NPUDeepseekSparseCLAAttention,
@@ -213,6 +217,10 @@ class OpenPanguMoE(nn.Module):
         # precomputed router logits so dummy/profile routing sees n_experts
         # rather than hidden_size as the last dim.
         self.experts.use_precomputed_router_logits = True
+        # Benchmark-only routing override, matching OpenPanguV2MOE.
+        self.experts.use_moe_force_load_balance = (
+            os.environ.get("USE_MOE_FORCE_LOAD_BALANCE", "False").lower() == "true"
+        )
 
     def forward(
         self,
@@ -969,6 +977,12 @@ class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):
                 return True
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 return True
+            # Shared layers reuse top-k and instantiate no indexer, though some
+            # checkpoints still retain their training-time indexer weights.
+            if ".self_attn.indexer." in name and name not in params_dict:
+                layer_id = int(name.split(".layers.", 1)[1].split(".", 1)[0])
+                if _skip_topk_for_layer(self.config, layer_id):
+                    return True
             return get_spec_layer_idx_from_weight_name(self.config, name) is not None
 
         def _try_load_stacked(name: str, loaded_weight: torch.Tensor) -> str | None:

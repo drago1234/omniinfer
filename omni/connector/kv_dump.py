@@ -44,6 +44,30 @@ def gen_hash(buf: torch.Tensor):
     return kind, digest
 
 
+def _diff_stat(a: torch.Tensor, b: torch.Tensor) -> tuple[int, int, int]:
+    """返回 (不同字节数, 总字节数, 首个不同位置); 完全相同返回 (0, n, -1)。"""
+    af = a.reshape(-1)
+    bf = b.reshape(-1)
+    if torch.equal(af, bf):
+        return 0, af.numel(), -1
+    neq = af != bf
+    n = int(neq.sum().item())
+    first = int(neq.nonzero()[0].item())
+    return n, af.numel(), first
+
+
+def _log_mismatch(title: str, req_id: str, detail_lines: list[str], n_mismatch: int = 0):
+    """把哈希不匹配打印成醒目、可定位的多行块(仍然只报错, 不中断)。"""
+    bar = "!" * 72
+    head = f"!!! KV HASH MISMATCH :: {title} !!!"
+    if n_mismatch:
+        head += f"  (mismatch #{n_mismatch} for this req)"
+    lines = [bar, head, f"  req_id  = {req_id}"]
+    lines.extend("  " + line for line in detail_lines)
+    lines.append(bar)
+    logger.error("\n".join(lines))
+
+
 def append_items(path: str, items: dict):
     if not isinstance(items, dict):
         raise TypeError(f"items must be dict, got {type(items)}")
@@ -152,6 +176,16 @@ class PrefillReq:
         self.tok_num = len(new.prompt_token_ids)
         self.blocks = [[idx for idx in group] for group in new.block_ids]
         self.block_set = {idx for blk in self.blocks for idx in blk}
+        self.recycled = False
+        logger.warning(f"new blocks: {new.block_ids}")
+
+    def _evict(self, idx: int):
+        # 该 block id 被滑窗/Mome 回收后复用: 旧占用已作废, 在表中置为 null block(0)
+        for blocks in self.blocks:
+            for pos, blk in enumerate(blocks):
+                if blk == idx:
+                    blocks[pos] = 0
+                    return
 
     def dump(self, shapes: list[list[torch.Tensor]], remote_req=None):
         def gen(idx_: int) -> dict:
@@ -179,11 +213,15 @@ class PrefillReq:
         return data
 
     def append_blocks(self, new_blks: tuple[list[int]] | None):
+        self.recycled = False
         if new_blks is not None:
+            logger.warning(f"new blocks: {new_blks}")
             for group, blocks in zip(self.blocks, new_blks):
                 for idx in blocks:
                     if idx in self.block_set:
-                        raise ValueError(f"duplicate block id: {idx}")
+                        # block id 复用 => 旧块已被丢弃(滑窗/Mome 回收), 不是错误
+                        self.recycled = True
+                        self._evict(idx)
                     self.block_set.add(idx)
                     group.append(idx)
         return self
@@ -197,6 +235,7 @@ class DecodeReq(PrefillReq):
         self.hashed_blocks: dict[int, list[list[str]]] = {}
         self.hashed_blks: list[int] = []
         self.hashed_batch: torch.Tensor = None
+        self.n_mismatch: int = 0
 
     def _check_blks(self, full: int, shapes: list[list[torch.Tensor]]):
         idxs = []
@@ -205,11 +244,17 @@ class DecodeReq(PrefillReq):
 
         hashed_num = len(self.hashed_blks)
         reorg = self.hashed_blks.copy()
-        for idx in reorg:
-            if idx not in idxs:
-                raise ValueError(f"hashed block {idx} not in active blocks {idxs}")
+        idxs_set = set(idxs)
+        if any(idx not in idxs_set for idx in reorg):
+            # 有已哈希块被丢弃(滑窗回收): 之前的基线作废, 重新建立
+            self.hashed_blks = []
+            self.hashed_batch = None
+            hashed_num = 0
+            reorg = []
+        seen = set(reorg)
         for idx in idxs:
-            if idx not in reorg:
+            if idx not in seen:
+                seen.add(idx)
                 reorg.append(idx)
 
         idx_ = shapes[0][0].new_tensor(reorg, dtype=torch.int)
@@ -217,17 +262,38 @@ class DecodeReq(PrefillReq):
         if self.hashed_batch is None:
             self.hashed_batch = [[None for cache in shape] for shape in shapes]
 
-        def make_cache(cache: torch.Tensor, cmp: torch.Tensor | None):
-            blks = cache[idx_].contiguous()
-            if cmp is not None:
-                a = blks[:hashed_num]
-                b = cmp.to(device=a.device)
-                if not torch.equal(a, b):
-                    raise ValueError("KV block hash mismatch in decode check")
-            return blks.cpu()
-
-        batch = [[make_cache(*cache) for cache in zip(*layer)]
-            for layer in zip(shapes, self.hashed_batch)]
+        batch = []
+        for si, (shape, prev) in enumerate(zip(shapes, self.hashed_batch)):
+            layer_out = []
+            for ci, (cache, cmp) in enumerate(zip(shape, prev)):
+                blks = cache[idx_].contiguous()
+                if cmp is not None:
+                    a = blks[:hashed_num]
+                    b = cmp.to(device=a.device)
+                    if not torch.equal(a, b):
+                        bad = []
+                        for j in range(hashed_num):
+                            n, total, first = _diff_stat(a[j], b[j])
+                            if n:
+                                bad.append((reorg[j], n, total, first))
+                        self.n_mismatch += 1
+                        detail = [
+                            f"kind    = block",
+                            f"full    = {full}",
+                            f"cache   = shapes[{si}].caches[{ci}]",
+                            f"bad     = {len(bad)}/{hashed_num} blocks",
+                        ]
+                        for blk_id, n, total, first in bad[:16]:
+                            detail.append(
+                                f"  block {blk_id}: {n}/{total} bytes differ, "
+                                f"first_off={first}")
+                        if len(bad) > 16:
+                            detail.append(f"  ... {len(bad) - 16} more blocks")
+                        detail.append("action  = update hash baseline")
+                        _log_mismatch("DECODE BLOCK", self.req_id, detail,
+                                      self.n_mismatch)
+                layer_out.append(blks.cpu())
+            batch.append(layer_out)
 
         self.hashed_batch = batch
         self.hashed_blks = reorg
@@ -249,11 +315,30 @@ class DecodeReq(PrefillReq):
             _full, _rest, _sect = self.hist_hash[name]
             if _full == full:
                 if _rest >= rest:
-                    raise ValueError(f"token slice rest must grow: {_rest} >= {rest}")
-                a = sect[:_rest]
-                b = _sect.to(device=a.device)
-                if not torch.equal(a, b):
-                    raise ValueError(f"KV token slice mismatch at {name}: full={full}")
+                    # 结构性异常(不满足增长), 不再中断: 报错并重置该层基线
+                    self.n_mismatch += 1
+                    _log_mismatch("DECODE TOKEN (rest not grow)", self.req_id, [
+                        f"kind    = token",
+                        f"layer   = {name}",
+                        f"full    = {full}",
+                        f"rest    = {rest} (prev {_rest}, not growing)",
+                        "action  = reset hash baseline",
+                    ], self.n_mismatch)
+                else:
+                    a = sect[:_rest]
+                    b = _sect.to(device=a.device)
+                    if not torch.equal(a, b):
+                        # 哈希不匹配不再中断: 报错并写入新哈希
+                        n, total, first = _diff_stat(a, b)
+                        self.n_mismatch += 1
+                        _log_mismatch("DECODE TOKEN", self.req_id, [
+                            f"kind    = token",
+                            f"layer   = {name}",
+                            f"full    = {full}",
+                            f"rest    = {rest} (prev {_rest})",
+                            f"diff    = {n}/{total} bytes differ, first_off={first}",
+                            "action  = update hash baseline",
+                        ], self.n_mismatch)
             self.hist_hash[name] = (full, rest, sect.cpu())
 
     def update(self,
@@ -265,6 +350,11 @@ class DecodeReq(PrefillReq):
         pg: int = 128,
     ):
         self.append_blocks(new_blks)
+        if self.recycled:
+            # 有块被回收复用: 旧的哈希基线作废, 重新建立
+            self.hashed_blks = []
+            self.hashed_batch = None
+            self.hist_hash = defaultdict(lambda: (None, None, None))
         self.tok_num = tok_num
         stable_tok = tok_num - mtp
         full = stable_tok // pg
@@ -292,6 +382,7 @@ class Dump:
         self.groups: list[dict[str, tuple[torch.Tensor]]] = None  # [group, layers, caches]
         self.reqs: dict[str, DecodeReq | PrefillReq] = {}
         self.remote_reqs: dict = {}
+        self.pending = False
 
         run_id = _make_run_id()
         self.path = f"{path}/{run_id}/"
@@ -326,6 +417,8 @@ class Dump:
         groups = model_runner.kv_cache_config.kv_cache_groups
 
         def validate(x):
+            if isinstance(x, tuple):
+                return x
             if not isinstance(x, list):
                 raise TypeError(f"kv_cache must be list, got {type(x)}")
             if not isinstance(x[0], tuple):
@@ -354,6 +447,8 @@ class Dump:
         if kv_role not in role:
             raise ValueError(f"unsupported kv_role: {kv_role}")
         is_prefill = role[kv_role]
+        # prefill 的 dump 要等 sample_tokens(含 MTP/draft forward) 之后再取, 见 Dump.finish()
+        self.pending = is_prefill
 
         news = scheduler_output.scheduled_new_reqs
         reqs = scheduler_output.scheduled_cached_reqs
@@ -363,8 +458,6 @@ class Dump:
         if is_prefill:
             self._prefill(req_ids, blocks, news)
             yield
-            for req in self.reqs.values():
-                req.data = req.dump(self.shapes)
         else:
             computed = reqs.num_computed_tokens
             mtp = model_runner.num_spec_tokens
@@ -372,6 +465,15 @@ class Dump:
 
             self._decode(req_ids, computed, blocks, news, mtp, remote_reqs)
             yield
+
+    def finish(self):
+        # 在 sample_tokens(含 MTP/draft forward, 会写入 lookahead 的 KV) 之后调用,
+        # 此时 KV cache 才是完整的, 才能安全地做 req.dump
+        if not self.pending or self.shapes is None:
+            return
+        self.pending = False
+        for req in self.reqs.values():
+            req.data = req.dump(self.shapes)
 
     def _decode(self, req_ids, computed, blocks, news, mtp, remote_reqs):
         self.remote_reqs.update(remote_reqs)
@@ -404,19 +506,36 @@ class Dump:
             self.reqs[new.req_id] = PrefillReq(new)
 
 
-def maybe_dump_kv(fn_execute_model):
-    def wrapper(
-        self: GPUModelRunner,
-        scheduler_output: SchedulerOutput,
-        intermediate_tensors=None,
-    ):
-        def get_instance(name="dump_prefill") -> Dump:
-            if not hasattr(maybe_dump_kv, name):
-                setattr(maybe_dump_kv, name, Dump(_kv_dump_path))
-            return getattr(maybe_dump_kv, name)
+def _get_instance(name: str = "dump_prefill") -> Dump:
+    if not hasattr(maybe_dump_kv, name):
+        setattr(maybe_dump_kv, name, Dump(_kv_dump_path))
+    return getattr(maybe_dump_kv, name)
 
-        if not _kv_dump_path:
-            return fn_execute_model(self, scheduler_output, intermediate_tensors)
-        with get_instance().update(self, scheduler_output):
-            return fn_execute_model(self, scheduler_output, intermediate_tensors)
-    return wrapper
+
+def maybe_dump_kv(stage: str):
+    if stage not in ("update", "finish"):
+        raise ValueError(f"unknown stage: {stage!r}, expected 'update' or 'finish'")
+
+    def decorator(fn):
+        if stage == "update":
+            # 挂在 execute_model 上: 进入前 _prefill/_decode 记账, 退出后交还
+            def wrapper(
+                self: GPUModelRunner,
+                scheduler_output: SchedulerOutput,
+                intermediate_tensors=None,
+            ):
+                if not _kv_dump_path:
+                    return fn(self, scheduler_output, intermediate_tensors)
+                with _get_instance().update(self, scheduler_output):
+                    return fn(self, scheduler_output, intermediate_tensors)
+            return wrapper
+
+        # stage == "finish": 挂在 sample_tokens (MTP/draft forward) 之后
+        def wrapper(self, *args, **kwargs):
+            ret = fn(self, *args, **kwargs)
+            if _kv_dump_path and hasattr(maybe_dump_kv, "dump_prefill"):
+                getattr(maybe_dump_kv, "dump_prefill").finish()
+            return ret
+        return wrapper
+
+    return decorator

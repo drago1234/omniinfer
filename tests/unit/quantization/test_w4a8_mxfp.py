@@ -181,7 +181,27 @@ class TestW4A8MXFPConfig:
         )
         assert config.group_size == 64
         assert config.ignored_layers == ["lm_head"]
+        assert config.enable_mxfp8_comm_quant is False
         assert config.get_name() == "w4a8_mxfp"
+
+    def test_from_config_mxfp8_comm_quant(self, w4_module):
+        module, _ = w4_module
+        config = module.W4A8MXFPConfig.from_config(
+            {"enable_mxfp8_comm_quant": True}
+        )
+
+        assert config.enable_mxfp8_comm_quant is True
+        assert config._mxfp8_config.enable_mxfp8_comm_quant is True
+
+    def test_from_config_rejects_non_bool_mxfp8_comm_quant(
+        self,
+        w4_module,
+    ):
+        module, _ = w4_module
+        with pytest.raises(ValueError, match="must be bool"):
+            module.W4A8MXFPConfig.from_config(
+                {"enable_mxfp8_comm_quant": "true"}
+            )
 
     def test_default_group_size(self, w4_module):
         module, _ = w4_module
@@ -824,3 +844,48 @@ class TestW4A8MXFPMoE:
             _E2M1_X2_SENTINEL
         )
         mock_npu.npu_swiglu_mx_quant.assert_called_once()
+
+
+@pytest.mark.parametrize("force_balance", [None, False, True])
+@pytest.mark.parametrize("use_ep", [False, True])
+def test_moe_apply_inherits_force_load_balance(
+    w4_module, moe_method, monkeypatch, force_balance, use_ep
+):
+    # Exercise W4A8's inherited MXFP8 routing before either expert backend.
+    mxfp8 = importlib.import_module("omni_npu.layers.quantization.mxfp8")
+    opts = mxfp8.model_extra_config.operator_opt_config
+    monkeypatch.setattr(opts, "shared_expert_multi_stream", False)
+    monkeypatch.setattr(opts, "enable_prefetch", False, raising=False)
+    monkeypatch.setattr(torch.npu, "current_stream", MagicMock())
+    moe_method.select_communication_strategy = MagicMock(
+        return_value=("agrs", SimpleNamespace())
+    )
+    moe_method.enable_agrs_finalize_metadata_overlap = False
+    moe_method.apply_prepare_permute = MagicMock(
+        return_value=SimpleNamespace(row_idx_type=0)
+    )
+    moe_method.apply_experts = MagicMock(return_value=torch.zeros(2, 4))
+    moe_method.apply_unpermute_finalize = MagicMock(return_value=torch.zeros(2, 4))
+    weights = torch.tensor([[0.7, 0.3], [0.6, 0.4]])
+    ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    select = MagicMock(return_value=(weights, ids))
+    monkeypatch.setattr(mxfp8, "NPUFusedMoE", SimpleNamespace(select_experts=select))
+    fused_tp = MagicMock(return_value=torch.zeros(2, 4))
+    monkeypatch.setattr(mxfp8, "fused_experts_tp", fused_tp)
+    layer = as_moe_runner(SimpleNamespace(gate=None), use_ep=use_ep)
+    if force_balance is not None:
+        layer.use_moe_force_load_balance = force_balance
+
+    moe_method.apply(
+        layer=layer, hidden_states=torch.ones(2, 4),
+        router_logits=torch.zeros(2, 4), top_k=2, renormalize=False,
+    )
+
+    assert select.call_args.kwargs["force_load_balance"] is (force_balance is True)
+    if use_ep:
+        assert moe_method.apply_prepare_permute.call_args.args[3] is ids
+        assert moe_method.apply_unpermute_finalize.call_args.args[3] is ids
+        assert moe_method.apply_unpermute_finalize.call_args.args[4] is weights
+    else:
+        assert fused_tp.call_args.kwargs["topk_ids"] is ids
+        assert fused_tp.call_args.kwargs["topk_weights"] is weights

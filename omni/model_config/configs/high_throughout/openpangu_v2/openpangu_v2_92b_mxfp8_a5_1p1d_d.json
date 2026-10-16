@@ -16,6 +16,7 @@
         "use_noncontiguous_kv": true,
         "enable_kv_rmsnorm_rope_cache": true,
         "decode_moe_dispatch_combine": true,
+        "use_quant_lightning_indexer_v2": true,
         "kv_nz": false,
         "merge_q_kv_conv": false,
         "use_aicpu_fa_tiling": true,

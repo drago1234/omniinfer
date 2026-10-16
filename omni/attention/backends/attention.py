@@ -78,6 +78,7 @@ class NPUMetadata:
     num_decode_tokens: int = 0
     decode_threshold: int = 1
     is_pure_prefill_without_prefix_and_use_kvnz: bool = False
+    causal: bool | torch.Tensor = True
 
 
 class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
@@ -154,6 +155,7 @@ class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
             num_decode_tokens=num_decode_tokens,
             decode_threshold=self.reorder_batch_threshold,
             is_pure_prefill_without_prefix_and_use_kvnz=is_pure_prefill_without_prefix_and_use_kvnz,
+            causal=getattr(common_attn_metadata, "causal", True),
         )
         return attn_metadata
 
@@ -314,6 +316,33 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
                 callers=("full", "swa"),
             )
 
+    def do_kv_cache_update(
+        self,
+        layer: AttentionLayer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if self.kv_sharing_target_layer_name is not None:
+            return
+        if slot_mapping is None or slot_mapping.numel() == 0:
+            return
+        key_cache, value_cache = kv_cache
+        key = key[: slot_mapping.numel()]
+        value = value[: slot_mapping.numel()]
+        slots = slot_mapping.reshape(-1)
+        if model_extra_config.operator_opt_config.kv_nz:
+            key = key.reshape(-1, self.num_kv_heads, self.head_size).contiguous()
+            value = value.reshape(-1, self.num_kv_heads, self.head_size).contiguous()
+            torch_npu.npu_scatter_pa_kv_cache(key, value, key_cache, value_cache, slots)
+            return
+        key = key.reshape(-1, self.num_kv_heads * self.head_size).contiguous()
+        value = value.reshape(-1, self.num_kv_heads * self.head_size).contiguous()
+        slots = slots.view(-1, 1)
+        torch_npu.npu_scatter_nd_update_(key_cache.view(-1, key.shape[-1]), slots, key)
+        torch_npu.npu_scatter_nd_update_(value_cache.view(-1, value.shape[-1]), slots, value)
+
     @attn_decorator(type='gqa')
     def forward(
         self,
@@ -333,6 +362,15 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         num_tokens = query.shape[0]
         if attn_metadata is None:
             return output
+
+        causal = getattr(attn_metadata, "causal", True)
+        if isinstance(causal, torch.Tensor):
+            raise NotImplementedError("per-sequence causal metadata is unsupported")
+        is_causal = bool(causal)
+        if not is_causal and self.sliding_window is not None:
+            raise NotImplementedError("non-causal sliding-window attention is unsupported")
+        if not is_causal and self.sink_len is not None:
+            raise NotImplementedError("non-causal sink attention is unsupported")
 
         if not (layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0):
             raise RuntimeError("layer._k_scale_float and layer._v_scale_float must both be 1.0")
@@ -481,8 +519,9 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             return output
 
         input_layout = "TND"
-        sparse_mode = 0 if self.is_cross_attention else 3
-        atten_mask = None if self.is_cross_attention else NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE
+        use_causal_mask = not self.is_cross_attention and is_causal
+        sparse_mode = 3 if use_causal_mask else 0
+        atten_mask = NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE if use_causal_mask else None
         next_tokens = 0
         key_cache = kv_cache[0]
         value_cache = kv_cache[1]

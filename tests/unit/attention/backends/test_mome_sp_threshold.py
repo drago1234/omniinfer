@@ -50,7 +50,7 @@ class TestMomeSPThreshold(unittest.TestCase):
         return result, build_sp, sp_metadata
 
     def test_threshold_boundaries_and_unpadded_total(self):
-        for threshold in (8192, 16384, 20480):
+        for threshold in (8192, 10240, 16384, 20480):
             for tokens, expected in ((threshold - 1, False), (threshold, True), (threshold + 1, True)):
                 with self.subTest(threshold=threshold, tokens=tokens):
                     metadata, build_sp, sp_metadata = self.build_metadata(tokens, threshold)

@@ -58,15 +58,23 @@ class NPUFusedMoEMethodBase(ABC):
         prepare_permute_result: PreparePermuteResult,
         finalize_params=None,
         finalize_metadata=None,
+        post_finalize_callback=None,
     ):
+        kwargs = {
+            "finalize_params": finalize_params,
+            "finalize_metadata": finalize_metadata,
+        }
+        # Only AGRS exposes the scheduling point. Other communication
+        # strategies keep their existing unpermute_finalize signatures.
+        if post_finalize_callback is not None:
+            kwargs["post_finalize_callback"] = post_finalize_callback
         return prepare_permute_and_unpermute_finalize.unpermute_finalize(
             layer,
             hidden_states,
             topk_ids,
             topk_weights,
             prepare_permute_result,
-            finalize_params=finalize_params,
-            finalize_metadata=finalize_metadata,
+            **kwargs,
         )
 
     @abstractmethod

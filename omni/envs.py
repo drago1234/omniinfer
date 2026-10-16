@@ -38,7 +38,6 @@ if TYPE_CHECKING:
     OMNI_PROFILE_SKIP_REQUESTS: int
     # Patch / Attention
     OMNI_DISABLE_PLUGIN_BACKENDS: str
-    OMNI_DISABLE_SPEC_DECODE_PAD: bool
     OMNI_STATIC_KERNEL_COMPILE_JOBS: int
     OMNI_HYBRID_ATTN_GROUP_SIZE: int
     OMNI_REPETITION_DETECTION_CONFIG: Optional[str]
@@ -311,15 +310,6 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Consumers: attention/backends/utils.py:160-177 (_is_plugin_disabled).
     "OMNI_DISABLE_PLUGIN_BACKENDS":
     lambda: get_env_with_fallback("OMNI_DISABLE_PLUGIN_BACKENDS", ["DISABLE_PLUGIN_BACKENDS"], ""),
-
-    # Skip the upstream branch that pads a newly scheduled decode request from
-    # 1 token up to 1 + num_spec_tokens so the step keeps a full CUDA graph.
-    # On NPU the padded dummy draft slots break the step, so this is on (True)
-    # by default. Set to 0/false to restore the upstream padding. Effective
-    # only when OMNI_VLLM_PATCHES_DIR loads pangu_v2_base.
-    # Consumers: patch_scheduler_spec_decode_pad.py (Scheduler.schedule fork).
-    "OMNI_DISABLE_SPEC_DECODE_PAD":
-    lambda: get_env_with_fallback("OMNI_DISABLE_SPEC_DECODE_PAD", None, True, _as_bool),
 
     # Override for the KV-cache group size in pangu_v2_hybrid models. The
     # default heuristic is min(num_layers_per_type), with a 1.25x bump to

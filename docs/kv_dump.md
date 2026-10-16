@@ -25,20 +25,21 @@ export KV_DUMP_PATH=/path/to/output/
 
 ## 3. 代码接入
 
-在 `GPUModelRunner.execute_model` 入口处包裹：
+在 `GPUModelRunner.execute_model` 与 `sample_tokens` 两处包裹：
 
 ```python
 from omni_npu.connector.kv_dump import maybe_dump_kv
 
-# 原函数
+@maybe_dump_kv("update")   # execute_model: 前段记账
 def execute_model(self, scheduler_output, ...):
     ...
 
-# 包裹后
-execute_model = maybe_dump_kv(execute_model)
+@maybe_dump_kv("finish")   # sample_tokens: MTP/draft forward 之后补 dump
+def sample_tokens(self, grammar_output):
+    ...
 ```
 
-`maybe_dump_kv` 是一个装饰器工厂：若 `KV_DUMP_PATH` 为空则原样返回函数；否则返回 wrapper，在每次 `execute_model` 调用前后执行 hash 与 dump。
+`maybe_dump_kv(stage)` 是一个装饰器工厂：若 `KV_DUMP_PATH` 为空则旁路；否则 `stage="update"` 返回在 `execute_model` 前后做记账/校验的 wrapper，`stage="finish"` 返回在 `sample_tokens` 之后触发 `Dump.finish()`（补做 prefill 的 dump，覆盖 MTP 层）的 wrapper。
 
 ## 4. 输出说明
 

@@ -76,12 +76,34 @@ class LLMDataDistConnector(KVConnectorBase_V1, SupportsHMA):
         return self.scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens):
-        def parse_block(b: KVCacheBlock) -> int:
-            not_skip = self.is_prefill or b.block_hash is None
+        # Only full-attention groups may skip their prefix-cache hits.
+        # Other groups (SWA/Mamba) interleave null placeholders and
+        # window-tail hits in their block tables; skipping those breaks
+        # the positional P/D pairing in SchemePull._parse_blocks.
+        # FA_GROUP_IDS_SKIP_PULL is pushed at runtime by the hybrid kv
+        # patch module (by instance, via sys.modules scan) -- do NOT try
+        # to import that module here: it is registered by file path and
+        # the package path may not exist on this deployment.
+        fa_skip_ids = globals().get("FA_GROUP_IDS_SKIP_PULL", frozenset())
+        if not self.is_prefill and not fa_skip_ids and not getattr(
+            self, "_fa_skip_inactive_logged", False
+        ):
+            self._fa_skip_inactive_logged = True
+            logger.debug(
+                "FA-skip inactive: FA group ids not pushed "
+                "(non-hybrid deployment or patch not loaded); pulling all"
+            )
+
+        def parse_block(b: KVCacheBlock, group_idx: int) -> int:
+            not_skip = (
+                self.is_prefill
+                or group_idx not in fa_skip_ids
+                or b.block_hash is None
+            )
             return b.block_id if not_skip else -1
-        block_ids = [  # -1 for decode hits prefix cache
-            [parse_block(b) for b in group]
-            for group in blocks.blocks]
+        block_ids = [  # -1 for decode FA hits prefix cache
+            [parse_block(b, i) for b in group]
+            for i, group in enumerate(blocks.blocks)]
         return self.scheduler.update_state_after_alloc(request, block_ids)
 
     def build_connector_meta(self, scheduler_output):
@@ -185,7 +207,7 @@ class LLMDataDistConnector(KVConnectorBase_V1, SupportsHMA):
 
 class PrefillScheduler:
     POLL_INTERVAL = 0.2
-    TIMEOUT_WAIT_PULL_DONE = 600.0
+    TIMEOUT_WAIT_PULL_DONE = 3600.0
 
     def __init__(self, vllm_config: VllmConfig):
         self.parallel = desc = ParallelDesc(vllm_config)

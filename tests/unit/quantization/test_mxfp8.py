@@ -75,6 +75,8 @@ def _make_mock_torch_npu():
         npu_quant_matmul=MagicMock(side_effect=_mock_npu_quant_matmul),
         npu_grouped_matmul=MagicMock(side_effect=_mock_npu_grouped_matmul),
         npu_swiglu_mx_quant=MagicMock(side_effect=_mock_npu_swiglu_mx_quant),
+        npu_format_cast=MagicMock(side_effect=lambda x, _fmt: x),
+        Format=SimpleNamespace(FRACTAL_NZ=29),
         float8_e8m0fnu=_E8M0_SENTINEL,
     )
 
@@ -113,6 +115,9 @@ def mock_torch_npu(monkeypatch):
     with patch("omni_npu.layers.quantization.mxfp8.torch_npu", ns), patch(
         "omni_npu.layers.quantization.mxfp8._FLOAT8_E8M0FNU_DTYPE",
         _E8M0_SENTINEL,
+    ), patch(
+        "omni_npu.layers.quantization.mxfp8.on_ascend950",
+        return_value=True,
     ), patch(
         "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
         return_value=0,
@@ -294,6 +299,18 @@ class TestMxfp8Config:
         cfg = mxfp8_module.Mxfp8Config.from_config({"ignore": []})
         assert cfg.ignored_layers is None
 
+    def test_from_config_mxfp8_comm_quant(self, mxfp8_module):
+        cfg = mxfp8_module.Mxfp8Config.from_config(
+            {"enable_mxfp8_comm_quant": True}
+        )
+        assert cfg.enable_mxfp8_comm_quant is True
+
+    def test_from_config_rejects_non_bool_mxfp8_comm_quant(self, mxfp8_module):
+        with pytest.raises(ValueError, match="must be bool"):
+            mxfp8_module.Mxfp8Config.from_config(
+                {"enable_mxfp8_comm_quant": "true"}
+            )
+
     def test_get_name(self, mxfp8_module):
         assert mxfp8_module.Mxfp8Config.get_name() == "mxfp8"
 
@@ -430,6 +447,21 @@ class TestMxfp8LinearMethod:
         assert linear_layer_created.weight_scale.shape == (128 // 64, 128, 2)
         assert linear_layer_created.weight.requires_grad is False
         assert linear_layer_created.weight_scale.requires_grad is False
+
+    def test_process_weights_after_loading_converts_weight_to_nz(
+        self,
+        mock_torch_npu,
+        linear_method,
+        linear_layer_created,
+    ):
+        linear_method.process_weights_after_loading(linear_layer_created)
+
+        mock_torch_npu.npu_format_cast.assert_called_once()
+        cast_weight, cast_format = mock_torch_npu.npu_format_cast.call_args.args
+        assert cast_weight.shape == linear_layer_created.weight.shape
+        assert cast_format == 29
+        assert linear_layer_created.weight.is_mxfp8_weight_nz is True
+        assert linear_layer_created.weight_scale.shape == (2, 128, 2)
 
     def test_apply_shape_and_kernel_calls(
         self, mock_torch_npu, linear_method, linear_layer_created
@@ -575,6 +607,67 @@ class TestMxfp8FCLinearMethod:
             fc_linear_method.apply(fc_layer_created, x, x_transform="ALL2ALL")
         assert a2a.call_count == 2
         ag.assert_not_called()
+
+    @pytest.mark.parametrize("rank", [0, 1])
+    def test_apply_x_transform_dp2tp_all2all_slices_scale_groups(
+        self, mock_torch_npu, fc_linear_method, fc_layer_created, rank
+    ):
+        fc_linear_method.process_weights_after_loading(fc_layer_created)
+        x_fp8 = torch.zeros(4, 256, dtype=torch.int8)
+        x_scale = torch.arange(32, dtype=torch.uint8).reshape(4, 4, 2)
+        gathered_scale = torch.cat([x_scale, x_scale + 32], dim=0)
+        exchanged_fp8 = torch.zeros(8, 128, dtype=torch.int8)
+        x = {"x_mxfp8": x_fp8, "pertoken_scale": x_scale}
+        dp2tp = MagicMock(return_value=exchanged_fp8)
+        ag = MagicMock(return_value=gathered_scale)
+        with patch(
+            "omni_npu.v1.distributed.communication_op_ext.layer_parallel_dp2tp_all2all",
+            dp2tp,
+        ), patch(
+            "omni_npu.v1.distributed.communication_op_ext.layer_parallel_all_gather", ag
+        ), patch(
+            "omni_npu.v1.distributed.parallel_state_ext.get_layer_parallel_world_size",
+            return_value=2,
+        ), patch(
+            "omni_npu.v1.distributed.parallel_state_ext.get_layer_parallel_rank",
+            return_value=rank,
+        ):
+            out = fc_linear_method.apply(fc_layer_created, x, x_transform="DP2TPAll2All")
+        # fp8 payload goes through the dp->tp all2all; scale rows through all_gather.
+        dp2tp.assert_called_once_with(x_fp8, "mlp_layer", "x", 0)
+        ag.assert_called_once_with(x_scale, "mlp_layer", "x", 0)
+        # Each rank owns two scale groups, with token rows from both DP ranks.
+        args, kwargs = mock_torch_npu.npu_quant_matmul.call_args
+        assert args[0] is exchanged_fp8
+        assert kwargs["pertoken_scale"].shape == (8, 2, 2)
+        assert torch.equal(kwargs["pertoken_scale"], gathered_scale[:, rank * 2:(rank + 1) * 2, :])
+        assert kwargs["pertoken_scale"].is_contiguous()
+        assert out.shape == (8, 128)
+
+    def test_apply_x_transform_dp2tp_all2all_rejects_indivisible_scale_groups(
+        self, mock_torch_npu, fc_linear_method, fc_layer_created
+    ):
+        fc_linear_method.process_weights_after_loading(fc_layer_created)
+        x = {
+            "x_mxfp8": torch.zeros(4, 128, dtype=torch.int8),
+            "pertoken_scale": torch.zeros(4, 4, 2, dtype=torch.uint8),
+        }
+        identity = MagicMock(side_effect=lambda t, *a, **k: t)
+        with patch(
+            "omni_npu.v1.distributed.communication_op_ext.layer_parallel_dp2tp_all2all",
+            identity,
+        ), patch(
+            "omni_npu.v1.distributed.communication_op_ext.layer_parallel_all_gather",
+            identity,
+        ), patch(
+            "omni_npu.v1.distributed.parallel_state_ext.get_layer_parallel_world_size",
+            return_value=3,
+        ), patch(
+            "omni_npu.v1.distributed.parallel_state_ext.get_layer_parallel_rank",
+            return_value=0,
+        ):
+            with pytest.raises(AssertionError, match="divisible"):
+                fc_linear_method.apply(fc_layer_created, x, x_transform="DP2TPAll2All")
 
 
 # --------------------------------------------------------------------------- #
@@ -1267,7 +1360,8 @@ def _patch_npu_streams(monkeypatch):
     return main_stream
 
 
-def _set_schedule(mxfp8_module, monkeypatch, *, multi_stream, schedule):
+def _set_schedule(mxfp8_module, monkeypatch, *, multi_stream, schedule,
+                  router_gating_in_fp32=False):
     monkeypatch.setattr(
         mxfp8_module,
         "model_extra_config",
@@ -1275,6 +1369,7 @@ def _set_schedule(mxfp8_module, monkeypatch, *, multi_stream, schedule):
             operator_opt_config=SimpleNamespace(
                 shared_expert_multi_stream=multi_stream,
                 shared_expert_parallel_schedule=schedule,
+                router_gating_in_fp32=router_gating_in_fp32,
             ),
         ),
     )
@@ -1303,8 +1398,9 @@ class TestMxfp8MoEMethodApplyExpertsCV:
         layer._shared_experts = SimpleNamespace(_layer=shared_experts)
         return as_moe_runner(layer)
 
+    @pytest.mark.parametrize("tuple_output", [False, True])
     def test_apply_experts_cv_returns_routed_and_shared_tuple(
-        self, mock_torch_npu, moe_method, mxfp8_module, monkeypatch
+        self, mock_torch_npu, moe_method, mxfp8_module, monkeypatch, tuple_output
     ):
         main_stream = _patch_npu_streams(monkeypatch)
         _set_schedule(
@@ -1318,6 +1414,8 @@ class TestMxfp8MoEMethodApplyExpertsCV:
             act_fn=MagicMock(side_effect=lambda x: x),
             down_proj=MagicMock(return_value=shared_down_out),
         )
+        if tuple_output:
+            shared_experts.down_proj.return_value = (shared_down_out, None)
         layer = self._build_layer(moe_method, shared_experts)
         finished_event = torch.npu.Event()
         pr = SimpleNamespace(
@@ -1391,6 +1489,7 @@ def _build_apply_method(mxfp8_module, moe_method, monkeypatch):
     moe_method.tp_size = 1
     moe_method.tp_rank = 0
     moe_method.shared_experts_stream = _DummyStream()
+    moe_method.enable_agrs_finalize_metadata_overlap = False
     moe_method.select_communication_strategy = MagicMock(
         return_value=("agrs", SimpleNamespace())
     )
@@ -1410,8 +1509,117 @@ def _build_apply_method(mxfp8_module, moe_method, monkeypatch):
     return moe_method
 
 
+class _RecordingGate:
+    """Gate stand-in that records the exact tensor it was called with."""
+
+    def __init__(self, weight_dtype=torch.bfloat16):
+        self.weight = torch.zeros(4, 128, dtype=weight_dtype)
+        self.inputs = []
+
+    def __call__(self, x):
+        self.inputs.append(x)
+        return torch.zeros(x.shape[0], 4, dtype=torch.float32), None
+
+
 class TestMxfp8MoEMethodApply:
     """Covers the .apply schedule branching (cv / with_finalize / synchronous)."""
+
+    def test_apply_agrs_overlaps_finalize_metadata_with_experts(
+        self, mock_torch_npu, moe_method, mxfp8_module, monkeypatch
+    ):
+        main_stream = _patch_npu_streams(monkeypatch)
+        _set_schedule(
+            mxfp8_module, monkeypatch,
+            multi_stream=False, schedule="with_finalize",
+        )
+        moe_method = _build_apply_method(mxfp8_module, moe_method, monkeypatch)
+        moe_method.enable_agrs_finalize_metadata_overlap = True
+        routed_expert_output = torch.zeros(2, 128, dtype=torch.bfloat16)
+        finalize_metadata = object()
+        from contextlib import contextmanager
+
+        active_stream = main_stream
+        calls = []
+
+        @contextmanager
+        def stream_context(stream):
+            nonlocal active_stream
+            previous = active_stream
+            active_stream = stream
+            try:
+                yield
+            finally:
+                active_stream = previous
+
+        monkeypatch.setattr(torch.npu, "stream", stream_context)
+        monkeypatch.setattr(torch.npu, "current_stream", lambda: active_stream)
+
+        def prepare_metadata(*args, **kwargs):
+            calls.append(("metadata", active_stream))
+            return finalize_metadata
+
+        def apply_experts(*args, **kwargs):
+            calls.append(("experts", active_stream))
+            return routed_expert_output
+
+        moe_method.apply_experts = MagicMock(side_effect=apply_experts)
+        moe_method.prepare_finalize_metadata = MagicMock(side_effect=prepare_metadata)
+
+        layer = moe_layer(
+            gate=lambda x: (torch.zeros(x.shape[0], 4), None),
+            shared_experts=None,
+        )
+        moe_method.apply(
+            layer=layer,
+            hidden_states=torch.ones(2, 128, dtype=torch.bfloat16),
+            router_logits=None,
+            top_k=1,
+            renormalize=False,
+        )
+
+        assert calls == [
+            ("metadata", moe_method.shared_experts_stream),
+            ("experts", main_stream),
+        ]
+        assert moe_method.shared_experts_stream.wait_stream_calls == [main_stream]
+        assert main_stream.wait_stream_calls == [moe_method.shared_experts_stream]
+        moe_method.prepare_finalize_metadata.assert_called_once()
+        assert (
+            moe_method.apply_unpermute_finalize.call_args.kwargs["finalize_metadata"]
+            is finalize_metadata
+        )
+
+    def test_apply_agrs_metadata_overlap_disabled_uses_finalize_fallback(
+        self, mock_torch_npu, moe_method, mxfp8_module, monkeypatch
+    ):
+        _patch_npu_streams(monkeypatch)
+        _set_schedule(
+            mxfp8_module, monkeypatch,
+            multi_stream=False, schedule="with_finalize",
+        )
+        moe_method = _build_apply_method(mxfp8_module, moe_method, monkeypatch)
+        moe_method.apply_experts = MagicMock(
+            return_value=torch.zeros(2, 128, dtype=torch.bfloat16)
+        )
+        moe_method.prepare_finalize_metadata = MagicMock()
+
+        layer = moe_layer(
+            gate=lambda x: (torch.zeros(x.shape[0], 4), None),
+            shared_experts=None,
+        )
+        moe_method.apply(
+            layer=layer,
+            hidden_states=torch.ones(2, 128, dtype=torch.bfloat16),
+            router_logits=None,
+            top_k=1,
+            renormalize=False,
+        )
+
+        moe_method.prepare_finalize_metadata.assert_not_called()
+        assert (
+            moe_method.apply_unpermute_finalize.call_args.kwargs["finalize_metadata"]
+            is None
+        )
 
     def test_apply_cv_unpacks_apply_experts_tuple(
         self, mock_torch_npu, moe_method, mxfp8_module, monkeypatch
@@ -1527,6 +1735,55 @@ class TestMxfp8MoEMethodApply:
         shared_experts.assert_called_once()
         # tp_size==1 → x_slice == hidden_states.
         assert torch.equal(shared_experts.call_args.args[0], hidden)
+
+    def test_apply_after_finalize_starts_shared_before_reduce_scatter(
+        self, mock_torch_npu, moe_method, mxfp8_module, monkeypatch
+    ):
+        _patch_npu_streams(monkeypatch)
+        _set_schedule(
+            mxfp8_module, monkeypatch,
+            multi_stream=True, schedule="with_finalize",
+        )
+        moe_method = _build_apply_method(mxfp8_module, moe_method, monkeypatch)
+        moe_method.apply_experts = MagicMock(
+            return_value=torch.zeros(2, 128, dtype=torch.bfloat16)
+        )
+        moe_method.enable_agrs_finalize_metadata_overlap = True
+        moe_method.prepare_finalize_metadata = MagicMock(return_value=object())
+        events = []
+
+        def finalize_then_reduce(*args, post_finalize_callback=None, **kwargs):
+            events.append("finalize")
+            assert post_finalize_callback is not None
+            post_finalize_callback()
+            events.append("reduce_scatter")
+            return torch.zeros(2, 128, dtype=torch.bfloat16)
+
+        moe_method.apply_unpermute_finalize = MagicMock(
+            side_effect=finalize_then_reduce
+        )
+
+        def run_shared(x):
+            events.append("shared_expert")
+            return torch.full_like(x, 3.0)
+
+        shared_experts = MagicMock(side_effect=run_shared)
+        shared_experts.gate_up_proj = SimpleNamespace(tp_size=1)
+        layer = moe_layer(
+            gate=lambda x: (torch.zeros(x.shape[0], 4), None),
+            shared_experts=shared_experts,
+        )
+
+        output = moe_method.apply(
+            layer=layer,
+            hidden_states=torch.ones(2, 128, dtype=torch.bfloat16),
+            router_logits=None,
+            top_k=1,
+            renormalize=False,
+        )
+
+        assert events == ["finalize", "shared_expert", "reduce_scatter"]
+        assert isinstance(output, tuple)
 
     def test_apply_synchronous_runs_shared_on_main_stream(
         self, mock_torch_npu, moe_method, mxfp8_module, monkeypatch
@@ -1845,6 +2102,92 @@ class TestMxfp8MoEMethodApply:
         assert first_call.args[0] == "moe"
         assert second_call.args[0] == "next_attn"
         assert second_call.kwargs["layer"] is layer
+
+    def test_apply_router_gating_fp32_config_casts_gate_input(
+        self, mock_torch_npu, moe_method, mxfp8_module, monkeypatch
+    ):
+        _patch_npu_streams(monkeypatch)
+        _set_schedule(
+            mxfp8_module, monkeypatch,
+            multi_stream=False, schedule="with_finalize",
+            router_gating_in_fp32=True,
+        )
+        moe_method = _build_apply_method(mxfp8_module, moe_method, monkeypatch)
+        moe_method.apply_experts = MagicMock(
+            return_value=torch.zeros(2, 128, dtype=torch.bfloat16)
+        )
+        gate = _RecordingGate(torch.bfloat16)
+        layer = moe_layer(gate=gate, shared_experts=None)
+        hidden = torch.ones(2, 128, dtype=torch.bfloat16)
+
+        moe_method.apply(
+            layer=layer,
+            hidden_states=hidden,
+            router_logits=None,
+            top_k=1,
+            renormalize=False,
+        )
+
+        # Config flag forces the router input upcast even for a bf16 gate.
+        assert len(gate.inputs) == 1
+        assert gate.inputs[0].dtype == torch.float32
+
+    def test_apply_fp32_gate_weight_casts_gate_input(
+        self, mock_torch_npu, moe_method, mxfp8_module, monkeypatch
+    ):
+        _patch_npu_streams(monkeypatch)
+        _set_schedule(
+            mxfp8_module, monkeypatch,
+            multi_stream=False, schedule="with_finalize",
+            router_gating_in_fp32=False,
+        )
+        moe_method = _build_apply_method(mxfp8_module, moe_method, monkeypatch)
+        moe_method.apply_experts = MagicMock(
+            return_value=torch.zeros(2, 128, dtype=torch.bfloat16)
+        )
+        gate = _RecordingGate(torch.float32)
+        layer = moe_layer(gate=gate, shared_experts=None)
+        hidden = torch.ones(2, 128, dtype=torch.bfloat16)
+
+        moe_method.apply(
+            layer=layer,
+            hidden_states=hidden,
+            router_logits=None,
+            top_k=1,
+            renormalize=False,
+        )
+
+        # fp32 gate weight alone triggers the upcast.
+        assert len(gate.inputs) == 1
+        assert gate.inputs[0].dtype == torch.float32
+
+    def test_apply_bf16_gate_weight_keeps_gate_input(
+        self, mock_torch_npu, moe_method, mxfp8_module, monkeypatch
+    ):
+        _patch_npu_streams(monkeypatch)
+        _set_schedule(
+            mxfp8_module, monkeypatch,
+            multi_stream=False, schedule="with_finalize",
+            router_gating_in_fp32=False,
+        )
+        moe_method = _build_apply_method(mxfp8_module, moe_method, monkeypatch)
+        moe_method.apply_experts = MagicMock(
+            return_value=torch.zeros(2, 128, dtype=torch.bfloat16)
+        )
+        gate = _RecordingGate(torch.bfloat16)
+        layer = moe_layer(gate=gate, shared_experts=None)
+        hidden = torch.ones(2, 128, dtype=torch.bfloat16)
+
+        moe_method.apply(
+            layer=layer,
+            hidden_states=hidden,
+            router_logits=None,
+            top_k=1,
+            renormalize=False,
+        )
+
+        # No flag + bf16 gate weight: the tensor is passed through untouched.
+        assert gate.inputs == [hidden]
 
 
 if __name__ == "__main__":

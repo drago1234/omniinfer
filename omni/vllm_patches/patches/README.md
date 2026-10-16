@@ -50,9 +50,8 @@ patches/
 | `patch_single_type_kv_cache_manager.py` | 注册 `MomeManager` / `ShareKVSlidingWindowManager` 并为 Mome 注入 admission cap；vLLM #52707：`allocate_external_computed_blocks` 在 PD 外部块数量为负时不再调用 `get_new_blocks` |
 | `patch_kv_cache_utils.py` | `HYBRID_ATTN_GROUP_SIZE` 环境变量 override hybrid KV group 分组 |
 | `patch_kv_cache_dtype.py` | 支持 int8/hif8 等 KV cache dtype |
-| `patch_hybrid_kv_cache_coordinator.py` | hybrid APC：`find_longest_cache_hit_per_group` 把公共命中长度按 group 重复，给 LLMDataDist fill |
+| `patch_hybrid_kv_cache_coordinator.py` | hybrid APC：仅 Decode FA-skip（`OMNI_PD_ROLE=decode`）；否则 `_find_longest_cache_hit_per_group` |
 | `patch_scheduler.py` | PD / reasoning `max_tokens` 排除 thinking |
-| `patch_scheduler_spec_decode_pad.py` | fork `Scheduler.schedule`，默认关闭「新 decode 请求补齐到 1 + num_spec_tokens」的 padding（`OMNI_DISABLE_SPEC_DECODE_PAD`，默认 1） |
 | `patch_speculative.py` | MTP / speculative config |
 | `patch_model_arch_config_convertor.py` | Pangu MLA 架构识别 |
 | `patch_process_weights_after_loading.py` | NPU 权重后处理：loader 在 quant packing 之后补调 `NPUPanguSparseAttention` / `NPUmHC` / `NPUmHCRL` / `NPURMSNorm` |

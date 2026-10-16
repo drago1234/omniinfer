@@ -9,12 +9,20 @@ keeps a full CUDA graph. On NPU that padding injects dummy ``-1`` draft slots
 into the step and breaks it, so the branch is disabled by default.
 
 ``schedule`` is forked verbatim from upstream vLLM (commit
-752a3a504485790a2e8491cacbb35c137339ad34). The only deviation is the extra
-``and not envs.OMNI_DISABLE_SPEC_DECODE_PAD`` clause marked with
-``# omni-npu:`` below. Keep this fork pinned to that upstream revision:
-refresh it whenever the vendored vLLM is bumped.
+752a3a504485790a2e8491cacbb35c137339ad34). Deviations from that revision,
+each guarded by tests in test_patch_scheduler_spec_decode_pad.py:
 
-Set ``OMNI_DISABLE_SPEC_DECODE_PAD=0`` to restore the upstream behaviour.
+- the pad condition also fires when the request already has computed
+  tokens (``or num_computed_tokens > 0``, same as upstream PR #55126);
+- a placeholder-width guard: dummy ``-1`` draft slots are clamped to
+  ``min(num_spec_tokens, num_new_tokens - 1)`` in both write paths, plus
+  a lower-bound assert on ``total_num_scheduled_tokens``. Without it, a
+  pad whose ``num_new_tokens`` is shrunk afterwards (threshold/budget)
+  lets ``update_scheduler_for_invalid_drafts`` trim the count negative
+  and the -1 escapes to the worker, killing the engine.
+
+Keep this fork pinned to that upstream revision: refresh it whenever the
+vendored vLLM is bumped.
 """
 
 import time
@@ -260,9 +268,13 @@ class PanguV2SpecDecodePadPatch(VLLMPatch):
                 )
                 if num_scheduled_spec_tokens > 0:
                     spec_token_ids = request.spec_token_ids
-                    if len(spec_token_ids) > num_scheduled_spec_tokens:
-                        spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
-                    scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+                    max_slots = min(num_scheduled_spec_tokens, num_new_tokens - 1)
+                    if max_slots > 0:
+                        if len(spec_token_ids) > max_slots:
+                            spec_token_ids = spec_token_ids[:max_slots]
+                        scheduled_spec_decode_tokens[request.request_id] = (
+                            spec_token_ids
+                        )
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
@@ -348,6 +360,8 @@ class PanguV2SpecDecodePadPatch(VLLMPatch):
                     # Get locally-cached tokens.
                     if (
                         self.connector is not None
+                        # omni-npu: offload must assemble hits through the cache manager.
+                        and not getattr(self.kv_cache_manager, "_omni_is_offloading_connector", False)
                         and self.has_mamba_layers
                         and isinstance(
                             self.kv_cache_manager.coordinator,
@@ -474,20 +488,26 @@ class PanguV2SpecDecodePadPatch(VLLMPatch):
                     if (
                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
                         and num_new_tokens == 1
-                        and (scheduled_running_reqs and not prefill_scheduled)
-                        # omni-npu: a fresh decode request must not be
-                        # padded to the full spec-decode width; the extra
-                        # dummy draft slots break the NPU graph step.
-                        and not envs.OMNI_DISABLE_SPEC_DECODE_PAD
+                        and not prefill_scheduled
+                        and (scheduled_running_reqs or num_computed_tokens > 0)
                     ):
-                        num_new_tokens = 1 + self.num_spec_tokens
+                        padded_num_tokens = 1 + self.num_spec_tokens
+
+                        # Reserve room for the token(s) sampled by this step.
+                        # Near max_model_len, keep the original unpadded decode size.
                         if (
-                            num_new_tokens > token_budget
-                            or num_computed_tokens + num_new_tokens > self.max_model_len
+                            num_computed_tokens
+                            + padded_num_tokens
+                            + self.num_sampled_tokens_per_step
+                            <= self.max_model_len
                         ):
-                            # Prefer to not schedule than schedule un-padded here.
-                            break
-                        pad_spec_decode = True
+                            if padded_num_tokens > token_budget:
+                                # Prefer not to schedule an unpadded request when
+                                # the token budget cannot accommodate padding.
+                                break
+
+                            num_new_tokens = padded_num_tokens
+                            pad_spec_decode = True
 
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
@@ -652,9 +672,11 @@ class PanguV2SpecDecodePadPatch(VLLMPatch):
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
-                    scheduled_spec_decode_tokens[request_id] = [
-                        -1
-                    ] * self.num_spec_tokens
+                    num_pad_slots = min(self.num_spec_tokens, num_new_tokens - 1)
+                    if num_pad_slots > 0:
+                        scheduled_spec_decode_tokens[request_id] = [
+                            -1
+                        ] * num_pad_slots
                 # Only track requests that will still be prefilling after this chunk.
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)
@@ -686,6 +708,11 @@ class PanguV2SpecDecodePadPatch(VLLMPatch):
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        assert total_num_scheduled_tokens >= 0, (
+            "total_num_scheduled_tokens is negative "
+            f"({total_num_scheduled_tokens}); per-request counts: "
+            f"{dict(num_scheduled_tokens)}"
+        )
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs

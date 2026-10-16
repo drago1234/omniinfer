@@ -39,6 +39,7 @@ from omni_npu.connector.utils import ParallelDesc
 from omni_npu.connector.llmdatadist_connector_v1 import (
     LLMDataDistConnector,
     Metadata,
+    PrefillScheduler,
     SchemePull,
 )
 
@@ -349,6 +350,71 @@ class TestLLMDataDistConnector:
         # threads don't leak into later tests (e.g. test_kv_dump's global
         # time.sleep patch), which is the root of the cross-test pollution here.
         _stop_daemon(*p_workers, *d_workers, p_scheduler, d_scheduler)
+
+
+class TestPrefillSchedulerTimeout:
+    """P 侧等待 D 侧 pull 完成的超时分区逻辑。
+
+    ``build_connector_metadata`` 把 ``finish_time`` 中的请求分成
+    ``pending``（仍在等待 D 侧拉取，P 侧延迟释放显存）与 ``timeout``
+    （等待超过 ``TIMEOUT_WAIT_PULL_DONE``，P 侧可回收 block）两组。
+    该超时从 600s 放宽到 3600s，保证长尾的 D 侧拉取不会在 10 分钟后被
+    提前回收。`__init__` 会启动 daemon 线程并依赖真实 llm-datadist 环境，
+    这里用 ``__new__`` 旁路，只构造元数据路径需要的字段。
+    """
+
+    @staticmethod
+    def _make_scheduler(finish_time):
+        sched = PrefillScheduler.__new__(PrefillScheduler)
+        sched.addr = "tcp://scheduler:0"
+        sched.finish_time = dict(finish_time)
+        return sched
+
+    def test_timeout_is_one_hour(self):
+        assert PrefillScheduler.TIMEOUT_WAIT_PULL_DONE == 3600.0
+
+    def test_fresh_requests_stay_pending(self):
+        now = time.time()
+        sched = self._make_scheduler({"req0": now - 1, "req1": now})
+
+        meta = sched.build_connector_metadata()
+
+        assert meta.scheduler_addr == "tcp://scheduler:0"
+        assert meta.req_params["pending"] == {"req0", "req1"}
+        assert meta.req_params["timeout"] == set()
+
+    def test_timed_out_requests_are_reported(self):
+        now = time.time()
+        timeout = PrefillScheduler.TIMEOUT_WAIT_PULL_DONE
+        sched = self._make_scheduler({
+            "req-old": now - timeout - 1,
+            "req-new": now - 5,
+        })
+
+        meta = sched.build_connector_metadata()
+
+        assert meta.req_params["timeout"] == {"req-old"}
+        assert meta.req_params["pending"] == {"req-new"}
+
+    def test_timeout_boundary_is_exclusive(self):
+        # `now - ts > TIMEOUT`：接近超时时长仍算 pending，超过后才进入
+        # timeout 组。（判定用的是墙钟差值，精确等于 TIMEOUT 的边界会被
+        # 两次 time.time() 之间的浮点误差推到任一侧，因此各留 1 秒余量。）
+        now = time.time()
+        timeout = PrefillScheduler.TIMEOUT_WAIT_PULL_DONE
+        sched = self._make_scheduler({"req-edge": now - timeout + 1})
+        assert sched.build_connector_metadata().req_params["timeout"] == set()
+
+        sched.finish_time["req-edge"] = now - timeout - 1
+        assert sched.build_connector_metadata().req_params["timeout"] == {"req-edge"}
+
+    def test_finished_sending_clears_finish_time(self):
+        sched = self._make_scheduler({"req0": time.time(), "req1": time.time()})
+
+        sched.update_connector_output(SimpleNamespace(finished_sending=["req0"]))
+
+        assert "req0" not in sched.finish_time
+        assert "req1" in sched.finish_time
 
 
 class TestConnectorMetrics:

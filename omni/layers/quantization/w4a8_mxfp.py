@@ -183,6 +183,7 @@ class W4A8MXFPConfig(QuantizationConfig):
         group_size: int = MX_BLOCK_SIZE,
         ignored_layers: Optional[list[str]] = None,
         non_moe_quant_method: str = W4A8_MXFP,
+        enable_mxfp8_comm_quant: bool = False,
     ):
         super().__init__()
         if group_size <= 0:
@@ -195,11 +196,18 @@ class W4A8MXFPConfig(QuantizationConfig):
                 f'"{W4A8_MXFP}" or "{MXFP8}", but got '
                 f'"{non_moe_quant_method}"'
             )
+        if not isinstance(enable_mxfp8_comm_quant, bool):
+            raise ValueError(
+                "enable_mxfp8_comm_quant must be bool, got "
+                f"{enable_mxfp8_comm_quant!r}"
+            )
         self.group_size = group_size
         self.ignored_layers = ignored_layers
         self.non_moe_quant_method = non_moe_quant_method
+        self.enable_mxfp8_comm_quant = enable_mxfp8_comm_quant
         self._mxfp8_config = Mxfp8Config(
             ignored_layers=ignored_layers,
+            enable_mxfp8_comm_quant=enable_mxfp8_comm_quant,
         )
 
     @classmethod
@@ -210,6 +218,10 @@ class W4A8MXFPConfig(QuantizationConfig):
             non_moe_quant_method=config.get(
                 "non_moe_quant_method",
                 W4A8_MXFP,
+            ),
+            enable_mxfp8_comm_quant=config.get(
+                "enable_mxfp8_comm_quant",
+                False,
             ),
         )
 

@@ -48,10 +48,12 @@
   `null`。
 - `run_server_prefill_profile` 属于 Prefill 启动流程，包括 `runner`、`workdir`、
   vLLM `docker_envs`、加载 `.bashrc` 后执行的准备命令、多节点后端和有序 CLI
-  `args`。公共 task 会固定注入通信网卡、主机地址、端口和多节点坐标等拓扑环境。
-- `run_server_decode_profile` 管理对应的 Decode 启动字段。Role 只在 P 主机解析
-  Prefill profile，只在 D 主机解析 Decode profile，因此一侧可以安全引用另一侧
-  不存在的主机变量。
+  `args`。默认 `enable_kv_events: true`：启动模板在 `prepare_commands` 之后追加
+  `--kv-events-config`（`API_PORT+100`）；已手写该参数时不重复追加，可设
+  `enable_kv_events: false` 或 `OMNI_ENABLE_KV_EVENTS=0` 关闭。
+- `run_server_decode_profile` 管理对应的 Decode 启动字段（含同上的
+  `enable_kv_events`）。Role 只在 P 主机解析 Prefill profile，只在 D 主机解析
+  Decode profile，因此一侧可以安全引用另一侧不存在的主机变量。
 - `run_server_common_profile` 管理 Prefill 和 Decode 共用的 KV Connector、等待时间
   以及弹性流程中可选的 Proxy 刷新行为。
 - `run_proxy_profile` 属于 `run_proxy`，管理 Omni Proxy 的工作目录、命令和

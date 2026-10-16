@@ -29,13 +29,18 @@ class _DummyDefaultStream:
 
 @pytest.fixture
 def rejection_mod(monkeypatch):
+    # Resolve vLLM dependencies before replacing torch_npu with a sampling stub.
+    import torch_npu as real_torch_npu
+
+    monkeypatch.setattr(real_torch_npu.npu, "get_device_name", lambda index=0: "Ascend910B2")
+    import omni_npu.sample.rejection_sampler as mod
+
     fake_default_stream = _DummyDefaultStream()
     # Streams are dummied out in these tests; no-op Tensor.record_stream so
     # real tensors can flow through code that records cross-stream usage.
     monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None)
     # Load real torch_npu first so package submodules (e.g. _inductor) stay
     # importable after we overlay a lightweight stub for unit tests.
-    import torch_npu as real_torch_npu  # noqa: F401
     try:
         importlib.import_module("torch_npu._inductor")
     except Exception:
@@ -97,8 +102,6 @@ def rejection_mod(monkeypatch):
         raising=False,
     )
 
-    import omni_npu.sample.rejection_sampler as mod
-
     mod = importlib.reload(mod)
     monkeypatch.setattr(
         mod.torch,
@@ -110,6 +113,73 @@ def rejection_mod(monkeypatch):
         raising=False,
     )
     return mod, fake_torch_npu, fake_default_stream
+
+
+@pytest.mark.parametrize("device_name", ["Ascend910_9391", "Ascend950DT_9582"])
+@pytest.mark.parametrize("disable_npu_sample", [False, True])
+@pytest.mark.parametrize("with_sampling", [False, True])
+def test_sampler_routes_topk_topp_by_config(
+    rejection_mod, monkeypatch, device_name, disable_npu_sample, with_sampling
+):
+    """A5 uses the same NPU path as A3 unless the operator is explicitly disabled."""
+    mod, fake_torch_npu, _ = rejection_mod
+    from omni_npu.v1 import utils
+
+    monkeypatch.setattr(utils, "_npu_device_name", lambda: device_name)
+    monkeypatch.setattr(
+        mod,
+        "model_extra_config",
+        SimpleNamespace(
+            operator_opt_config=SimpleNamespace(
+                disable_npu_top_k_top_p_sample=disable_npu_sample
+            )
+        ),
+    )
+    base_sampler = SimpleNamespace(
+        logprobs_mode="raw_logits", dsa_stream=_DummyDefaultStream()
+    )
+    sampler = mod.NPURejectionSampler(base_sampler)
+    assert sampler.use_npu_sample is (not disable_npu_sample)
+    assert sampler.dsa_stream is base_sampler.dsa_stream
+
+    calls = []
+
+    def native_filter(logits, k, p):
+        assert disable_npu_sample, "Unexpected upstream Triton-capable fallback"
+        calls.append("native")
+        return logits
+
+    def npu_filter(logits, k, p):
+        assert not disable_npu_sample, "Explicit disable must bypass the NPU operator"
+        calls.append("npu")
+        return logits
+
+    def npu_sample(logits, k, p, q, is_need_logits):
+        filtered = npu_filter(logits, k, p)
+        return filtered.argmax(dim=-1), filtered
+
+    monkeypatch.setattr(mod, "apply_top_k_top_p", native_filter)
+    monkeypatch.setattr(mod, "apply_top_k_top_p_npu", npu_filter)
+    monkeypatch.setattr(fake_torch_npu, "npu_top_k_top_p_sample", npu_sample)
+    # Eight expanded draft rows exercise the batch size that enables Triton upstream.
+    logits = torch.arange(4, dtype=torch.float32).repeat(8, 1)
+    cu = torch.tensor([4, 8], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        all_greedy=False,
+        temperature=torch.ones(2),
+        top_k=torch.full((2,), 2, dtype=torch.int32),
+        top_p=torch.full((2,), 0.9),
+    )
+    if with_sampling:
+        tokens, filtered = mod.compute_probs_and_sample(
+            logits, cu, metadata, torch.ones_like(logits), sampler.use_npu_sample,
+            not_support_float=False,
+        )
+        assert torch.equal(tokens, torch.full((8,), 3, dtype=torch.int32))
+    else:
+        filtered = mod.compute_probs(logits, cu, metadata, sampler.use_npu_sample)
+    assert filtered is logits
+    assert calls == (["native"] if disable_npu_sample else ["npu"])
 
 
 def test_expand_batch_to_tokens_with_replacement(rejection_mod):
