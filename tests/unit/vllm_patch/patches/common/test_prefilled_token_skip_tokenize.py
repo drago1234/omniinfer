@@ -484,7 +484,7 @@ def test_relay_finish_cleans_up_and_notifies_in_same_tick(pd, termination):
         batch.finished_requests = s.finished_by_client[3]
         return {3: batch}
 
-    pd._original_update_from_output.side_effect = update
+    pd.SchedulerKvXferFinishedPatch._upstream_update_from_output.side_effect = update
     outputs = pd.SchedulerKvXferFinishedPatch.update_from_output(scheduler, "schedule", transfer)
     assert outputs[3] is batch and batch.outputs[0] is native_output
     assert batch.scheduler_stats is stats and batch.timestamp == 123
@@ -504,8 +504,8 @@ def test_relay_finish_cleans_up_and_notifies_in_same_tick(pd, termination):
     scheduler.finish_requests.assert_called_once_with("req", "finished_" + notification.finish_reason)
 
     # A later tick must not replay the terminal output.
-    pd._original_update_from_output.side_effect = None
-    pd._original_update_from_output.return_value = {}
+    pd.SchedulerKvXferFinishedPatch._upstream_update_from_output.side_effect = None
+    pd.SchedulerKvXferFinishedPatch._upstream_update_from_output.return_value = {}
     assert pd.SchedulerKvXferFinishedPatch.update_from_output(scheduler, None, None) == {}
 
 
@@ -541,9 +541,9 @@ def test_scheduler_output_wrapper_preserves_native_result_without_pending_finish
     if pending is not None:
         scheduler._omni_pending_finish_outputs = pending
     expected = {4: pd.EngineCoreOutputs(outputs=[object()], finished_requests={"native"})}
-    pd._original_update_from_output.return_value = expected
+    pd.SchedulerKvXferFinishedPatch._upstream_update_from_output.return_value = expected
     assert pd.SchedulerKvXferFinishedPatch.update_from_output(scheduler, "s", "r") is expected
-    pd._original_update_from_output.assert_called_once_with(scheduler, "s", "r")
+    pd.SchedulerKvXferFinishedPatch._upstream_update_from_output.assert_called_once_with(scheduler, "s", "r")
 
 
 def test_scheduler_patch_registers_receive_and_finish_output_together(pd):
@@ -1094,7 +1094,7 @@ def test_one_token_prefill_handoff_respects_decode_budget(pd, kind, user_budget)
         pd.SchedulerKvXferFinishedPatch._update_from_kv_xfer_finished(s, runner_output)
         return {}
 
-    pd._original_update_from_output.side_effect = native_update
+    pd.SchedulerKvXferFinishedPatch._upstream_update_from_output.side_effect = native_update
     decode_steps = []
 
     async def native_generate(*args, **kwargs):
@@ -1146,8 +1146,8 @@ def test_one_token_prefill_handoff_respects_decode_budget(pd, kind, user_budget)
     assert "prefilled_token" not in engine_request.sampling_params.extra_args["kv_transfer_params"]
     if user_budget == 1:
         assert scheduler._omni_pending_finish_outputs == []
-        pd._original_update_from_output.side_effect = None
-        pd._original_update_from_output.return_value = {}
+        pd.SchedulerKvXferFinishedPatch._upstream_update_from_output.side_effect = None
+        pd.SchedulerKvXferFinishedPatch._upstream_update_from_output.return_value = {}
         assert pd.SchedulerKvXferFinishedPatch.update_from_output(scheduler, None, None) == {}
 
 

@@ -66,7 +66,6 @@ logger = init_logger(__name__)
 _orig_request_output_init = RequestOutput.__init__
 _orig_request_output_add = RequestOutput.add
 _orig_request_init = Request.__init__
-_orig_scheduler_update_from_output = Scheduler.update_from_output
 _orig_engine_core_add_request = EngineCore.add_request
 _orig_make_request_output = RequestState.make_request_output
 _orig_to_sampling_params = ChatCompletionRequest.to_sampling_params
@@ -229,6 +228,13 @@ class ECTransferSchedulerPatch(VLLMPatch):
         "_free_request",
     ]
 
+    _upstream_update_from_output = Scheduler.update_from_output
+
+    @classmethod
+    def apply(cls):
+        # Relay to earlier update_from_output wrappers instead of replacing them.
+        cls.apply_bypass_conflict("update_from_output")
+
     def get_ec_connector(self) -> "ECConnectorBase | None":
         return self.ec_connector
 
@@ -253,7 +259,7 @@ class ECTransferSchedulerPatch(VLLMPatch):
         original_free_request = getattr(self, "_free_request")
         self._free_request = _free_request_adapter
         try:
-            engine_core_outputs = _orig_scheduler_update_from_output(
+            engine_core_outputs = ECTransferSchedulerPatch._upstream_update_from_output(
                 self,
                 scheduler_output,
                 model_runner_output,
