@@ -401,6 +401,7 @@ class TestNPUMomeAttentionMetadataBuilder(unittest.TestCase):
         builder.reorder_batch_threshold = 1
         builder.kv_cache_spec = MagicMock(block_size=8)
         builder.decode_cudagraph_max_bs = 16
+        builder.max_num_blocks = 128
         builder.cache_indices_tensor = torch.empty(16, dtype=torch.int32)
         builder.num_computed_tokens = torch.empty(16, dtype=torch.int32)
         builder.num_accepted_tokens = torch.empty(16, dtype=torch.int32)
@@ -609,13 +610,16 @@ class TestNPUMomeAttentionMetadataBuilder(unittest.TestCase):
 class TestComputePrefixCachingBlockIndices(unittest.TestCase):
     """Unit tests for NPUMomeAttentionMetadataBuilder._compute_prefix_caching_block_indices."""
 
-    def _make_builder(self, num_spec=0, is_decode_node=False):
+    def _make_builder(self, num_spec=0, is_decode_node=False, max_num_blocks=128):
         b = mome_mod.NPUMomeAttentionMetadataBuilder.__new__(
             mome_mod.NPUMomeAttentionMetadataBuilder
         )
         b.num_spec = num_spec
         b.is_decode_node = is_decode_node
         b.reuse_prefilled_tokens = False
+        # __init__ derives this from max_model_len / mome_block_size; the
+        # upper clamp of block_idx_last_computed_token reads it.
+        b.max_num_blocks = max_num_blocks
         return b
 
     def _make_common(self, num_computed, seq_lens):
@@ -747,6 +751,108 @@ class TestComputePrefixCachingBlockIndices(unittest.TestCase):
 
         self.assertEqual(int(lct[0].item()), 2)
         self.assertEqual(int(lct[1].item()), 0)
+
+    def test_spec_decode_index_clamped_to_max_num_blocks(self):
+        """
+        The MTP physical high-water mark can point past the last block of the
+        running cache (spec-decode padding near max_model_len); the result is
+        clamped to max_num_blocks - 1 so the kernel never indexes out of
+        bounds.
+        """
+        b = self._make_builder(num_spec=2, max_num_blocks=2)
+        # num_computed=16 == num_prompt=16, num_accepted=2, block_size=8
+        # MTP: ceil((16-2+2+1)/8)-1 = ceil(17/8)-1 = 2 -> clamped to 1
+        common = self._make_common(num_computed=[16], seq_lens=[18])
+        num_accepted = torch.tensor([2], dtype=torch.int32)
+        num_prompt = torch.tensor([16], dtype=torch.int32)
+
+        lct, _, _ = b._compute_prefix_caching_block_indices(
+            common, mome_block_size=8,
+            num_accepted_tokens=num_accepted, num_prompt_tokens=num_prompt,
+        )
+
+        self.assertEqual(int(lct[0].item()), 1)
+
+    def test_no_spec_index_clamped_to_max_num_blocks(self):
+        """
+        The simple ceil-division formula hits the same upper clamp.
+        """
+        b = self._make_builder(num_spec=0, max_num_blocks=2)
+        # num_computed=24, block_size=8: ceil(24/8)-1 = 2 -> clamped to 1
+        common = self._make_common(num_computed=[24], seq_lens=[24])
+        num_accepted = torch.tensor([1], dtype=torch.int32)
+
+        lct, _, _ = b._compute_prefix_caching_block_indices(
+            common, mome_block_size=8, num_accepted_tokens=num_accepted
+        )
+
+        self.assertEqual(int(lct[0].item()), 1)
+
+
+class TestBuilderInit(unittest.TestCase):
+    """``__init__`` derives ``max_num_blocks`` from the model config.
+
+    It is computed unconditionally (both the prefix-caching and the plain
+    branch of the buffer allocation), and the prefix-caching cache-index
+    buffer is shaped ``(decode_cudagraph_max_bs, max_num_blocks)``.
+    """
+
+    @staticmethod
+    def _init_builder(*, enable_prefix_caching, max_model_len=1024,
+                      max_num_seqs=4, mome_block_size=4):
+        from vllm.v1 import kv_cache_interface as vllm_kvi
+
+        # ``__init__`` resolves MomeSpec through the patched
+        # vllm.v1.kv_cache_interface; make the patch visible even when it has
+        # not been applied in this process yet.
+        with patch.object(vllm_kvi, "MomeSpec", MomeSpec, create=True):
+            # MomeSpec is a frozen dataclass with many required fields the
+            # builder never reads beyond ``block_size``; bypass its __init__
+            # and set the one field through the frozen-dataclass escape hatch.
+            spec = MomeSpec.__new__(MomeSpec)
+            object.__setattr__(spec, "block_size", mome_block_size)
+            vllm_config = SimpleNamespace(
+                speculative_config=None,
+                kv_transfer_config=None,
+                model_config=SimpleNamespace(
+                    max_model_len=max_model_len,
+                    hf_config=SimpleNamespace(),
+                ),
+                scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+                parallel_config=SimpleNamespace(
+                    decode_context_parallel_size=1,
+                ),
+                cache_config=SimpleNamespace(
+                    enable_prefix_caching=enable_prefix_caching
+                ),
+                compilation_config=SimpleNamespace(
+                    max_cudagraph_capture_size=None,
+                    cudagraph_mode=SimpleNamespace(
+                        has_full_cudagraphs=lambda: False
+                    ),
+                ),
+            )
+            return mome_mod.NPUMomeAttentionMetadataBuilder(
+                kv_cache_spec=spec,
+                layer_names=["layer0"],
+                vllm_config=vllm_config,
+                device=torch.device("cpu"),
+            )
+
+    def test_max_num_blocks_is_cdiv_of_max_model_len(self):
+        builder = self._init_builder(enable_prefix_caching=True)
+
+        # cdiv(1024, 4) == 256
+        self.assertEqual(builder.max_num_blocks, 256)
+        # decode_cudagraph_max_bs = max_num_seqs * (num_spec + 1) = 4
+        self.assertEqual(builder.cache_indices_tensor.shape, (4, 256))
+
+    def test_max_num_blocks_exists_without_prefix_caching(self):
+        builder = self._init_builder(enable_prefix_caching=False)
+
+        self.assertEqual(builder.max_num_blocks, 256)
+        # The plain branch allocates a 1-D cache-index buffer.
+        self.assertEqual(builder.cache_indices_tensor.shape, (4,))
 
 
 def _manual_builder(*, reuse_prefilled_tokens=False):
