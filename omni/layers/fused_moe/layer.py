@@ -31,7 +31,10 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from omni_npu.compilation.acl_graph import set_aclgraph_recapture
 from omni_npu.layers.fused_moe import routed_experts_handle
 from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp, fused_experts_tp_with_shared
-from omni_npu.layers.fused_moe.fused_moe_method_base import NPUFusedMoEMethodBase
+from omni_npu.layers.fused_moe.fused_moe_method_base import (
+    NPUFusedMoEMethodBase,
+    npu_grouped_moe_experts_bf16,
+)
 from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import PreparePermuteOptions, PreparePermuteResult
 from omni_npu.layers.fused_moe.shared_expert import shared_expert_core_limit
 from omni_npu.layers.prefetch import PrefetchManager
@@ -342,25 +345,12 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
         expert_tokens = prepare_permute_result.expert_tokens.to(torch.int64)
         experts = layer.routed_experts
         group_list_type = int(layer.moe_config.moe_parallel_config.use_ep)
-        gate_up_proj = torch_npu.npu_grouped_matmul(
-            [hidden_states],
-            [experts.w13_weight],
-            bias=None,
-            group_list=expert_tokens,
-            split_item=3,
-            group_type=0,
-            group_list_type=group_list_type,
-        )[0]
-        intermediate_hidden_states = torch_npu.npu_swiglu(gate_up_proj)
-        return torch_npu.npu_grouped_matmul(
-            [intermediate_hidden_states],
-            [experts.w2_weight],
-            bias=None,
-            group_list=expert_tokens,
-            split_item=3,
-            group_type=0,
-            group_list_type=group_list_type,
-        )[0]
+        return npu_grouped_moe_experts_bf16(
+            hidden_states,
+            experts,
+            expert_tokens,
+            group_list_type,
+        )
 
 
 @MoERunner.register_oot
