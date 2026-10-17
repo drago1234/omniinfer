@@ -56,6 +56,8 @@ from omni_npu.v1.utils import on_ascend950
 from omni_npu.profiler.wrapper import NpuProfilerWrapper
 import omni_npu.envs as omni_envs
 from omni_npu.diagnostics.metrics import stage_metrics
+from omni_npu.worker.collective_features import collective_feature
+import omni_npu.diagnostics.nan_inf.collective  # noqa: F401
 from omni_npu.worker.cpu_affinity import apply_worker_cpu_affinity
 
 logger = init_logger(__name__)
@@ -478,6 +480,12 @@ class NPUWorker(Worker):
         output = super().sample_tokens(grammar_output)
         stage_metrics.stamp_async_forward(self.model_runner, output)
         return output
+
+    def collective_feature(
+        self, feature: str, action: str = "configure", **options
+    ) -> dict:
+        """Configure an allowlisted optional feature via ``/collective_rpc``."""
+        return collective_feature(self, feature, action, **options)
 
     def sleep(self, level: int = 1) -> None:
         if self.is_full_async_rl:
