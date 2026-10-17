@@ -778,6 +778,14 @@ class NPUModelRunner(GPUModelRunner):
         self._hook_model_load_weights(self.get_model())
         self._hook_model_load_weights(self.get_drafter_model())
 
+        # Static-kernel cache pool pull: fetch the pooled bundle into the
+        # default product dir BEFORE any compilation runs (profile/warmup come
+        # after load_model). Main process, rank0-of-pod pulls + barrier; any
+        # failure degrades to local-only mode. Never raises.
+        from omni_npu.compilation.static_kernel_cache_pool import maybe_pull_static_kernel_cache
+
+        maybe_pull_static_kernel_cache(self.vllm_config)
+
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         if not (self.speculative_config and self.speculative_config.draft_model_config):
             return None
@@ -812,7 +820,16 @@ class NPUModelRunner(GPUModelRunner):
             # recapturing to avoid stale pool memory staying live.
             reset_stale_aclgraph_resources(self._iter_aclgraph_wrappers())
         with switch_torch_device():
-            return super().capture_model()
+            captured = super().capture_model()
+
+        # Static-kernel cache pool upload: capture completion is the
+        # deterministic "all compilation finished" signal. rank0 spawns a
+        # daemon thread that consolidates the produced .run files into
+        # ts_pool_outputs and uploads first-wins; never blocks or raises.
+        from omni_npu.compilation.static_kernel_cache_pool import schedule_static_kernel_cache_upload
+
+        schedule_static_kernel_cache_upload(self.vllm_config)
+        return captured
 
     def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput"):
         # Mitigation for the upstream VLLM bug where the MM encoder output

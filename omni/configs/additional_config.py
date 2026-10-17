@@ -121,6 +121,15 @@ class OmniAdditionalConfig:
     #   super_kernel_optimize (bool)             — super-kernel fusion with
     #                                              dcci options; implies
     #                                              static_kernel_compile.
+    #   static_kernel_cache_enable (bool, default False)    — reuse previously compiled
+    #                                              static-kernel .run packages
+    #                                              via the pool hooks (a
+    #                                              vendored entry bypasses
+    #                                              the force_eager gate; see
+    #                                              compilation/npugraph_ex.py).
+    #   static_kernel_cache_dir (str, optional)             — cache dir that PARENTS
+    #                                              static_kernel_compile_outputs/;
+    #                                              default = process cwd.
     #   capture_limit (int, default 64)          — static capture size cap.
     #   clone_input (bool, default True)         — clone graph inputs.
     #   clone_output (bool, default False)       — clone graph outputs.
