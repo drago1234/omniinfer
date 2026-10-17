@@ -9,7 +9,7 @@
   ansible.builtin.set_fact:
     ACTUAL_DOCKER_NAME_M: "{{ ansible_env.DOCKER_NAME_M }}_{{ inventory_hostname }}"
   when:
-    - enable_kv_pool | bool
+    - enable_fusion_pool | bool
     - "'M' in group_names"
   tags: always
 
@@ -35,7 +35,7 @@
       {% for mount in extra_mounts %}-v {{ mount }}
       {% endfor %}
   when:
-    - enable_kv_pool | bool
+    - enable_fusion_pool | bool
     - "'M' in group_names"
   tags: run_docker
 
@@ -50,7 +50,7 @@
     DOCKER_NAME_M: "{{ ACTUAL_DOCKER_NAME_M }}"
   failed_when: false
   changed_when: false
-  when: "'M' in group_names and (enable_kv_pool | bool)"
+  when: "'M' in group_names and (enable_fusion_pool | bool)"
   tags:
     - run_docker
     - clean_up
@@ -58,7 +58,7 @@
 - name: Show generated mooncake master container name.
   ansible.builtin.debug:
     msg: "Generated container name: {{ existing_master_containers.stdout_lines }}"
-  when: "'M' in group_names and (enable_kv_pool | bool)"
+  when: "'M' in group_names and (enable_fusion_pool | bool)"
   tags:
     - run_docker
     - clean_up
@@ -82,7 +82,7 @@
           - "{{ ACTUAL_DOCKER_NAME_M }}"
   when:
     - "'M' in group_names"
-    - enable_kv_pool | bool
+    - enable_fusion_pool | bool
     - existing_master_containers.stdout != ''
   tags:
     - never
@@ -93,7 +93,7 @@
   environment:
     DOCKER_NAME_M: "{{ ACTUAL_DOCKER_NAME_M }}"
   when: >-
-    'M' in group_names and (enable_kv_pool | bool)
+    'M' in group_names and (enable_fusion_pool | bool)
     and existing_master_containers.stdout == ''
   tags: run_docker
 
@@ -102,6 +102,6 @@
     path: "{{ ansible_env.LOG_PATH }}/{{ inventory_hostname }}"
     state: directory
   when:
-    - enable_kv_pool | bool
+    - enable_fusion_pool | bool
     - "'M' in group_names"
   tags: run_docker

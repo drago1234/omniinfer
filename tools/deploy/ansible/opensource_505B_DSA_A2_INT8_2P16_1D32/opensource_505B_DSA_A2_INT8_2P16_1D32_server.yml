@@ -3,9 +3,9 @@
 ---
 - name: Run PanguV2 505B INT8 2P1D Prefill, Decode, and Omni Proxy services.
   # The dedicated mooncake master (group M) is DISABLED by default; enable it
-  # with `-e enable_kv_pool=true`. When disabled, m0 is excluded from
+  # with `-e enable_fusion_pool=true`. When disabled, m0 is excluded from
   # the play entirely (all:!M) and the P workers run without the KV pool.
-  hosts: "{{ 'all' if enable_kv_pool | default(false) | bool else 'all:!M' }}"
+  hosts: "{{ 'all' if enable_fusion_pool | default(false) | bool else 'all:!M' }}"
   any_errors_fatal: true
   max_fail_percentage: 0
   gather_facts: true
@@ -26,9 +26,9 @@
     model_path: "/mnt/sfs_turbo/bucket-910c-6055/rk/ckpt/505B_B005_INT8_open/"
     enable_prefix_caching: true
 
-    # Default OFF. `-e enable_kv_pool=true` deploys the dedicated
+    # Default OFF. `-e enable_fusion_pool=true` deploys the dedicated
     # mooncake master container (group M) and enables the P-side KV pool.
-    enable_kv_pool: false
+    enable_fusion_pool: false
 
     run_docker_profile:
       shm_size: 1000g
@@ -67,9 +67,9 @@
         hugepage_enabled: true
         cpu_bytes_to_use: 858993459200  # 800 GiB
         eviction_policy: arc  # arc or lru
-      # 由 enable_kv_pool=true 控制（M 组部署 + install_kv_pool +
-      # kv_pool_runtime fragment）。
-      kv_pool:
+      # 由 enable_fusion_pool=true 控制（M 组部署 + install_fusion_pool +
+      # fusion_pool_runtime fragment）。
+      fusion_pool:
         global_segment_size_gb: 64
       prepare_commands: |-
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_ALL | replace(' ', '') | trim | quote }}

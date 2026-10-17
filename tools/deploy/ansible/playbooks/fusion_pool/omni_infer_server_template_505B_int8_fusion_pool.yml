@@ -25,8 +25,8 @@
     enable_prefix_caching: true
 
     # Selecting this dedicated playbook enables the M service and P-side pool.
-    enable_kv_pool: true
-    kv_pool_enable_store_events: false
+    enable_fusion_pool: true
+    fusion_pool_enable_store_events: false
 
     # Requires the pool-aware Proxy and a Mooncake master built with ENABLE_KV_EVENTS.
     # These are the measured INT8 settings; override them for other workloads.
@@ -37,7 +37,7 @@
     omni_proxy_pool_w_hbm: 100
     omni_proxy_pool_w_local: 90
     omni_proxy_pool_w_remote: 80
-    mooncake_enable_kv_events: "{{ enable_kv_pool | bool and omni_proxy_pool_aware | bool }}"
+    mooncake_enable_kv_events: "{{ enable_fusion_pool | bool and omni_proxy_pool_aware | bool }}"
 
     run_docker_profile:
       shm_size: 1800g
@@ -97,7 +97,7 @@
         "$DOCKER_NAME_C" bash build.sh --skip-extras
 
     run_server_prefill_profile:
-      kv_pool:
+      fusion_pool:
         global_segment_size_gb: 64
       prepare_commands: |-
         export OMNI_WORKER_CPUSET_MAP=auto
@@ -146,14 +146,14 @@
         # 0.88 + 24576 chunk + 262144 len — ~3 GiB extra physical slack while
         # KV budget ~9.4 GiB still covers rate-1 load (4 seqs x ~0.85 GiB).
         GPU_UTIL=0.88
-        {% if enable_kv_pool | bool %}
-        if [ -f "{{ ansible_env.SCRIPTS_PATH }}/kv_pool_runtime.sh" ]; then
-          . "{{ ansible_env.SCRIPTS_PATH }}/kv_pool_runtime.sh"
+        {% if enable_fusion_pool | bool %}
+        if [ -f "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh" ]; then
+          . "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh"
         fi
         {% endif %}
       args:
         - >-
-          {% if enable_kv_pool | bool %}--kv-transfer-config "${KV_TRANSFER_CONFIG}"{% endif %}
+          {% if enable_fusion_pool | bool %}--kv-transfer-config "${KV_TRANSFER_CONFIG}"{% endif %}
         - --max-model-len 262144
         - --served-model-name {{ model | quote }}
         - '--additional-config ''{"enable_low_latency": true}'''
@@ -167,7 +167,7 @@
       # Decode joins the shared KV pool capacity-only (segment size mirrors
       # the Prefill side): it contributes its segment via the mooncake
       # master but performs no lookup and no saves.
-      kv_pool:
+      fusion_pool:
         global_segment_size_gb: 64
         local_buffer_size_gb: 8
       prepare_commands: |-
@@ -214,14 +214,14 @@
         export VLLM_DISABLE_COMPILE_CACHE=1
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
         GPU_UTIL=0.97
-        {% if enable_kv_pool | bool %}
-        if [ -f "{{ ansible_env.SCRIPTS_PATH }}/kv_pool_runtime.sh" ]; then
-          . "{{ ansible_env.SCRIPTS_PATH }}/kv_pool_runtime.sh"
+        {% if enable_fusion_pool | bool %}
+        if [ -f "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh" ]; then
+          . "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh"
         fi
         {% endif %}
       args:
         - >-
-          {% if enable_kv_pool | bool %}--kv-transfer-config "${KV_TRANSFER_CONFIG}"{% endif %}
+          {% if enable_fusion_pool | bool %}--kv-transfer-config "${KV_TRANSFER_CONFIG}"{% endif %}
         - --max-model-len 262144
         - --served-model-name {{ model | quote }}
         - --tp 1
@@ -258,7 +258,7 @@
         - --omni-proxy-work-aware-short-threshold {{ omni_proxy_work_aware_short_threshold if omni_proxy_schedule_algo == 'work_aware' else 0 }}
         - --omni-proxy-work-aware-service-floor-tokens {{ omni_proxy_work_aware_service_floor_tokens if omni_proxy_schedule_algo == 'work_aware' else 0 }}
         - >-
-          {% if enable_kv_pool | bool and omni_proxy_pool_aware | bool %}
+          {% if enable_fusion_pool | bool and omni_proxy_pool_aware | bool %}
           --omni-proxy-pool-aware-scheduling on
           --omni-proxy-pool-master-events {{ ((hostvars[groups['M'][0]].host_ip | default(hostvars[groups['M'][0]].ansible_host)) ~ ':' ~ (hostvars[groups['M'][0]].mooncake_kv_events_port | default(5599))) | quote }}
           --omni-proxy-pool-master-admin {{ ((hostvars[groups['M'][0]].host_ip | default(hostvars[groups['M'][0]].ansible_host)) ~ ':' ~ ((hostvars[groups['M'][0]].mooncake_metadata_port | default(8081) | int) + 100)) | quote }}
@@ -271,4 +271,4 @@
 
   tasks:
     - ansible.builtin.import_role:
-        name: kv_pool
+        name: fusion_pool
