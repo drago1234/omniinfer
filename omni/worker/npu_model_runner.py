@@ -90,7 +90,10 @@ from omni_npu.v1.layers.attention.weight_utils import refresh_mla_wrappers
 from omni_npu.v1.utils import switch_torch_device
 from omni_npu.worker.npu_input_batch import NPUInputBatch
 from omni_npu.worker.npu_mem_pool import NpuMemAllocator
-from omni_npu.connector.kv_dump import maybe_dump_kv
+from omni_npu.connector.kv_dump import (
+    maybe_dump_kv,
+    maybe_note_mome_cache,
+)
 from omni_npu.diagnostics.nan_inf.detector import NanInfDetector
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
@@ -338,6 +341,7 @@ class NPUModelRunner(GPUModelRunner):
         self._capture_dp_pad_target(forward_context)
         self.exec_count += 1
         logger.debug(f"Executing model forward {self.exec_count=}")
+        maybe_note_mome_cache(self)
         detector = getattr(self, "nan_inf_detector", None)
         checked = detector is not None and detector.should_check(forward_context)
         if checked:

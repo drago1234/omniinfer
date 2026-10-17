@@ -381,6 +381,11 @@ class PrefillWorker:
                 missed.add(req_id)
         self.pending = missed
         if timeout and get_world_group().rank_in_group == 0:
+            kv_timeout = timeout - self.reported
+            if kv_timeout:
+                logger.warning(
+                    f"kv timeout (>{PrefillScheduler.TIMEOUT_WAIT_PULL_DONE}s): "
+                    f"{kv_timeout}")
             send_done |= timeout
         send_done -= self.reported
         self.reported = (self.reported | send_done) & (pending | timeout)
