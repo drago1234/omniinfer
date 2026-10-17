@@ -12,6 +12,7 @@ import ast
 import functools
 import importlib.util
 import logging
+import os
 import sys
 import time
 import types
@@ -461,6 +462,7 @@ def _eagle_dummy_contract():
              PADDING_SLOT_ID=-1, NULL_BLOCK_ID=0,
              set_forward_context=contexts,
              get_forward_context=lambda: SimpleNamespace(capturing=False),
+             maybe_note_mome_cache=lambda *_args, **_kwargs: None,
              _forward_draft_model=lambda proposer, **kwargs: proposer.model(**kwargs)),
         "EagleProposerPatch",
     )
@@ -599,7 +601,7 @@ def test_runner_dummy_call_binds_to_eagle_api():
 
 def test_acl_replay_without_metadata_raises_instead_of_skipping_updates():
     get_params = MagicMock(side_effect=AssertionError("must not look up graph tasks"))
-    namespace = dict(get_graph_params=get_params)
+    namespace = dict(get_graph_params=get_params, os=os)
     update = _function(ROOT / "omni/compilation/acl_graph.py",
                        "_update_graph_tasks", namespace, "ACLGraphWrapper")
     descriptor = MagicMock(num_tokens=2)

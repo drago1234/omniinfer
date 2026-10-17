@@ -39,6 +39,7 @@ from omni_npu.sample.ops.draft_sampling import sample_draft_logits
 from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from omni_npu.attention.backends.mome import NPUMomeAttentionMetadataBuilder
+from omni_npu.connector.kv_dump import maybe_note_mome_cache
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu import envs as omni_envs
@@ -341,6 +342,12 @@ class EagleProposerPatch(VLLMPatch):
                 )
                 if self.method == "mtp" and self.n_predict > 1:
                     model_kwargs["spec_step_idx"] = fwd_idx
+                maybe_note_mome_cache(
+                    self.runner,
+                    draft=True,
+                    draft_head=fwd_idx if self.n_predict > 1 else 0,
+                    draft_step=fwd_idx,
+                )
                 ret_hidden_states = _forward_draft_model(self, **model_kwargs)
 
                 # Mirror active rank's per-iter (forward, compute_logits)
@@ -960,6 +967,12 @@ class EagleProposerPatch(VLLMPatch):
         ):
             forward_context = get_forward_context()
             forward_context.capturing = False
+            maybe_note_mome_cache(
+                self.runner,
+                draft=True,
+                draft_head=0,
+                draft_step=0,
+            )
             ret_hidden_states = _forward_draft_model(self, **model_kwargs)
 
         if not self.model_returns_tuple():
@@ -1190,6 +1203,12 @@ class EagleProposerPatch(VLLMPatch):
                     get_forward_context()
                 )
                 forward_context.capturing = False
+                maybe_note_mome_cache(
+                    self.runner,
+                    draft=True,
+                    draft_head=spec_step_idx if use_multi_mtp else 0,
+                    draft_step=token_index + 1,
+                )
                 ret_hidden_states = _forward_draft_model(self,
                     **model_kwargs
                 )

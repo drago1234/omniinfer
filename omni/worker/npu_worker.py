@@ -469,7 +469,11 @@ class NPUWorker(Worker):
             )
             res = None
         if self._is_auto_profiler_mode():
-            if self.profile_already_start and not self.profile_finished:
+            if (
+                forward_pass
+                and self.profile_already_start
+                and not self.profile_finished
+            ):
                 self.profile_step += 1
             if not self.profile_finished and self.profile_step > self.profiler_stop_step:
                 self.profiler.stop()
