@@ -448,10 +448,23 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             pre_tokens = self.sliding_window if self.sliding_window is not None else 0
             next_tokens = 0
             block_size = kv_cache[0].shape[-2] if use_kv_nz else kv_cache[0].shape[1]
+            key_cache, value_cache = kv_cache
+            if use_kv_nz:
+                # Expose the head dimension so the custom operator recognizes
+                # the paged NZ layout, as in the FIA V2 path below.
+                nz_dim = get_nz_dim(cache_dtype=key_cache.dtype)
+                key_cache = key_cache.view(
+                    -1, self.num_kv_heads, self.head_size // nz_dim,
+                    block_size, nz_dim,
+                )
+                value_cache = value_cache.view(
+                    -1, self.num_kv_heads, self.head_size_v // nz_dim,
+                    block_size, nz_dim,
+                )
             kwargs = {
                 "query": query[: num_actual_tokens],
-                "key": kv_cache[0],
-                "value": kv_cache[1],
+                "key": key_cache,
+                "value": value_cache,
                 "num_query_heads": self.num_heads,
                 "num_key_value_heads": self.num_kv_heads,
                 "input_layout": input_layout,

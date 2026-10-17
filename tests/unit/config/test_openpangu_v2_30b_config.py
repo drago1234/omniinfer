@@ -56,3 +56,28 @@ def test_openpangu_v2_30b_low_latency_config_is_registered():
         "kv_nz": True,
         "enable_moe_init_routing_v2": True,
     }
+
+
+def test_openpangu_v2_30b_bf16_a2_hybrid_config_is_registered():
+    best_practice_configs = _load(
+        "high_throughout/best_practice_configs.json"
+    )
+    matches = [
+        entry
+        for entry in best_practice_configs
+        if entry["model"] == MODEL_NAME
+        and entry["hardware"] == "A2"
+        and entry["precision"] == "bf16"
+    ]
+
+    assert len(matches) == 1
+    assert set(matches[0]["configs"]) == {"hybrid"}
+    relative_path = matches[0]["configs"]["hybrid"]["config_file"]
+    config = _load("high_throughout/" + relative_path)
+
+    assert config["model_parallel_config"] == {}
+    assert config["operator_optimization_config"] == {
+        "kv_nz": True,
+        "enable_moe_init_routing_v2": True,
+        "use_aicpu_fa_tiling": True,
+    }
