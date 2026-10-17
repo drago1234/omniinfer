@@ -131,13 +131,16 @@ def _install_stubs() -> None:
         "omni_npu.attention.backends.utils",
         _maybe_padded_raw_tensor_to_strided_caches=lambda *a, **k: None,
         register_attention_backend=_register_attention_backend,
+        scheme_conv_sp=lambda *a, **k: None,
+        split_decodes_and_prefills=_split_decodes_and_prefills,
     )
     put("omni_npu.model_config")
     put("omni_npu.model_config.config_loader")
     put(
         "omni_npu.model_config.config_loader.loader",
         model_extra_config=SimpleNamespace(
-            parall_config=SimpleNamespace(enable_flashcomm2=False)
+            parall_config=SimpleNamespace(enable_flashcomm2=False),
+            operator_opt_config=SimpleNamespace(enable_mome_sp=False),
         ),
     )
 
@@ -218,7 +221,7 @@ def make_builder(*, num_spec=1, is_decode_node=False, enable_prefix_caching=True
         cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False),
     )
     b.mome_block_size = MOME_BLOCK_SIZE
-    b.reorder_batch_threshold = 1
+    b.reorder_batch_threshold = num_spec + 1
     b.num_spec = num_spec
     b.fake_num_spec = num_spec
     b.use_spec_decode = num_spec > 0
@@ -667,17 +670,11 @@ class TestStep0NumAcceptedTokensSynthesis(unittest.TestCase):
         self.assertEqual(self.captured["common_prefix_len"], 0)
         self.assertIs(self.captured["fast_build"], True)
         self.assertIs(self.captured["num_prompt_tokens"], prompt)
+        self.assertIs(self.captured["for_drafting"], True)
 
 
 class TestAcceptedCountResetBoundary(unittest.TestCase):
-    """``build()``'s in-place reset of the accepted count vs prompt length.
-
-    The reset (num_accepted_tokens -> fake_num_spec + 1) fires only when
-    computed < prompt.  On the first decode round (computed == prompt) the
-    count produced by the previous MTP schedule must survive: masking it
-    back there points the kernel read at the stale draft tail of the
-    previous iteration instead of the committed history.
-    """
+    """Hybrid target prefill owns a different state tail from PD and drafting."""
 
     def _build(self, *, seq_len, query_len, prompt, accepted):
         builder = make_builder(num_spec=2)  # fake_num_spec = 2
@@ -698,15 +695,90 @@ class TestAcceptedCountResetBoundary(unittest.TestCase):
         )
         return seen["num_accepted_tokens"]
 
-    def test_computed_equals_prompt_keeps_accepted_count(self):
+    def test_hybrid_target_at_prompt_boundary_resets_accepted_count(self):
         # First decode round after a full prefill: computed == prompt.
         self.assertEqual(self._build(seq_len=10, query_len=2, prompt=8,
-                                     accepted=5).tolist(), [5])
+                                     accepted=5).tolist(), [3])
 
     def test_computed_below_prompt_resets_accepted_count(self):
         # Chunked prefill continuation: computed 7 < prompt 8.
         self.assertEqual(self._build(seq_len=9, query_len=2, prompt=8,
                                      accepted=5).tolist(), [3])
+
+
+class TestHybridPrefillStateBoundary(unittest.TestCase):
+    """Use the real builder to check the history consumed by the MoME kernel."""
+
+    def _build(self, *, pd=False, drafting=False, draft_index=1, accepted=None,
+               prefix_caching=True):
+        builder = make_builder(num_spec=3, is_decode_node=pd,
+                               enable_prefix_caching=prefix_caching)
+        if pd == "producer":
+            builder.is_decode_node = False
+        builder.mome_block_size = 128
+        builder.kernel_width = 3
+        # A resumed prefill, first decode, and later decode in the same batch.
+        cm = FakeCommonAttentionMetadata(
+            seq_lens=[22912, 22916, 22917], query_lens=[1, 4, 4])
+        cm.block_table_tensor = torch.arange(180, dtype=torch.int32).repeat(3, 1)
+        prompt = torch.full((3,), 22912, dtype=torch.int32)
+        if accepted is None:
+            accepted = torch.ones(3, dtype=torch.int32)
+        if drafting:
+            metadata = builder.build_for_drafting(
+                cm, draft_index=draft_index, num_accepted_tokens=accepted,
+                num_prompt_tokens=prompt)
+        else:
+            metadata = builder.build(
+                0, cm, num_accepted_tokens=accepted, num_prompt_tokens=prompt)
+        return metadata, accepted
+
+    def test_first_target_decode_reads_initialized_prompt_tail(self):
+        metadata, accepted = self._build()
+        self.assertEqual(metadata.num_accepted_tokens.tolist(), [4, 4, 1])
+        self.assertEqual(metadata.block_idx_last_computed_token.tolist(), [178, 178, 179])
+        self.assertEqual(metadata.block_idx_first_scheduled_token.tolist(), [178, 179, 179])
+        self.assertEqual(accepted.tolist(), [1, 1, 1])  # Do not mutate runner state.
+
+        # Only the final two states of the prompt block are initialized; the
+        # next block is poisoned, as in the captured 22,912-token bad case.
+        states = torch.full((180, 5), float("nan"))
+        states[178, -2:] = torch.tensor([7.0, 11.0])
+        block = metadata.block_idx_last_computed_token[1].item()
+        offset = metadata.num_accepted_tokens[1].item() - 1
+        torch.testing.assert_close(states[block, offset:offset + 2],
+                                   torch.tensor([7.0, 11.0]))
+
+    def test_pd_decode_keeps_existing_history_offsets(self):
+        metadata, _ = self._build(pd=True)
+        self.assertEqual(metadata.num_accepted_tokens.tolist(), [3, 1, 1])
+        self.assertEqual(metadata.block_idx_last_computed_token.tolist(), [178, 179, 179])
+
+    def test_pd_producer_keeps_existing_history_offsets(self):
+        metadata, _ = self._build(pd="producer")
+        self.assertEqual(metadata.num_accepted_tokens.tolist(), [4, 1, 1])
+        self.assertEqual(metadata.block_idx_last_computed_token.tolist(), [178, 179, 179])
+
+    def test_hybrid_drafter_keeps_explicit_history_offsets(self):
+        for draft_index in (0, 1):
+            with self.subTest(draft_index=draft_index):
+                metadata, _ = self._build(drafting=True, draft_index=draft_index)
+                self.assertEqual(metadata.num_accepted_tokens.tolist(), [4, 1, 1])
+                self.assertEqual(metadata.block_idx_last_computed_token.tolist(), [178, 179, 179])
+
+    def test_hybrid_draft_step0_keeps_synthesized_history_offset(self):
+        builder = make_builder(num_spec=3)
+        builder.kernel_width = 3
+        cm = FakeCommonAttentionMetadata(seq_lens=[12], query_lens=[4])
+        metadata = builder.build_for_drafting(
+            cm, draft_index=0, num_prompt_tokens=torch.tensor([8], dtype=torch.int32))
+        self.assertEqual(metadata.num_accepted_tokens.tolist(), [2])
+        self.assertEqual(metadata.block_idx_last_computed_token.tolist(), [2])
+
+    def test_target_without_prefix_cache_still_reads_prefill_tail(self):
+        metadata, _ = self._build(prefix_caching=False)
+        self.assertEqual(metadata.num_accepted_tokens.tolist(), [4, 4, 1])
+        self.assertIsNone(metadata.block_idx_last_computed_token)
 
 
 class TestStep0EndToEnd(unittest.TestCase):
