@@ -46,6 +46,63 @@ def make_model_extra_config(
     )
 
 
+@pytest.mark.parametrize("capturing", [False, True])
+@pytest.mark.parametrize("kv_nz", [False, True])
+def test_zero_sink_aicpu_uses_device_metadata_without_graph_task_updates(
+    npu_attention_classes, monkeypatch, capturing, kv_nz,
+):
+    module = npu_attention_classes["attention_module"]
+    impl_cls = npu_attention_classes["NPUAttentionBackendImpl"]
+    monkeypatch.setattr(module, "model_extra_config", make_model_extra_config(
+        kv_nz=kv_nz, use_aicpu_fa_tiling=True,
+    ))
+    monkeypatch.setattr(impl_cls, "SHARE_MASK_TRIL_SPARSE", torch.zeros(1))
+    monkeypatch.setattr(impl_cls, "_init_cross_layer_shared_ops", lambda self: None)
+    monkeypatch.setattr(module, "get_forward_context", lambda: types.SimpleNamespace(
+        capturing=capturing, batch_descriptor=None,
+    ))
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: None)
+    monkeypatch.setattr(torch.npu, "get_stream_limit", lambda _: {
+        "cube_core_num": 20, "vector_core_num": 40,
+    })
+    meta_tensor = torch.zeros(1024, dtype=torch.int32)
+    metadata_op = MagicMock(return_value=meta_tensor)
+    graph_task = MagicMock()
+    query = torch.randn(4, 24, 128)
+    sink_op = MagicMock(return_value=(query,))
+    monkeypatch.setattr(module, "npu_fused_infer_attention_sink_metadata", metadata_op)
+    monkeypatch.setattr(module, "capture_graph_task", graph_task)
+    monkeypatch.setattr(torch.ops.custom, "npu_fused_infer_attention_sink", sink_op)
+    impl = impl_cls(24, 128, 128 ** -0.5, num_kv_heads=4, sink_len=0)
+    shape = (2, 32, 128, 16) if kv_nz else (2, 128, 512)
+    cache = (torch.zeros(shape), torch.zeros(shape))
+    metadata = types.SimpleNamespace(
+        num_actual_tokens=4, query_start_loc=torch.tensor([0, 4]),
+        seq_lens=torch.tensor([17]), block_tables=torch.tensor([[0, 1]]),
+        slot_mapping=None, is_pure_prefill_without_prefix_and_use_kvnz=False,
+    )
+    layer = types.SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    output = torch.empty_like(query)
+    impl.forward(layer, query, None, None, cache, metadata, output)
+    graph_task.assert_not_called()
+    metadata_op.assert_called_once()
+    metadata_args = metadata_op.call_args.args[0]
+    assert metadata_args["num_heads_q"] == 24
+    assert metadata_args["num_heads_kv"] == 4
+    assert metadata_args["sink_num"] == 0
+    assert metadata_args["actual_seq_lengths"].dtype == torch.int64
+    kwargs = sink_op.call_args.kwargs
+    assert kwargs["meta_data"] is meta_tensor
+    assert kwargs["sink_number"] == 0
+    assert kwargs["sparse_mode"] == 3
+    assert kwargs["key"].shape == ((2, 4, 8, 128, 16) if kv_nz else shape)
+    assert kwargs["key"].data_ptr() == cache[0].data_ptr()
+    assert kwargs["value"].shape == kwargs["key"].shape
+    assert kwargs["value"].data_ptr() == cache[1].data_ptr()
+    assert cache[0].shape == cache[1].shape == shape
+    torch.testing.assert_close(output, query)
+
+
 class SinkLenZeroThenNone:
 
     def __init__(self, impl):
@@ -62,6 +119,10 @@ def npu_attention_classes(monkeypatch):
     Module-scoped fixture that sets up NPU attention backend classes.
     Uses patches to mock vLLM dependencies and provides clean isolation.
     """
+    # Load layers before replacing vllm.distributed with the narrow test stub;
+    # their real imports include vllm.distributed.kv_transfer.
+    importlib.import_module("omni_npu.layers")
+
     # Define a TypeVar for the metadata type
     MetadataT = TypeVar('MetadataT')
 

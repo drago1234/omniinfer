@@ -1,5 +1,15 @@
 [
     {
+        "model": "openpangu_v2_omni_30B",
+        "hardware": "A2",
+        "precision": "bf16",
+        "configs": {
+            "hybrid": {
+                "config_file": "openpangu_v2/openpangu_v2_omni_30b_bf16_a2_hybrid.json"
+            }
+        }
+    },
+    {
         "model": "deepseek_v3",
         "hardware": "A3",
         "precision": "w8a8c16",
