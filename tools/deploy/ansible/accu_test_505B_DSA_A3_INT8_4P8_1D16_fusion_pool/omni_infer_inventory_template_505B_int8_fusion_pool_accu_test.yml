@@ -86,7 +86,7 @@ all:
     M:
       vars:
         # mooncake master service ports; shared by the master startup command
-        # and _kv_pool_runtime.sh.j2 (P-side mooncake.json).
+        # and _fusion_pool_runtime.sh.j2 (P-side mooncake.json).
         mooncake_metadata_port: 8081
         mooncake_rpc_port: 16752
       hosts:

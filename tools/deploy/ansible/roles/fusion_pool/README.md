@@ -7,14 +7,14 @@
 ## 入口与阶段
 
 独立的 92B BF16 1P1D 场景位于
-[`playbooks/kv_pool/`](../../playbooks/kv_pool/)，对应的 P/D/C/M 配置位于
-[`inventories/kv_pool/`](../../inventories/kv_pool/)。原有普通 Playbook 不接入本 role。
+[`playbooks/fusion_pool/`](../../playbooks/fusion_pool/)，对应的 P/D/C/M 配置位于
+[`inventories/fusion_pool/`](../../inventories/fusion_pool/)。原有普通 Playbook 不接入本 role。
 新 Playbook 选择以下入口：
 
 ```yaml
 tasks:
   - ansible.builtin.import_role:
-      name: kv_pool
+      name: fusion_pool
 ```
 
 | 阶段 | 实现 |
@@ -31,29 +31,29 @@ tasks:
 
 ## 配置
 
-`enable_kv_pool` 和 `kv_pool_repo_root` 保持为顶层配置。
-角色默认关闭 KV pool，独立 KV pool Playbook 显式设置 `enable_kv_pool: true`：
+`enable_fusion_pool` 和 `fusion_pool_repo_root` 保持为顶层配置。
+角色默认关闭 KV pool，独立 KV pool Playbook 显式设置 `enable_fusion_pool: true`：
 
 ```yaml
-enable_kv_pool: false
-kv_pool_repo_root: "{{ (role_path ~ '/../../../../../../Pangu-Fusion') | realpath }}"
+enable_fusion_pool: false
+fusion_pool_repo_root: "{{ (role_path ~ '/../../../../../../Pangu-Fusion') | realpath }}"
 ```
 
-只覆盖 `enable_kv_pool` 时仍使用默认的外部仓库路径。
+只覆盖 `enable_fusion_pool` 时仍使用默认的外部仓库路径。
 关闭时不加载外部模块。M 实际容器名只在启用
 且处理 M 主机时由 `ansible_env.DOCKER_NAME_M` 生成。M 容器仅在不存在时创建，
 不会随 P/D/C 重部署删除。
 
-`kv_pool_repo_root` 指向执行机上的 Pangu-Fusion checkout，默认定位到
+`fusion_pool_repo_root` 指向执行机上的 Pangu-Fusion checkout，默认定位到
 OmniInfer 仓库旁的 `Pangu-Fusion` 目录。路径由 role 所在位置解析，不随
 Playbook 移入子目录而改变；部署时可覆盖为实际绝对路径。启用前须准备兼容的：
 
-- `Pangu-FusionPool/kv_pool/deploy/install_kv_pool.yml`
-- `Pangu-FusionPool/kv_pool/deploy/run_mooncake_master.yml`
-- `Pangu-FusionPool/kv_pool/deploy/_kv_pool_runtime.sh.j2`
+- `Pangu-FusionPool/fusion_pool/deploy/install_fusion_pool.yml`
+- `Pangu-FusionPool/fusion_pool/deploy/run_mooncake_master.yml`
+- `Pangu-FusionPool/fusion_pool/deploy/_fusion_pool_runtime.sh.j2`
 
 本 role 不获取外部仓库；外部模块继续维护安装、master 启动和 runtime 的实现。
-`run_server_prefill_profile.kv_pool` 与以下专用默认值递归合并：
+`run_server_prefill_profile.fusion_pool` 与以下专用默认值递归合并：
 
 ```yaml
 global_segment_size_gb: 32
@@ -84,8 +84,8 @@ master 启动任务。单独选择 `run_server` 不自动追加 master 启动，
 部署前复制到自己的配置目录并填写节点地址、设备及连接信息：
 
 ```bash
-PLAYBOOK=playbooks/kv_pool/omni_infer_server_template_performance1P1D_92B_bf16_kv_pool.yml
-INVENTORY=inventories/kv_pool/omni_infer_inventory_used_for_1P8_1D8_for_kv_pool.yml
+PLAYBOOK=playbooks/fusion_pool/omni_infer_server_template_performance1P1D_92B_bf16_fusion_pool.yml
+INVENTORY=inventories/fusion_pool/omni_infer_inventory_used_for_1P8_1D8_for_fusion_pool.yml
 
 # 以下检查不执行部署。
 ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --syntax-check
@@ -93,8 +93,8 @@ ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --list-hosts
 ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --list-tags
 
 # 实际部署使用已填写的 Inventory 与兼容的外部模块。
-ansible-playbook -i /path/to/kv_pool_inventory.yml "$PLAYBOOK" \
-  -e kv_pool_repo_root=/path/to/Pangu-Fusion
+ansible-playbook -i /path/to/fusion_pool_inventory.yml "$PLAYBOOK" \
+  -e fusion_pool_repo_root=/path/to/Pangu-Fusion
 ```
 
 仓库的 `ansible.cfg` 仍使用 `roles_path = roles`，嵌套 Playbook 无需更改 role

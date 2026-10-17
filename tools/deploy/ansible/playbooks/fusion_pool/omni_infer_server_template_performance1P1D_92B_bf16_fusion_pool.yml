@@ -24,7 +24,7 @@
     model_path: "/mnt/sfs_turbo/bucket-910c-6055/s00562949/models/openPangu_2.0_Flash_BF16/global_step_26/"
 
     # Selecting this dedicated playbook enables the M service and P-side pool.
-    enable_kv_pool: true
+    enable_fusion_pool: true
 
     run_docker_profile:
       shm_size: 1600g
@@ -85,9 +85,9 @@
         "$DOCKER_NAME_C" bash build.sh --skip-extras
 
     run_server_prefill_profile:
-      # 由 enable_kv_pool=true 控制（M 组部署 + install_kv_pool +
-      # kv_pool_runtime fragment）。
-      kv_pool:
+      # 由 enable_fusion_pool=true 控制（M 组部署 + install_fusion_pool +
+      # fusion_pool_runtime fragment）。
+      fusion_pool:
         global_segment_size_gb: 64
       prepare_commands: |-
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_ALL | replace(' ', '') | trim | quote }}
@@ -125,14 +125,14 @@
         EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
         REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","ban_sequence_end_in_thinking":true}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
-        {% if enable_kv_pool | bool %}
-        if [ -f "{{ ansible_env.SCRIPTS_PATH }}/kv_pool_runtime.sh" ]; then
-          . "{{ ansible_env.SCRIPTS_PATH }}/kv_pool_runtime.sh"
+        {% if enable_fusion_pool | bool %}
+        if [ -f "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh" ]; then
+          . "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh"
         fi
         {% endif %}
       args:
         - >-
-          {% if enable_kv_pool | bool %}--kv-transfer-config "${KV_TRANSFER_CONFIG}"{% endif %}
+          {% if enable_fusion_pool | bool %}--kv-transfer-config "${KV_TRANSFER_CONFIG}"{% endif %}
         - --max-model-len 524288
         - --served-model-name {{ model | quote }}
         - '--additional-config ''{"enable_low_latency": true}'''
@@ -146,7 +146,7 @@
       # Decode joins the shared KV pool capacity-only (segment size mirrors
       # the Prefill side): it contributes its segment via the mooncake
       # master but performs no lookup and no saves.
-      kv_pool:
+      fusion_pool:
         global_segment_size_gb: 64
         local_buffer_size_gb: 8
       prepare_commands: |-
@@ -194,14 +194,14 @@
         EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
         REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","ban_sequence_end_in_thinking":true}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
-        {% if enable_kv_pool | bool %}
-        if [ -f "{{ ansible_env.SCRIPTS_PATH }}/kv_pool_runtime.sh" ]; then
-          . "{{ ansible_env.SCRIPTS_PATH }}/kv_pool_runtime.sh"
+        {% if enable_fusion_pool | bool %}
+        if [ -f "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh" ]; then
+          . "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh"
         fi
         {% endif %}
       args:
         - >-
-          {% if enable_kv_pool | bool %}--kv-transfer-config "${KV_TRANSFER_CONFIG}"{% endif %}
+          {% if enable_fusion_pool | bool %}--kv-transfer-config "${KV_TRANSFER_CONFIG}"{% endif %}
         - --max-model-len 524288
         - --served-model-name {{ model | quote }}
         - --tp 1
@@ -238,4 +238,4 @@
 
   tasks:
     - ansible.builtin.import_role:
-        name: kv_pool
+        name: fusion_pool

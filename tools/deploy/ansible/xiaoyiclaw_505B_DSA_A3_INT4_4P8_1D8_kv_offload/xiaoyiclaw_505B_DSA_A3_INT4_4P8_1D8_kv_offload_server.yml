@@ -66,9 +66,9 @@
         # 分片 DDR 载入：每卡只从 DDR 读 1/tp，卡间 all-gather 拼齐；不满足条件时各卡一致退回原路径。
         # 特性默认关，这里只是把开关摆出来；要开改成 true。
         sharded_load: false
-      # 由 enable_kv_pool=true 控制（M 组部署 + install_kv_pool +
-      # kv_pool_runtime fragment）。
-      kv_pool:
+      # 由 enable_fusion_pool=true 控制（M 组部署 + install_fusion_pool +
+      # fusion_pool_runtime fragment）。
+      fusion_pool:
         global_segment_size_gb: 64
       prepare_commands: |-
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_ALL | replace(' ', '') | trim | quote }}
