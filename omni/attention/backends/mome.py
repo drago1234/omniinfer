@@ -425,6 +425,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         num_prompt_tokens: torch.Tensor | None = None,
         allow_runner_num_prompt_tokens: bool = True,
         draft_step0: bool = False,
+        for_drafting: bool = False,
     ) -> NPUMomeAttentionMetadata:
         """
         Build Mome attention metadata from common attention metadata.
@@ -463,7 +464,15 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             # would point the read at the stale draft tail of the previous
             # iteration instead of the committed history.
             if not draft_step0:
-                num_accepted_tokens.masked_fill_(num_computed_tokens < num_prompt_tokens, self.fake_num_spec + 1)
+                previous_prefill = num_computed_tokens < num_prompt_tokens
+                if not self.is_pd_disagg and not for_drafting:
+                    # Hybrid target prefill only writes the prompt tail. Drafting
+                    # updates a separate model's state, not this target cache.
+                    # At equality, reset the history offset before computing the
+                    # block index; otherwise a full prompt block reads the next,
+                    # unwritten state block. Keep PD and drafter semantics intact.
+                    previous_prefill = num_computed_tokens <= num_prompt_tokens
+                num_accepted_tokens.masked_fill_(previous_prefill, self.fake_num_spec + 1)
 
         # if the current schedule is the recompute of the last prompt,
         # we reset num_accepted_tokens = fake_num_spec to let the kernel read the [-3:-1] tokens from the cache
@@ -684,6 +693,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             fast_build=True,
             num_prompt_tokens=num_prompt_tokens,
             draft_step0=draft_step0_synthesized,
+            for_drafting=True,
         )
 
     def build_for_cudagraph_capture(self, common_attn_metadata: CommonAttentionMetadata):
