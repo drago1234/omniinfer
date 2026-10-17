@@ -1,0 +1,199 @@
+{
+  "name": "rltraining_505B_DSA_A3_BF16_1P32_1D32",
+  "version": "1.0.0",
+  "description": "",
+  "type": "REAL_TIME",
+  "deploy_type": "MULTI",
+  "group_configs": [
+    {
+      "advanced_config": {
+        "custom_metrics_path": "",
+        "deploy_timeout_minutes": 60,
+        "dynamic_routing_enable": false,
+        "ems_enable": false,
+        "mooncake_enable": false,
+        "port": 7000,
+        "protocol": "HTTP",
+        "service_secret": {
+          "group_enable": false,
+          "secret_enable": false,
+          "secret_volumes": []
+        },
+        "upgrade_config": {
+          "rolling_update": {
+            "max_surge": "25%",
+            "max_unavailable": "25%"
+          },
+          "type": "ROLLING"
+        }
+      },
+      "count": 1,
+      "deploy_type": "MULTI",
+      "description": "",
+      "framework": "COMMON",
+      "high_avail_switch": true,
+      "mirror_traffic_enable": false,
+      "mirror_traffic_weight": 0,
+      "model": {
+        "source": "EFS",
+        "mount_path": "/mnt",
+        "efs_sub_path": "/",
+        "read_only": false,
+        "host_cache": false,
+        "source_id": "631e010d-948c-11f1-88b7-fa163ee29cb4",
+        "os_warm_up": false
+      },
+      "pool_id": "pool-b1f625b8-e05e-4977-ada7-7ec9b550c481",
+      "priority": 1,
+      "schedule_strategy": "HIGH_AVAILABILITY",
+      "secret_type": "dew",
+      "system_log_dump_enable": false,
+      "unit_configs": [
+        {
+          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/model_arts\n\nTORCH_DEVICE_BACKEND_AUTOLOAD=0 bash \"${SCRIPT_PATH}/proxy.sh\" \\\n  --omni-proxy-pd-policy sequential \\\n  --omni-proxy-max-batch-num-token 100000 \\\n  --omni-proxy-prefill-max-num-seqs 32 \\\n  --omni-proxy-decode-max-num-seqs 8 \\\n  --core-num 4 \\\n  --start-core-index 16 &&\n\nexport BASE_API_PORT=9000\nexport HCCL_BUFFSIZE=200\nexport gpu_util=0.8\nexport max_num_seqs=32\nexport max_num_batched_tokens=65536\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"/workspace/omniinfer/components/omni-npu/src/omni_npu/model_config/configs/high_throughout/openpangu_v2/openpangu_v2_505b_bf16_a3_1p1d_precision_consistency_p.json\"\nexport CUSTOM_MODEL_CONFIG_PATH=\"${OMNI_CUSTOM_MODEL_CONFIG_PATH}\"\n\nbash \"${SCRIPT_PATH}/prefill.sh\" \\\n  --dtype bfloat16 \\\n  --max-model-len 163840 \\\n  --max-num-seqs 32 \\\n  --max-num-batched-tokens 65536 \\\n  --enable-logging-iteration-details \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --enforce-eager \\\n  --enable-expert-parallel \\\n  --enable-prefix-caching \\\n  --no-async-scheduling \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity",
+          "codes": [],
+          "count": 4,
+          "custom_spec": {
+            "arch": "arm64",
+            "ascend": 16,
+            "card": 8.0,
+            "cpu": 300,
+            "memory": 2000000.0,
+            "ratio": 2,
+            "type_alias": "Snt9b23"
+          },
+          "dumps": [],
+          "envs": {
+            "MODEL_PATH": "/mnt/bucket-910c-6055/lijun/505B/index_cache/iter_0009525",
+            "MODEL_NAME": "pangu_ultra_moe",
+            "PREFILL_INSTANCE_NUM": "1",
+            "DECODE_INSTANCE_NUM": "1",
+            "PROXY_PORT": "7000",
+            "ENABLE_OMNI_CACHE": "0",
+            "dtype": "bfloat16",
+            "max_model_len": "163840",
+            "ASCEND_GLOBAL_LOG_LEVEL": "3",
+            "TASK_QUEUE_ENABLE": "1",
+            "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+            "HCCL_CONNECT_TIMEOUT": "1800",
+            "HCCL_EXEC_TIMEOUT": "1800",
+            "HCCL_OP_RETRY_ENABLE": "L0:0,L1:0,L2:0",
+            "HCCL_DETERMINISTIC": "STRICT",
+            "HCCL_OP_EXPANSION_MODE": "AI_CPU",
+            "VLLM_ENABLE_MC2": "1",
+            "OMNI_NPU_PATCHES_DIR": "pangu_v2_hybrid",
+            "OMNI_VLLM_PATCHES": "ALL",
+            "OMNI_NPU_VLLM_PATCHES": "ALL",
+            "VLLM_PLUGINS": "omni-npu,omni_npu_patches,omni_custom_models",
+            "VLLM_SERVER_DEV_MODE": "1"
+          },
+          "files": [],
+          "group_count": 1,
+          "image": {
+            "category": "CPU",
+            "id": "1ee3ce93-436a-11f1-9299-0255ac10016b",
+            "source": "SWR_PRO",
+            "swr_path": "swr-aifm-exp-t3bbun.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-rl-1.1.0-arm-py311-a3-cann.8.5.1.b110-pta_2.9.0-op-1.2.1.post2-omni_release_1.1.0.post1-rl_master-202608300627:0.0.1"
+          },
+          "models": [],
+          "name": "prefill",
+          "npu_reset_enable": false,
+          "recovery": "Instance",
+          "role": "COMMON",
+          "security_config": {},
+          "termination_grace": {
+            "termination_grace_period_seconds": 30
+          }
+        },
+        {
+          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/model_arts\n\nexport BASE_API_PORT=9100\nexport HCCL_BUFFSIZE=200\nexport HCCL_EP_BUFFSIZE=300\nexport gpu_util=0.80\nexport tp=1\nexport dp=64\nexport max_num_seqs=8\nexport max_num_batched_tokens=32\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"/workspace/omniinfer/components/omni-npu/src/omni_npu/model_config/configs/high_throughout/openpangu_v2/openpangu_v2_505b_bf16_a3_1p1d_precision_consistency_d.json\"\nexport CUSTOM_MODEL_CONFIG_PATH=\"${OMNI_CUSTOM_MODEL_CONFIG_PATH}\"\n\nbash \"${SCRIPT_PATH}/decode.sh\" \\\n  --dtype bfloat16 \\\n  --max-model-len 163840 \\\n  --max-num-seqs 8 \\\n  --max-num-batched-tokens 32 \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --enable-expert-parallel \\\n  --disable-log-requests \\\n  --enable-prefix-caching \\\n  --no-async-scheduling \\\n  --distributed-executor-backend mp \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --compilation-config '{\"level\":3,\"cudagraph_mode\":\"FULL\",\"backend\":\"eager\",\"cudagraph_capture_sizes\":[4,8,16,32],\"compile_sizes\":[4,8,16,32]}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity",
+          "codes": [],
+          "count": 4,
+          "custom_spec": {
+            "arch": "arm64",
+            "ascend": 16,
+            "card": 8.0,
+            "cpu": 300,
+            "memory": 2000000.0,
+            "ratio": 2,
+            "type_alias": "Snt9b23"
+          },
+          "dumps": [],
+          "envs": {
+            "MODEL_PATH": "/mnt/bucket-910c-6055/lijun/505B/index_cache/iter_0009525",
+            "MODEL_NAME": "pangu_ultra_moe",
+            "PREFILL_INSTANCE_NUM": "1",
+            "DECODE_INSTANCE_NUM": "1",
+            "PROXY_PORT": "7000",
+            "ENABLE_OMNI_CACHE": "0",
+            "dtype": "bfloat16",
+            "max_model_len": "163840",
+            "ASCEND_GLOBAL_LOG_LEVEL": "3",
+            "TASK_QUEUE_ENABLE": "1",
+            "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+            "HCCL_CONNECT_TIMEOUT": "1800",
+            "HCCL_EXEC_TIMEOUT": "1800",
+            "HCCL_OP_RETRY_ENABLE": "L0:0,L1:0,L2:0",
+            "HCCL_DETERMINISTIC": "STRICT",
+            "HCCL_OP_EXPANSION_MODE": "AI_CPU",
+            "VLLM_ENABLE_MC2": "1",
+            "OMNI_NPU_PATCHES_DIR": "pangu_v2_hybrid",
+            "OMNI_VLLM_PATCHES": "ALL",
+            "OMNI_NPU_VLLM_PATCHES": "ALL",
+            "VLLM_PLUGINS": "omni-npu,omni_npu_patches,omni_custom_models",
+            "VLLM_SERVER_DEV_MODE": "1"
+          },
+          "files": [],
+          "group_count": 1,
+          "image": {
+            "category": "CPU",
+            "id": "1ee3ce93-436a-11f1-9299-0255ac10016b",
+            "source": "SWR_PRO",
+            "swr_path": "swr-aifm-exp-t3bbun.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-rl-1.1.0-arm-py311-a3-cann.8.5.1.b110-pta_2.9.0-op-1.2.1.post2-omni_release_1.1.0.post1-rl_master-202608300627:0.0.1"
+          },
+          "models": [],
+          "name": "decode",
+          "npu_reset_enable": false,
+          "recovery": "Instance",
+          "role": "COMMON",
+          "security_config": {},
+          "termination_grace": {
+            "termination_grace_period_seconds": 30
+          }
+        }
+      ],
+      "weight": 0,
+      "workload_type": "LWS",
+      "name": "deploy-rltraining_505B_DSA_A3_BF16_1P32_1D32"
+    }
+  ],
+  "workspace_id": "1d670a16e0b34acbb27975dfec4d3790",
+  "workload_type": "LWS",
+  "runtime_config": {
+    "service_invoke": {
+      "port": 7000,
+      "protocol": "HTTPS",
+      "auth_type": "API_KEY",
+      "dynamic_routing_enable": false,
+      "ems_enable": false,
+      "internet_access_enable": true,
+      "intranet_approval_enable": true,
+      "request_retry_enable": false
+    },
+    "service_limit": {
+      "rate_limit": {
+        "num": 200,
+        "unit": "SECONDS"
+      },
+      "request_size_limit": 20,
+      "request_timeout": 30,
+      "ip_white_list": [],
+      "ip_black_list": []
+    },
+    "service_secret": {
+      "group_enable": false,
+      "secret_enable": false,
+      "secret_volumes": []
+    }
+  }
+}
