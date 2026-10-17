@@ -181,27 +181,14 @@ class TestW4A8MXFPConfig:
         )
         assert config.group_size == 64
         assert config.ignored_layers == ["lm_head"]
-        assert config.enable_mxfp8_comm_quant is False
         assert config.get_name() == "w4a8_mxfp"
 
-    def test_from_config_mxfp8_comm_quant(self, w4_module):
+    def test_from_config_ignores_legacy_comm_quant(self, w4_module):
         module, _ = w4_module
         config = module.W4A8MXFPConfig.from_config(
             {"enable_mxfp8_comm_quant": True}
         )
-
-        assert config.enable_mxfp8_comm_quant is True
-        assert config._mxfp8_config.enable_mxfp8_comm_quant is True
-
-    def test_from_config_rejects_non_bool_mxfp8_comm_quant(
-        self,
-        w4_module,
-    ):
-        module, _ = w4_module
-        with pytest.raises(ValueError, match="must be bool"):
-            module.W4A8MXFPConfig.from_config(
-                {"enable_mxfp8_comm_quant": "true"}
-            )
+        assert not hasattr(config, "enable_mxfp8_comm_quant")
 
     def test_default_group_size(self, w4_module):
         module, _ = w4_module

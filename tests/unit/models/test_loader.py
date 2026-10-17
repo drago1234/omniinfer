@@ -227,6 +227,39 @@ class TestConfigLoaderUnit(unittest.TestCase):
                 self.assertEqual(parallel.ena_context_parallel, role == "p")
                 self.assertFalse(operator.enable_mome_sp)
 
+    def test_mxfp8_comm_quant_default(self):
+        from omni_npu.model_config.config_loader.loader import ModelOperatorOptConfig
+
+        self.assertFalse(ModelOperatorOptConfig().enable_mxfp8_comm_quant)
+
+    def test_model_operator_opt_config_enable_mxfp8_comm_quant_from_config(self):
+        """Test _init_model_extra_config loads enable_mxfp8_comm_quant from operator config"""
+        from omni_npu.model_config.config_loader.loader import (
+            _init_model_extra_config,
+            TaskConfig,
+            model_extra_config,
+        )
+
+        task_config = TaskConfig()
+        # Restore every singleton attribute replaced by the config loader,
+        # including when initialization or the assertion raises.
+        with patch.multiple(
+            model_extra_config,
+            task_config=model_extra_config.task_config,
+            parall_config=model_extra_config.parall_config,
+            operator_opt_config=model_extra_config.operator_opt_config,
+        ), patch(
+            "omni_npu.model_config.config_loader.loader._get_best_practice_config",
+            return_value={
+                "model_parallel_config": {},
+                "operator_optimization_config": {"enable_mxfp8_comm_quant": True},
+            },
+        ):
+            _init_model_extra_config(task_config)
+            self.assertTrue(
+                model_extra_config.operator_opt_config.enable_mxfp8_comm_quant
+            )
+
     def test_model_operator_opt_config_lmhead_fp32_from_config(self):
         """Test _init_model_extra_config loads lmhead_fp32 from operator config"""
         from omni_npu.model_config.config_loader.loader import (
