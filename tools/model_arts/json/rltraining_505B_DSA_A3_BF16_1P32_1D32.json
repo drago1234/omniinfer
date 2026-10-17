@@ -1,5 +1,5 @@
 {
-  "name": "rltraining_505B_DSA_A3_BF16_1P16_1D16",
+  "name": "rltraining_505B_DSA_A3_BF16_1P32_1D32",
   "version": "1.0.0",
   "description": "",
   "type": "REAL_TIME",
@@ -52,7 +52,7 @@
         {
           "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/model_arts\n\nTORCH_DEVICE_BACKEND_AUTOLOAD=0 bash \"${SCRIPT_PATH}/proxy.sh\" \\\n  --omni-proxy-pd-policy sequential \\\n  --omni-proxy-max-batch-num-token 100000 \\\n  --omni-proxy-prefill-max-num-seqs 32 \\\n  --omni-proxy-decode-max-num-seqs 8 \\\n  --core-num 4 \\\n  --start-core-index 16 &&\n\nexport BASE_API_PORT=9000\nexport HCCL_BUFFSIZE=200\nexport gpu_util=0.8\nexport max_num_seqs=32\nexport max_num_batched_tokens=65536\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"/workspace/omniinfer/components/omni-npu/src/omni_npu/model_config/configs/high_throughout/openpangu_v2/openpangu_v2_505b_bf16_a3_1p1d_precision_consistency_p.json\"\nexport CUSTOM_MODEL_CONFIG_PATH=\"${OMNI_CUSTOM_MODEL_CONFIG_PATH}\"\n\nbash \"${SCRIPT_PATH}/prefill.sh\" \\\n  --dtype bfloat16 \\\n  --max-model-len 163840 \\\n  --max-num-seqs 32 \\\n  --max-num-batched-tokens 65536 \\\n  --enable-logging-iteration-details \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --enforce-eager \\\n  --enable-expert-parallel \\\n  --enable-prefix-caching \\\n  --no-async-scheduling \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity",
           "codes": [],
-          "count": 2,
+          "count": 4,
           "custom_spec": {
             "arch": "arm64",
             "ascend": 16,
@@ -106,9 +106,9 @@
           }
         },
         {
-          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/model_arts\n\nexport BASE_API_PORT=9100\nexport HCCL_BUFFSIZE=200\nexport HCCL_EP_BUFFSIZE=300\nexport gpu_util=0.80\nexport tp=1\nexport dp=32\nexport max_num_seqs=8\nexport max_num_batched_tokens=32\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"/workspace/omniinfer/components/omni-npu/src/omni_npu/model_config/configs/high_throughout/openpangu_v2/openpangu_v2_505b_bf16_a3_1p1d_precision_consistency_d.json\"\nexport CUSTOM_MODEL_CONFIG_PATH=\"${OMNI_CUSTOM_MODEL_CONFIG_PATH}\"\n\nbash \"${SCRIPT_PATH}/decode.sh\" \\\n  --dtype bfloat16 \\\n  --max-model-len 163840 \\\n  --max-num-seqs 8 \\\n  --max-num-batched-tokens 32 \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --enable-expert-parallel \\\n  --disable-log-requests \\\n  --enable-prefix-caching \\\n  --no-async-scheduling \\\n  --distributed-executor-backend mp \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --compilation-config '{\"level\":3,\"cudagraph_mode\":\"FULL\",\"backend\":\"eager\",\"cudagraph_capture_sizes\":[4,8,16,32],\"compile_sizes\":[4,8,16,32]}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity",
+          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/model_arts\n\nexport BASE_API_PORT=9100\nexport HCCL_BUFFSIZE=200\nexport HCCL_EP_BUFFSIZE=300\nexport gpu_util=0.80\nexport tp=1\nexport dp=64\nexport max_num_seqs=8\nexport max_num_batched_tokens=32\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"/workspace/omniinfer/components/omni-npu/src/omni_npu/model_config/configs/high_throughout/openpangu_v2/openpangu_v2_505b_bf16_a3_1p1d_precision_consistency_d.json\"\nexport CUSTOM_MODEL_CONFIG_PATH=\"${OMNI_CUSTOM_MODEL_CONFIG_PATH}\"\n\nbash \"${SCRIPT_PATH}/decode.sh\" \\\n  --dtype bfloat16 \\\n  --max-model-len 163840 \\\n  --max-num-seqs 8 \\\n  --max-num-batched-tokens 32 \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --enable-expert-parallel \\\n  --disable-log-requests \\\n  --enable-prefix-caching \\\n  --no-async-scheduling \\\n  --distributed-executor-backend mp \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --compilation-config '{\"level\":3,\"cudagraph_mode\":\"FULL\",\"backend\":\"eager\",\"cudagraph_capture_sizes\":[4,8,16,32],\"compile_sizes\":[4,8,16,32]}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity",
           "codes": [],
-          "count": 2,
+          "count": 4,
           "custom_spec": {
             "arch": "arm64",
             "ascend": 16,
@@ -164,7 +164,7 @@
       ],
       "weight": 0,
       "workload_type": "LWS",
-      "name": "deploy-rltraining_505B_DSA_A3_BF16_1P16_1D16"
+      "name": "deploy-rltraining_505B_DSA_A3_BF16_1P32_1D32"
     }
   ],
   "workspace_id": "1d670a16e0b34acbb27975dfec4d3790",
