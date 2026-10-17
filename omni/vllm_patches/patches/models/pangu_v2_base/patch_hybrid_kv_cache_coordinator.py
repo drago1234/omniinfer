@@ -2,25 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Hybrid APC: Decode FA-skip; other paths run the producer per-group lookup.
+"""Hybrid APC: common valid Prefill prefix; independent Decode group hits.
 
-PD Decode must reuse local FA prefix cache. vLLM
-``find_longest_cache_hit_per_group`` looks up each group independently; the
-connector scheduler then takes ``max(per_group_hits)``. On Decode that blocks
-FA skip (Mome miss / wrong pull path).
+Prefill must have a usable state in every group at the reported computed
+boundary. MoME snapshots at longer prefixes cannot be truncated to that
+boundary: the shorter snapshot may not exist. Use the coordinator's common
+hit fixed point, which rechecks groups until all agree on a valid boundary.
 
-This patch only changes Decode: report FA hit length and clear local
-Mome/Mamba computed blocks so PD pulls Prefill's last state. Other paths run
-the upstream producer fix below.
-
-Decode is detected by ``OMNI_PD_ROLE=decode`` (``pd_run.sh --role``, set by
-ansible ``run_vllm_decode.sh.j2``). Anything else uses
-``_find_longest_cache_hit_per_group``.
-
-Producer fix: full-attention blocks keep their true hit so the deep D-side
-APC hit is not re-pulled. The scalar is ``min(hit_lengths)`` so SWA/Mome do
-not over-skip. A Mamba/Mome snapshot past that minimum is looked up again at
-the minimum.
+Decode keeps independent group hits for its FA skip-pull path. It is selected
+by OMNI_PD_ROLE=decode; other roles use the common Prefill prefix.
 """
 
 from typing import Callable
@@ -36,6 +26,7 @@ from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 _find_longest_cache_hit_per_group: Callable = (
     HybridKVCacheCoordinator.find_longest_cache_hit_per_group
 )
+
 
 _PATH_LOGGED = False
 
@@ -59,7 +50,7 @@ def _log_hybrid_apc_path_once(is_consumer: bool) -> None:
             "HybridAPC per_group using %s path",
             "consumer-FA-skip"
             if is_consumer
-            else "_find_longest_cache_hit_per_group",
+            else "producer-common-prefix",
         )
     except Exception:  # noqa: BLE001
         pass
@@ -70,7 +61,7 @@ def find_longest_cache_hit_per_group(
     block_hashes,
     max_cache_hit_length: int,
 ):
-    """Dispatch: consumer FA-skip, else upstream per-group real-hit lookup."""
+    """Dispatch to Decode per-group hits or a common Prefill boundary."""
     is_consumer = _is_kv_consumer()
     _log_hybrid_apc_path_once(is_consumer)
     if is_consumer:
@@ -85,12 +76,11 @@ def _producer_per_group(
     block_hashes,
     max_cache_hit_length: int,
 ):
-    """Return per-group real blocks with a uniform min length scalar."""
-    # adapt start
-    blocks, hit_lengths = (
-        HybridAPCConnectorHitPatch._upstream_find_longest_cache_hit_per_group(
-            self, block_hashes, max_cache_hit_length
-        )
+    """Return blocks and computed lengths at one valid Prefill boundary."""
+    # Pass the original request limit. Capping it at an already reduced
+    # per-group hit would apply the EAGLE lookahead drop a second time.
+    blocks, hit_length = self.find_longest_cache_hit(
+        block_hashes, max_cache_hit_length
     )
     return blocks, (hit_length,) * len(blocks)
 
