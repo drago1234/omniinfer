@@ -249,6 +249,7 @@ def layer_module(monkeypatch):
         pass
 
     method_base_module.NPUFusedMoEMethodBase = _NPUFusedMoEMethodBase
+    method_base_module.npu_grouped_moe_experts_bf16 = MagicMock()
     prepare_module = _ensure_module(
         monkeypatch, "omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize")
     prepare_module.PreparePermuteOptions = SimpleNamespace

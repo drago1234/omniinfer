@@ -132,3 +132,71 @@ def test_make_communication_strategy_selector_sets_selector(monkeypatch):
 
     assert method.communication_strategy_selector is fake_selector
     assert strategy == "agrs"
+
+
+def _make_bf16_helper_stub_torch_npu(monkeypatch):
+    """Stub torch_npu (already mocked by the autouse fixture) with capture mocks.
+
+    Returns (gmm_mock, swiglu_mock); the helper resolves torch_npu at call
+    time so the stub takes effect even though the module was imported early.
+    """
+    torch_npu = sys.modules["torch_npu"]
+    gmm_mock = MagicMock(side_effect=lambda inputs, weights, **kwargs: [inputs[0]])
+    swiglu_mock = MagicMock(side_effect=lambda tensor: tensor)
+    monkeypatch.setattr(torch_npu, "npu_grouped_matmul", gmm_mock, raising=False)
+    monkeypatch.setattr(torch_npu, "npu_swiglu", swiglu_mock, raising=False)
+    return gmm_mock, swiglu_mock
+
+
+@pytest.mark.unit
+def test_npu_grouped_moe_experts_bf16_without_output_dtype(monkeypatch):
+    from omni_npu.layers.fused_moe.fused_moe_method_base import (
+        npu_grouped_moe_experts_bf16,
+    )
+
+    gmm_mock, swiglu_mock = _make_bf16_helper_stub_torch_npu(monkeypatch)
+    hidden_states = torch.ones(3, 4)
+    w13, w2 = torch.ones(2, 4, 4), torch.ones(2, 4, 4) * 2
+    experts = SimpleNamespace(w13_weight=w13, w2_weight=w2)
+    expert_tokens = torch.tensor([2, 1], dtype=torch.int64)
+
+    out = npu_grouped_moe_experts_bf16(hidden_states, experts, expert_tokens, 0)
+
+    assert out is hidden_states  # both mocked kernels pass through
+    assert gmm_mock.call_count == 2
+    assert swiglu_mock.call_count == 1
+    first_kwargs = gmm_mock.call_args_list[0].kwargs
+    second_kwargs = gmm_mock.call_args_list[1].kwargs
+    # output_dtype must NOT be forwarded when not given (layer.py contract).
+    assert "output_dtype" not in first_kwargs
+    assert "output_dtype" not in second_kwargs
+    assert gmm_mock.call_args_list[0].args == ([hidden_states], [w13])
+    assert gmm_mock.call_args_list[1].args == ([hidden_states], [w2])
+    assert first_kwargs == second_kwargs == {
+        "bias": None,
+        "group_list": expert_tokens,
+        "split_item": 3,
+        "group_type": 0,
+        "group_list_type": 0,
+    }
+
+
+@pytest.mark.unit
+def test_npu_grouped_moe_experts_bf16_forwards_output_dtype(monkeypatch):
+    from omni_npu.layers.fused_moe.fused_moe_method_base import (
+        npu_grouped_moe_experts_bf16,
+    )
+
+    gmm_mock, swiglu_mock = _make_bf16_helper_stub_torch_npu(monkeypatch)
+    hidden_states = torch.ones(3, 4, dtype=torch.bfloat16)
+    experts = SimpleNamespace(w13_weight=torch.ones(2, 4, 4), w2_weight=torch.ones(2, 4, 4))
+    expert_tokens = torch.tensor([2, 1], dtype=torch.int64)
+
+    out = npu_grouped_moe_experts_bf16(
+        hidden_states, experts, expert_tokens, 1, output_dtype=torch.bfloat16
+    )
+
+    assert out is hidden_states
+    for call in gmm_mock.call_args_list:
+        assert call.kwargs["output_dtype"] == torch.bfloat16
+        assert call.kwargs["group_list_type"] == 1
