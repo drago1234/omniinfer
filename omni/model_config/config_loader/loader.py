@@ -132,6 +132,7 @@ class ModelParallelConfig:
 
 @dataclass
 class ModelOperatorOptConfig:
+    enable_mxfp8_comm_quant: bool = False
     enable_kv_rmsnorm_rope_cache: bool = False
     enable_prefill_mla_absorb_pa: bool = False
     kv_nz: bool = False

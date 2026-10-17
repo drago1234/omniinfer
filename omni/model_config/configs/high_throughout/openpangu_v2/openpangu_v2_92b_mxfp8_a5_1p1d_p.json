@@ -27,6 +27,7 @@
         "use_quant_lightning_indexer_v2": true,
         "kv_nz": false,
         "merge_q_kv_conv": false,
-        "use_aicpu_fa_tiling": true
+        "use_aicpu_fa_tiling": true,
+        "enable_mxfp8_comm_quant": true
     }
 }

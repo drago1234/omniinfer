@@ -749,10 +749,8 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
         moe_quant_config = getattr(quant_method, "moe_quant_config", None)
         use_mxfp8 = _uses_mxfp_activation(moe_quant_config)
         use_hifloat8 = _uses_hifloat_activation(moe_quant_config)
-        quant_config = getattr(quant_method, "quant_config", None)
-        enable_mxfp8_comm_quant = bool(
-            quant_config
-            and getattr(quant_config, "enable_mxfp8_comm_quant", False)
+        enable_mxfp8_comm_quant = (
+            model_extra_config.operator_opt_config.enable_mxfp8_comm_quant
         )
         dispatch_quant_kwargs = {}
         if use_mxfp8 and enable_mxfp8_comm_quant:

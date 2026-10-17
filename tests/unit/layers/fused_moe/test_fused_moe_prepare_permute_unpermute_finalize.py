@@ -1004,16 +1004,19 @@ def test_dispatch_prepare_permute_passes_quant_mode_and_mask(prepare_module):
 )
 def test_dispatch_prepare_permute_mxfp_disables_dispatch_quant(
     prepare_module,
+    monkeypatch,
     use_mxfp8_w8a8,
     use_mxfp4_w4a8,
 ):
     module, stubs = prepare_module
+    monkeypatch.setattr(
+        module.model_extra_config.operator_opt_config, "enable_mxfp8_comm_quant", False
+    )
     layer = _moe_layer(
         global_num_experts=4,
         local_num_experts=2,
         quant_config=object(),
         quant_method=SimpleNamespace(
-            quant_config=SimpleNamespace(enable_mxfp8_comm_quant=False),
             moe_quant_config=SimpleNamespace(
                 use_mxfp8_w8a8=use_mxfp8_w8a8,
                 use_mxfp4_w4a8=use_mxfp4_w4a8,
@@ -1102,13 +1105,15 @@ def test_dispatch_prepare_permute_mxfp_communication_quant(
     use_mxfp4_w4a8,
 ):
     module, stubs = prepare_module
+    monkeypatch.setattr(
+        module.model_extra_config.operator_opt_config, "enable_mxfp8_comm_quant", True
+    )
     monkeypatch.setattr(module, "on_ascend950", lambda: True)
     layer = _moe_layer(
         global_num_experts=4,
         local_num_experts=2,
         quant_config=object(),
         quant_method=SimpleNamespace(
-            quant_config=SimpleNamespace(enable_mxfp8_comm_quant=True),
             moe_quant_config=SimpleNamespace(
                 use_mxfp8_w8a8=use_mxfp8_w8a8,
                 use_mxfp4_w4a8=use_mxfp4_w4a8,
@@ -1148,13 +1153,15 @@ def test_dispatch_prepare_permute_mxfp_communication_quant_requires_ascend950(
     monkeypatch,
 ):
     module, stubs = prepare_module
+    monkeypatch.setattr(
+        module.model_extra_config.operator_opt_config, "enable_mxfp8_comm_quant", True
+    )
     monkeypatch.setattr(module, "on_ascend950", lambda: False)
     layer = _moe_layer(
         global_num_experts=4,
         local_num_experts=2,
         quant_config=object(),
         quant_method=SimpleNamespace(
-            quant_config=SimpleNamespace(enable_mxfp8_comm_quant=True),
             moe_quant_config=SimpleNamespace(use_mxfp8_w8a8=True),
         ),
     )
