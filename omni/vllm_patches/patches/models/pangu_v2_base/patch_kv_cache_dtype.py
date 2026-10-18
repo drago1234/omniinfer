@@ -90,3 +90,10 @@ class ExtendStrDtypeToTorchDtypePatch(VLLMPatch):
         **torch_utils_module.STR_DTYPE_TO_TORCH_DTYPE,
         **NEW_CACHE_DTYPES,
     }
+
+    @classmethod
+    def apply(cls):
+        # Other modules may have imported this dict before patches are applied.
+        # Extend the original object so those references also see custom dtypes.
+        torch_utils_module.STR_DTYPE_TO_TORCH_DTYPE.update(NEW_CACHE_DTYPES)
+        super().apply()

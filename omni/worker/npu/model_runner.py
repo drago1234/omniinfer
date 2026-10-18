@@ -16,6 +16,8 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
+from omni_npu.v1.utils import switch_torch_device
+from omni_npu.worker.npu.spec_decode import init_speculator
 from omni_npu.worker.npu.utils import install_torch_cuda_aliases
 
 logger = init_logger(__name__)
@@ -48,6 +50,12 @@ class NPUModelRunnerV2(GPUModelRunner):
         init_aclgraph_config(vllm_config)
         logger.info("[omni-npu/mrv2] building NPUModelRunnerV2")
         super().__init__(vllm_config, device)
+
+        # Release the upstream proposer before allocating its NPU replacement.
+        del self.speculator
+        self.speculator = None
+        if self.speculative_config is not None and self.is_last_pp_rank:
+            self.speculator = init_speculator(self.vllm_config, self.device)
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         """Load the model, then align its multimodal buffer with mHC output."""
@@ -84,6 +92,10 @@ class NPUModelRunnerV2(GPUModelRunner):
             )
         encoder_runner.inputs_embeds = inputs_embeds.repeat(1, num_streams)
 
+    def initialize_kv_cache(self, kv_cache_config):
+        with switch_torch_device():
+            return super().initialize_kv_cache(kv_cache_config)
+
     def capture_model(self) -> int:
         """Guard the aicpu-tiling assumption around the upstream capture.
 
@@ -95,7 +107,8 @@ class NPUModelRunnerV2(GPUModelRunner):
         from omni_npu.worker.npu.aclgraph_utils import ensure_graph_params
 
         ensure_graph_params(self.vllm_config.compilation_config)
-        self._install_acl_task_refresh()
+        with switch_torch_device():
+            self._install_acl_task_refresh()
         return super().capture_model()
 
     def _install_acl_task_refresh(self) -> None:
@@ -245,13 +258,22 @@ class NPUModelRunnerV2(GPUModelRunner):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ):
-        output = super().execute_model(
-            scheduler_output,
-            intermediate_tensors=intermediate_tensors,
-            dummy_run=dummy_run,
-            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-            is_profile=is_profile,
-        )
-        if dummy_run:
-            self._sync_dummy_main_compute_logits(is_profile)
-        return output
+        # Keep imports/initialization outside this scope: torch.npu does not
+        # provide CUDA compiler internals. Runtime graph capture uses the NPU
+        # managers, and stream/device resolution must see NPU availability.
+        with switch_torch_device():
+            output = super().execute_model(
+                scheduler_output,
+                intermediate_tensors=intermediate_tensors,
+                dummy_run=dummy_run,
+                skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                is_profile=is_profile,
+            )
+            if dummy_run:
+                self._sync_dummy_main_compute_logits(is_profile)
+            return output
+
+    def sample_tokens(self, grammar_output):
+        # Sampling includes the MTP proposer and its stream contexts.
+        with switch_torch_device():
+            return super().sample_tokens(grammar_output)
