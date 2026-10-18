@@ -353,11 +353,13 @@ class TaskDist:
         self.mailboxes = [queue.Queue() for _ in range(ranks)]
         self.errors = queue.Queue()
         self.groups = [MockGroup(r, self) for r in range(ranks)]
+        self.exchange_barrier = threading.Barrier(ranks)
 
     def run(
         self,
         task: Callable[[], None],
     ) -> None:
+        self.exchange_barrier = threading.Barrier(self.ranks)
         for q in self.mailboxes:
             while not q.empty():
                 q.get_nowait()
@@ -396,6 +398,7 @@ class TaskDist:
         except BaseException as e:
             # BaseException: surface silent thread deaths that Exception misses.
             self.errors.put(e)
+            self.exchange_barrier.abort()
             # Unblock peers stuck in _exchange.get().
             for q in self.mailboxes:
                 try:
@@ -427,6 +430,9 @@ class TaskDist:
                     f"TaskDist rank {rank} aborted: peer reported failure"
                 )
             recvs[src] = piece
+        # All ranks must drain this round before anyone sends the next one.
+        # Otherwise a fast sender can occupy two of a peer's receive slots.
+        self.exchange_barrier.wait(timeout=30)
         return recvs
 
     def _a2a_v(
@@ -503,6 +509,40 @@ class TestTaskDist:
         expected = torch.tensor([[0.0], [1.0], [2.0], [3.0]], **cfg_f32)
         for rank in range(4):
             assert torch.equal(results[rank], expected)
+
+    def test_consecutive_exchange_rounds(self):
+        sp = TaskDist(ranks=4)
+
+        def task():
+            rank = sp.thread_local.rank
+            for step in range(32):
+                piece = torch.tensor([step, rank], **cfg_i32)
+                received = sp._exchange([piece] * sp.ranks)
+                expected = torch.tensor(
+                    [[step, src] for src in range(sp.ranks)], **cfg_i32,
+                )
+                assert torch.equal(torch.stack(received), expected)
+
+        with _utils_env():
+            sp.run(task)
+
+    def test_worker_failure_aborts_barrier_and_allows_reuse(self):
+        sp = TaskDist(ranks=2)
+        peer_ready = threading.Event()
+
+        def failing_task():
+            if sp.thread_local.rank == 0:
+                assert peer_ready.wait(timeout=5)
+                raise ValueError("intentional worker failure")
+            peer_ready.set()
+            sp.exchange_barrier.wait(timeout=5)
+
+        with _utils_env():
+            with pytest.raises(ValueError, match="intentional worker failure"):
+                sp.run(failing_task)
+            assert sp.exchange_barrier.broken
+            sp.run(lambda: sp._exchange([torch.tensor(0)] * sp.ranks))
+            assert not sp.exchange_barrier.broken
 
     def test_get_tp_group_per_thread(self):
         sp = TaskDist(ranks=4)

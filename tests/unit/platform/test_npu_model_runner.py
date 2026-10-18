@@ -3334,3 +3334,162 @@ class TestSlotMappingReqIndices:
             NPUModelRunner._prepare_inputs(runner, object(), np.array([1]))
 
         assert runner._req_indices_valid_tokens is None
+
+
+class TestSynchronizeInputPrep:
+    """UT for NPUModelRunner.synchronize_input_prep.
+
+    The protocol under test:
+      - event None: plain passthrough, no device/event interaction.
+      - event set: event.synchronize() before the body runs (enter), then on
+        exit (even on exception) torch.npu.synchronize() followed by
+        event.record() so the next step's non_blocking H2D cannot race the
+        forward that just consumed the buffers.
+    """
+
+    def _make_runner(self, event=None):
+        runner = object.__new__(NPUModelRunner)
+        runner.prepare_inputs_event = event
+        return runner
+
+    def _make_event(self, log):
+        event = MagicMock(name="prepare_inputs_event")
+        event.synchronize.side_effect = lambda: log.append("event.synchronize")
+        event.record.side_effect = lambda: log.append("event.record")
+        return event
+
+    def _patch_npu_sync(self, monkeypatch, log):
+        monkeypatch.setattr(
+            runner_module.torch.npu, "synchronize",
+            lambda: log.append("npu.synchronize"),
+        )
+
+    def test_none_event_yields_without_sync(self, monkeypatch):
+        runner = self._make_runner()
+        log = []
+        self._patch_npu_sync(monkeypatch, log)
+
+        ran = False
+        with runner.synchronize_input_prep():
+            ran = True
+            # Nothing before or during the body when there is no event.
+            assert log == []
+
+        assert ran
+        assert log == []
+
+    def test_event_synchronized_before_body(self, monkeypatch):
+        log = []
+        runner = self._make_runner(event=self._make_event(log))
+        self._patch_npu_sync(monkeypatch, log)
+
+        with runner.synchronize_input_prep():
+            # Drained on enter, before the body could consume the buffers.
+            assert log == ["event.synchronize"]
+            log.clear()
+
+        # Only the exit path ran since: drain device, then re-arm event.
+        assert log == ["npu.synchronize", "event.record"]
+
+    def test_device_sync_and_record_after_body(self, monkeypatch):
+        log = []
+        runner = self._make_runner(event=self._make_event(log))
+        self._patch_npu_sync(monkeypatch, log)
+
+        with runner.synchronize_input_prep():
+            pass
+
+        # Exit order: drain device first, then re-arm the event for the
+        # next step's H2D.
+        assert log == ["event.synchronize", "npu.synchronize", "event.record"]
+
+    def test_recorded_on_body_exception(self, monkeypatch):
+        log = []
+        runner = self._make_runner(event=self._make_event(log))
+        self._patch_npu_sync(monkeypatch, log)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with runner.synchronize_input_prep():
+                raise RuntimeError("boom")
+
+        # finally-branch still runs and keeps the original error.
+        assert log == ["event.synchronize", "npu.synchronize", "event.record"]
+
+    def test_none_event_propagates_without_sync(self, monkeypatch):
+        runner = self._make_runner()
+        log = []
+        self._patch_npu_sync(monkeypatch, log)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with runner.synchronize_input_prep():
+                raise RuntimeError("boom")
+
+        assert log == []
+
+@pytest.mark.parametrize("config", [
+    None,
+    SimpleNamespace(method="mtp", rejection_sample_method="standard", draft_sample_method="probabilistic"),
+    SimpleNamespace(method="mtp", rejection_sample_method="block", draft_sample_method="greedy"),
+    SimpleNamespace(method="mtp", rejection_sample_method="block", draft_sample_method="temperature_only"),
+    SimpleNamespace(method="eagle", rejection_sample_method="block", draft_sample_method="probabilistic"),
+    SimpleNamespace(method="eagle3", rejection_sample_method="block", draft_sample_method="probabilistic"),
+    SimpleNamespace(method="dflash", rejection_sample_method="block", draft_sample_method="probabilistic"),
+])
+def test_dummy_sampler_delegates_without_mtp_block_probs(monkeypatch, config):
+    runner = object.__new__(NPUModelRunner)
+    runner.speculative_config = config
+    runner.rejection_sampler = MagicMock()
+    hidden_states = torch.zeros(2, 4)
+    result = object()
+    calls = []
+
+    def original(self, hidden):
+        calls.append((self, hidden))
+        return result
+
+    monkeypatch.setattr(GPUModelRunner, "_dummy_sampler_run", original)
+    assert runner._dummy_sampler_run(hidden_states) is result
+    assert len(calls) == 1
+    assert calls[0][0] is runner and calls[0][1] is hidden_states
+    runner.rejection_sampler.register_forward_pre_hook.assert_not_called()
+
+
+@pytest.mark.parametrize("raise_in_parent", [False, True])
+def test_mtp_block_dummy_sampler_supplies_probs_and_removes_hook(monkeypatch, raise_in_parent):
+    class RecordingSampler(torch.nn.Module):
+        def forward(self, metadata, draft_probs, logits, sampling_metadata):
+            assert metadata is spec_metadata
+            assert sampling_metadata is sampling
+            assert draft_probs.shape == (3, 8)
+            assert draft_probs.dtype == torch.float32
+            assert draft_probs.device == logits.device
+            assert torch.all(draft_probs >= 0)
+            torch.testing.assert_close(draft_probs.sum(dim=-1), torch.ones(3))
+            return draft_probs
+
+    runner = object.__new__(NPUModelRunner)
+    runner.speculative_config = SimpleNamespace(
+        method="mtp", rejection_sample_method="block", draft_sample_method="probabilistic",
+    )
+    runner.rejection_sampler = RecordingSampler()
+    spec_metadata = SimpleNamespace(draft_token_ids=torch.arange(3))
+    sampling = object()
+    hidden_states = torch.zeros(2, 4)
+    calls = []
+
+    def original(self, hidden):
+        assert self is runner and hidden is hidden_states
+        calls.append(self.rejection_sampler(spec_metadata, None, torch.zeros(3, 8), sampling))
+        if raise_in_parent:
+            raise RuntimeError("dummy sampler failed")
+        return calls[-1]
+
+    monkeypatch.setattr(GPUModelRunner, "_dummy_sampler_run", original)
+    if raise_in_parent:
+        with pytest.raises(RuntimeError, match="dummy sampler failed"):
+            runner._dummy_sampler_run(hidden_states)
+    else:
+        assert runner._dummy_sampler_run(hidden_states) is calls[-1]
+    assert len(calls) == 1
+    assert not runner.rejection_sampler._forward_pre_hooks
+    assert GPUModelRunner._dummy_sampler_run is original
