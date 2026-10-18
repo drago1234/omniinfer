@@ -3425,3 +3425,71 @@ class TestSynchronizeInputPrep:
                 raise RuntimeError("boom")
 
         assert log == []
+
+@pytest.mark.parametrize("config", [
+    None,
+    SimpleNamespace(method="mtp", rejection_sample_method="standard", draft_sample_method="probabilistic"),
+    SimpleNamespace(method="mtp", rejection_sample_method="block", draft_sample_method="greedy"),
+    SimpleNamespace(method="mtp", rejection_sample_method="block", draft_sample_method="temperature_only"),
+    SimpleNamespace(method="eagle", rejection_sample_method="block", draft_sample_method="probabilistic"),
+    SimpleNamespace(method="eagle3", rejection_sample_method="block", draft_sample_method="probabilistic"),
+    SimpleNamespace(method="dflash", rejection_sample_method="block", draft_sample_method="probabilistic"),
+])
+def test_dummy_sampler_delegates_without_mtp_block_probs(monkeypatch, config):
+    runner = object.__new__(NPUModelRunner)
+    runner.speculative_config = config
+    runner.rejection_sampler = MagicMock()
+    hidden_states = torch.zeros(2, 4)
+    result = object()
+    calls = []
+
+    def original(self, hidden):
+        calls.append((self, hidden))
+        return result
+
+    monkeypatch.setattr(GPUModelRunner, "_dummy_sampler_run", original)
+    assert runner._dummy_sampler_run(hidden_states) is result
+    assert len(calls) == 1
+    assert calls[0][0] is runner and calls[0][1] is hidden_states
+    runner.rejection_sampler.register_forward_pre_hook.assert_not_called()
+
+
+@pytest.mark.parametrize("raise_in_parent", [False, True])
+def test_mtp_block_dummy_sampler_supplies_probs_and_removes_hook(monkeypatch, raise_in_parent):
+    class RecordingSampler(torch.nn.Module):
+        def forward(self, metadata, draft_probs, logits, sampling_metadata):
+            assert metadata is spec_metadata
+            assert sampling_metadata is sampling
+            assert draft_probs.shape == (3, 8)
+            assert draft_probs.dtype == torch.float32
+            assert draft_probs.device == logits.device
+            assert torch.all(draft_probs >= 0)
+            torch.testing.assert_close(draft_probs.sum(dim=-1), torch.ones(3))
+            return draft_probs
+
+    runner = object.__new__(NPUModelRunner)
+    runner.speculative_config = SimpleNamespace(
+        method="mtp", rejection_sample_method="block", draft_sample_method="probabilistic",
+    )
+    runner.rejection_sampler = RecordingSampler()
+    spec_metadata = SimpleNamespace(draft_token_ids=torch.arange(3))
+    sampling = object()
+    hidden_states = torch.zeros(2, 4)
+    calls = []
+
+    def original(self, hidden):
+        assert self is runner and hidden is hidden_states
+        calls.append(self.rejection_sampler(spec_metadata, None, torch.zeros(3, 8), sampling))
+        if raise_in_parent:
+            raise RuntimeError("dummy sampler failed")
+        return calls[-1]
+
+    monkeypatch.setattr(GPUModelRunner, "_dummy_sampler_run", original)
+    if raise_in_parent:
+        with pytest.raises(RuntimeError, match="dummy sampler failed"):
+            runner._dummy_sampler_run(hidden_states)
+    else:
+        assert runner._dummy_sampler_run(hidden_states) is calls[-1]
+    assert len(calls) == 1
+    assert not runner.rejection_sampler._forward_pre_hooks
+    assert GPUModelRunner._dummy_sampler_run is original

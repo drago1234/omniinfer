@@ -102,6 +102,13 @@ class EagleProposerPatch(VLLMPatch):
         EagleProposer_original_init(
             self, vllm_config=vllm_config, device=device, runner=runner
         )
+        # Collect MTP draft Q for NPU block rejection before configuring draft top-k.
+        if (
+            self.method == "mtp"
+            and self.speculative_config.rejection_sample_method == "block"
+            and self.speculative_config.draft_sample_method == "probabilistic"
+        ):
+            self._enable_probabilistic_draft_probs = True
         self._draft_top_k = omni_envs.OMNI_DRAFT_TOP_K if self._enable_probabilistic_draft_probs else None
         if self._draft_top_k is not None and self._draft_top_k < -1:
             raise ValueError("OMNI_DRAFT_TOP_K must be -1, 0, or a positive integer")
@@ -637,19 +644,22 @@ class EagleProposerPatch(VLLMPatch):
                 )
             slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
 
-            if group.kv_cache_group_id == self.kv_cache_gid:
-                # Update base CM in-place (preserves current behaviour)
-                common_attn_metadata.block_table_tensor = blk_table_tensor
-                common_attn_metadata.slot_mapping[:slot_mapping.numel()] = slot_mapping
-                group_cm = common_attn_metadata
-            else:
-                group_cm = copy(common_attn_metadata)
-                group_cm.block_table_tensor = blk_table_tensor
-                group_cm.slot_mapping = (
-                    blk_table.slot_mapping.gpu[:common_attn_metadata.num_actual_tokens]
-                )
-                group_cm.slot_mapping[:slot_mapping.numel()] = slot_mapping
-            group_cm.slot_mapping[slot_mapping.numel():] = -1
+            num_tokens = common_attn_metadata.num_actual_tokens
+            num_valid = slot_mapping.numel()
+            slot_buffer = blk_table.slot_mapping.gpu
+
+            # Later draft steps can use fewer tokens than the first pass.
+            # Rebind every group's view to this step's execution size while
+            # retaining its persistent backing storage for graph execution.
+            group_cm = (
+                common_attn_metadata
+                if group.kv_cache_group_id == self.kv_cache_gid
+                else copy(common_attn_metadata)
+            )
+            group_cm.block_table_tensor = blk_table_tensor
+            group_cm.slot_mapping = slot_buffer[:num_tokens]
+            group_cm.slot_mapping[:num_valid].copy_(slot_mapping)
+            group_cm.slot_mapping[num_valid:].fill_(PADDING_SLOT_ID)
 
             extra_attn_metadata_args = {}
             if isinstance(builder, NPUMomeAttentionMetadataBuilder):
