@@ -4,7 +4,7 @@
 
 gumbel_sample: upstream reaches tldevice.log1p, a returning-None stub on
 triton-ascend 3.2.2. apply_top_k_top_p: the upstream Qrita Triton kernel fails
-to compile there, so the PyTorch sort path is taken unconditionally.
+to compile there, so the CANN fused filter is used while preserving logits dtype.
 
 Only V2 consumers are replaced. The defining module
 vllm/v1/sample/ops/topk_topp_sampler.py is left alone because MRv1's

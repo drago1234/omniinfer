@@ -22,6 +22,10 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
 )
 
 from omni_npu.worker.npu.ops.gumbel import _npu_gumbel_block_argmax
+from omni_npu.worker.npu.ops.position_sampling_rng import (
+    make_uniform,
+    position_rng_enabled,
+)
 
 
 def _next_power_of_2(x: int) -> int:  # pragma: no cover
@@ -141,6 +145,8 @@ def _rejection_kernel(  # pragma: no cover
     local_residual_mass_ptr,
     local_residual_mass_stride,
     vocab_num_blocks,
+    accept_uniform_ptr,
+    EXTERNAL_UNIFORM: tl.constexpr,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
     SYNTHETIC_MODE: tl.constexpr,
@@ -163,7 +169,10 @@ def _rejection_kernel(  # pragma: no cover
         logit_idx = start_idx + i
         draft_sampled = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
         pos = tl.load(pos_ptr + logit_idx)
-        u = _npu_rand_uniform(seed, pos)
+        if EXTERNAL_UNIFORM:
+            u = tl.maximum(tl.load(accept_uniform_ptr + logit_idx), 4.6566127342e-10)
+        else:
+            u = _npu_rand_uniform(seed, pos)
         use_block_path = False
         if USE_BLOCK_VERIFICATION:
             use_block_path = not is_greedy
@@ -298,7 +307,10 @@ def _resample_kernel(  # pragma: no cover
     seed_ptr,
     pos_ptr,
     cumulative_log_p_ptr,
+    uniform_ptr,
+    uniform_stride,
     vocab_size,
+    EXTERNAL_UNIFORM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
     USE_FP64: tl.constexpr,
@@ -397,6 +409,10 @@ def _resample_kernel(  # pragma: no cover
         0,  # processed_logits_stride
         None,  # processed_logits_col_ptr
         vocab_size,
+        uniform_ptr,
+        uniform_stride,
+        req_idx,
+        EXTERNAL_UNIFORM=EXTERNAL_UNIFORM,
         APPLY_TEMPERATURE=False,
         USE_FP64=USE_FP64,
     )
@@ -466,7 +482,7 @@ def _insert_resampled_kernel(  # pragma: no cover
     )
 
 
-def rejection_sample(  # pragma: no cover
+def rejection_sample(
     target_logits: torch.Tensor,
     draft_logits: torch.Tensor | None,
     draft_sampled: torch.Tensor,
@@ -487,6 +503,13 @@ def rejection_sample(  # pragma: no cover
 
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
+    external_uniform = position_rng_enabled()
+    # Use U[0] from the same position-indexed vector used for Gumbel noise.
+    accept_uniform = (
+        make_uniform(num_logits, 1, target_logits.device,
+                     expanded_idx_mapping, seed, pos)
+        if external_uniform else target_logits
+    )
     draft_logits_stride_0 = 0
     draft_logits_stride_1 = 0
     has_draft_logits = draft_logits is not None
@@ -626,6 +649,7 @@ def rejection_sample(  # pragma: no cover
         cu_num_logits, idx_mapping, temperature, seed, pos,
         synthetic_conditional_rates, cumulative_log_p,
         local_residual_mass, local_residual_mass.stride(0), vocab_num_blocks,
+        accept_uniform, EXTERNAL_UNIFORM=external_uniform,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,
         SYNTHETIC_MODE=synthetic_mode,
@@ -645,6 +669,14 @@ def rejection_sample(  # pragma: no cover
         num_reqs,
         resample_num_blocks,
         dtype=torch.float32,
+    )
+    # num_sampled is the rejected/bonus offset before _insert_resampled_kernel.
+    # Select its absolute position on device; no CPU readback during FULL graph.
+    uniform = (
+        make_uniform(num_reqs, vocab_size, target_logits.device,
+                     expanded_idx_mapping, seed, pos,
+                     cu_num_logits=cu_num_logits, rejected_steps=num_sampled)
+        if external_uniform else target_logits
     )
     _resample_kernel[(num_reqs, resample_num_blocks)](
         resampled_local_argmax,
@@ -666,7 +698,10 @@ def rejection_sample(  # pragma: no cover
         seed,
         pos,
         cumulative_log_p,
+        uniform,
+        uniform.stride(0),
         vocab_size,
+        EXTERNAL_UNIFORM=external_uniform,
         BLOCK_SIZE=RESAMPLE_BLOCK_SIZE,
         HAS_DRAFT_LOGITS=has_draft_logits,
         USE_FP64=use_fp64,

@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     OMNI_MAX_DISPATCH_COMBINE_THRESHOLD: int
     OMNI_BEST_EP: bool
     OMNI_NPU_TOP_K_TOP_P_SAMPLE_NOT_SUPPORT_FLOAT: bool
+    OMNI_MRV2_POSITION_RNG: bool
     OMNI_DRAFT_TOP_K: Optional[int]
     # Diagnostics
     OMNI_DUMP_ENABLE: bool
@@ -416,6 +417,11 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Consumers: layers/quantization/compressed_tensors/compressed_tensors_moe.py:65,316-328.
     "OMNI_BEST_EP":
     lambda: get_env_with_fallback("OMNI_BEST_EP", ["BEST_EP"], False, _as_bool),
+
+    # MRv2 batched Philox keyed by request seed and absolute position.
+    # Disable before graph capture to compare the original inline RNG.
+    "OMNI_MRV2_POSITION_RNG":
+    lambda: get_env_with_fallback("OMNI_MRV2_POSITION_RNG", None, True, _as_exact_one),
 
     # Probabilistic draft only: unset follows each request's top_k; -1/0
     # disables draft top-k; positive values override it (clamped to vocab size).

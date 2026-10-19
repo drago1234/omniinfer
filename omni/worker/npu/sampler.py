@@ -7,28 +7,28 @@ Two symbols are injected by
 
 1. ``gumbel_sample`` — ported from vllm-ascend's
    ``vllm_ascend/worker/v2/sample/gumbel.py`` (the Ascend-native adaptation of
-   upstream ``vllm/v1/worker/gpu/sample/gumbel.py``). Uses ``tl.rand`` (Philox)
-   for the uniform draw and the ``+1e-20`` epsilon form
+   upstream ``vllm/v1/worker/gpu/sample/gumbel.py``). Uses batched stateless
+   Philox uniforms indexed by request seed and position, and the ``+1e-20`` form
    ``-log(-log(r + 1e-20) + 1e-20)`` for the Gumbel transform — this avoids
    ``tldevice.log1p`` which is a returning-None stub on triton-ascend 3.2.2.
 
-2. ``apply_top_k_top_p`` — NPU override that unconditionally takes the PyTorch
-   sort path (``apply_top_k_top_p_pytorch``). The upstream Qrita Triton kernel
-   (``_topk_topp_kernel``, ~960 lines) fails to compile on triton-ascend 3.2.2
-   (``scf.while`` + dynamic ``memref.reinterpret_cast`` → BiShengHIR pipeline
-   crash, verified 2026-08-13). The sort path uses only mature CANN ops
-   (sort/gather/cumsum/masked_fill) and matches the numpy sort oracle 100%
-   on mask layout. It is a pure filter (returns masked logits; sampling stays
-   in ``gumbel_sample``), matching the MRv2 dispatch contract.
+2. ``apply_top_k_top_p`` uses the CANN fused filter and preserves the input
+   logits dtype. It returns filtered logits; token selection stays in the
+   existing Gumbel/rejection sampler.
 """
 
 from __future__ import annotations
 
 import torch
+import torch_npu
 
 from vllm.triton_utils import tl, triton
 
 from omni_npu.worker.npu.ops.gumbel import _npu_gumbel_block_argmax
+from omni_npu.worker.npu.ops.position_sampling_rng import (
+    make_uniform,
+    position_rng_enabled,
+)
 
 
 @triton.jit(
@@ -54,7 +54,10 @@ def _gumbel_sample_kernel(  # pragma: no cover
     seeds_ptr,
     pos_ptr,
     temp_ptr,
+    uniform_ptr,
+    uniform_stride,
     vocab_size,
+    EXTERNAL_UNIFORM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
 ):
@@ -73,7 +76,9 @@ def _gumbel_sample_kernel(  # pragma: no cover
         logits, block, mask, token_idx,
         expanded_idx_mapping_ptr, temp_ptr, seeds_ptr, pos_ptr,
         processed_logits_ptr, processed_logits_stride, processed_logits_col_ptr,
-        vocab_size, APPLY_TEMPERATURE=APPLY_TEMPERATURE, USE_FP64=False,
+        vocab_size, uniform_ptr, uniform_stride, token_idx,
+        EXTERNAL_UNIFORM=EXTERNAL_UNIFORM,
+        APPLY_TEMPERATURE=APPLY_TEMPERATURE, USE_FP64=False,
     )
     token_id = block_idx * BLOCK_SIZE + idx
     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
@@ -96,6 +101,9 @@ def gumbel_sample(
     ``temp == 0`` rows are greedy (argmax, no noise); ``temp != 0`` rows get
     Gumbel noise scaled by the row's temperature. Mixed batches are handled
     correctly — each row is decided independently by its own ``temp``.
+
+    Set OMNI_MRV2_POSITION_RNG=0 before graph capture to use the original
+    inline RNG for comparison. The default is batched, position-indexed RNG.
     """
     if use_fp64:
         raise NotImplementedError(
@@ -116,6 +124,12 @@ def gumbel_sample(
         dtype=torch.float32,
         device=logits.device,
     )
+    external_uniform = position_rng_enabled()
+    uniform = (
+        make_uniform(num_tokens, vocab_size, logits.device,
+                     expanded_idx_mapping, seed, pos)
+        if external_uniform else logits
+    )
     _gumbel_sample_kernel[(num_tokens, num_blocks)](
         local_argmax,
         local_argmax.stride(0),
@@ -130,7 +144,10 @@ def gumbel_sample(
         seed,
         pos,
         temperature,
+        uniform,
+        uniform.stride(0),
         vocab_size,
+        EXTERNAL_UNIFORM=external_uniform,
         BLOCK_SIZE=BLOCK_SIZE,
         APPLY_TEMPERATURE=apply_temperature,
     )
@@ -145,23 +162,28 @@ def apply_top_k_top_p(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
 ) -> torch.Tensor:
-    """NPU top-k / top-p filter — pure mask, returns logits (no sampling).
+    """Filter logits with CANN; leave token selection to the existing sampler.
 
-    Unconditionally delegates to the PyTorch sort implementation. The upstream
-    Qrita Triton kernel (``apply_top_k_top_p_triton``) fails to compile on
-    triton-ascend 3.2.2 (BiShengHIR ``scf.while`` + dynamic index crash,
-    verified 2026-08-13), so the upstream dispatch's ``num_tokens >= 8 →
-    Triton`` branch must be bypassed. The sort path uses only mature CANN ops
-    and matches the numpy sort oracle 100% on mask layout.
+    Requires a CANN runtime supporting the input dtype, including FP32. Do not
+    downcast logits: rounding can change the top-k/top-p mask and distribution.
 
-    This is a pure filter: masked positions become ``-inf``, kept positions
-    keep their value; sampling stays in ``gumbel_sample``. Signature mirrors
-    upstream ``apply_top_k_top_p`` so it replaces it via ``setattr``.
+    Uses CANN semantics: top-k keeps k entries even at tied logits; p=1 disables
+    top-p filtering. These boundary cases differ from the PyTorch sort fallback.
     """
-    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
-
-    if p is None and k is None:
+    if k is None and p is None:
         return logits
-    # allow_cpu_sync=True routes top-k-only through apply_top_k_only
-    # (torch.topk, no full-vocab sort); same semantics as upstream's CPU path.
-    return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
+
+    rows, vocab_size = logits.shape
+    if k is None:
+        k = torch.full((rows,), vocab_size, dtype=torch.int32, device=logits.device)
+    else:
+        k = k.to(dtype=torch.int32).contiguous()
+    if p is None:
+        p = torch.ones(rows, dtype=logits.dtype, device=logits.device)
+    else:
+        p = p.to(dtype=logits.dtype).contiguous()
+
+    _, filtered_logits = torch_npu.npu_top_k_top_p_sample(
+        logits.contiguous(), k, p, q=None, is_need_logits=True
+    )
+    return filtered_logits.to(dtype=logits.dtype)
