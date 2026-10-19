@@ -7,7 +7,7 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def _npu_gumbel_block_argmax(  # pragma: no cover
+def _npu_gumbel_block_argmax(
     logits,
     block,
     mask,
@@ -24,11 +24,12 @@ def _npu_gumbel_block_argmax(  # pragma: no cover
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
+    # Callers promote logits to FP32; MRv2 temperature and uniforms are FP32.
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx).to(tl.int64)
     is_valid_req = req_state_idx >= 0
     temp = tl.load(
         temp_ptr + req_state_idx, mask=is_valid_req, other=0.0
-    ).to(tl.float32)
+    )
     if APPLY_TEMPERATURE:
         if temp != 0.0:
             # Match the behavior of the upstream _temperature_kernel.
@@ -48,14 +49,13 @@ def _npu_gumbel_block_argmax(  # pragma: no cover
             mask=mask & is_valid_req,
         )
 
-    logits = logits.to(tl.float32)
     if temp != 0.0:
         # Uniform rows follow the caller's sampling rows, not state slots:
         # token_idx for draft sampling, req_idx for rejected/bonus sampling.
         r = tl.load(
             uniform_ptr + uniform_row * uniform_stride + block,
             mask=mask & is_valid_req, other=0.5,
-        ).to(tl.float32)
+        )
         # Keep the original transform, including its endpoint handling.
         gumbel_noise = -tl.log(-tl.log(r + 1e-20) + 1e-20)
         logits = tl.where(mask, logits + gumbel_noise, float("-inf"))

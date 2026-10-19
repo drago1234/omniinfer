@@ -37,7 +37,7 @@ from omni_npu.worker.npu.ops.position_sampling_rng import make_uniform
         "vocab_size",
     ]
 )
-def _gumbel_sample_kernel(  # pragma: no cover
+def _gumbel_sample_kernel(
     local_argmax_ptr,
     local_argmax_stride,
     local_max_ptr,

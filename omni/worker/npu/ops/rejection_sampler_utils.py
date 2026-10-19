@@ -25,7 +25,7 @@ from omni_npu.worker.npu.ops.gumbel import _npu_gumbel_block_argmax
 from omni_npu.worker.npu.ops.position_sampling_rng import make_uniform
 
 
-def _next_power_of_2(x: int) -> int:  # pragma: no cover
+def _next_power_of_2(x: int) -> int:
     next_power_of_2 = getattr(triton, "next_power_of_2", None)
     if next_power_of_2 is not None:
         return next_power_of_2(x)
@@ -33,7 +33,7 @@ def _next_power_of_2(x: int) -> int:  # pragma: no cover
 
 
 @triton.jit
-def _compute_local_residual_mass_kernel(  # pragma: no cover
+def _compute_local_residual_mass_kernel(
     local_residual_mass_ptr,
     local_residual_mass_stride,
     cumulative_log_p_ptr,
@@ -69,7 +69,7 @@ def _compute_local_residual_mass_kernel(  # pragma: no cover
         return
 
     req_state_idx = tl.load(expanded_idx_mapping_ptr + logit_idx).to(tl.int64)
-    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+    temp = tl.load(temp_ptr + req_state_idx)
     if temp == 0.0:
         return
 
@@ -88,7 +88,7 @@ def _compute_local_residual_mass_kernel(  # pragma: no cover
     )
 
     # Compute the residual mass: max(p_i * M_b(x|x_{<i}) - M_s(x|x_{<i}), 0)
-    p = tl.exp(tl.load(cumulative_log_p_ptr + logit_idx - 1).to(tl.float32))
+    p = tl.exp(tl.load(cumulative_log_p_ptr + logit_idx - 1))
     m_b = tl.exp(target_log_probs)
     m_s = tl.exp(draft_log_probs)
     partial = tl.sum(tl.maximum(p * m_b - m_s, 0.0), axis=0)
@@ -99,7 +99,7 @@ def _compute_local_residual_mass_kernel(  # pragma: no cover
 
 
 @triton.jit
-def _rejection_kernel(  # pragma: no cover
+def _rejection_kernel(
     sampled_ptr,
     sampled_stride,
     rejected_steps_ptr,
@@ -140,7 +140,7 @@ def _rejection_kernel(  # pragma: no cover
     start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     num_draft_tokens = end_idx - start_idx - 1
-    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+    temp = tl.load(temp_ptr + req_state_idx)
     is_greedy = temp == 0.0
 
     accepted_length = tl.zeros((), tl.int64)
@@ -157,7 +157,7 @@ def _rejection_kernel(  # pragma: no cover
         if use_block_path:
             # Block verification (Sun et al., 2024): https://arxiv.org/abs/2403.10444
             prefix_joint_ratio = tl.exp(
-                tl.load(cumulative_log_p_ptr + logit_idx).to(tl.float32)
+                tl.load(cumulative_log_p_ptr + logit_idx)
             )
             if i < num_draft_tokens - 1:
                 residual_mass = _compute_global_residual_mass(
@@ -265,7 +265,7 @@ def _rejection_kernel(  # pragma: no cover
 
 
 @triton.jit
-def _resample_kernel(  # pragma: no cover
+def _resample_kernel(
     resampled_local_argmax_ptr,
     resampled_local_argmax_stride,
     resampled_local_max_ptr,
@@ -298,7 +298,7 @@ def _resample_kernel(  # pragma: no cover
     resample_token_idx = start_idx + resample_idx
     req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx).to(tl.int64)
 
-    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+    temp = tl.load(temp_ptr + req_state_idx)
     is_bonus = resample_token_idx == end_idx - 1
     if temp == 0.0:
         if not is_bonus:
@@ -338,9 +338,7 @@ def _resample_kernel(  # pragma: no cover
             # shifting when nothing was accepted (tau == 0).
             log_p_tau = 0.0
             if resample_idx > 0:
-                log_p_tau = tl.load(cumulative_log_p_ptr + resample_token_idx - 1).to(
-                    tl.float32
-                )
+                log_p_tau = tl.load(cumulative_log_p_ptr + resample_token_idx - 1)
             target_log_probs += log_p_tau
         draft_log_probs = draft_logits - draft_lse
         # Compute the residual:
@@ -354,7 +352,7 @@ def _resample_kernel(  # pragma: no cover
             ratio < 1.0,
             target_log_probs + tl.log(1 - ratio),
             float("-inf"),
-        ).to(tl.float32)
+        )
     else:
         # One-hot draft. The residual is just the target distribution with
         # the rejected draft token probability zeroed out.
@@ -368,7 +366,7 @@ def _resample_kernel(  # pragma: no cover
             block != rejected_draft_token,
             target_logits,
             float("-inf"),
-        ).to(tl.float32)
+        )
 
     # Resample the rejected/bonus token.
     value, idx = _npu_gumbel_block_argmax(
@@ -402,7 +400,7 @@ def _resample_kernel(  # pragma: no cover
 
 
 @triton.jit
-def _insert_resampled_kernel(  # pragma: no cover
+def _insert_resampled_kernel(
     sampled_ptr,
     sampled_stride,
     num_sampled_ptr,
@@ -426,7 +424,7 @@ def _insert_resampled_kernel(  # pragma: no cover
     # Increment the number of sampled tokens.
     tl.store(num_sampled_ptr + req_idx, num_sampled + 1)
 
-    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+    temp = tl.load(temp_ptr + req_state_idx)
     is_bonus = resample_token_idx == end_idx - 1
     if temp == 0.0:
         if not is_bonus:
