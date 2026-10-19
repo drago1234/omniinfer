@@ -2,11 +2,17 @@
 # SPDX-License-Identifier: MIT
 """Unit tests for omni_npu.compilation.static_kernel_cache_pool (engine bridge).
 
-Locks the bridge's architectural invariants: the static_kernel_cache_enable gate runs
-BEFORE any static_kernel_cache import, the reuse marker is killed up-front and
-rewritten only on a gate-passed HIT, hooks never raise, and the upload log
-protocol (silent on not-attempted) holds. static_kernel_cache / torch.distributed /
-npugraph_ex_config are all injected as sys.modules fakes.
+Locks the bridge's architectural invariants: the static_kernel_cache_enable
+gate runs BEFORE any static_kernel_cache import, pull serialization is
+POD-scoped (the local world group's rank_in_group==0 pulls, per-pod
+barrier), upload dedup is WORLD-scoped (world rank 0 alone uploads, and
+only after the capture-end rendezvous), the group setup is collective
+(it runs on every past-the-gate process, non-pullers included), the
+reuse marker is killed up-front and rewritten only on a gate-passed HIT,
+hooks never raise, and the upload log protocol (silent on
+not-attempted) holds. static_kernel_cache / torch.distributed /
+parallel_state_ext / npugraph_ex_config are all injected as sys.modules
+fakes.
 """
 import enum
 import logging
@@ -43,18 +49,55 @@ class _FakeBundleLayout:
         self.root = Path(root)
 
 
+@pytest.fixture(autouse=True)
+def _reset_upload_latch():
+    """The capture-end rendezvous latch is per-process engine state."""
+    bridge._upload_rendezvous_done = False
+    yield
+    bridge._upload_rendezvous_done = False
+
+
 @pytest.fixture
 def fake_dist(monkeypatch):
-    """torch.distributed stand-in; rank/barrier behaviour is programmable."""
-    state = {"rank": 0, "barrier": 0}
+    """torch.distributed stand-in; rank/barrier behaviour is programmable.
+    ``barrier_groups`` records the group argument of every barrier (None =
+    default/world group)."""
+    state = {"rank": 0, "initialized": True, "barrier": 0, "barrier_groups": [], "module": None}
     dist = types.ModuleType("torch.distributed")
     dist.is_available = lambda: True
-    dist.is_initialized = lambda: True
+    dist.is_initialized = lambda: state["initialized"]
     dist.get_rank = lambda: state["rank"]
-    dist.barrier = lambda: state.__setitem__("barrier", state["barrier"] + 1)
+
+    def _barrier(group=None):
+        state["barrier"] += 1
+        state["barrier_groups"].append(group)
+
+    dist.barrier = _barrier
+    state["module"] = dist
     monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
     monkeypatch.setitem(sys.modules, "torch.distributed", dist)
     return state
+
+
+@pytest.fixture
+def fake_groups(monkeypatch):
+    """parallel_state_ext stand-in: local/world GroupCoordinator fakes with
+    programmable rank_in_group; the init/get hooks are MagicMocks so tests
+    can program initialization failures."""
+    local = types.SimpleNamespace(rank_in_group=0, device_group=object())
+    world = types.SimpleNamespace(rank_in_group=0, device_group=object())
+    pse = types.ModuleType("omni_npu.v1.distributed.parallel_state_ext")
+    pse.initialize_local_world_group = MagicMock()
+    pse.get_local_world_group = MagicMock(return_value=local)
+    pse.get_world_group = MagicMock(return_value=world)
+    monkeypatch.setitem(sys.modules, "omni_npu.v1", types.ModuleType("omni_npu.v1"))
+    monkeypatch.setitem(
+        sys.modules, "omni_npu.v1.distributed", types.ModuleType("omni_npu.v1.distributed")
+    )
+    monkeypatch.setitem(
+        sys.modules, "omni_npu.v1.distributed.parallel_state_ext", pse
+    )
+    return types.SimpleNamespace(pse=pse, local=local, world=world)
 
 
 @pytest.fixture
@@ -109,10 +152,10 @@ def sk_config(monkeypatch, tmp_path):
 
 @pytest.fixture
 def fast_upload_thread(monkeypatch):
-    """Drop the 5s settle delay. _wait(mock) blocks until the daemon thread
-    has demonstrably reached the pool call, then drains the thread if it is
-    still alive — polling for the thread by NAME alone races against a
-    thread that finishes before the first enumeration."""
+    """_wait(mock) blocks until the daemon thread has demonstrably reached
+    the pool call, then drains the thread if it is still alive — polling for
+    the thread by NAME alone races against a thread that finishes before the
+    first enumeration."""
     monkeypatch.setattr(time, "sleep", lambda s: None)
 
     def _wait(mock, timeout=10.0):
@@ -154,11 +197,11 @@ def test_disabled_gate_never_imports_static_kernel_cache(
 
 
 # ---------------------------------------------------------------------------
-# Pull hook: marker lifecycle
+# Pull hook: pod-scoped serialization and marker lifecycle
 # ---------------------------------------------------------------------------
 
 def test_pull_miss_clears_stale_marker(
-    sk_config, fake_dist, fake_static_kernel_cache, tmp_path, caplog
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, tmp_path, caplog
 ):
     _marker_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
     _marker_path(tmp_path).write_text("stale\n")
@@ -171,11 +214,13 @@ def test_pull_miss_clears_stale_marker(
 
     assert not _marker_path(tmp_path).exists()
     assert "static_kernel_cache pool pull: miss (fingerprint=fp_test)" in caplog.text
+    # Rendezvous is pod-scoped: the local world group's device group.
     assert fake_dist["barrier"] == 1
+    assert fake_dist["barrier_groups"] == [fake_groups.local.device_group]
 
 
 def test_pull_hit_rewrites_marker_with_fingerprint(
-    sk_config, fake_dist, fake_static_kernel_cache, tmp_path, caplog
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, tmp_path, caplog
 ):
     def _land_bundle(*args, **kwargs):
         # Contract of a HIT: the restore already landed the bundle under the
@@ -193,16 +238,17 @@ def test_pull_hit_rewrites_marker_with_fingerprint(
 
     assert _marker_path(tmp_path).read_text() == "fp_test\n"
     assert "static_kernel_cache pool pull: hit (fingerprint=fp_test)" in caplog.text
-    # Marker is on disk before the release barrier: every rank's boot-static
-    # decision (post-barrier) observes it.
+    # Marker is on disk before the release barrier: every process's
+    # boot-static decision (post-barrier) observes it.
     assert fake_dist["barrier"] == 1
+    assert fake_dist["barrier_groups"] == [fake_groups.local.device_group]
     layout_arg, fingerprint_arg = fake_static_kernel_cache.static_kernel_cache_store.bounded_pull.call_args[0]
     assert layout_arg.root == tmp_path
     assert fingerprint_arg == "fp_test"
 
 
 def test_pull_swallows_hook_exceptions(
-    sk_config, fake_dist, fake_static_kernel_cache, tmp_path, caplog
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, tmp_path, caplog
 ):
     fake_static_kernel_cache.static_kernel_cache_store.bounded_pull.side_effect = RuntimeError("boom")
 
@@ -211,26 +257,34 @@ def test_pull_swallows_hook_exceptions(
 
     assert "static_kernel_cache pool pull failed" in caplog.text
     assert not _marker_path(tmp_path).exists()
-    # The rendezvous must hold even on failure: non-zero ranks are already
-    # waiting at theirs.
+    # The rendezvous must hold even on failure: the other members are
+    # already waiting at theirs.
     assert fake_dist["barrier"] == 1
+    assert fake_dist["barrier_groups"] == [fake_groups.local.device_group]
 
 
-def test_nonzero_rank_barriers_without_touching_the_pool(
-    sk_config, fake_dist, fake_static_kernel_cache, caplog
+def test_pull_local_rank1_barriers_without_touching_the_pool(
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, caplog
 ):
-    fake_dist["rank"] = 1
+    # The pull decision is POD-scoped: local rank 1 must not pull even at
+    # world rank 0 (a single-pod multi-server deployment).
+    fake_groups.local.rank_in_group = 1
+    fake_dist["rank"] = 0
 
     with caplog.at_level(logging.INFO):
         bridge.maybe_pull_static_kernel_cache(_vllm())
 
     fake_static_kernel_cache.static_kernel_cache_store.bounded_pull.assert_not_called()
     assert fake_dist["barrier"] == 1
+    assert fake_dist["barrier_groups"] == [fake_groups.local.device_group]
     assert "static_kernel_cache pool pull:" not in caplog.text
+    # Group setup is collective: it ran on the non-puller too, before any
+    # rank branching.
+    fake_groups.pse.initialize_local_world_group.assert_called_once()
 
 
 def test_missing_package_degrades_to_full_compile(
-    sk_config, fake_dist, no_static_kernel_cache, tmp_path, caplog
+    sk_config, fake_dist, fake_groups, no_static_kernel_cache, tmp_path, caplog
 ):
     with caplog.at_level(logging.INFO):
         bridge.maybe_pull_static_kernel_cache(_vllm())
@@ -242,8 +296,102 @@ def test_missing_package_degrades_to_full_compile(
     assert fake_dist["barrier"] == 1
 
 
+def test_multinode_second_pod_local_rank0_pulls(
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, tmp_path, caplog
+):
+    # Two pods of eight servers each: world rank 8 is its pod's rank 0.
+    # Each pod pulls its own copy; the barrier stays pod-local so the pods
+    # boot independently.
+    fake_dist["rank"] = 8
+    fake_groups.local.rank_in_group = 0
+    fake_static_kernel_cache.static_kernel_cache_store.bounded_pull.return_value = (
+        _FakePullResult.MISS
+    )
+
+    with caplog.at_level(logging.INFO):
+        bridge.maybe_pull_static_kernel_cache(_vllm())
+
+    fake_static_kernel_cache.static_kernel_cache_store.bounded_pull.assert_called_once()
+    assert fake_dist["barrier"] == 1
+    assert fake_dist["barrier_groups"] == [fake_groups.local.device_group]
+
+
+def test_multinode_second_pod_local_rank1_does_not_pull(
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, caplog
+):
+    fake_dist["rank"] = 9
+    fake_groups.local.rank_in_group = 1
+
+    with caplog.at_level(logging.INFO):
+        bridge.maybe_pull_static_kernel_cache(_vllm())
+
+    fake_static_kernel_cache.static_kernel_cache_store.bounded_pull.assert_not_called()
+    assert fake_dist["barrier"] == 1
+    assert fake_dist["barrier_groups"] == [fake_groups.local.device_group]
+
+
+def test_pull_abandoned_when_pod_group_unavailable(
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, tmp_path, caplog
+):
+    # No silent fallback: pooling is abandoned entirely; the stale marker
+    # still dies, and no barrier is owed (every rank fails identically).
+    fake_groups.pse.initialize_local_world_group.side_effect = RuntimeError("no local size")
+    fake_dist["rank"] = 0
+    _marker_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    _marker_path(tmp_path).write_text("stale\n")
+
+    with caplog.at_level(logging.INFO):
+        bridge.maybe_pull_static_kernel_cache(_vllm())  # must not raise
+
+    assert "local world group unavailable" in caplog.text
+    assert "abandoned" in caplog.text
+    fake_static_kernel_cache.static_kernel_cache_store.bounded_pull.assert_not_called()
+    assert fake_dist["barrier"] == 0
+    assert not _marker_path(tmp_path).exists()
+
+
+def test_upload_abandoned_when_pod_group_unavailable(
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, caplog
+):
+    fake_groups.pse.initialize_local_world_group.side_effect = RuntimeError("no local size")
+    fake_dist["rank"] = 0
+
+    with caplog.at_level(logging.INFO):
+        bridge.schedule_static_kernel_cache_upload(_vllm())  # must not raise
+
+    assert "local world group unavailable" in caplog.text
+    assert fake_dist["barrier"] == 0
+    fake_static_kernel_cache.static_kernel_cache_store.bounded_upload.assert_not_called()
+    assert "static_kernel_cache pool upload" not in caplog.text
+
+
+def test_no_distributed_runtime_single_process_pulls_and_uploads(
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, fast_upload_thread, caplog
+):
+    # No distributed runtime at all (tests, CLI-adjacent paths): the single
+    # process is its own pod's rank 0 — it pulls, rendezvous are no-ops, and
+    # the world-rank-0 upload decision defaults to "this process".
+    fake_dist["initialized"] = False
+    fake_static_kernel_cache.static_kernel_cache_store.bounded_pull.return_value = (
+        _FakePullResult.MISS
+    )
+
+    with caplog.at_level(logging.INFO):
+        bridge.maybe_pull_static_kernel_cache(_vllm())
+        assert fake_static_kernel_cache.static_kernel_cache_store.bounded_pull.called
+        assert fake_dist["barrier"] == 0
+
+        bridge.schedule_static_kernel_cache_upload(_vllm())
+        assert fast_upload_thread(
+            fake_static_kernel_cache.static_kernel_cache_store.bounded_upload
+        )
+
+    assert fake_dist["barrier"] == 0  # no rendezvous without a distributed runtime
+    fake_static_kernel_cache.static_kernel_cache_store.bounded_upload.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
-# Upload hook: log protocol and never-raise
+# Upload hook: capture-end rendezvous, world-rank0 dedup, log protocol
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -254,7 +402,7 @@ def test_missing_package_degrades_to_full_compile(
     ],
 )
 def test_upload_outcome_log_lines(
-    sk_config, fake_dist, fake_static_kernel_cache, fast_upload_thread, caplog,
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, fast_upload_thread, caplog,
     upload_result, expected_line,
 ):
     fake_static_kernel_cache.static_kernel_cache_store.bounded_upload.return_value = upload_result
@@ -268,8 +416,28 @@ def test_upload_outcome_log_lines(
     assert expected_line in caplog.text
 
 
+def test_upload_rendezvous_precedes_the_upload_thread(
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, fast_upload_thread, caplog
+):
+    """The capture-end rendezvous runs synchronously in the boot thread —
+    when the hook returns, every process's capture has been accounted for
+    and the index is settled, so the upload thread needs no settle delay."""
+    fake_static_kernel_cache.static_kernel_cache_store.bounded_upload.return_value = True
+
+    with caplog.at_level(logging.INFO):
+        bridge.schedule_static_kernel_cache_upload(_vllm())
+        # Synchronous, pod-scoped, and exactly once — before any thread work.
+        assert fake_dist["barrier"] == 1
+        assert fake_dist["barrier_groups"] == [fake_groups.local.device_group]
+        assert fast_upload_thread(
+            fake_static_kernel_cache.static_kernel_cache_store.bounded_upload
+        )
+
+    assert fake_dist["barrier"] == 1  # the upload itself adds no rendezvous
+
+
 def test_upload_stays_silent_when_pool_not_attempted(
-    sk_config, fake_dist, fake_static_kernel_cache, fast_upload_thread, caplog
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, fast_upload_thread, caplog
 ):
     fake_static_kernel_cache.static_kernel_cache_store.bounded_upload.return_value = None
 
@@ -283,7 +451,7 @@ def test_upload_stays_silent_when_pool_not_attempted(
 
 
 def test_upload_swallows_hook_exceptions(
-    sk_config, fake_dist, fake_static_kernel_cache, fast_upload_thread, caplog
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, fast_upload_thread, caplog
 ):
     fake_static_kernel_cache.static_kernel_cache_store.bounded_upload.side_effect = RuntimeError("boom")
 
@@ -297,7 +465,7 @@ def test_upload_swallows_hook_exceptions(
 
 
 def test_upload_missing_package_is_skipped_silently(
-    sk_config, fake_dist, no_static_kernel_cache, caplog
+    sk_config, fake_dist, fake_groups, no_static_kernel_cache, caplog
 ):
     with caplog.at_level(logging.INFO):
         bridge.schedule_static_kernel_cache_upload(_vllm())
@@ -311,3 +479,54 @@ def test_upload_missing_package_is_skipped_silently(
 
     assert "static_kernel_cache package not importable" in caplog.text
     assert "static_kernel_cache pool upload:" not in caplog.text
+
+
+def test_upload_dedup_is_world_rank0(
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, caplog
+):
+    # A non-zero world rank reaches the rendezvous (the pod must account for
+    # every capture) but never uploads: one canonical commit per cluster.
+    fake_dist["rank"] = 8
+    fake_groups.local.rank_in_group = 0
+
+    with caplog.at_level(logging.INFO):
+        bridge.schedule_static_kernel_cache_upload(_vllm())
+
+    assert fake_dist["barrier"] == 1
+    assert fake_dist["barrier_groups"] == [fake_groups.local.device_group]
+    fake_static_kernel_cache.static_kernel_cache_store.bounded_upload.assert_not_called()
+    assert "static_kernel_cache pool upload" not in caplog.text
+
+
+def test_upload_reentry_skips_rendezvous_and_upload(
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, fast_upload_thread, caplog
+):
+    # ACLGraph recapture re-runs capture_model on a single process; the
+    # re-entry must not wait on a rendezvous the siblings will never join.
+    fake_static_kernel_cache.static_kernel_cache_store.bounded_upload.return_value = True
+
+    with caplog.at_level(logging.DEBUG):
+        bridge.schedule_static_kernel_cache_upload(_vllm())
+        assert fast_upload_thread(
+            fake_static_kernel_cache.static_kernel_cache_store.bounded_upload
+        )
+        bridge.schedule_static_kernel_cache_upload(_vllm())
+
+    assert fake_dist["barrier"] == 1  # exactly one rendezvous per engine life
+    assert fake_static_kernel_cache.static_kernel_cache_store.bounded_upload.call_count == 1
+    assert "skipping recapture-time upload" in caplog.text
+
+
+def test_upload_barrier_failure_never_raises(
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, monkeypatch, caplog
+):
+    def _boom(group=None):
+        raise RuntimeError("hccl down")
+
+    monkeypatch.setattr(fake_dist["module"], "barrier", _boom)
+
+    with caplog.at_level(logging.INFO):
+        bridge.schedule_static_kernel_cache_upload(_vllm())  # must not raise
+
+    assert "static_kernel_cache pool upload scheduling failed" in caplog.text
+    fake_static_kernel_cache.static_kernel_cache_store.bounded_upload.assert_not_called()

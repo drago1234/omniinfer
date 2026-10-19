@@ -5,18 +5,123 @@
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from omni_npu.worker.npu.buffer_utils import NPUUvaBuffer
 from omni_npu.worker.npu import mode as mode_mod
 from omni_npu.worker.npu.mode import RuntimeMode, resolve_mode
 
 
+@pytest.fixture
+def delayed_h2d(monkeypatch):
+    """Run real host writes, but defer device reads until an event is waited.
+
+    This models the source-memory race deterministically without depending on
+    NPU load or timings. Device consumers also run in stream FIFO order.
+    """
+    from omni_npu.worker.npu import buffer_utils as bu
+
+    class Stream:
+        def __init__(self):
+            self.tasks = []
+            self.completed = 0
+
+        def finish(self, fence):
+            while self.completed < fence:
+                self.tasks[self.completed]()
+                self.completed += 1
+
+    stream = Stream()
+    class Event:
+        def __init__(self):
+            self.stream = None
+
+        def record(self, recorded_stream):
+            self.stream = recorded_stream
+            self.fence = len(recorded_stream.tasks)
+
+        def synchronize(self):
+            # Like torch.npu.Event, waiting before the first record is a no-op.
+            if self.stream is not None:
+                self.stream.finish(self.fence)
+
+    real_zeros = torch.zeros
+
+    class DeviceTensor:
+        def __init__(self, size, dtype):
+            self.data = real_zeros(size, dtype=dtype)
+
+        def copy_(self, src, non_blocking):
+            assert non_blocking is True
+            # Deliberately retain the source reference, not a host snapshot.
+            stream.tasks.append(lambda: self.data.copy_(src))
+
+        def __getitem__(self, index):
+            return self.data[index]
+
+    def zeros(size, *, dtype, device, pin_memory=False):
+        if device == "delayed_device":
+            return DeviceTensor(size, dtype)
+        return real_zeros(size, dtype=dtype, device=device)
+
+    def forbid_global_sync():
+        pytest.fail("slot reuse must not synchronize the whole device")
+
+    monkeypatch.setattr(torch, "zeros", zeros)
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(
+        Event=Event, current_stream=lambda: stream,
+        synchronize=forbid_global_sync), raising=False)
+    monkeypatch.setattr(bu, "resolve_mode", lambda: RuntimeMode.TORCH_COPY_TO_NPU)
+    monkeypatch.setattr(bu, "_current_npu_device", lambda: "delayed_device")
+    import vllm.v1.worker.gpu.buffer_utils as upstream
+
+    monkeypatch.setattr(upstream, "UvaBuffer", NPUUvaBuffer)
+    monkeypatch.setattr(upstream.UvaBufferPool, "copy_to_uva",
+                        bu.copy_to_uva_with_slot_event)
+    return SimpleNamespace(pool_type=upstream.UvaBufferPool, stream=stream, module=bu)
+
+
+@pytest.mark.parametrize("input_kind", ["numpy", "tensor", "list"])
+def test_delayed_h2d_source_is_not_overwritten(delayed_h2d, input_kind):
+    """Preserve each queued copy across repeated reuse of both host slots."""
+    env = delayed_h2d
+    pool = env.pool_type(256, dtype=torch.int32, max_concurrency=2)
+    results = []
+    for value in range(32):
+        src = np.full(256, value, dtype=np.int32)
+        if input_kind == "tensor":
+            src = torch.from_numpy(src)
+        elif input_kind == "list":
+            src = src.tolist()
+        dev = pool.copy_to_uva(src)
+        env.stream.tasks.append(lambda dev=dev: results.append(dev.clone()))
+    env.stream.finish(len(env.stream.tasks))
+    assert len(results) == 32
+    for value, actual in enumerate(results):
+        assert bool((actual == value).all()), f"H2D result {value} was overwritten"
+
+
+def test_true_uva_does_not_create_h2d_event(delayed_h2d, monkeypatch):
+    env = delayed_h2d
+    def unexpected_event():
+        pytest.fail("true UVA must not create an H2D event")
+
+    monkeypatch.setattr(torch.npu, "Event", unexpected_event)
+    monkeypatch.setattr(env.module, "resolve_mode", lambda: RuntimeMode.NPU_UVA_VIEW)
+    monkeypatch.setattr(env.module, "_accelerator_view", lambda cpu: cpu)
+    buf = NPUUvaBuffer(4, torch.int32)
+    buf.wait_for_host_reuse()
+    assert buf.uva is buf.cpu
+    assert buf._copy_done is None
+    assert not env.stream.tasks
+
+
 def _npu_available() -> bool:
     try:
-        import torch
         import torch_npu  # noqa: F401
     except ImportError:
         return False
@@ -30,7 +135,6 @@ requires_npu = pytest.mark.skipif(not _npu_available(), reason="NPU is unavailab
 class TestNPUUvaBuffer:
     def test_three_views_and_device(self):
         """.cpu/.np 是 CPU 真值，.uva 必须落在 NPU：这是红线（第 3.5 节）。"""
-        import torch
 
         buf = NPUUvaBuffer((4, 8), torch.int32)
         assert buf.cpu.device.type == "cpu"
@@ -46,7 +150,6 @@ class TestNPUUvaBuffer:
 
     def test_np_and_cpu_share_memory(self):
         """.np 必须是 .cpu 的视图而非副本，否则 UvaBackedTensor 的真值会分叉。"""
-        import torch
 
         buf = NPUUvaBuffer(16, torch.int32)
         buf.cpu[5] = 42
@@ -56,7 +159,6 @@ class TestNPUUvaBuffer:
 
     def test_three_consumer_points(self):
         """Exercise device arithmetic, indexing, and temperature scaling."""
-        import torch
 
         buf = NPUUvaBuffer(8, torch.int32)
         buf.np[:] = np.arange(1, 9, dtype=np.int32)
@@ -71,7 +173,6 @@ class TestNPUUvaBuffer:
 
     def test_round_robin_preserved(self):
         """池化轮转是 WAR 保护，不是优化：必须保留（gpu/buffer_utils.py:16-18）。"""
-        import torch
         from vllm.v1.worker.gpu.buffer_utils import UvaBufferPool
         import vllm.v1.worker.gpu.buffer_utils as bu
 
