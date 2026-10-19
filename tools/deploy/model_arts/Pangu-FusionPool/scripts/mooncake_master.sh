@@ -1,0 +1,108 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Supervisor and master arguments mirror the bare-machine master template.
+if [[ -f ~/.bashrc ]]; then source ~/.bashrc; fi
+source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null || true
+source /usr/local/Ascend/cann-9.1.0/set_env.sh 2>/dev/null || true
+TENANT_ARGS=()
+EVENT_ARGS=(-enable_kv_events=true
+    "-kv_events_bind_endpoint=tcp://0.0.0.0:${MOONCAKE_KV_EVENTS_PORT:-5599}"
+    -kv_events_backend_id=omni-pool)
+
+export LD_LIBRARY_PATH=/opt/openEuler/gcc-toolset-12/root/usr/lib64:/usr/local/lib/python3.11/site-packages/mooncake:/usr/local/lib:$LD_LIBRARY_PATH
+
+# The launch task returns immediately; only this detached supervisor owns the
+# master. Repeated launch tasks must not restart a healthy shared KV pool.
+command -v flock >/dev/null || { echo 'flock is required' >&2; exit 1; }
+command -v mooncake_master >/dev/null || { echo 'mooncake_master is required' >&2; exit 1; }
+if [[ ${1:-} != --supervise ]]; then
+  nohup /bin/bash "${BASH_SOURCE[0]}" --supervise \
+    >> /tmp/mooncake_master_supervisor.log 2>&1 < /dev/null &
+  exit 0
+fi
+
+exec 9>/tmp/mooncake_master_supervisor.lock
+flock -n 9 || exit 0
+
+log_supervisor() {
+  printf '%s [master supervisor] %s\n' "$(date '+%F %T%z')" "$*"
+}
+
+# A legacy, unsupervised master cannot safely be adopted. Do not flush its KV
+# metadata during redeploy: require a deliberate stop before the first switch.
+if pgrep -f '^([^ ]*/)?mooncake_master[[:space:]].*enable_http_metadata_server' >/dev/null; then
+  log_supervisor 'legacy master already running; stop it deliberately and rerun this script to enable supervision'
+  exit 1
+fi
+
+supervisor_stop=0
+master_child_pid=''
+retry_sleep_pid=''
+request_stop() {
+  supervisor_stop=1
+  log_supervisor 'stop requested; automatic restart disabled'
+  if [[ -n $master_child_pid ]]; then
+    kill -TERM "$master_child_pid" 2>/dev/null || true
+  fi
+  if [[ -n $retry_sleep_pid ]]; then
+    kill -TERM "$retry_sleep_pid" 2>/dev/null || true
+  fi
+}
+trap request_stop TERM INT
+printf '%s\n' "$$" > /tmp/mooncake_master_supervisor.pid
+trap 'rm -f /tmp/mooncake_master_supervisor.pid' EXIT
+
+restart_delay=1
+restart_attempt=0
+while (( ! supervisor_stop )); do
+  start_seconds=$SECONDS
+  # Disable recovery explicitly: restart rebuilds capacity through Client
+  # remount, while old object/key metadata is intentionally discarded.
+  # default_kv_lease_ttl is in milliseconds.
+  mooncake_master -enable_http_metadata_server=true \
+    -http_metadata_server_host=0.0.0.0 \
+    -http_metadata_server_port="${MOONCAKE_METADATA_PORT:-8081}" \
+    -rpc_port="${MOONCAKE_RPC_PORT:-16752}" \
+    -metrics_port="${MOONCAKE_METRICS_PORT:-8181}" \
+    -default_kv_lease_ttl=60000 \
+    -eviction_high_watermark_ratio=0.9 \
+    -allocation_strategy=local_first \
+    -enable_ha=false \
+    -enable_snapshot=false \
+    -enable_snapshot_restore=false \
+    "${EVENT_ARGS[@]}" "${TENANT_ARGS[@]}" >> /tmp/mooncake_master.log 2>&1 9>&- &
+  master_child_pid=$!
+  restart_attempt=$((restart_attempt + 1))
+  log_supervisor "start child_pid=$master_child_pid attempt=$restart_attempt"
+  # A stop arriving immediately after spawn must still terminate the child.
+  if (( supervisor_stop )); then
+    kill -TERM "$master_child_pid" 2>/dev/null || true
+  fi
+  child_exit_code=0
+  wait "$master_child_pid" || child_exit_code=$?
+  if (( supervisor_stop )); then
+    # Signal traps interrupt wait; wait again so cleanup completes before exit.
+    wait "$master_child_pid" 2>/dev/null || true
+    log_supervisor "stopped child_pid=$master_child_pid"
+    break
+  fi
+  uptime_seconds=$((SECONDS - start_seconds))
+  log_supervisor "child exited child_pid=$master_child_pid exit_code=$child_exit_code uptime_s=$uptime_seconds"
+  master_child_pid=''
+  if (( uptime_seconds >= 60 )); then
+    restart_delay=1
+  fi
+  log_supervisor "restarting delay_s=$restart_delay"
+  sleep "$restart_delay" 9>&- &
+  retry_sleep_pid=$!
+  if (( supervisor_stop )); then
+    kill -TERM "$retry_sleep_pid" 2>/dev/null || true
+  fi
+  wait "$retry_sleep_pid" 2>/dev/null || true
+  retry_sleep_pid=''
+  restart_delay=$((restart_delay * 2))
+  if (( restart_delay > 10 )); then
+    restart_delay=10
+  fi
+done
