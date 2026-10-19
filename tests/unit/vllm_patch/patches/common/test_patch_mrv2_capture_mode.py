@@ -62,8 +62,8 @@ def _flag_recording_factory(seen):
     return create_forward_fn
 
 
-def test_only_the_full_recorded_pass_is_rewritten():
-    """FULL 的录制那一遍改成 FULL；warmup 与 PIECEWISE 一律不动。"""
+def test_full_warmup_and_recording_use_the_compiled_path():
+    """FULL 预热及录制均走编译路径，PIECEWISE 保持原有行为。"""
     from vllm.config import CUDAGraphMode
 
     seen = []
@@ -75,8 +75,8 @@ def test_only_the_full_recorded_pass_is_rewritten():
     )
 
     assert seen == [
-        ("FULL", "warmup", "NONE"),            # 图外，保持 NONE
-        ("FULL", "record", "FULL"),            # ← 唯一被改写的一处
+        ("FULL", "warmup", "FULL"),            # 图外完成静态编译
+        ("FULL", "record", "FULL"),
         ("PIECEWISE", "warmup", "NONE"),
         ("PIECEWISE", "warmup", "PIECEWISE"),  # 复用 warmup 闭包，真值不误伤
     ]
@@ -99,7 +99,7 @@ def test_dual_configs_are_resolved_before_reaching_the_wrapper():
     # mixed_mode 为 NONE 时上游不建 mixed 表，只剩 decode 侧的 FULL desc
     capture(object(), _recording_factory(seen), [_desc(decode_only.decode_mode())])
 
-    assert seen == [("FULL", "warmup", "NONE"), ("FULL", "record", "FULL")]
+    assert seen == [("FULL", "warmup", "FULL"), ("FULL", "record", "FULL")]
 
 
 def test_a_non_none_recorded_mode_passes_through():
@@ -182,7 +182,7 @@ def test_capturing_flag_patch_installs_the_descriptor():
 
 
 def test_capturing_flag_is_raised_only_for_the_full_recorded_pass():
-    """标志与 mode 改写同范围：只有 FULL 的录制那一遍抬起。
+    """mode 在预热及录制均为 FULL，capturing 只在录制时抬起。
 
     warmup 跑在 torch.cuda.graph 之外，抬起会让 attention 在没有图的情况下
     注册 ACL task；PIECEWISE 由内层 wrapper 自己管。标志挂在这次调用上而非
@@ -228,4 +228,39 @@ def test_capturing_flag_is_restored_when_the_recorded_pass_raises():
     with pytest.raises(RuntimeError, match="capture blew up"):
         capture(object(), create_forward_fn, [_desc(CUDAGraphMode.FULL)])
 
+    assert cudagraph._capturing_default() is False
+
+
+def test_static_compile_extra_forward_is_not_recorded():
+    """回归 NONE 预热绕过编译、首次静态编译 forward 被录入外层图的问题。"""
+    from vllm.config import CUDAGraphMode
+
+    compiled = False
+    executions = []
+    states = []
+
+    def factory(desc, warmup):
+        attn_state = object()
+        states.append(attn_state)
+
+        def forward(mode):
+            nonlocal compiled
+            capturing = cudagraph._capturing_default()
+            # 对应 decorators._bypass_prefill 的 NONE 分支及 vendor 首次编译。
+            if mode is CUDAGraphMode.FULL and not compiled:
+                executions.append(("static_compile", capturing, attn_state))
+                compiled = True
+            executions.append(("forward", capturing, attn_state))
+
+        return forward, attn_state
+
+    capture = cudagraph.build_capture_with_full_mode(_upstream_capture_loop)
+    capture(object(), factory, [_desc(CUDAGraphMode.FULL)])
+
+    assert [(name, capturing) for name, capturing, _ in executions] == [
+        ("static_compile", False), ("forward", False), ("forward", True),
+    ]
+    assert executions[0][2] is executions[1][2] is states[0]
+    assert executions[2][2] is states[1]
+    assert states[0] is not states[1]
     assert cudagraph._capturing_default() is False

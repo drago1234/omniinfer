@@ -23,8 +23,11 @@ def _npu_gumbel_block_argmax(  # pragma: no cover
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
-    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx).to(tl.int64)
+    is_valid_req = req_state_idx >= 0
+    temp = tl.load(
+        temp_ptr + req_state_idx, mask=is_valid_req, other=0.0
+    ).to(tl.float32)
     if APPLY_TEMPERATURE:
         if temp != 0.0:
             # Match the behavior of the upstream _temperature_kernel.
@@ -41,12 +44,12 @@ def _npu_gumbel_block_argmax(  # pragma: no cover
             + col * vocab_size
             + block,
             logits,
-            mask=mask,
+            mask=mask & is_valid_req,
         )
 
     logits = logits.to(tl.float32)
     if temp != 0.0:
-        seed = tl.load(seeds_ptr + req_state_idx)
+        seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
         # NPU: cast pos to int32. Triton-Ascend cannot lower the uint64 path
         # used by upstream Philox random generation on Ascend vector cores.
         pos = tl.load(pos_ptr + token_idx).to(tl.int32)

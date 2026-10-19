@@ -9,11 +9,11 @@ Two patches, both serving P5 (see 2-ModelRunnerV2支持 Graph分析/ModelRunnerV
   descriptor supplies a thread-local default while an explicit assignment still wins.
 - CudaGraphManager.capture: upstream calls the recorded pass with NONE because no
   inner wrapper takes over once V2 records from the outside, and omni reads that
-  field as "am I in a graph". Wrapping the create_forward_fn factory carries both
-  the rewritten mode and the capturing flag on the one call that matters: the
-  factory's own `warmup` argument separates the two passes, so neither signal
-  reaches the warmup pass that runs outside the graph, and neither is attached to
-  torch.cuda.graph, which unrelated code also enters.
+  field to select its compiled model path. Both FULL warmup and recording use
+  FULL so static-kernel compilation runs before the outer capture starts.
+  The factory's `warmup` argument keeps the capturing flag confined to recording;
+  warmup uses separate attention state and must not register ACL tasks.
+  Neither signal is attached to the shared torch.cuda.graph API.
 """
 
 from vllm.logger import init_logger

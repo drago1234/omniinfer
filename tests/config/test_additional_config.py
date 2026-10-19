@@ -25,6 +25,17 @@ def test_known_keys_mapped():
     assert cfg.enable_omni_cache is True
 
 
+def test_npugraph_ex_config_is_a_free_dict_passthrough():
+    sub = {
+        "enable": True,
+        "static_kernel_compile": True,
+        "static_kernel_cache_enable": True,
+        "static_kernel_cache_dir": "/cache/root",
+    }
+    cfg = OmniAdditionalConfig.from_vllm_config(_vllm({"npugraph_ex_config": sub}))
+    assert cfg.npugraph_ex_config == sub
+
+
 def test_unknown_shared_key_is_ignored_by_omni_accessor():
     cfg = OmniAdditionalConfig.from_vllm_config(_vllm({"totally_unknown_key": 123}))
     assert cfg.combine_block == 1  # Default value.

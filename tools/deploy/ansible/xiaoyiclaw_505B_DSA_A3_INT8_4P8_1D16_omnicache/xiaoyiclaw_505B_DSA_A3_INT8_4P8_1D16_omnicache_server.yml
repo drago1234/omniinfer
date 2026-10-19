@@ -43,7 +43,7 @@
     pangu_prefill_async_scheduling: true
     # Preserve baseline AIV; override with AI_CPU to isolate the observed hang.
     pangu_prefill_hccl_op_expansion_mode: AIV
-    enable_kv_pool: false
+    enable_fusion_pool: false
 
     omnicache_v2_prefill_kv_transfer_config:
       kv_connector: OmniCacheConnector

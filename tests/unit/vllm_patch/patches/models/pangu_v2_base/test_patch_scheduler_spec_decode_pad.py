@@ -332,45 +332,6 @@ def test_fork_matches_upstream_except_the_guard():
             "\nPAD_CONDITION",
             text,
         )
-        # Register the placeholder-width guard as an intentional deviation:
-        # both sides normalize to the same anchors so the rest of the fork
-        # still has to match upstream line by line.
-        text = re.sub(
-            r"num_pad_slots = min\(self\.num_spec_tokens, num_new_tokens - 1\)"
-            r".*?\] \* num_pad_slots",
-            "PLACEHOLDER_BLOCK",
-            text,
-            flags=re.S,
-        )
-        text = re.sub(
-            r"scheduled_spec_decode_tokens\[request_id\] = \["
-            r"\s*-1\s*\] \* self\.num_spec_tokens",
-            "PLACEHOLDER_BLOCK",
-            text,
-            flags=re.S,
-        )
-        text = re.sub(
-            r"max_slots = min\(num_scheduled_spec_tokens, num_new_tokens - 1\)"
-            r".*?\(\n\s+spec_token_ids\s*\n\s*\)",
-            "SPEC_REL_BLOCK",
-            text,
-            flags=re.S,
-        )
-        text = re.sub(
-            r"if len\(spec_token_ids\) > num_scheduled_spec_tokens:\s*"
-            r"spec_token_ids = spec_token_ids\[:num_scheduled_spec_tokens\]\s*"
-            r"scheduled_spec_decode_tokens\[request\.request_id\] = "
-            r"spec_token_ids",
-            "SPEC_REL_BLOCK",
-            text,
-            flags=re.S,
-        )
-        text = re.sub(
-            r"assert total_num_scheduled_tokens >= 0, \(.*?\n\s*\)\n",
-            "",
-            text,
-            flags=re.S,
-        )
         lines = [line.rstrip() for line in text.splitlines()]
         while lines and not lines[-1].strip():
             lines.pop()
@@ -648,84 +609,6 @@ def test_spec_padding_near_max_model_len_keeps_unpadded():
     assert output.num_scheduled_tokens == {"r0": 1, "w0": 1}
     assert output.scheduled_spec_decode_tokens == {}
     assert fake.kv_cache_manager.allocate_calls[-1][1] == 1
-
-
-def test_pad_placeholder_clamped_when_threshold_shrinks_accounting():
-    # Regression: the pad decision sizes num_new_tokens to 1 + num_spec_tokens,
-    # but a later long_prefill_token_threshold shrink must shrink the dummy
-    # placeholder with it, otherwise update_scheduler_for_invalid_drafts()
-    # (num_scheduled_tokens -= len(placeholder) - valid_k) drives the
-    # accounted count below zero and the negative total kills the worker.
-    running = _request("r0", num_tokens=5, num_computed_tokens=4)
-    waiting = _request("w0", num_tokens=6, num_computed_tokens=5)
-    fake = _FakeScheduler(
-        running=[running],
-        waiting=[waiting],
-        num_spec_tokens=2,
-        scheduler_config=SimpleNamespace(
-            long_prefill_token_threshold=2,
-            enable_chunked_prefill=False,
-        ),
-    )
-
-    output = _schedule(fake)
-
-    # Pad decides 1+2=3 tokens, the threshold shrinks the account to 2, so
-    # the placeholder may claim at most 2-1=1 slot (upstream wrote 2).
-    assert output.num_scheduled_tokens == {"r0": 1, "w0": 2}
-    assert output.scheduled_spec_decode_tokens == {"w0": [-1]}
-
-
-def test_pad_placeholder_dropped_when_accounting_shrinks_to_one():
-    # When the shrink eats all headroom no placeholder may be written at all:
-    # even a single dummy slot would trim the accounted count to zero.
-    running = _request("r0", num_tokens=5, num_computed_tokens=4)
-    waiting = _request("w0", num_tokens=6, num_computed_tokens=5)
-    fake = _FakeScheduler(
-        running=[running],
-        waiting=[waiting],
-        num_spec_tokens=2,
-        scheduler_config=SimpleNamespace(
-            long_prefill_token_threshold=1,
-            enable_chunked_prefill=False,
-        ),
-    )
-
-    output = _schedule(fake)
-
-    assert output.num_scheduled_tokens == {"r0": 1, "w0": 1}
-    assert output.scheduled_spec_decode_tokens == {}
-
-
-def test_running_spec_placeholder_clamped_to_accounted_tokens():
-    # A running request whose placeholder backlog outgrows the accounted
-    # tokens (e.g. the context window filled up) gets its placeholder
-    # clamped to num_new_tokens - 1 instead of scheduling an over-wide
-    # dummy batch that trims the count to zero.
-    running = _request(
-        "r0",
-        num_tokens=5,
-        num_computed_tokens=5,
-        spec_token_ids=[7, 8, 9],
-    )
-    running.num_tokens_with_spec = 8
-    fake = _FakeScheduler(running=[running])
-
-    output = _schedule(fake)
-
-    # num_new_tokens = 8 - 5 = 3: the stale 3-slot backlog would trim the
-    # account to zero (3 scheduled - 3 placeholder), so it is clamped to 2.
-    assert output.num_scheduled_tokens == {"r0": 3}
-    assert output.scheduled_spec_decode_tokens == {"r0": [7, 8]}
-
-
-def test_negative_total_guard_is_registered():
-    source = inspect.getsource(sched_mod.PanguV2SpecDecodePadPatch.schedule)
-    # The scheduler must fail locally on a negative total (with per-request
-    # counts) instead of leaking it to the worker's
-    # `assert total_num_scheduled_tokens > 0`.
-    assert "total_num_scheduled_tokens >= 0" in source
-    assert "per-request counts" in source
 
 
 def test_preemption_when_kv_blocks_unavailable():

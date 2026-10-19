@@ -31,7 +31,10 @@ from omni_npu.layers.prefetch import PrefetchManager
 from omni_npu.layers.fused_moe.layer import NPUFusedMoE
 from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp
 from omni_npu.layers.fused_moe.config import int4_w4a8_moe_quant_config
-from omni_npu.layers.fused_moe.fused_moe_method_base import NPUFusedMoEMethodBase
+from omni_npu.layers.fused_moe.fused_moe_method_base import (
+    NPUFusedMoEMethodBase,
+    npu_grouped_moe_experts_bf16,
+)
 from omni_npu.layers.quantization.moe_apply import unpack_apply_experts_state
 from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import (
     PreparePermuteOptions,
@@ -576,27 +579,13 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
             )
 
         if experts.quant_config is None:
-            gate_up_proj = torch_npu.npu_grouped_matmul(
-                [hidden_states],
-                [experts.w13_weight],
-                bias=None,
-                group_list=expert_tokens,
-                split_item=3,
+            return npu_grouped_moe_experts_bf16(
+                hidden_states,
+                experts,
+                expert_tokens,
+                group_list_type,
                 output_dtype=hidden_states.dtype,
-                group_type=0,
-                group_list_type=group_list_type,
-            )[0]
-            intermediate_hidden_states = torch_npu.npu_swiglu(gate_up_proj)
-            return torch_npu.npu_grouped_matmul(
-                [intermediate_hidden_states],
-                [experts.w2_weight],
-                bias=None,
-                group_list=expert_tokens,
-                split_item=3,
-                output_dtype=hidden_states.dtype,
-                group_type=0,
-                group_list_type=group_list_type,
-            )[0]
+            )
 
         if pertoken_scale is None:
             raise ValueError("Quantized path requires dynamic per-token scale.")

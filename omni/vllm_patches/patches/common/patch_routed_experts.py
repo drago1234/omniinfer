@@ -54,7 +54,6 @@ _ORIGINAL_CHAT_CHOICE_INIT = ChatCompletionResponseChoice.__init__
 _ORIGINAL_CHAT_STREAM_CHOICE_INIT = ChatCompletionResponseStreamChoice.__init__
 _ORIGINAL_COMPLETION_CHOICE_INIT = CompletionResponseChoice.__init__
 _ORIGINAL_COMPLETION_STREAM_CHOICE_INIT = CompletionResponseStreamChoice.__init__
-_original_add = RequestOutput.add
 _ROUTED_EXPERT_KEYS = (
     "routed_experts_shape",
     "routed_experts_dtype",
@@ -136,6 +135,13 @@ def _concatenate_routed_experts(
 class RequestOutputRoutedExpertsAggregationPatch(VLLMPatch):
     _attr_names_to_apply = ["add"]
 
+    _upstream_add = RequestOutput.add
+
+    @classmethod
+    def apply(cls):
+        # Relay to the EC transfer RequestOutput.add wrapper instead of replacing it.
+        cls.apply_bypass_conflict("add")
+
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         existing_routed_experts = {
             completion.index: completion.routed_experts
@@ -146,7 +152,9 @@ class RequestOutputRoutedExpertsAggregationPatch(VLLMPatch):
             for completion in next_output.outputs
         }
 
-        _original_add(self, next_output, aggregate)
+        RequestOutputRoutedExpertsAggregationPatch._upstream_add(
+            self, next_output, aggregate
+        )
 
         if not aggregate:
             return

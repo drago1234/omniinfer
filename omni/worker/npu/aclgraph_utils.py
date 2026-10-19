@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import functools
 import threading
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -57,17 +58,17 @@ class CaptureWindow:
         _CAPTURING.value = self._previous
 
 
-def _force_full_mode(forward_fn):
-    """Run the recorded pass as FULL, with the capturing flag raised.
+def _force_full_mode(forward_fn, *, capturing=True):
+    """Use the compiled FULL path, raising capturing only for the recorded pass.
 
-    Both signals are scoped to this one call rather than to torch.cuda.graph:
-    the wrapper is only installed for the recorded pass, so the warmup pass --
-    which runs outside the graph and must register nothing -- is untouched,
-    and unrelated code entering torch.cuda.graph no longer trips the flag.
+    FULL warmup must reach the same compiled callable before the outer graph
+    starts recording. NONE bypasses compilation in omni's model decorator,
+    leaving static-kernel compilation's extra forward inside the recorded graph.
+    Warmup must still leave capturing unset so attention registers no ACL tasks.
     """
 
     def forward_fn_full(cg_mode):
-        with CaptureWindow():
+        with CaptureWindow() if capturing else nullcontext():
             return forward_fn(
                 CUDAGraphMode.FULL if cg_mode is CUDAGraphMode.NONE else cg_mode
             )
@@ -82,7 +83,8 @@ def build_capture_with_full_mode(original_capture):
     from the outside, but omni reads that field as "am I in a graph" in three
     places. Rewriting the argument rather than the ForwardContext field also
     keeps set_forward_context synthesizing the BatchDescriptor that MoME
-    dereferences. The warmup pass keeps NONE: it runs outside the graph.
+    dereferences. FULL warmup also uses FULL to initialize the compiled path,
+    but does not raise capturing: it runs outside the graph with its own state.
     """
 
     @functools.wraps(original_capture)
@@ -102,9 +104,9 @@ def build_capture_with_full_mode(original_capture):
             # such as FULL_DECODE_ONLY are split by decode_mode()/mixed_mode()
             # when the capture descs are built, so only PIECEWISE and FULL
             # reach here and a new dual config needs no change.
-            if warmup or desc.cg_mode is not CUDAGraphMode.FULL:
+            if desc.cg_mode is not CUDAGraphMode.FULL:
                 return forward_fn, attn_state
-            return _force_full_mode(forward_fn), attn_state
+            return _force_full_mode(forward_fn, capturing=not warmup), attn_state
 
         result = original_capture(self, create_forward_fn_full, *args, **kwargs)
 

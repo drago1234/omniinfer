@@ -299,17 +299,12 @@ class TestMxfp8Config:
         cfg = mxfp8_module.Mxfp8Config.from_config({"ignore": []})
         assert cfg.ignored_layers is None
 
-    def test_from_config_mxfp8_comm_quant(self, mxfp8_module):
-        cfg = mxfp8_module.Mxfp8Config.from_config(
+    def test_from_config_ignores_legacy_comm_quant(self, mxfp8_module):
+        module = mxfp8_module
+        config = module.Mxfp8Config.from_config(
             {"enable_mxfp8_comm_quant": True}
         )
-        assert cfg.enable_mxfp8_comm_quant is True
-
-    def test_from_config_rejects_non_bool_mxfp8_comm_quant(self, mxfp8_module):
-        with pytest.raises(ValueError, match="must be bool"):
-            mxfp8_module.Mxfp8Config.from_config(
-                {"enable_mxfp8_comm_quant": "true"}
-            )
+        assert not hasattr(config, "enable_mxfp8_comm_quant")
 
     def test_get_name(self, mxfp8_module):
         assert mxfp8_module.Mxfp8Config.get_name() == "mxfp8"

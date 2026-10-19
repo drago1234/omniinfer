@@ -66,9 +66,9 @@
         # 分片 DDR 载入：每卡只从 DDR 读 1/tp，卡间 all-gather 拼齐；不满足条件时各卡一致退回原路径。
         # 特性默认关，这里只是把开关摆出来；要开改成 true。
         sharded_load: false
-      # 由 enable_kv_pool=true 控制（M 组部署 + install_kv_pool +
-      # kv_pool_runtime fragment）。
-      kv_pool:
+      # 由 enable_fusion_pool=true 控制（M 组部署 + install_fusion_pool +
+      # fusion_pool_runtime fragment）。
+      fusion_pool:
         global_segment_size_gb: 64
       prepare_commands: |-
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_ALL | replace(' ', '') | trim | quote }}
@@ -98,7 +98,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --dtype bfloat16 --enforce-eager"
         EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu"
-        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","ban_sequence_end_in_thinking":true}'
+        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
         {% if enable_prefix_caching | bool %}
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prefix-caching --mamba-block-size 128"
@@ -161,7 +161,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu"
-        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","ban_sequence_end_in_thinking":true}'
+        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
         {% if enable_prefix_caching | bool %}
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prefix-caching --mamba-block-size 128"

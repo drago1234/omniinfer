@@ -63,9 +63,9 @@
         hugepage_enabled: true
         cpu_bytes_to_use: 1288490188800  # 1 TiB 
         eviction_policy: arc  # arc or lru
-      # 由 enable_kv_pool=true 控制（M 组部署 + install_kv_pool +
-      # kv_pool_runtime fragment）。
-      kv_pool:
+      # 由 enable_fusion_pool=true 控制（M 组部署 + install_fusion_pool +
+      # fusion_pool_runtime fragment）。
+      fusion_pool:
         global_segment_size_gb: 64
       prepare_commands: |-
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_ALL | replace(' ', '') | trim | quote }}
@@ -95,7 +95,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --dtype bfloat16 --enforce-eager"
         EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu"
-        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","ban_sequence_end_in_thinking":true}'
+        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
         {% if enable_prefix_caching | bool %}
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prefix-caching --mamba-block-size 128"
@@ -109,7 +109,7 @@
         fi
         export TORCH_COMPILE_DISABLE=1
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-        GPU_UTIL=0.8
+        GPU_UTIL=0.9
       args:
         - --max-model-len 524288
         - --served-model-name {{ model | quote }}
@@ -158,7 +158,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu"
-        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","ban_sequence_end_in_thinking":true}'
+        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
         {% if enable_prefix_caching | bool %}
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prefix-caching --mamba-block-size 128"

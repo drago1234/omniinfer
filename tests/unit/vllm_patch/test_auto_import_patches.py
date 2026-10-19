@@ -146,7 +146,7 @@ def test_nonempty_new_selector_takes_precedence_over_old_selector(monkeypatch):
     assert [name for name, _ in loaded] == ["common", "pangu_v2_base", "low_latency"]
 
 
-def test_legacy_vl_group_contains_six_multimodal_patches():
+def test_legacy_vl_group_contains_expected_multimodal_patches():
     models_root = Path(vllm_patches.__file__).parent / "patches/models"
     selected = vllm_patches._find_patch_dir_exact("openpangu_v1_vl", models_root)
     assert selected == [models_root / "openpangu_v1_vl"]
@@ -156,10 +156,12 @@ def test_legacy_vl_group_contains_six_multimodal_patches():
     # duplicate implementations remain after combining the two groups.
     paths = sorted(selected[0].rglob("*.py"), key=lambda path: path.name)
     assert [path.relative_to(selected[0]).as_posix() for path in paths] == [
+        "patch_gather_mm_embedding.py",
         "patch_m_rotary_embedding.py",
         "patch_media_utils.py",
         "patch_mm_feature_transfer_args.py",
         "patch_multimodal_embeddings.py",
         "patch_multimodal_prompt_updates.py",
+        "patch_shm_reference_counting.py",
         "patch_video.py",
     ]
