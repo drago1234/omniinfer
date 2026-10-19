@@ -37,10 +37,11 @@ def _accelerator_view(cpu_tensor: torch.Tensor) -> torch.Tensor:
 class NPUUvaBuffer:
     """Expose CPU, NumPy, and device views of an upstream UVA buffer."""
 
-    __slots__ = ("cpu", "np", "_dev", "_fast")
+    __slots__ = ("cpu", "np", "_dev", "_fast", "_copy_done")
 
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype) -> None:
         self._fast = resolve_mode() is RuntimeMode.NPU_UVA_VIEW
+        self._copy_done = None if self._fast else torch.npu.Event()
         # The UVA view requires pinned memory; _check_npu_uva_prereqs rejects
         # anything else, so the fast path cannot honour PIN_MEMORY=0.
         self.cpu = torch.zeros(
@@ -60,9 +61,30 @@ class NPUUvaBuffer:
     def uva(self) -> torch.Tensor:
         if not self._fast:
             self._dev.copy_(self.cpu, non_blocking=True)
+            self._copy_done.record(torch.npu.current_stream())
         return self._dev
+
+    def wait_for_host_reuse(self) -> None:
+        """Protect the pinned source before a pool slot is overwritten.
+
+        Only the staged-copy path is covered. True UVA has no H2D operation
+        and retains the upstream bounded-consumer-lifetime contract.
+        """
+        if self._copy_done is not None:
+            self._copy_done.synchronize()
 
     @property
     def device_bytes(self) -> int:
         """Return additional device memory used by this buffer."""
         return 0 if self._fast else self._dev.numel() * self._dev.element_size()
+
+
+def copy_to_uva_with_slot_event(self, x):
+    """UvaBufferPool.copy_to_uva with a per-slot H2D reuse fence."""
+    self._curr = (self._curr + 1) % self.max_concurrency
+    buf = self._uva_bufs[self._curr]
+    buf.wait_for_host_reuse()
+    dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
+    n = len(x)
+    dst[:n] = x
+    return buf.uva[:n]
