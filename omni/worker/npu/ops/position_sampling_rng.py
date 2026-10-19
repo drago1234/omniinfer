@@ -10,14 +10,6 @@ conversion uses the upper 24 bits, independent of batch shape and tile layout.
 import torch
 from vllm.triton_utils import tl, triton
 
-from omni_npu import envs
-
-
-def position_rng_enabled() -> bool:
-    """Read before graph capture; a captured graph keeps its selected RNG path."""
-    return envs.OMNI_MRV2_POSITION_RNG
-
-
 @triton.jit
 def _mulhi16(x, A: tl.constexpr):
     # Exact high32(A*x). Split both operands into 16-bit limbs so CANN can

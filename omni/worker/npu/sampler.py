@@ -25,10 +25,7 @@ import torch_npu
 from vllm.triton_utils import tl, triton
 
 from omni_npu.worker.npu.ops.gumbel import _npu_gumbel_block_argmax
-from omni_npu.worker.npu.ops.position_sampling_rng import (
-    make_uniform,
-    position_rng_enabled,
-)
+from omni_npu.worker.npu.ops.position_sampling_rng import make_uniform
 
 
 @triton.jit(
@@ -51,13 +48,10 @@ def _gumbel_sample_kernel(  # pragma: no cover
     logits_ptr,
     logits_stride,
     expanded_idx_mapping_ptr,
-    seeds_ptr,
-    pos_ptr,
     temp_ptr,
     uniform_ptr,
     uniform_stride,
     vocab_size,
-    EXTERNAL_UNIFORM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
 ):
@@ -74,10 +68,9 @@ def _gumbel_sample_kernel(  # pragma: no cover
 
     value, idx = _npu_gumbel_block_argmax(
         logits, block, mask, token_idx,
-        expanded_idx_mapping_ptr, temp_ptr, seeds_ptr, pos_ptr,
+        expanded_idx_mapping_ptr, temp_ptr,
         processed_logits_ptr, processed_logits_stride, processed_logits_col_ptr,
         vocab_size, uniform_ptr, uniform_stride, token_idx,
-        EXTERNAL_UNIFORM=EXTERNAL_UNIFORM,
         APPLY_TEMPERATURE=APPLY_TEMPERATURE, USE_FP64=False,
     )
     token_id = block_idx * BLOCK_SIZE + idx
@@ -102,8 +95,8 @@ def gumbel_sample(
     Gumbel noise scaled by the row's temperature. Mixed batches are handled
     correctly — each row is decided independently by its own ``temp``.
 
-    Set OMNI_MRV2_POSITION_RNG=0 before graph capture to use the original
-    inline RNG for comparison. The default is batched, position-indexed RNG.
+    Uniforms are generated in a batch from each request seed and absolute
+    position before launching the sampling kernel.
     """
     if use_fp64:
         raise NotImplementedError(
@@ -124,11 +117,8 @@ def gumbel_sample(
         dtype=torch.float32,
         device=logits.device,
     )
-    external_uniform = position_rng_enabled()
-    uniform = (
-        make_uniform(num_tokens, vocab_size, logits.device,
-                     expanded_idx_mapping, seed, pos)
-        if external_uniform else logits
+    uniform = make_uniform(
+        num_tokens, vocab_size, logits.device, expanded_idx_mapping, seed, pos
     )
     _gumbel_sample_kernel[(num_tokens, num_blocks)](
         local_argmax,
@@ -141,13 +131,10 @@ def gumbel_sample(
         logits,
         logits.stride(0),
         expanded_idx_mapping,
-        seed,
-        pos,
         temperature,
         uniform,
         uniform.stride(0),
         vocab_size,
-        EXTERNAL_UNIFORM=external_uniform,
         BLOCK_SIZE=BLOCK_SIZE,
         APPLY_TEMPERATURE=apply_temperature,
     )
@@ -170,7 +157,7 @@ def apply_top_k_top_p(
     Uses CANN semantics: top-k keeps k entries even at tied logits; p=1 disables
     top-p filtering. These boundary cases differ from the PyTorch sort fallback.
     """
-    if k is None and p is None:
+    if p is None and k is None:
         return logits
 
     rows, vocab_size = logits.shape

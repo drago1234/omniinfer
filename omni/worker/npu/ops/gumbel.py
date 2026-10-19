@@ -14,8 +14,6 @@ def _npu_gumbel_block_argmax(  # pragma: no cover
     token_idx,
     expanded_idx_mapping_ptr,
     temp_ptr,
-    seeds_ptr,
-    pos_ptr,
     processed_logits_ptr,
     processed_logits_stride,
     processed_logits_col_ptr,
@@ -23,7 +21,6 @@ def _npu_gumbel_block_argmax(  # pragma: no cover
     uniform_ptr,
     uniform_stride,
     uniform_row,
-    EXTERNAL_UNIFORM: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
@@ -53,19 +50,12 @@ def _npu_gumbel_block_argmax(  # pragma: no cover
 
     logits = logits.to(tl.float32)
     if temp != 0.0:
-        if EXTERNAL_UNIFORM:
-            # Uniform rows follow the caller's sampling rows, not state slots:
-            # token_idx for draft sampling, req_idx for rejected/bonus sampling.
-            r = tl.load(
-                uniform_ptr + uniform_row * uniform_stride + block,
-                mask=mask & is_valid_req, other=0.5,
-            ).to(tl.float32)
-        else:
-            seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
-            # NPU: int32 avoids the unsupported uint64 Philox lowering path.
-            pos = tl.load(pos_ptr + token_idx).to(tl.int32)
-            gumbel_seed = tl.randint(seed, pos)
-            r = tl.rand(gumbel_seed, block).to(tl.float32)
+        # Uniform rows follow the caller's sampling rows, not state slots:
+        # token_idx for draft sampling, req_idx for rejected/bonus sampling.
+        r = tl.load(
+            uniform_ptr + uniform_row * uniform_stride + block,
+            mask=mask & is_valid_req, other=0.5,
+        ).to(tl.float32)
         # Keep the original transform, including its endpoint handling.
         gumbel_noise = -tl.log(-tl.log(r + 1e-20) + 1e-20)
         logits = tl.where(mask, logits + gumbel_noise, float("-inf"))
