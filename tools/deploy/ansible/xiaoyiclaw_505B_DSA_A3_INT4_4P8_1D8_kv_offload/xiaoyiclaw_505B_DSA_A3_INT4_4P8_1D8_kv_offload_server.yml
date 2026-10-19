@@ -74,6 +74,7 @@
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_ALL | replace(' ', '') | trim | quote }}
         export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=36000
         export VLLM_DISABLE_PYNCCL=1
+        export VLLM_USE_V2_MODEL_RUNNER=1
         export HCCL_BUFFSIZE=100
         export HCCL_CONNECT_TIMEOUT=120
         export HCCL_EXEC_TIMEOUT=120
@@ -136,6 +137,7 @@
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_BY_GROUP | replace(' ', '') | trim | quote }}
         export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=36000
         export VLLM_DISABLE_PYNCCL=1
+        export VLLM_USE_V2_MODEL_RUNNER=1
         export HCCL_BUFFSIZE=1200
         export HCCL_CONNECT_TIMEOUT=1800
         export HCCL_EXEC_TIMEOUT=1800
