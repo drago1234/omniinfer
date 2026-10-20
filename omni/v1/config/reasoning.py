@@ -7,6 +7,7 @@ from dataclasses import field
 from vllm.config.model import ModelConfig
 from vllm.config.reasoning import ReasoningConfig as VllmReasoningConfig
 from vllm.config.utils import config
+from vllm.reasoning import ReasoningParserManager
 from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
 
@@ -50,6 +51,14 @@ class ReasoningConfig(VllmReasoningConfig):
     _banned_token_ids: tuple[int, ...] = field(
         default=(), init=False, repr=False
     )
+    _natural_reasoning_end_token_ids: list[int] | None = field(
+        default=None, init=False, repr=False
+    )
+
+    @property
+    def natural_reasoning_end_token_ids(self) -> list[int] | None:
+        """Parser end marker, distinct from the budget's forced end sequence."""
+        return self._natural_reasoning_end_token_ids
 
     @property
     def banned_token_ids(self) -> tuple[int, ...]:
@@ -65,7 +74,16 @@ class ReasoningConfig(VllmReasoningConfig):
 
         # This preserves vLLM 0.25.1's parser-derived marker support.
         super().initialize_token_ids(model_config)
-        if not self.enabled or not self.ban_tokens_in_thinking:
+        if not self.enabled:
+            return
+
+        # Backport of vLLM 0.30.0 (vllm#46727): the V2 thinking budget
+        # distinguishes the parser's natural end marker from the forced
+        # ``reasoning_end_str`` sequence.
+        if self._natural_reasoning_end_token_ids is None:
+            self._init_natural_reasoning_end_token_ids(model_config)
+
+        if not self.ban_tokens_in_thinking:
             return
 
         tokenizer = cached_tokenizer_from_config(model_config=model_config)
@@ -89,3 +107,24 @@ class ReasoningConfig(VllmReasoningConfig):
                 missing,
             )
         self._banned_token_ids = tuple(resolved)
+
+    def _init_natural_reasoning_end_token_ids(
+        self, model_config: ModelConfig
+    ) -> None:
+        """Use the parser's end marker, falling back to initialized end IDs."""
+        token_ids = self.reasoning_end_token_ids
+        if self.reasoning_parser:
+            tokenizer = cached_tokenizer_from_config(model_config=model_config)
+            parser_cls = ReasoningParserManager.get_reasoning_parser(
+                self.reasoning_parser
+            )
+            natural_end_str = parser_cls(tokenizer).reasoning_end_str
+            if natural_end_str:
+                token_ids = tokenizer.encode(natural_end_str, add_special_tokens=False)
+                if not token_ids:
+                    raise ValueError(
+                        "ReasoningConfig: failed to tokenize natural reasoning end "
+                        f"string: natural_reasoning_end_str='{natural_end_str}'. "
+                        "Ensure the string is a valid token in the model's vocabulary."
+                    )
+        self._natural_reasoning_end_token_ids = list(token_ids or [])

@@ -9,7 +9,9 @@ test_patch_repetition_detection_config.py. Run with pytest or directly.
 The stubs reproduce the 0.25.1 facts the patch leans on:
 ``thinking_token_budget`` is a real SamplingParams field, native
 create_engine_config already feeds ``self.reasoning_config`` into VllmConfig,
-and process_inputs takes params positionally and clones it internally.
+process_inputs takes params positionally and clones it internally, and
+``_validate_params`` still rejects a budget on the V2 model runner (the gate
+patch 3 lifts).
 """
 
 import importlib.util
@@ -119,12 +121,37 @@ class _EngineArgs:
 
 
 class _InputProcessor:
-    def __init__(self, vllm_config):
+    """Mirrors 0.25.1 ``InputProcessor``: the V2 gate lives in
+    ``_validate_params`` and keys on ``use_v2_model_runner``."""
+
+    def __init__(self, vllm_config, use_v2_model_runner=False):
         self.vllm_config = vllm_config
+        self.use_v2_model_runner = use_v2_model_runner
+
+    def _validate_params(self, params, supported_tasks):
+        if not isinstance(params, _SamplingParams):
+            return
+        if params.thinking_token_budget is None:
+            return
+        # input_processor.py:102-117 (0.25.1), verbatim in order.
+        cfg = self.vllm_config.reasoning_config
+        if cfg is None or not getattr(cfg, "enabled", True):
+            raise ValueError(
+                "thinking_token_budget is set but reasoning_config is "
+                "not configured. Please set --reasoning-parser "
+                "and/or --reasoning-config to use thinking_token_budget."
+            )
+        if self.use_v2_model_runner:
+            raise ValueError(
+                "thinking_token_budget is not yet supported by the V2 "
+                "model runner. Run vLLM with VLLM_USE_V2_MODEL_RUNNER=0 "
+                "to use thinking_token_budget."
+            )
 
     def process_inputs(self, request_id, prompt, params, **kwargs):
-        # 0.25.1 clones the params (input_processor.py:315); the clone is what
-        # reaches the engine core, so the test asserts on it.
+        # 0.25.1 validates before cloning (input_processor.py:102 / :315).
+        self._validate_params(params, kwargs.get("supported_tasks", ()))
+        # The clone is what reaches the engine core, so tests assert on it.
         if isinstance(params, _SamplingParams):
             clone = _SamplingParams(params.thinking_token_budget)
         else:
@@ -150,6 +177,14 @@ class _VLLMPatch:
             target._omni_npu_applied_patches[name] = cls.__name__
             setattr(target, name, cls.__dict__[name])
 
+    @staticmethod
+    def _upstream_attr_name(name):
+        # Mirrors core.py: a leading underscore keeps a single separator, so
+        # "_validate_params" is reached as "_upstream_validate_params".
+        if name.startswith("_"):
+            return f"_upstream{name}"
+        return f"_upstream_{name}"
+
     @classmethod
     def apply_bypass_conflict(cls, *upstream):
         target = cls._target
@@ -157,7 +192,7 @@ class _VLLMPatch:
             attr = getattr(target, name)
             if name == "from_cli_args":
                 attr = attr.__func__
-            setattr(cls, f"_upstream_{name}", attr)
+            setattr(cls, cls._upstream_attr_name(name), attr)
         for name in cls._attr_names_to_apply:
             if name in cls.__dict__:
                 setattr(target, name, cls.__dict__[name])
@@ -230,6 +265,10 @@ def _load_patch():
     # without first calling apply().
     mod.ThinkingLimitInputProcessorPatch._upstream_process_inputs = (
         _InputProcessor.process_inputs
+    )
+    # _validate_params is chained the same way (apply_bypass_conflict).
+    mod.ThinkingLimitV2GatePatch._upstream_validate_params = (
+        _InputProcessor._validate_params
     )
     return mod
 
@@ -353,6 +392,7 @@ def test_patch_targets():
     names = {name: target for name, target, _ in REGISTERED}
     assert names["ThinkingLimitEngineArgsPatch"] is _EngineArgs
     assert names["ThinkingLimitInputProcessorPatch"] is _InputProcessor
+    assert names["ThinkingLimitV2GatePatch"] is _InputProcessor
 
 
 # --- _normalize_thinking_token_budget --------------------------------------
@@ -598,6 +638,115 @@ def test_params_passed_as_kwarg_is_also_found():
         supported_tasks=("generate",),
     )
     assert out["params"].thinking_token_budget == 128
+
+
+# --- ThinkingLimitV2GatePatch._validate_params ------------------------------
+
+
+def _validate(processor, params):
+    return PATCH.ThinkingLimitV2GatePatch._validate_params(
+        processor, params, ("generate",)
+    )
+
+
+def _raises(exc_type, fn, match=None):
+    """pytest.raises stand-in so these tests also run standalone."""
+    try:
+        fn()
+    except exc_type as exc:
+        return match is None or match in str(exc)
+    return False
+
+
+def _v2_processor(reasoning_config):
+    return _InputProcessor(
+        _VllmConfig(reasoning_config=reasoning_config, model_config=_ModelConfigStub()),
+        use_v2_model_runner=True,
+    )
+
+
+def test_v2_budget_request_is_no_longer_rejected():
+    """0.25.1's "not yet supported by the V2 model runner" gate must go: the
+    NPU V2 sampler implements the feature."""
+    _reset()
+    proc = _v2_processor(_ReasoningConfig(thinking_token_budget=128))
+    assert _validate(proc, _SamplingParams(100)) is None
+    # The flag is only cleared for the upstream call.
+    assert proc.use_v2_model_runner is True
+
+
+def test_v2_gate_does_not_touch_requests_without_a_budget():
+    _reset()
+    proc = _v2_processor(_ReasoningConfig(thinking_token_budget=128))
+    seen = []
+    native = PATCH.ThinkingLimitV2GatePatch._upstream_validate_params
+
+    def _record(self, params, supported_tasks):
+        seen.append(self.use_v2_model_runner)
+        return native(self, params, supported_tasks)
+
+    PATCH.ThinkingLimitV2GatePatch._upstream_validate_params = _record
+    try:
+        assert _validate(proc, _SamplingParams()) is None
+    finally:
+        PATCH.ThinkingLimitV2GatePatch._upstream_validate_params = native
+    # No budget: the gate patch is a transparent passthrough.
+    assert seen == [True]
+
+
+def test_v2_gate_keeps_the_reasoning_config_check():
+    """Only the V2 rejection is lifted; the native reasoning_config check stays."""
+    _reset()
+    proc = _v2_processor(None)
+    assert _raises(ValueError, lambda: _validate(proc, _SamplingParams(100)),
+                   match="reasoning_config is")
+    assert proc.use_v2_model_runner is True
+
+
+def test_v2_gate_restores_the_flag_when_native_raises():
+    _reset()
+    proc = _v2_processor(types.SimpleNamespace(enabled=False))
+    assert _raises(ValueError, lambda: _validate(proc, _SamplingParams(100)))
+    assert proc.use_v2_model_runner is True
+
+
+def test_v1_budget_request_keeps_native_behaviour():
+    """MRv1 path is untouched: the flag is already False, no rewiring."""
+    _reset()
+    proc = _InputProcessor(
+        _VllmConfig(
+            reasoning_config=_ReasoningConfig(thinking_token_budget=128),
+            model_config=_ModelConfigStub(),
+        ),
+        use_v2_model_runner=False,
+    )
+    assert _validate(proc, _SamplingParams(100)) is None
+    assert proc.use_v2_model_runner is False
+
+
+def test_v2_gate_chains_with_another_validate_params_patch():
+    """A prior link (e.g. structured output) must still run: the gate patch
+    uses apply_bypass_conflict and calls _upstream_validate_params."""
+    _reset()
+    native_validate = _InputProcessor._validate_params
+    prior_calls = []
+
+    def _prior(self, params, supported_tasks):
+        prior_calls.append(params)
+        return native_validate(self, params, supported_tasks)
+
+    with _monkeypatch() as mp:
+        mp.setattr(_InputProcessor, "_validate_params", _prior)
+        mp.setattr(
+            PATCH.ThinkingLimitV2GatePatch,
+            "_upstream_validate_params",
+            PATCH.ThinkingLimitV2GatePatch._upstream_validate_params,
+        )
+        PATCH.ThinkingLimitV2GatePatch.apply()
+
+        proc = _v2_processor(_ReasoningConfig(thinking_token_budget=128))
+        assert _InputProcessor._validate_params(proc, _SamplingParams(100), ("generate",)) is None
+        assert prior_calls and isinstance(prior_calls[0], _SamplingParams)
 
 
 # --- apply() / relay-chain integration --------------------------------------

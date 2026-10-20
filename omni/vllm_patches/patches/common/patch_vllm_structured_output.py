@@ -545,9 +545,6 @@ def _maybe_inject_server_structured_outputs(
                 params.structured_outputs = built
 
 
-_original_validate_params = InputProcessor._validate_params
-
-
 @register_patch("StructuredOutputInputProcessorPatch", InputProcessor)
 class StructuredOutputInputProcessorPatch(VLLMPatch):
     """Inject server-side structured-output defaults before validation.
@@ -558,14 +555,26 @@ class StructuredOutputInputProcessorPatch(VLLMPatch):
     populated and are left untouched (request wins). Otherwise the server-side
     config is materialized into ``params.structured_outputs`` so vLLM's
     existing backend selection + validation handle it like any request.
+
+    ``apply_bypass_conflict``: ``_validate_params`` is also wrapped by
+    patch_thinking_limit.py (MRv2 thinking-budget gate) and any future link.
+    Chaining through ``_upstream_validate_params`` instead of a
+    module-import-time capture keeps every link alive no matter which patch
+    module is imported/applied first.
     """
 
     _attr_names_to_apply = ["_validate_params"]
 
+    @classmethod
+    def apply(cls):
+        cls.apply_bypass_conflict("_validate_params")
+
     def _validate_params(self, params, supported_tasks):
         if isinstance(params, SamplingParams):
             _maybe_inject_server_structured_outputs(self.vllm_config, params)
-        return _original_validate_params(self, params, supported_tasks)
+        return StructuredOutputInputProcessorPatch._upstream_validate_params(
+            self, params, supported_tasks
+        )
 
 
 # --------------------------------------------------------------------------

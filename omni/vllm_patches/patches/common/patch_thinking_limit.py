@@ -19,14 +19,18 @@ natively:
   ``InputBatch``.
 
 So, unlike the 0.14.0 patch, this file does **not** re-implement any of that. It
-adds only the two Omni value-adds that have no native equivalent:
+adds only the three Omni value-adds that have no native equivalent:
 
 1. ``OMNI_REASONING_CONFIG`` env-var override of ``--reasoning-config``
-   (env > CLI; dict/JSON-string coercion), and
+   (env > CLI; dict/JSON-string coercion),
 2. a **server-side default** ``thinking_token_budget``: when the launch config
    sets ``reasoning_config.thinking_token_budget`` and a request omits its own
    budget, the default is injected so the request is capped. The request's own
-   ``thinking_token_budget`` always wins.
+   ``thinking_token_budget`` always wins,
+3. lifting 0.25.1's "``thinking_token_budget`` is not yet supported by the V2
+   model runner" rejection, which upstream removes in vllm#46727 together with
+   its own V2 implementation. Omni's V2 implementation is
+   ``omni/worker/npu/thinking_budget.py`` (see ``patch_mrv2_thinking_budget.py``).
 
 The thinking-ban feature (``ban_tool_start/end_in_thinking``) and the MTP
 structured-output fix from the same upstream commits already live in
@@ -229,3 +233,53 @@ class ThinkingLimitInputProcessorPatch(VLLMPatch):
         return ThinkingLimitInputProcessorPatch._upstream_process_inputs(
             self, *args, **kwargs
         )
+
+
+# ────────────────────────────────────────────────────────────
+# Patch 3: InputProcessor._validate_params — lift the MRv2 hard rejection
+# ────────────────────────────────────────────────────────────
+# vllm#46727 removes this gate; the NPU V2 sampler now provides the feature.
+
+
+@register_patch("ThinkingLimitV2GatePatch", InputProcessor)
+class ThinkingLimitV2GatePatch(VLLMPatch):
+    """Let ``thinking_token_budget`` through on the V2 model runner.
+
+    The gate keys on ``InputProcessor.use_v2_model_runner`` (set in
+    ``__init__`` from ``vllm_config``), which nothing else reads in 0.25.1.
+    Rather than re-implementing the native validator, the flag is cleared for
+    the duration of the upstream call so ``params.verify`` and the
+    ``reasoning_config`` presence check still run exactly as before.
+
+    ``apply_bypass_conflict``: ``_validate_params`` is also wrapped by
+    patch_vllm_structured_output.py. Chaining through
+    ``_upstream_validate_params`` keeps both link's behaviour independent of
+    the patch apply order (file names decide it today).
+    """
+
+    _attr_names_to_apply = ["_validate_params"]
+
+    @classmethod
+    def apply(cls):
+        cls.apply_bypass_conflict("_validate_params")
+
+    def _validate_params(self, params, supported_tasks):
+        # Only the combination that 0.25.1 rejects is special-cased; the flag
+        # is left untouched (and the call is a plain passthrough) otherwise.
+        budgeted = (
+            isinstance(params, SamplingParams)
+            and params.thinking_token_budget is not None
+        )
+        v2 = getattr(self, "use_v2_model_runner", False)
+        if not (budgeted and v2):
+            return ThinkingLimitV2GatePatch._upstream_validate_params(
+                self, params, supported_tasks
+            )
+
+        self.use_v2_model_runner = False
+        try:
+            return ThinkingLimitV2GatePatch._upstream_validate_params(
+                self, params, supported_tasks
+            )
+        finally:
+            self.use_v2_model_runner = v2

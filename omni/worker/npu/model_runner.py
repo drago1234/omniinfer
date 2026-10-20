@@ -57,9 +57,24 @@ class NPUModelRunnerV2(GPUModelRunner):
         if self.speculative_config is not None and self.is_last_pp_rank:
             self.speculator = init_speculator(self.vllm_config, self.device)
 
+    def _init_thinking_budget_state(self) -> None:
+        """Attach state after load_model creates the 0.25.1 Sampler."""
+        if self.sampler is None:  # Pooling models and non-last PP ranks.
+            return
+
+        from omni_npu.worker.npu.thinking_budget import NPUThinkingBudgetState
+
+        state = NPUThinkingBudgetState(
+            self.req_states, self.vllm_config.reasoning_config
+        )
+        self.sampler.thinking_budget_state = state
+        if state.enabled:
+            logger.info("[omni-npu/mrv2] thinking budget enabled on V2 sampler")
+
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
-        """Load the model, then align its multimodal buffer with mHC output."""
+        """Load the model, then attach sampling state and align mHC buffers."""
         super().load_model(load_dummy_weights, *args, **kwargs)
+        self._init_thinking_budget_state()
         self._align_mhc_mm_embedding_width()
 
     def _align_mhc_mm_embedding_width(self) -> None:
