@@ -72,13 +72,23 @@ _orig_process_outputs = OutputProcessor.process_outputs
 class NanInfDegradationOutputProcessorPatch(VLLMPatch):
     _attr_names_to_apply = ["process_outputs"]
 
+    @classmethod
+    def apply(cls):
+        # Preserve EC-transfer handling installed before this patch.
+        cls.apply_bypass_conflict("process_outputs")
+
     def process_outputs(self, engine_core_outputs, *args, **kwargs):
         try:
             degradation.record_engine_outputs(self, engine_core_outputs)
         except Exception as record_error:  # noqa: BLE001
             logger.warning("omni-nan-inf: failed to record degraded outputs: %r",
                            record_error)
-        return _orig_process_outputs(self, engine_core_outputs, *args, **kwargs)
+        upstream = getattr(
+            NanInfDegradationOutputProcessorPatch,
+            "_upstream_process_outputs",
+            _orig_process_outputs,
+        )
+        return upstream(self, engine_core_outputs, *args, **kwargs)
 
 
 try:
