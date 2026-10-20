@@ -3,7 +3,8 @@
 """Current MRv2 seed/position RNG reproducibility on a single NPU.
 
 These tests check the compiled RNG, not old/new random-sequence equivalence or
-model logits. The independent Philox oracle is covered by the CPU kernel UT.
+model logits. Arithmetic, batch layout and boundary cases belong to the CPU UT;
+keep one device-graph case for each distinct RNG path here.
 Run on an idle device with OMNI_TEST_NPU_DEVICE (default: 0).
 """
 
@@ -40,37 +41,9 @@ def _assert_exact(actual, expected):
     torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("vocab", [1, 1031, 151552])
-def test_uniform_reproducibility_and_batch_layout(rng, vocab):
-    seed_values = [0, 17, 2**32 + 19, 2**63 - 1, -1]
-    pos_values = [0, 8192, 2**32 + 11, 2**63 - 1, 42, 8192, 0]
-    rows = [0, 1, 2, 3, 4, 1, -1]
-    mapping = _tensor(rows, torch.int32)
-    seeds, positions = _tensor(seed_values), _tensor(pos_values)
-    baseline = rng(7, vocab, "npu", mapping, seeds, positions).cpu()
-    assert baseline.dtype == torch.float32
-    assert bool(((baseline >= 0) & (baseline < 1)).all())
-    for _ in range(3):
-        _assert_exact(rng(7, vocab, "npu", mapping, seeds, positions), baseline)
-    _assert_exact(baseline[1], baseline[5])
-    _assert_exact(baseline[6], torch.full((vocab,), 0.5))
-    _assert_exact(rng(7, 1, "npu", mapping, seeds, positions)[:, 0], baseline[:, 0])
-
-    order_values = [4, 2, 0, 1]
-    order = _tensor(order_values)
-    subset = rng(4, vocab, "npu", mapping[order], seeds, positions[order])
-    _assert_exact(subset, baseline[order_values])
-
-    relocated = _tensor([4 - state if state >= 0 else -1 for state in rows], torch.int32)
-    _assert_exact(rng(7, vocab, "npu", relocated, _tensor(seed_values[::-1]), positions),
-                  baseline)
-
-
 @pytest.mark.parametrize("mode,vocab", [
     ("accept", 1),
-    ("draft", 1031),
     ("draft", 151552),
-    ("resample", 1031),
     ("resample", 151552),
 ])
 def test_graph_replay_observes_rng_metadata(rng, mode, vocab):
