@@ -10,6 +10,7 @@ conversion uses the upper 24 bits, independent of batch shape and tile layout.
 import torch
 from vllm.triton_utils import tl, triton
 
+
 @triton.jit
 def _mulhi16(x, A: tl.constexpr):
     # Exact high32(A*x). Split both operands into 16-bit limbs so CANN can
@@ -65,7 +66,7 @@ def _batched_uniform(out, mapping, seeds, positions, cu, rejected, n, v,
     valid = valid_row & (state >= 0)
     seed = tl.load(seeds + state, mask=valid, other=0).to(tl.uint64)
     pos = tl.load(positions + token, mask=valid, other=0).to(tl.uint64)
-    c0, c1, c2, c3 = _philox4x32(group, tl.full((B,),0,tl.uint32),
+    c0, c1, c2, c3 = _philox4x32(group, tl.full((B,), 0, tl.uint32),
                                 pos.to(tl.uint32), (pos >> 32).to(tl.uint32),
                                 seed.to(tl.uint32), (seed >> 32).to(tl.uint32))
     if FIRST_ONLY:
