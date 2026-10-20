@@ -207,29 +207,6 @@ class NPUThinkingBudgetState:
         )
 
 
-# NOTE: upstream factors the committed/pending token load into a @triton.jit
-# device function (_load_effective_token) with an early return. triton-ascend
-# 3.2.2 cannot legalize that separately-compiled function
-# (ConvertTritonIRToLinalgIR: "failed to legalize unresolved materialization
-# from memref<?xi32> to !tt.ptr<i32>", then "tt.call does not reference a
-# valid function" at the call site), so the load is inlined branch-free at
-# each use in _thinking_budget_kernel: both sources are loaded with clamped
-# indices and selected with tl.where.
-#
-#     pos = ...                      # effective position to read
-#     is_committed = pos < total_len
-#     committed = tl.load(all_token_ids_ptr + req_state_idx * stride
-#                         + tl.where(is_committed, pos, 0))
-#     pending = tl.load(input_ids_ptr + tl.where(
-#         is_committed, 0,
-#         (cur_req_first_pos + pos - total_len + 1).to(tl.int32)))
-#     actual = tl.where(is_committed, committed, pending)
-#
-# In decode/spec-decode, input_ids at local position 0 is the already
-# committed last sampled token, so effective draft-prefix positions map to
-# local position (pos - total_len + 1) of the request's first logits row.
-
-
 @triton.jit
 def _update_committed_marker_cache_kernel(  # pragma: no cover - triton
     expanded_idx_mapping_ptr,
