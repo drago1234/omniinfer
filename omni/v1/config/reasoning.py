@@ -7,6 +7,7 @@ from dataclasses import field
 from vllm.config.model import ModelConfig
 from vllm.config.reasoning import ReasoningConfig as VllmReasoningConfig
 from vllm.config.utils import config
+from vllm.reasoning import ReasoningParserManager
 from vllm.tokenizers import cached_tokenizer_from_config
 
 
@@ -62,6 +63,21 @@ class ReasoningConfig(VllmReasoningConfig):
     _sequence_end_token_ids: tuple[int, ...] = field(
         default=(), init=False, repr=False
     )
+    _natural_reasoning_end_token_ids: list[int] | None = field(
+        default=None, init=False, repr=False
+    )
+
+    @property
+    def natural_reasoning_end_token_ids(self) -> list[int] | None:
+        """Token IDs with which the model naturally ends reasoning.
+
+        Backport of vLLM 0.30.0 (vllm#46727): the parser's own end marker,
+        as opposed to ``reasoning_end_token_ids``, which may carry an extra
+        transition phrase that is only forced once the thinking budget is
+        exhausted. The ModelRunnerV2 thinking-budget state requires all
+        three marker sets before it enables itself.
+        """
+        return self._natural_reasoning_end_token_ids
 
     @property
     def tool_call_start_token_id(self) -> int | None:
@@ -85,7 +101,16 @@ class ReasoningConfig(VllmReasoningConfig):
 
         # This preserves vLLM 0.25.1's parser-derived marker support.
         super().initialize_token_ids(model_config)
-        if not self.enabled or not (
+        if not self.enabled:
+            return
+
+        # Backport of vLLM 0.30.0 (vllm#46727): the V2 thinking budget
+        # distinguishes the parser's natural end marker from the forced
+        # ``reasoning_end_str`` sequence.
+        if self._natural_reasoning_end_token_ids is None:
+            self._init_natural_reasoning_end_token_ids(model_config)
+
+        if not (
             self.ban_tool_start_in_thinking
             or self.ban_tool_end_in_thinking
             or self.ban_sequence_end_in_thinking
@@ -116,3 +141,41 @@ class ReasoningConfig(VllmReasoningConfig):
                 for marker in ("<|message_end|>", "<|pangu_text_end|>")
                 if marker in vocab
             )
+
+    def _init_natural_reasoning_end_token_ids(
+        self, model_config: ModelConfig
+    ) -> None:
+        """Derive the natural reasoning-end token IDs (vLLM 0.30.0 semantics).
+
+        The parser's own ``reasoning_end_str`` is the natural marker; the
+        configured ``reasoning_end_str`` (possibly carrying a transition
+        phrase) stays the forced sequence. When no parser is configured the
+        two coincide. When the marker IDs were injected directly without any
+        strings, the forced sequence doubles as the natural marker.
+        """
+        natural_end_str = ""
+        tokenizer = None
+        if self.reasoning_parser:
+            tokenizer = cached_tokenizer_from_config(model_config=model_config)
+            parser_cls = ReasoningParserManager.get_reasoning_parser(
+                self.reasoning_parser
+            )
+            natural_end_str = parser_cls(tokenizer).reasoning_end_str or ""
+        if not natural_end_str:
+            natural_end_str = self.reasoning_end_str
+        if not natural_end_str:
+            self._natural_reasoning_end_token_ids = list(
+                self._reasoning_end_token_ids or []
+            )
+            return
+
+        if tokenizer is None:
+            tokenizer = cached_tokenizer_from_config(model_config=model_config)
+        token_ids = tokenizer.encode(natural_end_str, add_special_tokens=False)
+        if not token_ids:
+            raise ValueError(
+                "ReasoningConfig: failed to tokenize natural reasoning end "
+                f"string: natural_reasoning_end_str='{natural_end_str}'. "
+                "Ensure the string is a valid token in the model's vocabulary."
+            )
+        self._natural_reasoning_end_token_ids = token_ids

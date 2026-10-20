@@ -57,9 +57,50 @@ class NPUModelRunnerV2(GPUModelRunner):
         if self.speculative_config is not None and self.is_last_pp_rank:
             self.speculator = init_speculator(self.vllm_config, self.device)
 
+    def _init_thinking_budget_state(self) -> None:
+        """Attach the per-request thinking-budget state to the V2 sampler.
+
+        The 0.25.1 Sampler constructor predates upstream thinking-budget
+        support (vllm#46727, released in 0.30.0), so the NPU state is grafted
+        on here. The patched Sampler methods (patch_mrv2_thinking_budget.py)
+        no-op when the attribute is absent, and the state itself disables
+        when the reasoning marker sets are incomplete.
+
+        Called from ``load_model``: 0.25.1 creates the V2 Sampler there (it
+        needs ``model_state`` for ``num_new_sampled_tokens_per_step``), so
+        ``self.sampler`` is still ``None`` at the end of ``__init__``.
+        """
+        sampler = getattr(self, "sampler", None)
+        req_states = getattr(self, "req_states", None)
+        if sampler is None or req_states is None:
+            # Pooling models and non-last PP ranks never build a Sampler. Log
+            # instead of returning silently so a wiring mistake (e.g. calling
+            # this before load_model created the sampler) is diagnosable.
+            logger.debug(
+                "[omni-npu/mrv2] thinking budget not attached: sampler=%s "
+                "req_states=%s",
+                sampler is not None,
+                req_states is not None,
+            )
+            return
+
+        from omni_npu.worker.npu.thinking_budget import NPUThinkingBudgetState
+
+        reasoning_config = getattr(self.vllm_config, "reasoning_config", None)
+        state = NPUThinkingBudgetState(req_states, reasoning_config)
+        sampler.thinking_budget_state = state
+        if state.enabled:
+            logger.info("[omni-npu/mrv2] thinking budget enabled on V2 sampler")
+
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
-        """Load the model, then align its multimodal buffer with mHC output."""
+        """Load the model, then wire post-load state.
+
+        Upstream builds the V2 Sampler inside ``load_model``, so the thinking
+        budget state (and any future sampler-side state) can only be attached
+        after this call returns.
+        """
         super().load_model(load_dummy_weights, *args, **kwargs)
+        self._init_thinking_budget_state()
         self._align_mhc_mm_embedding_width()
 
     def _align_mhc_mm_embedding_width(self) -> None:

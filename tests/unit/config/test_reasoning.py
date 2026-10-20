@@ -59,6 +59,9 @@ class TestReasoningConfig(unittest.TestCase):
         mock_omni_tok.assert_not_called()
         mock_vllm_tok.assert_not_called()
         self.assertTrue(cfg.enabled)
+        # Direct ID injection without strings: the forced sequence doubles
+        # as the natural end marker (no tokenizer round-trip).
+        self.assertEqual(cfg.natural_reasoning_end_token_ids, [2])
 
     @patch("vllm.config.reasoning.cached_tokenizer_from_config")
     @patch("omni_npu.v1.config.reasoning.cached_tokenizer_from_config")
@@ -309,6 +312,104 @@ class TestReasoningConfig(unittest.TestCase):
         self.assertEqual(cfg.tool_call_start_token_id, 999)
         # End ban off → end id never probed.
         self.assertIsNone(cfg.tool_call_end_token_id)
+
+    # --- natural_reasoning_end_token_ids (vLLM 0.30.0 backport) -------
+
+    @patch("vllm.config.reasoning.cached_tokenizer_from_config")
+    @patch("omni_npu.v1.config.reasoning.cached_tokenizer_from_config")
+    def test_natural_end_falls_back_to_reasoning_end_str(
+        self, mock_omni_tok: MagicMock, mock_vllm_tok: MagicMock
+    ) -> None:
+        """No parser configured → the forced end sequence doubles as natural."""
+        mock_enc = MagicMock()
+        mock_enc.encode.side_effect = (
+            lambda s, add_special_tokens=False: [1]
+            if s == "<s>"
+            else [2]
+            if s == "<e>"
+            else [99]
+        )
+        mock_omni_tok.return_value = mock_enc
+        mock_vllm_tok.return_value = mock_enc
+
+        cfg = ReasoningConfig(reasoning_start_str="<s>", reasoning_end_str="<e>")
+        cfg.initialize_token_ids(self.model_config)
+        self.assertEqual(cfg.reasoning_end_token_ids, [2])
+        self.assertEqual(cfg.natural_reasoning_end_token_ids, [2])
+
+    @patch("vllm.config.reasoning.cached_tokenizer_from_config")
+    @patch("omni_npu.v1.config.reasoning.cached_tokenizer_from_config")
+    @patch("omni_npu.v1.config.reasoning.ReasoningParserManager")
+    def test_natural_end_uses_parser_marker(
+        self,
+        mock_parser_mgr: MagicMock,
+        mock_omni_tok: MagicMock,
+        mock_vllm_tok: MagicMock,
+    ) -> None:
+        """Parser configured → its end marker is the natural one, even when
+        the forced ``reasoning_end_str`` carries an extra transition phrase."""
+        mock_enc = MagicMock()
+        mock_enc.encode.side_effect = (
+            lambda s, add_special_tokens=False: [1]
+            if s == "<s>"
+            else [2]
+            if s == "Enough.</n>"
+            else [7]
+            if s == "</n>"
+            else [99]
+        )
+        mock_omni_tok.return_value = mock_enc
+        mock_vllm_tok.return_value = mock_enc
+        mock_parser = MagicMock()
+        mock_parser.reasoning_end_str = "</n>"
+        mock_parser_mgr.get_reasoning_parser.return_value = (
+            lambda tokenizer: mock_parser
+        )
+
+        cfg = ReasoningConfig(
+            reasoning_parser="deepseek_r1",
+            reasoning_start_str="<s>",
+            reasoning_end_str="Enough.</n>",
+        )
+        cfg.initialize_token_ids(self.model_config)
+        self.assertEqual(cfg.reasoning_end_token_ids, [2])
+        self.assertEqual(cfg.natural_reasoning_end_token_ids, [7])
+
+    @patch("vllm.config.reasoning.cached_tokenizer_from_config")
+    @patch("omni_npu.v1.config.reasoning.cached_tokenizer_from_config")
+    @patch("omni_npu.v1.config.reasoning.ReasoningParserManager")
+    def test_natural_end_empty_encode_raises(
+        self,
+        mock_parser_mgr: MagicMock,
+        mock_omni_tok: MagicMock,
+        mock_vllm_tok: MagicMock,
+    ) -> None:
+        """A parser marker that fails to tokenize raises instead of silently
+        disabling the V2 thinking budget."""
+        mock_enc = MagicMock()
+        mock_enc.encode.side_effect = (
+            lambda s, add_special_tokens=False: [1]
+            if s == "<s>"
+            else [2]
+            if s == "<e>"
+            else []
+        )
+        mock_omni_tok.return_value = mock_enc
+        mock_vllm_tok.return_value = mock_enc
+        mock_parser = MagicMock()
+        mock_parser.reasoning_end_str = "</n>"
+        mock_parser_mgr.get_reasoning_parser.return_value = (
+            lambda tokenizer: mock_parser
+        )
+
+        cfg = ReasoningConfig(
+            reasoning_parser="deepseek_r1",
+            reasoning_start_str="<s>",
+            reasoning_end_str="<e>",
+        )
+        with self.assertRaises(ValueError) as ctx:
+            cfg.initialize_token_ids(self.model_config)
+        self.assertIn("natural reasoning end", str(ctx.exception))
 
     # --- ban_sequence_end_in_thinking ----------------------------------
 
