@@ -1,29 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""V2 thinking-token budget hooks. Implementation: omni/worker/npu/thinking_budget.py.
+"""Backport vllm#46727's sampler lifecycle to the 0.25.1 V2 runner.
 
-Upstream 0.25.1's ModelRunnerV2 Sampler predates thinking-budget support
-(vllm#46727, released in 0.30.0), so the NPU state is attached by
-``NPUModelRunnerV2._init_thinking_budget_state`` and driven through the three
-lifecycle methods wrapped here:
-
-* ``add_request`` — stage the per-request budget;
-* ``apply_staged_writes`` — sync budgets / reset marker caches (upstream
-  ``model_runner`` already calls this every step after ``req_states`` staged
-  writes, so ``all_token_ids`` / ``total_len`` are current);
-* ``apply_sampling_params`` — force the reasoning-end token onto logits of
-  over-budget rows. The write happens on the returned FP32 logits, i.e. after
-  logit bias / penalties / bad_words / temperature / min_p. A 1e9 write is
-  the row's global maximum, so the subsequent top-k/top-p filter can never
-  drop the forced token, and being after logit bias is what lets it override
-  min_tokens masking (cf. upstream's ``restores_masked_end_token`` test).
-  This wrapper also covers the spec-decode path: the V2 RejectionSampler
-  calls ``sampler.apply_sampling_params`` for the target logits, and the
-  kernels consume the expanded per-draft-step rows through
-  ``expanded_local_pos``.
-
-``apply_bypass_conflict`` keeps the chain extendable: another patch may wrap
-these methods later and reach this one through ``_upstream_<name>``.
+NPUModelRunnerV2 attaches the state after load_model creates the sampler.
+The sampling hook writes returned FP32 logits after bias, penalties, bad
+words, temperature and min_p. Ordinary sampling applies top-k/top-p next;
+speculative verification has already applied those filters, so this hook
+restores the forced token afterwards. Upstream instead forces before
+temperature; this wrapper preserves the 0.25.1 sampling interface.
 """
 
 from vllm.logger import init_logger
@@ -45,11 +29,7 @@ else:
 
     @register_patch("MRv2ThinkingBudgetSamplerPatch", up_sampler.Sampler)
     class MRv2ThinkingBudgetSamplerPatch(VLLMPatch):
-        """Sampler lifecycle hooks for NPUThinkingBudgetState.
-
-        The state attribute may be absent (e.g. pooling models, non-last PP
-        ranks, or a plain upstream runner in tests); every hook no-ops then.
-        """
+        """Forward lifecycle events when the NPU runner attached a state."""
 
         _attr_names_to_apply = [
             "add_request",

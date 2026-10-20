@@ -55,6 +55,8 @@ class TestReasoningConfig(unittest.TestCase):
         mock_omni_tok.assert_not_called()
         mock_vllm_tok.assert_not_called()
         self.assertTrue(cfg.enabled)
+        self.assertEqual(cfg.natural_reasoning_end_token_ids, [2])
+        self.assertIsNot(cfg.natural_reasoning_end_token_ids, cfg.reasoning_end_token_ids)
 
     @patch("vllm.config.reasoning.cached_tokenizer_from_config")
     @patch("omni_npu.v1.config.reasoning.cached_tokenizer_from_config")
@@ -285,6 +287,30 @@ class TestReasoningConfig(unittest.TestCase):
         cfg.initialize_token_ids(self.model_config)
         self.assertEqual(cfg.reasoning_end_token_ids, [2])
         self.assertEqual(cfg.natural_reasoning_end_token_ids, [2])
+        mock_omni_tok.assert_not_called()
+        self.assertEqual(mock_enc.encode.call_count, 2)
+
+    @patch("vllm.config.reasoning.cached_tokenizer_from_config")
+    @patch("omni_npu.v1.config.reasoning.cached_tokenizer_from_config")
+    @patch("omni_npu.v1.config.reasoning.ReasoningParserManager")
+    def test_natural_end_without_parser_marker_reuses_end_ids(
+        self, mock_parser_mgr, mock_omni_tok, mock_vllm_tok
+    ) -> None:
+        tokenizer = MagicMock()
+        tokenizer.encode.side_effect = lambda s, **kw: [1] if s == "<s>" else [2, 3]
+        mock_omni_tok.return_value = mock_vllm_tok.return_value = tokenizer
+        mock_parser_mgr.get_reasoning_parser.return_value.return_value.reasoning_end_str = ""
+
+        cfg = ReasoningConfig(
+            reasoning_parser="deepseek_r1",
+            reasoning_start_str="<s>", reasoning_end_str="<e>",
+        )
+        cfg.initialize_token_ids(self.model_config)
+        self.assertEqual(cfg.natural_reasoning_end_token_ids, [2, 3])
+        self.assertEqual(tokenizer.encode.call_count, 2)
+        cfg.initialize_token_ids(self.model_config)
+        self.assertEqual(tokenizer.encode.call_count, 2)
+        mock_parser_mgr.get_reasoning_parser.assert_called_once_with("deepseek_r1")
 
     @patch("vllm.config.reasoning.cached_tokenizer_from_config")
     @patch("omni_npu.v1.config.reasoning.cached_tokenizer_from_config")

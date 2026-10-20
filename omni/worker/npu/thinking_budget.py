@@ -13,19 +13,18 @@ reasoning naturally (``natural_reasoning_end_token_ids``) is never forced.
 
 Differences from the upstream CUDA implementation:
 
-1. The per-request budget is staged in a plain numpy array and copied H2D
-   when dirty, instead of ``UvaBackedTensor`` zero-copy (UVA host aliasing is
-   not available on NPU; ``NPUUvaBuffer`` stages H2D copies the same way).
-2. The marker-cache kernel is launched over logits rows and gated on
+The upstream ``UvaBackedTensor`` uses the existing MRv2 NPU buffer patches
+for staged H2D copies or the optional UVA view.
+
+1. The marker-cache kernel is launched over logits rows and gated on
    ``local_pos == 0`` (exactly one row per request per step) instead of a
    separate ``req_ids`` tensor, because the 0.25.1
    ``Sampler.apply_sampling_params`` signature does not carry ``idx_mapping``.
-3. The cold scan (new/resumed request) is a flag-guarded for-loop instead of
+2. The cold scan (new/resumed request) is a flag-guarded for-loop instead of
    upstream's ``while`` loop: ``scf.while`` with dynamic indexing crashes the
    triton-ascend 3.2.2 pipeline (cf. ``omni/worker/npu/sampler.py``).
-   Iterations past the first marker hit are no-ops, so the worst case stays
-   O(max_model_len / BLOCK) vectorized work, same bound as upstream.
-4. Upstream's ``_load_effective_token`` @triton.jit device function (early
+   Its bound uses the committed length; blocks after a marker hit skip loads.
+3. Upstream's ``_load_effective_token`` @triton.jit device function (early
    return under ``if``) cannot be legalized by triton-ascend's
    ConvertTritonIRToLinalgIR pass ("failed to legalize unresolved
    materialization from memref<?xi32> to !tt.ptr<i32>"; the call site then
@@ -54,6 +53,7 @@ from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.states import RequestState
 
 logger = init_logger(__name__)
@@ -100,12 +100,11 @@ class NPUThinkingBudgetState:
             )
             return
 
-        # Budget per request; -1 means no budget. The numpy array is the
-        # source of truth and is copied to the device when dirty.
-        self.budget_np = np.full(self.max_num_reqs, -1, dtype=np.int32)
-        self.budget_gpu = torch.full(
-            (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
+        self.thinking_token_budget = UvaBackedTensor(
+            self.max_num_reqs, dtype=torch.int32
         )
+        self.thinking_token_budget.np.fill(-1)
+        self.thinking_token_budget.copy_to_uva()
         self.use_thinking_budget = np.zeros(self.max_num_reqs, dtype=bool)
 
         self.cached_last_start = torch.full(
@@ -130,12 +129,6 @@ class NPUThinkingBudgetState:
             end_ids, dtype=torch.int32, device=self.device
         )
 
-        # total_len <= max_model_len; the marker window adds MAX_LEN - 1.
-        max_marker_len = max(len(start_ids), len(natural_end_ids))
-        self._max_cold_scan_blocks = (
-            req_states.max_model_len + max_marker_len + _COLD_SCAN_BLOCK - 1
-        ) // _COLD_SCAN_BLOCK
-
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         if not self.enabled:
             return
@@ -146,8 +139,8 @@ class NPUThinkingBudgetState:
         else:
             budget = min(budget, _INT32_MAX)
             self._reset_reqs.append(req_idx)
-        if self.budget_np[req_idx] != budget:
-            self.budget_np[req_idx] = budget
+        if self.thinking_token_budget.np[req_idx] != budget:
+            self.thinking_token_budget.np[req_idx] = budget
             self._budget_dirty = True
 
     def apply_staged_writes(self) -> None:
@@ -162,9 +155,7 @@ class NPUThinkingBudgetState:
             self.cached_scan_pos.index_fill_(0, idx, 0)
             self._reset_reqs.clear()
         if self._budget_dirty:
-            self.budget_gpu.copy_(
-                torch.from_numpy(self.budget_np), non_blocking=True
-            )
+            self.thinking_token_budget.copy_to_uva()
             self._budget_dirty = False
 
     def apply(
@@ -175,15 +166,7 @@ class NPUThinkingBudgetState:
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
     ) -> None:
-        """Force the reasoning-end sequence onto over-budget rows.
-
-        Called by the patched ``Sampler.apply_sampling_params`` on the
-        returned FP32 logits, i.e. after logit bias (so the forced write
-        overrides min_tokens masking), temperature and min_p. A 1e9 write is
-        the global maximum of the row, so the later top-k/top-p filter can
-        never drop the forced token; the MRv1-style "before temperature"
-        ordering is not required for correctness here.
-        """
+        """Force the reasoning-end sequence onto over-budget FP32 logits."""
         if not self.enabled or not np.any(
             self.use_thinking_budget[idx_mapping_np]
         ):
@@ -193,7 +176,7 @@ class NPUThinkingBudgetState:
             logits,
             expanded_idx_mapping,
             expanded_local_pos,
-            self.budget_gpu,
+            self.thinking_token_budget.gpu,
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
             input_ids,
@@ -203,7 +186,6 @@ class NPUThinkingBudgetState:
             self.reasoning_start_token_ids,
             self.natural_reasoning_end_token_ids,
             self.reasoning_end_token_ids,
-            self._max_cold_scan_blocks,
         )
 
 
@@ -220,7 +202,6 @@ def _update_committed_marker_cache_kernel(  # pragma: no cover - triton
     cached_scan_pos_ptr,
     reasoning_start_token_ids_ptr,
     natural_reasoning_end_token_ids_ptr,
-    num_cold_blocks,
     START_LEN: tl.constexpr,
     NATURAL_END_LEN: tl.constexpr,
     MAX_LEN: tl.constexpr,
@@ -250,15 +231,9 @@ def _update_committed_marker_cache_kernel(  # pragma: no cover - triton
         last_start = -1
         last_end = -1
 
-    # Multi-way tests use `&` on int1 scalars, never `and`: triton's AST-to-TTIR
-    # pass rejects chained boolean operators ("chained boolean operators
-    # (A or B or C) are not supported"), and `&` is the form already proven on
-    # triton-ascend in this file's mask arithmetic.
     if (scan_pos == 0) & (last_start < 0) & (last_end < 0):
-        # Cold scan: walk backward in vectorized blocks, stopping after the
-        # first block with a marker. Flag-guarded for-loop instead of
-        # upstream's while-loop (scf.while crashes triton-ascend 3.2.2).
-        for b in tl.range(0, num_cold_blocks):
+        # Ascend-compatible cold scan; skip loads after the first marker hit.
+        for b in tl.range(0, tl.cdiv(total_len, BLOCK)):
             block_hi = total_len - b * BLOCK
             if (block_hi > 0) & (last_start < 0) & (last_end < 0):
                 block_lo = block_hi - BLOCK
@@ -336,7 +311,7 @@ def _update_committed_marker_cache_kernel(  # pragma: no cover - triton
 
 
 @triton.jit
-def _thinking_budget_kernel(  # pragma: no cover - trion
+def _thinking_budget_kernel(  # pragma: no cover - triton
     logits_ptr,
     logits_stride,
     expanded_idx_mapping_ptr,
@@ -485,7 +460,6 @@ def apply_thinking_budget(
     reasoning_start_token_ids: torch.Tensor,
     natural_reasoning_end_token_ids: torch.Tensor,
     reasoning_end_token_ids: torch.Tensor,
-    max_cold_scan_blocks: int,
 ) -> None:
     num_tokens = logits.shape[0]
     start_len = reasoning_start_token_ids.shape[0]
@@ -504,7 +478,6 @@ def apply_thinking_budget(
         cached_scan_pos,
         reasoning_start_token_ids,
         natural_reasoning_end_token_ids,
-        max_cold_scan_blocks,
         START_LEN=start_len,
         NATURAL_END_LEN=natural_end_len,
         MAX_LEN=max(start_len, natural_end_len),

@@ -57,14 +57,7 @@ class ReasoningConfig(VllmReasoningConfig):
 
     @property
     def natural_reasoning_end_token_ids(self) -> list[int] | None:
-        """Token IDs with which the model naturally ends reasoning.
-
-        Backport of vLLM 0.30.0 (vllm#46727): the parser's own end marker,
-        as opposed to ``reasoning_end_token_ids``, which may carry an extra
-        transition phrase that is only forced once the thinking budget is
-        exhausted. The ModelRunnerV2 thinking-budget state requires all
-        three marker sets before it enables itself.
-        """
+        """Parser end marker, distinct from the budget's forced end sequence."""
         return self._natural_reasoning_end_token_ids
 
     @property
@@ -118,37 +111,20 @@ class ReasoningConfig(VllmReasoningConfig):
     def _init_natural_reasoning_end_token_ids(
         self, model_config: ModelConfig
     ) -> None:
-        """Derive the natural reasoning-end token IDs (vLLM 0.30.0 semantics).
-
-        The parser's own ``reasoning_end_str`` is the natural marker; the
-        configured ``reasoning_end_str`` (possibly carrying a transition
-        phrase) stays the forced sequence. When no parser is configured the
-        two coincide. When the marker IDs were injected directly without any
-        strings, the forced sequence doubles as the natural marker.
-        """
-        natural_end_str = ""
-        tokenizer = None
+        """Use the parser's end marker, falling back to initialized end IDs."""
+        token_ids = self.reasoning_end_token_ids
         if self.reasoning_parser:
             tokenizer = cached_tokenizer_from_config(model_config=model_config)
             parser_cls = ReasoningParserManager.get_reasoning_parser(
                 self.reasoning_parser
             )
-            natural_end_str = parser_cls(tokenizer).reasoning_end_str or ""
-        if not natural_end_str:
-            natural_end_str = self.reasoning_end_str
-        if not natural_end_str:
-            self._natural_reasoning_end_token_ids = list(
-                self._reasoning_end_token_ids or []
-            )
-            return
-
-        if tokenizer is None:
-            tokenizer = cached_tokenizer_from_config(model_config=model_config)
-        token_ids = tokenizer.encode(natural_end_str, add_special_tokens=False)
-        if not token_ids:
-            raise ValueError(
-                "ReasoningConfig: failed to tokenize natural reasoning end "
-                f"string: natural_reasoning_end_str='{natural_end_str}'. "
-                "Ensure the string is a valid token in the model's vocabulary."
-            )
-        self._natural_reasoning_end_token_ids = token_ids
+            natural_end_str = parser_cls(tokenizer).reasoning_end_str
+            if natural_end_str:
+                token_ids = tokenizer.encode(natural_end_str, add_special_tokens=False)
+                if not token_ids:
+                    raise ValueError(
+                        "ReasoningConfig: failed to tokenize natural reasoning end "
+                        f"string: natural_reasoning_end_str='{natural_end_str}'. "
+                        "Ensure the string is a valid token in the model's vocabulary."
+                    )
+        self._natural_reasoning_end_token_ids = list(token_ids or [])

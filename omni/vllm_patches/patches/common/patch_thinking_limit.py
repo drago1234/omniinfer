@@ -238,19 +238,7 @@ class ThinkingLimitInputProcessorPatch(VLLMPatch):
 # ────────────────────────────────────────────────────────────
 # Patch 3: InputProcessor._validate_params — lift the MRv2 hard rejection
 # ────────────────────────────────────────────────────────────
-# 0.25.1 rejects every request that carries ``thinking_token_budget`` when the
-# V2 model runner is on:
-#
-#     if self.use_v2_model_runner:
-#         raise ValueError(
-#             "thinking_token_budget is not yet supported by the V2 model "
-#             "runner. Run vLLM with VLLM_USE_V2_MODEL_RUNNER=0 ...")
-#
-# That gate predates the V2 implementation and is removed by upstream
-# vllm#46727 (0.30.0). Omni supplies the missing implementation on the NPU V2
-# sampler (``omni/worker/npu/thinking_budget.py`` driven by
-# ``patch_mrv2_thinking_budget.py``), so the gate has to go -- without this the
-# request never reaches the engine core and the sampler never sees a budget.
+# vllm#46727 removes this gate; the NPU V2 sampler now provides the feature.
 
 
 @register_patch("ThinkingLimitV2GatePatch", InputProcessor)
