@@ -23,9 +23,10 @@ def rng():
         pytest.skip("NPU required")
     torch.npu.set_device(int(os.environ.get("OMNI_TEST_NPU_DEVICE", "0")))
     from omni_npu.worker.npu.ops import position_sampling_rng
-    from triton.runtime.interpreter import InterpretedFunction
-
-    assert not isinstance(position_sampling_rng._batched_uniform, InterpretedFunction)
+    # Use the backend already loaded by production code. Importing the CPU
+    # interpreter here can load incompatible optional Ascend extensions in CI.
+    assert isinstance(position_sampling_rng._batched_uniform,
+                      position_sampling_rng.triton.JITFunction)
     return position_sampling_rng.make_uniform
 
 
