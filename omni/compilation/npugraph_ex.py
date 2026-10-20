@@ -14,6 +14,41 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _load_static_kernel_cache_patch():
+    """Resolve omni's static_kernel_cache_patch helper regardless of how this file's
+    package is named in the current process.
+
+    The omni tree may be imported under a different top-level name
+    (``omni_npu``), and forked dynamo workers can fail to import the
+    package entirely even where the parent process imported it fine.
+    This file and static_kernel_cache_patch.py always ship in the same directory,
+    so the last resort is loading it by path from next to this file.
+    """
+    import importlib.util
+    import os
+
+    for modname in (
+        "omni.compilation.static_kernel_cache_patch",
+        "omni_npu.compilation.static_kernel_cache_patch",
+    ):
+        try:
+            module = importlib.import_module(modname)
+        except ImportError:
+            continue
+        logger.info("static_kernel_cache patch resolver: level=package modname=%s", modname)
+        return module.apply_static_kernel_cache_patch
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "static_kernel_cache_patch.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "omni_static_kernel_cache_patch", path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    logger.info("static_kernel_cache patch resolver: level=file path=%s", path)
+    return module.apply_static_kernel_cache_patch
+
+
 def graph_output_is_tuple(graph: fx.GraphModule) -> bool:
     """Return whether the FX graph output is already a tuple."""
     output_node = graph.graph.output_node()
@@ -99,7 +134,21 @@ class NpuGraphExAdaptor(CompilerInterface):
         if npugraph_ex_config.get(
             "static_kernel_compile", False
         ) or npugraph_ex_config.get("super_kernel_optimize", False):
+            # Static-kernel compile cache (static_kernel_cache_enable): torch_npu's
+            # CompilerConfig cannot express the four cache keys
+            # (static_kernel_compile is a plain OptionValue bool that
+            # rejects unknown attributes), so we shadow
+            # compile_static_kernel with a vendored entry at runtime.
+            # force_eager stays True — the vendored entry bypasses the gate
+            # itself and the backend keeps returning the eager callable that
+            # omni's ACLGraphWrapper captures.
+            if npugraph_ex_config.get("static_kernel_cache_enable", False):
+                apply_static_kernel_cache_patch = _load_static_kernel_cache_patch()
+                apply_static_kernel_cache_patch(npugraph_ex_config)
             config.static_kernel_compile = True
+            # !2903 compile-concurrency tuning. Bare import:
+            # static_kernel_compile.py ships in this same tree, so a
+            # missing module means the workspace itself is inconsistent.
             from omni_npu import envs as omni_envs
             from omni_npu.compilation.static_kernel_compile import (
                 configure_static_kernel_compile_jobs,

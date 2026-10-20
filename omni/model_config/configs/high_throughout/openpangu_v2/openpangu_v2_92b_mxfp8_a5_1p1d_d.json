@@ -16,6 +16,7 @@
         "use_noncontiguous_kv": true,
         "enable_kv_rmsnorm_rope_cache": true,
         "decode_moe_dispatch_combine": true,
+        "use_quant_lightning_indexer_v2": true,
         "kv_nz": false,
         "merge_q_kv_conv": false,
         "use_aicpu_fa_tiling": true,
@@ -23,6 +24,7 @@
         "split_q_up_in_multistream": true,
         "use_mome_inplace_update": true,
         "use_rope_fusion_op": true,
-        "enable_mhc_multistream": true
+        "enable_mhc_multistream": true,
+        "enable_mxfp8_comm_quant": true
     }
 }

@@ -97,7 +97,7 @@ docs/
 |---|---|---|
 | `components/README.md` | 空文件（0 字节） | 删除 |
 | `omni/TEST_SUMMARY.md` | 一次性测试搭建工作记录，内容已被 `tests/docs/README.md` 覆盖 | 删除 |
-| `tools/ansible/` 整套目录 | 与 `tools/deploy/ansible/` 平行重复且已分叉（缺 inventories、epd_server、kv_pool role 及生产 playbook） | 删除，统一保留 `tools/deploy/ansible/`；本规范中 Ansible 相关迁移来源均以 `tools/deploy/ansible/` 为准 |
+| `tools/ansible/` 整套目录 | 与 `tools/deploy/ansible/` 平行重复且已分叉（缺 inventories、epd_server、fusion_pool role 及生产 playbook） | 删除，统一保留 `tools/deploy/ansible/`；本规范中 Ansible 相关迁移来源均以 `tools/deploy/ansible/` 为准 |
 
 ## 4. Design 文档模板参考
 

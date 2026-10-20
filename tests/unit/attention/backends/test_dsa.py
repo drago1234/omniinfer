@@ -162,6 +162,36 @@ class TestNPUDSABackendReshapeNoncontiguous(unittest.TestCase):
         self.assertEqual(shapes, ((656,), (128,), (1,)))
         self.assertEqual(dtypes, (torch.uint8, torch.uint8, torch.float32))
 
+    def test_hif8_ds_mla_qli_v2_uses_mxfp8_layout(self):
+        operator_config = mla_mod.model_extra_config.operator_opt_config
+        with patch.object(
+            operator_config,
+            "use_quant_lightning_indexer_v2",
+            True,
+            create=True,
+        ):
+            shapes, dtypes = self._call_with_dtype("hif8_ds_mla")
+        self.assertEqual(shapes, ((656,), (1, 128), (1, 4)))
+        self.assertEqual(dtypes, (torch.uint8, torch.float8_e4m3fn, torch.uint8))
+
+    def test_qli_v2_does_not_override_other_quant_cache_layouts(self):
+        operator_config = mla_mod.model_extra_config.operator_opt_config
+        with patch.object(
+            operator_config,
+            "use_quant_lightning_indexer_v2",
+            True,
+            create=True,
+        ):
+            fp8_shapes, fp8_dtypes = self._call_with_dtype("fp8_ds_mla")
+            int8_shapes, int8_dtypes = self._call_with_dtype("int8_ds_mla")
+        self.assertEqual(fp8_shapes, ((656,), (128,), (1,)))
+        self.assertEqual(
+            fp8_dtypes,
+            (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float32),
+        )
+        self.assertEqual(int8_shapes, ((656,), (128,), (1,)))
+        self.assertEqual(int8_dtypes, (torch.int8, torch.int8, torch.float16))
+
     def test_li_int8_ds_mla_shapes_and_dtypes(self):
         shapes, dtypes = self._call_with_dtype("li_int8_ds_mla")
         self.assertEqual(shapes, ((576,), (128,), (1,)))

@@ -163,8 +163,9 @@ def test_forward_decode_routes_to_a5_multistream_when_stream_is_enabled():
 
 @pytest.mark.unit
 @pytest.mark.parametrize("split_q_up_in_multistream", [True, False])
+@pytest.mark.parametrize("quantized_input", [False, True])
 def test_forward_decode_a5_multistream_submits_three_stream_pipeline(
-    monkeypatch, split_q_up_in_multistream
+    monkeypatch, split_q_up_in_multistream, quantized_input
 ):
     from omni_npu.v1.layers.attention import npu_mla as mla_mod
     from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
@@ -222,10 +223,18 @@ def test_forward_decode_a5_multistream_submits_three_stream_pipeline(
         mark, "attention", torch.ones(1)
     )
 
-    with patch.object(torch.Tensor, "record_stream", return_value=None):
+    x = torch.zeros(2, 4)
+    if quantized_input:
+        x = {"x_int8": x.to(torch.int8), "pertoken_scale": torch.ones(2), "metadata": None}
+    recorded = []
+
+    def record_stream(tensor, stream):
+        recorded.append((tensor, stream))
+
+    with patch.object(torch.Tensor, "record_stream", new=record_stream):
         output = NPUDeepseekMLAAttention._forward_decode_multistream_a5(
             fake,
-            x=torch.zeros(2, 4),
+            x=x,
             cos=torch.zeros(2, 1, 1, 2),
             sin=torch.zeros(2, 1, 1, 2),
             attn_metadata=object(),
@@ -233,6 +242,8 @@ def test_forward_decode_a5_multistream_submits_three_stream_pipeline(
             get_mome_args=_empty_mome_args,
         )
 
+    inputs = [v for v in x.values() if isinstance(v, torch.Tensor)] if quantized_input else [x]
+    assert all(any(t is value and s is side_stream for t, s in recorded) for value in inputs)
     assert torch.equal(output, torch.ones(1))
     q_up_ops = (
         ["record", "q_b_nope"]
@@ -668,7 +679,10 @@ def _mock_torch_npu_stream():
     mock_npu.current_stream.return_value = MagicMock()
     mock_npu.Stream.return_value = MagicMock()
     mock_npu.stream.side_effect = lambda x: nullcontext()
-    with patch("torch.npu", mock_npu, create=True):
+    with (
+        patch("torch.npu", mock_npu, create=True),
+        patch.object(torch.Tensor, "npu", _identity),
+    ):
         yield
 
 
@@ -677,6 +691,8 @@ def _mock_misc(yarn_get_mscale_ret: float = 1.0):
     with (
         patch("vllm.logger.init_logger", return_value=MagicMock()),
         patch(f"{MLA_MODULE}.current_platform", MagicMock(device_type="cpu")),
+        patch(f"{MLA_MODULE}.npu_fused_infer_attention_sink_metadata", None),
+        patch(f"{MLA_MODULE}.npu_ai_infra_attention_pioneer_metadata", None),
         patch(f"{MLA_MODULE}.current_stream", MagicMock(), create=True),
         patch(f"{MLA_MODULE}.extract_layer_index", return_value=0),
         patch(f"{MLA_MODULE}.get_rope", return_value=None),
@@ -745,6 +761,10 @@ def _mock_torch_npu():
         k_nope = latent_kv.new_zeros(T, 1, 1, L)
         return k_pe, k_nope
 
+    def attention_pioneer(query, key, value, metadata, **kwargs):
+        assert metadata.shape == (1024,)
+        return fused_infer_attention_score(query, key, value, **kwargs)
+
     def kv_rmsnorm_rope_cache(latent_kv, weight, cos, sin, slot_mapping,
                               rope_cache, nope_cache, epsilon=1e-6, cache_mode="PA",
                               is_output_kv=True, **kwargs):
@@ -798,6 +818,10 @@ def _mock_torch_npu():
             _npu_fused_infer_attention_sink_metadata=MagicMock(
                 return_value=torch.zeros(1024, dtype=torch.int32)
             ),
+            npu_ai_infra_attention_pioneer_metadata=MagicMock(
+                return_value=torch.zeros(1024, dtype=torch.int32)
+            ),
+            npu_ai_infra_attention_pioneer=MagicMock(side_effect=attention_pioneer),
             npu_ai_infra_kv_rmsnorm_rope_cache_v2=MagicMock(side_effect=kv_rmsnorm_rope_cache_v2),
         ),
     ):
@@ -2059,6 +2083,136 @@ def test_forward_prefill_a5_sink_uses_standard_path():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("absorb_max_tokens", "expect_absorb"),
+    [(8192, True), (0, False)],
+)
+def test_forward_prefill_a5_swa_absorb_threshold_is_configurable(
+    monkeypatch, absorb_max_tokens, expect_absorb
+):
+    """Zero restores the pre-optimization A5 SWA standard-prefill route."""
+    from omni_npu.v1.layers.attention import npu_mla as mla_mod
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    fake = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
+    fake.ena_sp = False
+    fake.mla_absorb = True
+    fake.on_ascend950 = True
+    fake.sliding_window = 4096
+    fake.use_mome = False
+    fake._maybe_quant = lambda x: x
+    absorb_result = torch.ones(2, 4)
+    standard_result = torch.zeros(2, 4)
+    fake._forward_prefill_absorb_pa = MagicMock(return_value=absorb_result)
+    fake._forward_prefill_standard = MagicMock(return_value=standard_result)
+    monkeypatch.setattr(
+        mla_mod.model_extra_config.operator_opt_config,
+        "swa_prefill_absorb_max_tokens",
+        absorb_max_tokens,
+        raising=False,
+    )
+
+    result = NPUDeepseekMLAAttention._forward_prefill(
+        fake,
+        torch.zeros(2, 4),
+        torch.zeros(2, 1, 1, 2),
+        torch.zeros(2, 1, 1, 2),
+        attn_metadata=SimpleNamespace(query_cumlens_list=[1024]),
+    )
+
+    if expect_absorb:
+        assert result is absorb_result
+        fake._forward_prefill_absorb_pa.assert_called_once()
+        fake._forward_prefill_standard.assert_not_called()
+    else:
+        assert result is standard_result
+        fake._forward_prefill_absorb_pa.assert_not_called()
+        fake._forward_prefill_standard.assert_called_once()
+
+
+@pytest.mark.unit
+def test_forward_prefill_strong_consistency_overrides_swa_absorb_threshold(
+    monkeypatch,
+):
+    """Strong consistency must keep the batch-invariant absorb path."""
+    from omni_npu.v1.layers.attention import npu_mla as mla_mod
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    fake = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
+    fake.ena_sp = False
+    fake.mla_absorb = True
+    fake.on_ascend950 = True
+    fake.sliding_window = 4096
+    fake.use_mome = False
+    fake._maybe_quant = lambda x: x
+    expected = torch.ones(2, 4)
+    fake._forward_prefill_absorb_pa = MagicMock(return_value=expected)
+    fake._forward_prefill_standard = MagicMock()
+    operator_config = mla_mod.model_extra_config.operator_opt_config
+    monkeypatch.setattr(
+        operator_config,
+        "swa_prefill_absorb_max_tokens",
+        0,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        operator_config,
+        "use_batch_invariant_op",
+        True,
+        raising=False,
+    )
+
+    result = NPUDeepseekMLAAttention._forward_prefill(
+        fake,
+        torch.zeros(2, 4),
+        torch.zeros(2, 1, 1, 2),
+        torch.zeros(2, 1, 1, 2),
+        attn_metadata=SimpleNamespace(query_cumlens_list=[1024]),
+    )
+
+    assert result is expected
+    fake._forward_prefill_absorb_pa.assert_called_once()
+    fake._forward_prefill_standard.assert_not_called()
+
+
+@pytest.mark.unit
+def test_forward_prefill_a5_swa_absorb_threshold_uses_total_batch_tokens(
+    monkeypatch,
+):
+    from omni_npu.v1.layers.attention import npu_mla as mla_mod
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    fake = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
+    fake.ena_sp = False
+    fake.mla_absorb = True
+    fake.on_ascend950 = True
+    fake.sliding_window = 4096
+    fake.use_mome = False
+    fake._maybe_quant = lambda x: x
+    fake._forward_prefill_absorb_pa = MagicMock(return_value=torch.ones(2, 4))
+    expected = torch.zeros(2, 4)
+    fake._forward_prefill_standard = MagicMock(return_value=expected)
+    monkeypatch.setattr(
+        mla_mod.model_extra_config.operator_opt_config,
+        "swa_prefill_absorb_max_tokens",
+        8192,
+        raising=False,
+    )
+
+    result = NPUDeepseekMLAAttention._forward_prefill(
+        fake,
+        torch.zeros(2, 4),
+        torch.zeros(2, 1, 1, 2),
+        torch.zeros(2, 1, 1, 2),
+        attn_metadata=SimpleNamespace(query_cumlens_list=[4096, 9000]),
+    )
+
+    assert result is expected
+    fake._forward_prefill_absorb_pa.assert_not_called()
+    fake._forward_prefill_standard.assert_called_once()
+
+
+@pytest.mark.unit
 def test_apply_sink_attention_ascend950_prefill_path_calls_pioneer(monkeypatch):
     """A5 prefill path concatenates query/key rope tensors for pioneer attention."""
     from omni_npu.v1.layers.attention import npu_mla as mla_mod
@@ -2523,17 +2677,20 @@ def test_build_decode_sink_fia_kwargs_shape_and_keys(monkeypatch):
 
 
 @pytest.mark.unit
-def test_apply_sink_attention_consistency_core_merges_outputs(monkeypatch):
+@pytest.mark.parametrize("on_a5", [False, True])
+@pytest.mark.parametrize("sliding_window", [None, 16])
+def test_apply_sink_attention_consistency_core_merges_outputs(monkeypatch, on_a5, sliding_window):
     from omni_npu.v1.layers.attention import npu_mla as mla_mod
     from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 
-    T, N, L, R, S = 2, 2, 4, 2, 3
+    T, N, L, R, S = 4, 2, 4, 2, 3
+    valid_tokens = T - 1
     fake = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
     fake.num_local_heads = N
     fake.kv_lora_rank = L
     fake.param_sink_number = S
     fake.scaling = 0.5
-    fake.sliding_window = None
+    fake.sliding_window = sliding_window
     fake.attn = SimpleNamespace(
         sink_compressed_kv=torch.zeros(S, L),
         sink_k_pe=torch.zeros(S, R),
@@ -2555,23 +2712,22 @@ def test_apply_sink_attention_consistency_core_merges_outputs(monkeypatch):
 
     expected = torch.full((T, N, L), 9.0)
     meta = MagicMock(return_value="meta")
-    sink_v2 = MagicMock(
-        side_effect=[
-            (torch.zeros(T, N, L), None, torch.zeros(T, N, 1), torch.ones(T, N, 1)),
-            (torch.ones(T, N, L), None, torch.zeros(T, N, 1), torch.ones(T, N, 1)),
-        ]
-    )
-    rescale = MagicMock(return_value=(expected[:T], None, None))
+    kernel_outputs = [
+        (torch.zeros(valid_tokens, N, L), None, torch.zeros(valid_tokens, N, 1), torch.ones(valid_tokens, N, 1)),
+        (torch.ones(valid_tokens, N, L), None, torch.ones(valid_tokens, N, 1), torch.full((valid_tokens, N, 1), 2.0)),
+    ]
+    sink_v2 = MagicMock(side_effect=kernel_outputs)
+    rescale = MagicMock(return_value=(expected[:valid_tokens], None, None))
     monkeypatch.setattr(mla_mod.ops, "apply_FA_rescale_forward", rescale)
     monkeypatch.setattr(
         torch.ops.custom,
-        "_npu_fused_infer_attention_sink_metadata",
+        "npu_ai_infra_attention_pioneer_metadata" if on_a5 else "_npu_fused_infer_attention_sink_metadata",
         meta,
         raising=False,
     )
     monkeypatch.setattr(
         torch.ops.custom,
-        "npu_fused_infer_attention_sink_v2",
+        "npu_ai_infra_attention_pioneer_v2" if on_a5 else "npu_fused_infer_attention_sink_v2",
         sink_v2,
         raising=False,
     )
@@ -2581,17 +2737,76 @@ def test_apply_sink_attention_consistency_core_merges_outputs(monkeypatch):
         query=torch.zeros(T, N, L),
         query_rope=torch.zeros(T, N, R),
         kv_cache=(torch.zeros(1, 8, L), torch.zeros(1, 8, R)),
-        q_cumlens=torch.tensor([T], dtype=torch.int32),
-        kv_lens=torch.tensor([8], dtype=torch.int32),
-        block_table=torch.zeros(1, 2, dtype=torch.int32),
-        num_actual_tokens=T,
+        q_cumlens=torch.tensor([1, valid_tokens], dtype=torch.int32),
+        kv_lens=torch.tensor([8, 6], dtype=torch.int32),
+        block_table=torch.zeros(2, 2, dtype=torch.int32),
+        num_actual_tokens=valid_tokens,
+        on_a5=on_a5,
     )
 
     assert out.shape == (T, N, L)
-    torch.testing.assert_close(out[:T], expected[:T])
+    torch.testing.assert_close(out[:valid_tokens], expected[:valid_tokens])
+    assert torch.count_nonzero(out[valid_tokens:]).item() == 0
     assert meta.call_count == 2
     assert sink_v2.call_count == 2
     rescale.assert_called_once()
+    expected_merge_inputs = tuple(result[i] for result in kernel_outputs for i in (0, 2, 3))
+    assert all(actual is expected for actual, expected in zip(rescale.call_args.args, expected_merge_inputs))
+    normal_meta, sink_meta = [call.kwargs for call in meta.call_args_list]
+    assert normal_meta["actual_seq_lengths"].dtype == torch.int64
+    assert normal_meta["actual_seq_lengths_kv"].dtype == torch.int64
+    assert normal_meta["pre_tokens"] == (15 if sliding_window else 100)
+    assert normal_meta["head_dim_qk"] == L
+    assert normal_meta["head_dim_v"] == L
+    assert sink_meta["actual_seq_lengths_kv"].tolist() == ([S, S] if on_a5 else [S, 2 * S])
+    for call in sink_v2.call_args_list:
+        kernel_query = call.args[0] if on_a5 else call.kwargs["query"]
+        assert kernel_query.shape[0] == valid_tokens
+    if on_a5:
+        normal_kwargs, sink_kwargs = [call.kwargs for call in sink_v2.call_args_list]
+        assert normal_kwargs["pre_tokens"] == normal_meta["pre_tokens"]
+        assert normal_kwargs["next_tokens"] == 0
+        assert sink_kwargs["pre_tokens"] == sink_kwargs["next_tokens"] == 2147483647
+        assert sink_kwargs["block_size"] == S
+        assert sink_kwargs["num_heads"] == N
+        assert sink_kwargs["softmax_scale"] == 0.5
+        assert sink_kwargs["return_softmax_max_sum"] is True
+        assert sink_kwargs["key_sink"] is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("use_sp, tp_size, mome_sp", [(False, 1, False), (True, 1, False), (True, 2, True)])
+def test_finish_prefill_preserves_projection_and_redistribution_order(use_sp, tp_size, mome_sp):
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    host = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
+    host.o_proj = SimpleNamespace(tp_size=tp_size)
+    calls = MagicMock()
+    out, redistributed, projected = torch.zeros(4, 8), torch.ones(4, 8), torch.ones(4, 2)
+    host._apply_mome_out_prefill_sp = MagicMock(return_value=redistributed if mome_sp else None)
+    host._maybe_mome_out = MagicMock(return_value=redistributed)
+    host._apply_o_proj = MagicMock(return_value=projected)
+    sp = SimpleNamespace(
+        align_tokens=MagicMock(return_value=redistributed),
+        slice_tokens=MagicMock(return_value=projected[:2]),
+    ) if use_sp else None
+    for name in ("_apply_mome_out_prefill_sp", "_maybe_mome_out", "_apply_o_proj"):
+        calls.attach_mock(getattr(host, name), name)
+    if use_sp:
+        calls.attach_mock(sp.align_tokens, "align")
+        calls.attach_mock(sp.slice_tokens, "slice")
+    result = host._finish_prefill(out, torch.zeros(2, 8), sp, _empty_mome_args)
+    expected = ["_apply_mome_out_prefill_sp"]
+    if not mome_sp:
+        expected.append("_maybe_mome_out")
+    if use_sp and tp_size > 1:
+        expected.append("align")
+    expected.append("_apply_o_proj")
+    if use_sp:
+        expected.append("slice")
+    assert [call[0] for call in calls.mock_calls] == expected
+    host._apply_o_proj.assert_called_once_with(redistributed)
+    torch.testing.assert_close(result, projected[:2] if use_sp else projected)
 
 
 @pytest.mark.unit
@@ -2688,7 +2903,8 @@ def test_apply_sink_attention_consistency_core_uses_sliding_window(monkeypatch):
 
 
 @pytest.mark.unit
-def test_apply_sink_attention_precision_path_transposes_output(monkeypatch):
+@pytest.mark.parametrize("on_a5", [False, True])
+def test_apply_sink_attention_precision_path_transposes_output(monkeypatch, on_a5):
     from omni_npu.v1.layers.attention import npu_mla as mla_mod
     from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 
@@ -2715,7 +2931,12 @@ def test_apply_sink_attention_precision_path_transposes_output(monkeypatch):
         mla_mod, "get_forward_context", lambda: SimpleNamespace(virtual_engine=0)
     )
 
-    out = NPUDeepseekMLAAttention._apply_sink_attention(
+    apply_sink = (
+        NPUDeepseekMLAAttention._apply_sink_attention_a5
+        if on_a5 else NPUDeepseekMLAAttention._apply_sink_attention
+    )
+    backend_args = {"valid_tok": T, "q_heads": N} if on_a5 else {"num_actual_tokens": T, "layer_name": "test"}
+    out = apply_sink(
         fake,
         q_nope=torch.zeros(T, N, L),
         q_pe=torch.zeros(T, N, 2),
@@ -2725,13 +2946,13 @@ def test_apply_sink_attention_precision_path_transposes_output(monkeypatch):
         kv_lens=torch.tensor([8], dtype=torch.int32),
         block_table=torch.zeros(1, 2, dtype=torch.int32),
         num_tokens=T,
-        num_actual_tokens=T,
-        layer_name="test",
+        **backend_args,
     )
 
     assert out.shape == (N, T, L)
     torch.testing.assert_close(out, core_out.transpose(0, 1))
     fake._apply_sink_attention_consistency_core.assert_called_once()
+    assert fake._apply_sink_attention_consistency_core.call_args.kwargs.get("on_a5", False) is on_a5
 
 
 @pytest.mark.unit

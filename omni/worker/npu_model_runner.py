@@ -90,7 +90,11 @@ from omni_npu.v1.layers.attention.weight_utils import refresh_mla_wrappers
 from omni_npu.v1.utils import switch_torch_device
 from omni_npu.worker.npu_input_batch import NPUInputBatch
 from omni_npu.worker.npu_mem_pool import NpuMemAllocator
-from omni_npu.connector.kv_dump import maybe_dump_kv
+from omni_npu.connector.kv_dump import (
+    maybe_dump_kv,
+    maybe_note_mome_cache,
+)
+from omni_npu.diagnostics.nan_inf.detector import NanInfDetector
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -140,7 +144,7 @@ class NPUModelRunner(GPUModelRunner):
         self.sampler = NPUSamplerV1()
 
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.rejection_sampler = NPURejectionSampler(self.sampler)
+            self.rejection_sampler = NPURejectionSampler(self.sampler, self.speculative_config)
 
         if vllm_config.additional_config is not None:
             from omni_npu.compilation.npugraph_ex_config import init_aclgraph_config
@@ -189,6 +193,9 @@ class NPUModelRunner(GPUModelRunner):
 
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
         self.exec_count = 0
+        # Dormant until configured through /collective_rpc collective_feature.
+        self.nan_inf_detector = NanInfDetector(
+            dp_rank=vllm_config.parallel_config.data_parallel_rank)
 
         # Number of valid entries in req_indices for the in-flight
         # _prepare_inputs; None outside it (dummy runs, capture).
@@ -334,13 +341,39 @@ class NPUModelRunner(GPUModelRunner):
         self._capture_dp_pad_target(forward_context)
         self.exec_count += 1
         logger.debug(f"Executing model forward {self.exec_count=}")
-        return self.model(
+        maybe_note_mome_cache(self)
+        detector = getattr(self, "nan_inf_detector", None)
+        checked = detector is not None and detector.should_check(forward_context)
+        if checked:
+            detector.begin_step(self.exec_count, forward_context,
+                                self._nan_inf_step_ctx(input_ids, inputs_embeds))
+        output = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             **model_kwargs,
         )
+        if checked:
+            detector.end_step(forward_context)
+        return output
+
+    def _nan_inf_step_ctx(self, input_ids, inputs_embeds) -> dict[str, Any]:
+        ctx: dict[str, Any] = {}
+        tokens = input_ids if input_ids is not None else inputs_embeds
+        if tokens is not None:
+            ctx["num_input_tokens"] = int(tokens.shape[0])
+        try:
+            ctx["req_ids"] = list(self.input_batch.req_ids)
+        except Exception:  # noqa: BLE001
+            pass
+        return ctx
+
+    def _attach_nan_inf_report(self, output):
+        detector = getattr(self, "nan_inf_detector", None)
+        if detector is None:
+            return output
+        return detector.attach(output)
 
     def iter_kv_cache_attn_groups(self):
         """Public iterator over KV cache groups with attention backends."""
@@ -749,6 +782,14 @@ class NPUModelRunner(GPUModelRunner):
         self._hook_model_load_weights(self.get_model())
         self._hook_model_load_weights(self.get_drafter_model())
 
+        # Static-kernel cache pool pull: fetch the pooled bundle into the
+        # default product dir BEFORE any compilation runs (profile/warmup come
+        # after load_model). Main process, rank0-of-pod pulls + barrier; any
+        # failure degrades to local-only mode. Never raises.
+        from omni_npu.compilation.static_kernel_cache_pool import maybe_pull_static_kernel_cache
+
+        maybe_pull_static_kernel_cache(self.vllm_config)
+
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         if not (self.speculative_config and self.speculative_config.draft_model_config):
             return None
@@ -783,7 +824,16 @@ class NPUModelRunner(GPUModelRunner):
             # recapturing to avoid stale pool memory staying live.
             reset_stale_aclgraph_resources(self._iter_aclgraph_wrappers())
         with switch_torch_device():
-            return super().capture_model()
+            captured = super().capture_model()
+
+        # Static-kernel cache pool upload: capture completion is the
+        # deterministic "all compilation finished" signal. rank0 spawns a
+        # daemon thread that consolidates the produced .run files into
+        # ts_pool_outputs and uploads first-wins; never blocks or raises.
+        from omni_npu.compilation.static_kernel_cache_pool import schedule_static_kernel_cache_upload
+
+        schedule_static_kernel_cache_upload(self.vllm_config)
+        return captured
 
     def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput"):
         # Mitigation for the upstream VLLM bug where the MM encoder output
@@ -829,7 +879,7 @@ class NPUModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     @model_output_decorator
-    @maybe_dump_kv
+    @maybe_dump_kv("update")
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -849,10 +899,11 @@ class NPUModelRunner(GPUModelRunner):
                                         intermediate_tensors)
             if self.drafter is None:
                 del self.drafter
-            return res
+            return self._attach_nan_inf_report(res)
 
     @torch.inference_mode
     @model_output_decorator
+    @maybe_dump_kv("finish")
     def sample_tokens(self, grammar_output):
         with switch_torch_device():
             # Upstream sample_tokens calls drafter.dummy_run(num_tokens=1)
@@ -864,7 +915,7 @@ class NPUModelRunner(GPUModelRunner):
                     state.spec_decode_common_attn_metadata
                 )
 
-            return super().sample_tokens(grammar_output)
+            return self._attach_nan_inf_report(super().sample_tokens(grammar_output))
 
     # Override to also propagate num_accepted_tokens_cpu from the async-copied
     # valid_sampled_token_count. This runs during execute_model -> _update_requests,
@@ -966,6 +1017,36 @@ class NPUModelRunner(GPUModelRunner):
                 for k, v in self.intermediate_tensors.items()
             }
         )
+
+    @torch.inference_mode()
+    def _dummy_sampler_run(self, hidden_states: torch.Tensor):
+        # MRv1 MTP block warmup needs draft probabilities for NPU rejection sampling.
+        config = self.speculative_config
+        if not (
+            config is not None
+            and config.method == "mtp"
+            and config.rejection_sample_method == "block"
+            and config.draft_sample_method == "probabilistic"
+        ):
+            return super()._dummy_sampler_run(hidden_states)
+
+        def add_dummy_draft_probs(_module, args, kwargs):
+            metadata, draft_probs, logits, sampling_metadata = args
+            draft_probs = torch.rand(
+                metadata.draft_token_ids.numel(),
+                logits.shape[-1],
+                dtype=torch.float32,
+                device=logits.device,
+            ).softmax(dim=-1)
+            return (metadata, draft_probs, logits, sampling_metadata), kwargs
+
+        handle = self.rejection_sampler.register_forward_pre_hook(
+            add_dummy_draft_probs, with_kwargs=True
+        )
+        try:
+            return super()._dummy_sampler_run(hidden_states)
+        finally:
+            handle.remove()
 
     @torch.inference_mode()
     def _dummy_run(

@@ -47,6 +47,8 @@ def test_runner_installs_cuda_aliases_and_pins_override_surface(
     # 类是模块级声明的，基类换不掉，改钉住上游 __init__ 收到的实参。
     def fake_init(self, vllm_config, device):
         created.update(vllm_config=vllm_config, device=device)
+        self.speculator = None
+        self.speculative_config = None
 
     monkeypatch.setattr(GPUModelRunner, "__init__", fake_init)
     monkeypatch.setattr(npugraph_ex_config, "init_aclgraph_config", lambda cfg: None)
@@ -71,6 +73,7 @@ def test_runner_installs_cuda_aliases_and_pins_override_surface(
     # 钉住覆写面：多出来说明有人加了覆写没说明原因，少了说明某个适配被删掉了。
     own = set(vars(type(runner))) - _CLASS_NOISE
     assert own == {
+        "initialize_kv_cache",       # Scoped NPU target/draft graph managers
         "__init__",                  # torch.cuda 别名，必须早于上游 __init__ 建 Stream
         "load_model",                # MRv2 mHC 多模态模型加载后对齐 encoder buffer 宽度
         "_align_mhc_mm_embedding_width",  # mHC 多流输出宽度适配（来自基线提交）
@@ -81,6 +84,7 @@ def test_runner_installs_cuda_aliases_and_pins_override_surface(
         "prepare_dummy_attn",        # dummy forward 清零 block table，别写脏已交接的块
         "_omni_has_separate_kv_update",
         "_sync_dummy_main_compute_logits",
+        "sample_tokens",             # Scope NPU device APIs over MTP proposal
         "execute_model",             # 在 dummy target forward 后补 lm_head logits
     }, f"NPUModelRunnerV2 覆写面变化，实际定义了: {own}"
 
@@ -495,6 +499,35 @@ def test_gumbel_sample_pure_greedy():
     )
     torch.npu.synchronize()
     assert torch.equal(got.cpu(), logits.cpu().argmax(dim=-1))
+
+
+@requires_npu_sampling
+@requires_npu
+def test_gumbel_sample_masked_request_does_not_access_request_state():
+    """A padded row has request index -1 and must not read or write its state."""
+    import torch
+
+    from omni_npu.worker.npu.sampler import gumbel_sample
+
+    vocab = 151552
+    logits = torch.zeros((2, vocab), dtype=torch.bfloat16, device="npu")
+    logits[0, 4] = 1
+    logits[1, 9] = 2
+    idx_mapping = torch.tensor([0, -1], dtype=torch.int32, device="npu")
+    temperature = torch.zeros(1, dtype=torch.float32, device="npu")
+    seeds = torch.zeros(1, dtype=torch.int64, device="npu")
+    pos = torch.zeros(2, dtype=torch.int32, device="npu")
+    processed = torch.full((1, vocab), -7, dtype=torch.float32, device="npu")
+
+    got = gumbel_sample(
+        logits, idx_mapping, temperature, seeds, pos,
+        apply_temperature=False, output_processed_logits=processed,
+    )
+    torch.npu.synchronize()
+
+    assert got.cpu().tolist() == [4, 9]
+    assert processed[0, 4].item() == 1
+    assert processed[0, 9].item() == 0
 
 
 @requires_npu_sampling
@@ -966,11 +999,11 @@ def test_constructor_installs_graph_hooks_after_cuda_aliases(monkeypatch):
         "init_aclgraph_config",
         lambda config: events.append("acl-config"),
     )
-    monkeypatch.setattr(
-        GPUModelRunner,
-        "__init__",
-        lambda self, config, device: events.append("upstream-init"),
-    )
+    def upstream_init(self, config, device):
+        events.append("upstream-init")
+        self.speculator = None
+        self.speculative_config = None
+    monkeypatch.setattr(GPUModelRunner, "__init__", upstream_init)
 
     NPUModelRunnerV2(object(), object())
 
@@ -990,7 +1023,10 @@ def test_constructor_initializes_aclgraph_config_without_additional_config(
     seen = []
     monkeypatch.setattr(runner_module, "install_torch_cuda_aliases", lambda: None)
     monkeypatch.setattr(npugraph_ex_config, "init_aclgraph_config", seen.append)
-    monkeypatch.setattr(GPUModelRunner, "__init__", lambda self, cfg, dev: None)
+    def upstream_init(self, cfg, dev):
+        self.speculator = None
+        self.speculative_config = None
+    monkeypatch.setattr(GPUModelRunner, "__init__", upstream_init)
 
     config = SimpleNamespace(additional_config=None)
     runner_module.NPUModelRunnerV2(config, object())

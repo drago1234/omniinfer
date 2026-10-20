@@ -15,6 +15,43 @@ from omni_npu.vllm_patches.patches.models.high_throughout import (
 MomeAttention = patch_mod.NPUMoMEPatch.MomeAttention
 
 
+@pytest.mark.parametrize("cache_mode", ["all", "none"])
+def test_cache_spec_matches_legacy_mtp_mome(monkeypatch, cache_mode):
+    from vllm.v1 import kv_cache_interface
+    from omni_npu.layers.attention.npu_sparse_attentions import MomeAttention as LegacyMome
+    from omni_npu.vllm_patches.patches.models.pangu_v2_base.patch_kv_cache_interface import MomeSpec
+
+    monkeypatch.setattr(kv_cache_interface, "MomeSpec", MomeSpec, raising=False)
+    monkeypatch.setattr(patch_mod.model_extra_config.operator_opt_config, "num_extra_reserved_blocks", 2)
+    cfg = SimpleNamespace(cache_config=SimpleNamespace(
+        mamba_block_size=128, mamba_page_size_padded=201728, mamba_cache_mode=cache_mode,
+    ))
+    main = MomeAttention.__new__(MomeAttention)
+    draft = LegacyMome.__new__(LegacyMome)
+    torch.nn.Module.__init__(main)
+    for attention in (main, draft):
+        attention.kernel_size = 3
+        attention.num_spec_tokens = 3
+        attention.state_shapes = ((1536,), (512,), (8192,))
+        attention.state_dtypes = (torch.bfloat16,) * 3
+    draft.page_size_padded = 201728
+    draft.num_extra_reserved_blocks = 2
+    assert main.get_kv_cache_spec(cfg) == draft.get_kv_cache_spec(cfg)
+
+
+def test_cache_spec_rejects_align(monkeypatch):
+    from vllm.v1 import kv_cache_interface
+    from omni_npu.vllm_patches.patches.models.pangu_v2_base.patch_kv_cache_interface import MomeSpec
+
+    monkeypatch.setattr(kv_cache_interface, "MomeSpec", MomeSpec, raising=False)
+    cfg = SimpleNamespace(cache_config=SimpleNamespace(
+        mamba_block_size=128, mamba_page_size_padded=201728, mamba_cache_mode="align",
+    ))
+    attention = MomeAttention.__new__(MomeAttention)
+    with pytest.raises(NotImplementedError, match="MoME state-copy contract"):
+        attention.get_kv_cache_spec(cfg)
+
+
 def _attention():
     attention = MomeAttention.__new__(MomeAttention)
     torch.nn.Module.__init__(attention)

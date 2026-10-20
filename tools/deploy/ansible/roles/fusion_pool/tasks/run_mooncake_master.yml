@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+---
+- name: Start the enabled KV pool master.
+  ansible.builtin.include_tasks:
+    file: "{{ fusion_pool_repo_root }}/Pangu-FusionPool/fusion_pool/deploy/run_mooncake_master.yml"
+  when:
+    - enable_fusion_pool | bool
+    - "'M' in group_names"

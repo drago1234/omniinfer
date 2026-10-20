@@ -63,9 +63,9 @@
         hugepage_enabled: true
         cpu_bytes_to_use: 1288490188800  # 1 TiB 
         eviction_policy: arc  # arc or lru
-      # 由 enable_kv_pool=true 控制（M 组部署 + install_kv_pool +
-      # kv_pool_runtime fragment）。
-      kv_pool:
+      # 由 enable_fusion_pool=true 控制（M 组部署 + install_fusion_pool +
+      # fusion_pool_runtime fragment）。
+      fusion_pool:
         global_segment_size_gb: 64
       prepare_commands: |-
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_ALL | replace(' ', '') | trim | quote }}

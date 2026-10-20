@@ -16,7 +16,7 @@ from concurrent.futures import (
 )
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import lz4.block
 import msgspec
@@ -458,6 +458,7 @@ class ECNetworkConnector(ECConnectorBase):
     def __init__(self, vllm_config: VllmConfig, role: ECConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)
         transfer_config = vllm_config.ec_transfer_config
+        self.meta = ECNetworkConnectorMetadata()
         self.tp_rank = 0
         self.dp_rank = 0
         self.tp_size = 0
@@ -1339,15 +1340,31 @@ class ECNetworkConnector(ECConnectorBase):
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput,
     ) -> ECConnectorMetadata:
-        meta = ECNetworkConnectorMetadata()
         for mm_hash in self._mm_hashes_need_loads:
             endpoint = (
                 self._endpoint if self.is_producer
                 else self._mm_hash_endpoints.get(mm_hash)
             )
-            meta.add_mm_hash(mm_hash, endpoint)
+            self.meta.add_mm_hash(mm_hash, endpoint)
         self._mm_hashes_need_loads.clear()
-        return meta
+        return self.meta
+
+    def request_finished(
+        self, request: "Request"
+    ) -> tuple[bool, dict[str, Any] | None]:
+        if not self.is_producer:
+            return False, None
+        ec_transfer_params = {}
+        mm_hash_finished = [feature.identifier for feature in request.mm_features]
+        ec_transfer_params["mm_hash_endpoints"] = {mm_hash: self.meta.mm_hash_endpoints.pop(mm_hash)
+                                                   for mm_hash in mm_hash_finished 
+                                                   if mm_hash in self.meta.mm_hash_endpoints}
+        # CLean up metadata for finished mm_hashes
+        for mm_hash in mm_hash_finished:
+            if mm_hash in self.meta.mm_hashes:
+                self.meta.mm_hashes.remove(mm_hash)
+
+        return False, ec_transfer_params
 
     def update_connector_output(self, connector_output):
         return

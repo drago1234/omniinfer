@@ -28,6 +28,10 @@ declare -A config_dict=(
     {% endfor %}
 )
 
+{% if profile.get('enable_kv_events', true) | bool %}
+{% include '_kv_events_runtime.sh.j2' %}
+{% endif %}
+
 cd {{ profile.workdir }}
 bash {{ profile.workdir }}/{{ profile.runner }} \
   --local-decode-server-ip-list "$SERVER_IP_LIST" \

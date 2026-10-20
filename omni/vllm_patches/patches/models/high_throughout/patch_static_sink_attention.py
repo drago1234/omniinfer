@@ -343,12 +343,32 @@ class StaticSinkAttentionPatch(VLLMPatch):
                     )
 
                 if self.use_sparse:
+                    # Shared-indexer layers reuse top-k selections and have no
+                    # local Indexer, but keep the same DSA cache layout.
+                    index_head_dim = (
+                        self.indexer.head_dim
+                        if self.indexer is not None
+                        else vllm_config.model_config.hf_config.index_head_dim
+                    )
+                    c8_dsa_cache_dtypes = {
+                        "fp8_ds_mla",
+                        "hif8_ds_mla",
+                    }
+                    block_size = vllm_config.cache_config.block_size
+                    if vllm_config.cache_config.cache_dtype in c8_dsa_cache_dtypes:
+                        # Match the low-latency path: C8 DSA stores twice as
+                        # many tokens per block. The platform pads every hybrid
+                        # group to the largest page, which includes this one.
+                        block_size *= 2
                     return DSAAttentionSpec(
-                        block_size=vllm_config.cache_config.block_size,
+                        block_size=block_size,
                         num_kv_heads=1,
-                        head_size=self.head_size + self.indexer.head_dim,
+                        head_size=self.head_size + index_head_dim,
                         dtype=kv_cache_dtype,
                         cache_dtype_str=vllm_config.cache_config.cache_dtype,
+                        page_size_padded=(
+                            vllm_config.cache_config.mamba_page_size_padded
+                        ),
                     )
             return SinkMLAAttentionSpec(
                 block_size=vllm_config.cache_config.block_size,

@@ -14,7 +14,7 @@ tracks ownership per attribute name.
 from vllm.logger import init_logger
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-from omni_npu.worker.npu.buffer_utils import NPUUvaBuffer
+from omni_npu.worker.npu.buffer_utils import NPUUvaBuffer, copy_to_uva_with_slot_event
 
 logger = init_logger(__name__)
 
@@ -32,3 +32,10 @@ else:
         _attr_names_to_apply = ["UvaBuffer"]
 
         UvaBuffer = NPUUvaBuffer
+
+    @register_patch("MRv2UvaPoolReusePatch", up_buffer_utils.UvaBufferPool)
+    class MRv2UvaPoolReusePatch(VLLMPatch):
+        """Patch the existing class so already imported consumers are covered."""
+
+        _attr_names_to_apply = ["copy_to_uva"]
+        copy_to_uva = copy_to_uva_with_slot_event

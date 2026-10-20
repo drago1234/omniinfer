@@ -41,6 +41,8 @@
         "enable_multi_stream": true,
         "use_mome_inplace_update": true,
         "use_rope_fusion_op": true,
-        "enable_mhc_multistream": true
+        "use_quant_lightning_indexer_v2": true,
+        "enable_mhc_multistream": true,
+        "enable_mxfp8_comm_quant": true
     }
 }

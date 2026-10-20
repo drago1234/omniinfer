@@ -1,4 +1,5 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 import importlib
 import importlib.machinery
 import sys
@@ -28,13 +29,18 @@ class _DummyDefaultStream:
 
 @pytest.fixture
 def rejection_mod(monkeypatch):
+    # Resolve vLLM dependencies before replacing torch_npu with a sampling stub.
+    import torch_npu as real_torch_npu
+
+    monkeypatch.setattr(real_torch_npu.npu, "get_device_name", lambda index=0: "Ascend910B2")
+    import omni_npu.sample.rejection_sampler as mod
+
     fake_default_stream = _DummyDefaultStream()
     # Streams are dummied out in these tests; no-op Tensor.record_stream so
     # real tensors can flow through code that records cross-stream usage.
     monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None)
     # Load real torch_npu first so package submodules (e.g. _inductor) stay
     # importable after we overlay a lightweight stub for unit tests.
-    import torch_npu as real_torch_npu  # noqa: F401
     try:
         importlib.import_module("torch_npu._inductor")
     except Exception:
@@ -77,6 +83,8 @@ def rejection_mod(monkeypatch):
         "rocm_aiter_ops",
         types.SimpleNamespace(is_enabled=lambda: False),
     )
+    # Newer vLLM imports this capability check while loading compilation passes.
+    fake_aiter_ops.check_aiter_fused_qk_rmsnorm = lambda: False
     monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
     monkeypatch.setitem(sys.modules, "vllm._aiter_ops", fake_aiter_ops)
     monkeypatch.setattr(
@@ -94,8 +102,6 @@ def rejection_mod(monkeypatch):
         raising=False,
     )
 
-    import omni_npu.sample.rejection_sampler as mod
-
     mod = importlib.reload(mod)
     monkeypatch.setattr(
         mod.torch,
@@ -107,6 +113,75 @@ def rejection_mod(monkeypatch):
         raising=False,
     )
     return mod, fake_torch_npu, fake_default_stream
+
+
+@pytest.mark.parametrize("device_name", ["Ascend910_9391", "Ascend950DT_9582"])
+@pytest.mark.parametrize("disable_npu_sample", [False, True])
+@pytest.mark.parametrize("with_sampling", [False, True])
+def test_sampler_routes_topk_topp_by_config(
+    rejection_mod, monkeypatch, device_name, disable_npu_sample, with_sampling
+):
+    """A5 uses the same NPU path as A3 unless the operator is explicitly disabled."""
+    mod, fake_torch_npu, _ = rejection_mod
+    from omni_npu.v1 import utils
+
+    monkeypatch.setattr(utils, "_npu_device_name", lambda: device_name)
+    monkeypatch.setattr(
+        mod,
+        "model_extra_config",
+        SimpleNamespace(
+            operator_opt_config=SimpleNamespace(
+                disable_npu_top_k_top_p_sample=disable_npu_sample
+            )
+        ),
+    )
+    base_sampler = SimpleNamespace(
+        logprobs_mode="raw_logits", dsa_stream=_DummyDefaultStream()
+    )
+    sampler = mod.NPURejectionSampler(
+        base_sampler, SimpleNamespace(rejection_sample_method="standard")
+    )
+    assert sampler.use_npu_sample is (not disable_npu_sample)
+    assert sampler.dsa_stream is base_sampler.dsa_stream
+
+    calls = []
+
+    def native_filter(logits, k, p):
+        assert disable_npu_sample, "Unexpected upstream Triton-capable fallback"
+        calls.append("native")
+        return logits
+
+    def npu_filter(logits, k, p):
+        assert not disable_npu_sample, "Explicit disable must bypass the NPU operator"
+        calls.append("npu")
+        return logits
+
+    def npu_sample(logits, k, p, q, is_need_logits):
+        filtered = npu_filter(logits, k, p)
+        return filtered.argmax(dim=-1), filtered
+
+    monkeypatch.setattr(mod, "apply_top_k_top_p", native_filter)
+    monkeypatch.setattr(mod, "apply_top_k_top_p_npu", npu_filter)
+    monkeypatch.setattr(fake_torch_npu, "npu_top_k_top_p_sample", npu_sample)
+    # Eight expanded draft rows exercise the batch size that enables Triton upstream.
+    logits = torch.arange(4, dtype=torch.float32).repeat(8, 1)
+    cu = torch.tensor([4, 8], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        all_greedy=False,
+        temperature=torch.ones(2),
+        top_k=torch.full((2,), 2, dtype=torch.int32),
+        top_p=torch.full((2,), 0.9),
+    )
+    if with_sampling:
+        tokens, filtered = mod.compute_probs_and_sample(
+            logits, cu, metadata, torch.ones_like(logits), sampler.use_npu_sample,
+            not_support_float=False,
+        )
+        assert torch.equal(tokens, torch.full((8,), 3, dtype=torch.int32))
+    else:
+        filtered = mod.compute_probs(logits, cu, metadata, sampler.use_npu_sample)
+    assert filtered is logits
+    assert calls == (["native"] if disable_npu_sample else ["npu"])
 
 
 def test_expand_batch_to_tokens_with_replacement(rejection_mod):
@@ -225,11 +300,15 @@ def test_rejection_greedy_sample_native_basic(rejection_mod):
     assert torch.equal(output, torch.tensor([[1, 5, mod.PLACEHOLDER_TOKEN_ID]], dtype=torch.int32))
 
 
-def test_rejection_random_sample_native_with_draft_probs(rejection_mod):
+def test_rejection_random_sample_native_with_draft_probs(rejection_mod, monkeypatch):
     mod, _, _ = rejection_mod
     output = torch.full((1, 3), mod.PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
     target_probs = torch.tensor([[0.9, 0.1], [0.9, 0.1]], dtype=torch.float32)
     draft_probs = torch.tensor([[0.95, 0.05], [0.05, 0.95]], dtype=torch.float32)
+    monkeypatch.setattr(
+        mod, "sample_recovered_tokens",
+        lambda *args, **kwargs: torch.tensor([3, 4], dtype=torch.int32),
+    )
 
     mod.rejection_random_sample_native(
         output_token_ids=output,
@@ -238,7 +317,11 @@ def test_rejection_random_sample_native_with_draft_probs(rejection_mod):
         draft_probs=draft_probs,
         target_probs=target_probs,
         bonus_token_ids=torch.tensor([[7]], dtype=torch.int32),
-        recovered_token_ids=torch.tensor([3, 4], dtype=torch.int32),
+        num_draft_tokens=[2],
+        sampling_metadata=SimpleNamespace(generators={}),
+        stream=_DummyDefaultStream(),
+        device=torch.device("cpu"),
+        rejection_sample_method="standard",
         uniform_probs=torch.tensor([0.5, 0.95], dtype=torch.float32),
         is_greedy=torch.tensor([False]),
         max_spec_len=2,
@@ -425,23 +508,12 @@ def test_rejection_sample_random_path_invokes_helpers(rejection_mod, monkeypatch
 
     monkeypatch.setattr(mod, "sample_recovered_tokens", fake_sample_recovered_tokens)
 
-    def fake_rejection_random_sample_native(
-        output_token_ids,
-        cu_num_draft_tokens,
-        draft_token_ids,
-        draft_probs,
-        target_probs,
-        bonus_token_ids,
-        recovered_token_ids,
-        uniform_probs,
-        is_greedy,
-        max_spec_len,
-        vocab_size,
-        NO_DRAFT_PROBS,
-    ):
+    real_random_sample = mod.rejection_random_sample_native
+
+    def fake_rejection_random_sample_native(*args, **kwargs):
         called["random_called"] = True
-        called["no_draft_probs"] = NO_DRAFT_PROBS
-        output_token_ids[:] = torch.tensor([[4, 5, 6]], dtype=torch.int32)
+        called["no_draft_probs"] = kwargs["NO_DRAFT_PROBS"]
+        return real_random_sample(*args, **kwargs)
 
     monkeypatch.setattr(mod, "rejection_random_sample_native", fake_rejection_random_sample_native)
 
@@ -450,7 +522,7 @@ def test_rejection_sample_random_path_invokes_helpers(rejection_mod, monkeypatch
     assert called["sample_recovered_tokens_called"] is True
     assert called["random_called"] is True
     assert called["no_draft_probs"] is True
-    assert torch.equal(out, torch.tensor([[4, 5, 6]], dtype=torch.int32))
+    assert torch.equal(out, torch.tensor([[0, 5, mod.PLACEHOLDER_TOKEN_ID]], dtype=torch.int32))
 
 
 def _patch_tracking_stream_ctx(mod, monkeypatch, fake_default_stream, state):
@@ -480,7 +552,7 @@ def _patch_tracking_stream_ctx(mod, monkeypatch, fake_default_stream, state):
 
 def _rejection_sample_kwargs(mod):
     return dict(
-        draft_token_ids=torch.tensor([1, 2], dtype=torch.int32),
+        draft_token_ids=torch.tensor([0, 1], dtype=torch.int32),
         num_draft_tokens=[2],
         max_spec_len=2,
         cu_num_draft_tokens=torch.tensor([2], dtype=torch.int64),
@@ -569,7 +641,7 @@ def test_sample_recovered_tokens_multi_stream_side_ctx_and_record_stream(rejecti
 
     def fake_native(recovered_token_ids, cu_num_draft_tokens, draft_token_ids,
                     draft_probs, target_probs, q, vocab_size, PADDED_VOCAB_SIZE,
-                    NO_DRAFT_PROBS):
+                    NO_DRAFT_PROBS, target_scale=None):
         captured["q"] = q
 
     monkeypatch.setattr(mod, "sample_recovered_tokens_native", fake_native)
@@ -611,8 +683,10 @@ class _ForwardSamplingMetadata:
     generators: dict = field(default_factory=dict)
 
 
-def _build_npu_rejection_sampler(mod, monkeypatch, enable_mtp_invariant=False, sampler_multi_stream=True):
-    monkeypatch.setattr(mod, "on_ascend950", lambda: False)
+def _build_npu_rejection_sampler(
+    mod, monkeypatch, enable_mtp_invariant=False, sampler_multi_stream=True,
+    rejection_sample_method="standard",
+):
     monkeypatch.setattr(
         mod,
         "model_extra_config",
@@ -628,7 +702,9 @@ def _build_npu_rejection_sampler(mod, monkeypatch, enable_mtp_invariant=False, s
         logprobs_mode="raw_logits",
         dsa_stream=_DummyDefaultStream(),
     )
-    return mod.NPURejectionSampler(base_sampler)
+    return mod.NPURejectionSampler(
+        base_sampler, SimpleNamespace(rejection_sample_method=rejection_sample_method)
+    )
 
 
 def _build_spec_decode_metadata():
@@ -804,11 +880,15 @@ def test_rejection_greedy_sample_native_returns_accepted_num(rejection_mod):
     assert torch.equal(accepted_num, torch.tensor([1], dtype=torch.int32))
 
 
-def test_rejection_random_sample_native_returns_accepted_num(rejection_mod):
+def test_rejection_random_sample_native_returns_accepted_num(rejection_mod, monkeypatch):
     mod, _, _ = rejection_mod
     output = torch.full((1, 3), mod.PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
     target_probs = torch.tensor([[0.9, 0.1], [0.9, 0.1]], dtype=torch.float32)
     draft_probs = torch.tensor([[0.95, 0.05], [0.05, 0.95]], dtype=torch.float32)
+    monkeypatch.setattr(
+        mod, "sample_recovered_tokens",
+        lambda *args, **kwargs: torch.tensor([3, 4], dtype=torch.int32),
+    )
 
     accepted_num = mod.rejection_random_sample_native(
         output_token_ids=output,
@@ -817,7 +897,11 @@ def test_rejection_random_sample_native_returns_accepted_num(rejection_mod):
         draft_probs=draft_probs,
         target_probs=target_probs,
         bonus_token_ids=torch.tensor([[7]], dtype=torch.int32),
-        recovered_token_ids=torch.tensor([3, 4], dtype=torch.int32),
+        num_draft_tokens=[2],
+        sampling_metadata=SimpleNamespace(generators={}),
+        stream=_DummyDefaultStream(),
+        device=torch.device("cpu"),
+        rejection_sample_method="standard",
         uniform_probs=torch.tensor([0.5, 0.95], dtype=torch.float32),
         is_greedy=torch.tensor([False]),
         max_spec_len=2,
@@ -946,17 +1030,20 @@ def test_npu_rejection_sampler_forward_skips_rollback_when_all_accepted(
     assert torch.equal(gen.get_state(), expected_state)
 
 
+@pytest.mark.parametrize("method", ["standard", "block"])
 def test_npu_rejection_sampler_forward_uses_rejection_sample_with_draft_probs(
-    rejection_mod, monkeypatch
+    rejection_mod, monkeypatch, method
 ):
     """draft_probs != None takes the compute_probs + rejection_sample branch.
 
-    The simple-verify branch is only for ngram spec decode (draft_probs is
-    None); with real draft probabilities the sampler must instead normalize
+    The simple-verify branch is used when draft_probs is None; with real
+    draft probabilities the sampler must instead normalize
     the target logits and run full rejection sampling.
     """
     mod, _, _ = rejection_mod
-    rejection = _build_npu_rejection_sampler(mod, monkeypatch)
+    rejection = _build_npu_rejection_sampler(
+        mod, monkeypatch, rejection_sample_method=method
+    )
     metadata = _build_spec_decode_metadata()
     output_ids = torch.tensor([[1, mod.PLACEHOLDER_TOKEN_ID]], dtype=torch.int32)
 
@@ -992,10 +1079,10 @@ def test_npu_rejection_sampler_forward_uses_rejection_sample_with_draft_probs(
 
     def fake_rejection_sample(
         draft_token_ids, num_draft_tokens, max_spec_len, cu_num_draft_tokens,
-        draft_probs, target_probs, bonus_token_ids, sm, dsa_stream,
+        draft_probs, target_probs, bonus_token_ids, sm, dsa_stream, rejection_sample_method,
     ):
         rejection_sample_calls.append(
-            SimpleNamespace(draft_probs=draft_probs, target_probs=target_probs)
+            SimpleNamespace(draft_probs=draft_probs, target_probs=target_probs, method=rejection_sample_method)
         )
         return output_ids
 
@@ -1009,7 +1096,7 @@ def test_npu_rejection_sampler_forward_uses_rejection_sample_with_draft_probs(
         sampling_metadata=_ForwardSamplingMetadata(max_num_logprobs=None),
     )
 
-    # The ngram-only path must not run.
+    # The missing-Q fallback must not run.
     assert simple_verify_calls == []
     # compute_probs is fed the float32 target logits and the cumulative counts.
     assert len(compute_probs_calls) == 1
@@ -1020,7 +1107,94 @@ def test_npu_rejection_sampler_forward_uses_rejection_sample_with_draft_probs(
     # rejection_sample receives softmax-normalized target probs and our draft probs.
     assert len(rejection_sample_calls) == 1
     call = rejection_sample_calls[0]
+    assert call.method == method
     assert call.draft_probs is draft_probs
     assert torch.allclose(call.target_probs.sum(dim=-1), torch.ones(1))
     assert torch.equal(out.sampled_token_ids, output_ids)
     assert out.logprobs_tensors is None
+
+
+@pytest.mark.parametrize("uniform,expected_tau", [([0.9, 0.2], 2), ([0.1, 0.9], 1), ([0.9, 0.9], 0)])
+def test_block_chooses_longest_passing_prefix(rejection_mod, uniform, expected_tau):
+    """c=(1/2,1/4), Z_1=1/10, h=(1/6,1/4); later success can rescue the prefix."""
+    mod, _, _ = rejection_mod
+    tau, accepted, scale = mod.compute_block_acceptance_torch(
+        torch.tensor([0, 0]), [2], torch.tensor([[0.5, 0.5], [0.8, 0.2]]),
+        torch.tensor([[0.25, 0.75], [0.4, 0.6]]),
+        torch.tensor(uniform), torch.device("cpu"),
+    )
+    assert tau.tolist() == [expected_tau]
+    assert accepted.tolist() == [i < expected_tau for i in range(2)]
+    torch.testing.assert_close(scale, torch.tensor([1., 0.5]))
+
+
+@pytest.mark.parametrize("scale,expected", [(None, 1), (torch.tensor([0.25]), 0)])
+def test_recovery_applies_block_scale_without_changing_standard(rejection_mod, scale, expected):
+    mod, _, _ = rejection_mod
+    p = torch.tensor([[0.6, 0.3, 0.1]])
+    q = torch.tensor([[0.1, 0.1, 0.8]])
+    noise = torch.tensor([[2., 0.3, 1.]])
+    out = torch.empty(1, dtype=torch.int32)
+    mod.sample_recovered_tokens_native(
+        out, torch.tensor([1]), torch.tensor([0]), q, p, noise, 3, 4, False, scale,
+    )
+    assert out.tolist() == [expected]
+
+
+@pytest.mark.parametrize("method", ["standard", "block"])
+def test_rejection_sample_mixed_greedy_keeps_greedy_output(rejection_mod, monkeypatch, method):
+    mod, _, _ = rejection_mod
+    _build_npu_rejection_sampler(mod, monkeypatch, sampler_multi_stream=False)
+    monkeypatch.setattr(mod, "generate_uniform_probs", lambda *a, **k: torch.full((4,), .2))
+    monkeypatch.setattr(mod, "sample_recovered_tokens", lambda *a, **k: torch.tensor([1, 1, 0, 0], dtype=torch.int32))
+    p = torch.tensor([[.9, .1], [.1, .9], [.9, .1], [.1, .9]])
+    result = mod.rejection_sample(
+        torch.tensor([0, 0, 0, 1], dtype=torch.int32), [2, 2], 2, torch.tensor([2, 4]), p.clone(), p,
+        torch.tensor([[8], [9]], dtype=torch.int32),
+        SimpleNamespace(all_greedy=False, all_random=False, temperature=torch.tensor([0., 1.]), generators={}),
+        _DummyDefaultStream(), method,
+    )
+    assert result.tolist() == [[0, 1, -1], [0, 1, 9]]
+
+
+def test_forward_missing_q_block_matches_standard(rejection_mod, monkeypatch):
+    """Missing batch Q keeps legacy output and per-request RNG consumption."""
+    mod, _, _ = rejection_mod
+    metadata = SimpleNamespace(
+        max_spec_len=2, num_draft_tokens=[2, 2, 2],
+        cu_num_draft_tokens=torch.tensor([2, 4, 6]),
+        draft_token_ids=torch.tensor([0, 1, 0, 1, 0, 1], dtype=torch.int32),
+        target_logits_indices=torch.tensor([0, 1, 3, 4, 6, 7]),
+        bonus_logits_indices=torch.tensor([2, 5, 8]),
+    )
+    logits = torch.tensor([[2., 1.], [1., 2.], [1., 3.]]).repeat(3, 1)
+
+    def cpu_sample(logits, cu, sm, noise, *args):
+        ids = logits.argmax(-1) if sm.all_greedy else (logits.softmax(-1) / noise).argmax(-1)
+        return ids.int(), logits
+
+    class BonusSampler:
+        def __call__(self, logits, sampling_metadata, **kwargs):
+            ids = logits.argmax(-1) if sampling_metadata.all_greedy else (
+                logits.softmax(-1) / self.bonus_q).argmax(-1)
+            return SimpleNamespace(sampled_token_ids=ids.int()[:, None], logprobs_tensors=None)
+
+    monkeypatch.setattr(mod, "compute_probs_and_sample", cpu_sample)
+    monkeypatch.setattr(mod, "rejection_sample", lambda *a, **k: pytest.fail("missing Q entered probabilistic verifier"))
+    outputs, states = [], []
+    for method in ("standard", "block"):
+        sampler = _build_npu_rejection_sampler(
+            mod, monkeypatch, sampler_multi_stream=False,
+            enable_mtp_invariant=True, rejection_sample_method=method,
+        )
+        sampler.sampler = BonusSampler()
+        monkeypatch.setattr(sampler, "apply_logits_processors", lambda x, *a: x)
+        generators = {i: torch.Generator().manual_seed(i + 10) for i in range(3)}
+        result = sampler.forward(metadata, None, logits.clone(), _ForwardSamplingMetadata(
+            max_num_logprobs=None, all_greedy=False, generators=generators))
+        outputs.append(result.sampled_token_ids)
+        states.append([g.get_state() for g in generators.values()])
+    assert torch.equal(outputs[0], outputs[1])
+    assert (outputs[1][:, 0] >= 0).all()
+    for left, right in zip(*states):
+        assert torch.equal(left, right)

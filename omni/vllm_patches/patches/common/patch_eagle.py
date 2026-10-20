@@ -39,6 +39,7 @@ from omni_npu.sample.ops.draft_sampling import sample_draft_logits
 from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from omni_npu.attention.backends.mome import NPUMomeAttentionMetadataBuilder
+from omni_npu.connector.kv_dump import maybe_note_mome_cache
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu import envs as omni_envs
@@ -101,6 +102,13 @@ class EagleProposerPatch(VLLMPatch):
         EagleProposer_original_init(
             self, vllm_config=vllm_config, device=device, runner=runner
         )
+        # Collect MTP draft Q for NPU block rejection before configuring draft top-k.
+        if (
+            self.method == "mtp"
+            and self.speculative_config.rejection_sample_method == "block"
+            and self.speculative_config.draft_sample_method == "probabilistic"
+        ):
+            self._enable_probabilistic_draft_probs = True
         self._draft_top_k = omni_envs.OMNI_DRAFT_TOP_K if self._enable_probabilistic_draft_probs else None
         if self._draft_top_k is not None and self._draft_top_k < -1:
             raise ValueError("OMNI_DRAFT_TOP_K must be -1, 0, or a positive integer")
@@ -341,6 +349,12 @@ class EagleProposerPatch(VLLMPatch):
                 )
                 if self.method == "mtp" and self.n_predict > 1:
                     model_kwargs["spec_step_idx"] = fwd_idx
+                maybe_note_mome_cache(
+                    self.runner,
+                    draft=True,
+                    draft_head=fwd_idx if self.n_predict > 1 else 0,
+                    draft_step=fwd_idx,
+                )
                 ret_hidden_states = _forward_draft_model(self, **model_kwargs)
 
                 # Mirror active rank's per-iter (forward, compute_logits)
@@ -630,19 +644,22 @@ class EagleProposerPatch(VLLMPatch):
                 )
             slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
 
-            if group.kv_cache_group_id == self.kv_cache_gid:
-                # Update base CM in-place (preserves current behaviour)
-                common_attn_metadata.block_table_tensor = blk_table_tensor
-                common_attn_metadata.slot_mapping[:slot_mapping.numel()] = slot_mapping
-                group_cm = common_attn_metadata
-            else:
-                group_cm = copy(common_attn_metadata)
-                group_cm.block_table_tensor = blk_table_tensor
-                group_cm.slot_mapping = (
-                    blk_table.slot_mapping.gpu[:common_attn_metadata.num_actual_tokens]
-                )
-                group_cm.slot_mapping[:slot_mapping.numel()] = slot_mapping
-            group_cm.slot_mapping[slot_mapping.numel():] = -1
+            num_tokens = common_attn_metadata.num_actual_tokens
+            num_valid = slot_mapping.numel()
+            slot_buffer = blk_table.slot_mapping.gpu
+
+            # Later draft steps can use fewer tokens than the first pass.
+            # Rebind every group's view to this step's execution size while
+            # retaining its persistent backing storage for graph execution.
+            group_cm = (
+                common_attn_metadata
+                if group.kv_cache_group_id == self.kv_cache_gid
+                else copy(common_attn_metadata)
+            )
+            group_cm.block_table_tensor = blk_table_tensor
+            group_cm.slot_mapping = slot_buffer[:num_tokens]
+            group_cm.slot_mapping[:num_valid].copy_(slot_mapping)
+            group_cm.slot_mapping[num_valid:].fill_(PADDING_SLOT_ID)
 
             extra_attn_metadata_args = {}
             if isinstance(builder, NPUMomeAttentionMetadataBuilder):
@@ -960,6 +977,12 @@ class EagleProposerPatch(VLLMPatch):
         ):
             forward_context = get_forward_context()
             forward_context.capturing = False
+            maybe_note_mome_cache(
+                self.runner,
+                draft=True,
+                draft_head=0,
+                draft_step=0,
+            )
             ret_hidden_states = _forward_draft_model(self, **model_kwargs)
 
         if not self.model_returns_tuple():
@@ -1190,6 +1213,12 @@ class EagleProposerPatch(VLLMPatch):
                     get_forward_context()
                 )
                 forward_context.capturing = False
+                maybe_note_mome_cache(
+                    self.runner,
+                    draft=True,
+                    draft_head=spec_step_idx if use_multi_mtp else 0,
+                    draft_step=token_index + 1,
+                )
                 ret_hidden_states = _forward_draft_model(self,
                     **model_kwargs
                 )

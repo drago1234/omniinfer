@@ -56,6 +56,8 @@ from omni_npu.v1.utils import on_ascend950
 from omni_npu.profiler.wrapper import NpuProfilerWrapper
 import omni_npu.envs as omni_envs
 from omni_npu.diagnostics.metrics import stage_metrics
+from omni_npu.worker.collective_features import collective_feature
+import omni_npu.diagnostics.nan_inf.collective  # noqa: F401
 from omni_npu.worker.cpu_affinity import apply_worker_cpu_affinity
 
 logger = init_logger(__name__)
@@ -147,6 +149,8 @@ class NPUWorker(Worker):
 
             # Initialize the model best practice configs.
             load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
+            from omni_npu.model_config.config_loader import loader as _omni_loader
+            _enable_batch_invariant_determinism(_omni_loader.model_extra_config)
 
             # OMNI-CONF worker-scope snapshot (solution doc §3.3): full dump
             # on local_rank 0, hash-only elsewhere (cross-rank drift signal).
@@ -163,7 +167,6 @@ class NPUWorker(Worker):
 
             # Run declarative validation after the summary so startup errors
             # can be compared with the emitted configuration.
-            from omni_npu.model_config.config_loader import loader as _omni_loader
             from omni_npu.configs.validators import (
                 ValidationContext,
                 validate_all,
@@ -466,7 +469,11 @@ class NPUWorker(Worker):
             )
             res = None
         if self._is_auto_profiler_mode():
-            if self.profile_already_start and not self.profile_finished:
+            if (
+                forward_pass
+                and self.profile_already_start
+                and not self.profile_finished
+            ):
                 self.profile_step += 1
             if not self.profile_finished and self.profile_step > self.profiler_stop_step:
                 self.profiler.stop()
@@ -477,6 +484,12 @@ class NPUWorker(Worker):
         output = super().sample_tokens(grammar_output)
         stage_metrics.stamp_async_forward(self.model_runner, output)
         return output
+
+    def collective_feature(
+        self, feature: str, action: str = "configure", **options
+    ) -> dict:
+        """Configure an allowlisted optional feature via ``/collective_rpc``."""
+        return collective_feature(self, feature, action, **options)
 
     def sleep(self, level: int = 1) -> None:
         if self.is_full_async_rl:
@@ -622,6 +635,12 @@ class NPUWorker(Worker):
             # capture_model() normally consumes the flag on entry; clear any
             # residual if it failed before consume or was bypassed.
             consume_aclgraph_recapture()
+
+
+def _enable_batch_invariant_determinism(extra_config) -> None:
+    """On A5, mhc_pre is batch-invariant only at deterministic level 3."""
+    if on_ascend950() and extra_config.operator_opt_config.use_batch_invariant_op:
+        torch_npu.npu.set_deterministic_level(3)
 
 
 def _needs_dp_local_rank_offset(parallel_config) -> bool:

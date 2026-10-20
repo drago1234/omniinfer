@@ -31,8 +31,12 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from omni_npu.compilation.acl_graph import set_aclgraph_recapture
 from omni_npu.layers.fused_moe import routed_experts_handle
 from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp, fused_experts_tp_with_shared
-from omni_npu.layers.fused_moe.fused_moe_method_base import NPUFusedMoEMethodBase
+from omni_npu.layers.fused_moe.fused_moe_method_base import (
+    NPUFusedMoEMethodBase,
+    npu_grouped_moe_experts_bf16,
+)
 from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import PreparePermuteOptions, PreparePermuteResult
+from omni_npu.layers.fused_moe.shared_expert import shared_expert_core_limit
 from omni_npu.layers.prefetch import PrefetchManager
 from omni_npu.layers.utils import named_stream
 from omni_npu.model_config.config_loader.loader import model_extra_config
@@ -152,9 +156,10 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
             scoring_func=scoring_func,
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
+            force_load_balance=getattr(layer, "use_moe_force_load_balance", False),
         )
 
-        if model_extra_config.operator_opt_config.enable_precision_strong_consistency:
+        if model_extra_config.operator_opt_config.enable_precision_strong_consistency and not self.on_ascend950:
             # Sort each row of topk_ids in ascending order, and reorder topk_weights accordingly.
             sorted_indices = topk_ids.argsort(dim=-1)
             topk_ids = topk_ids.gather(dim=-1, index=sorted_indices).contiguous()
@@ -215,12 +220,13 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
             if shared_expert_multi_stream:
                 self.sub_stream.wait_stream(cur_stream)
                 with torch.npu.stream(self.sub_stream):
-                    if shared_experts.gate_up_proj.tp_size > 1:
-                        # Shared experts with TP>1 require full hidden_states;
-                        # output is all-reduced later.
-                        shared_output = shared_experts(hidden_states)
-                    else:
-                        shared_output = shared_experts(x_slice)
+                    with shared_expert_core_limit(strategy == "dispatch_combine"):
+                        if shared_experts.gate_up_proj.tp_size > 1:
+                            # Shared experts with TP>1 require full hidden_states;
+                            # output is all-reduced later.
+                            shared_output = shared_experts(hidden_states)
+                        else:
+                            shared_output = shared_experts(x_slice)
             else:
                 if shared_experts.gate_up_proj.tp_size > 1:
                     # Shared experts with TP>1 require full hidden_states;
@@ -339,25 +345,12 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
         expert_tokens = prepare_permute_result.expert_tokens.to(torch.int64)
         experts = layer.routed_experts
         group_list_type = int(layer.moe_config.moe_parallel_config.use_ep)
-        gate_up_proj = torch_npu.npu_grouped_matmul(
-            [hidden_states],
-            [experts.w13_weight],
-            bias=None,
-            group_list=expert_tokens,
-            split_item=3,
-            group_type=0,
-            group_list_type=group_list_type,
-        )[0]
-        intermediate_hidden_states = torch_npu.npu_swiglu(gate_up_proj)
-        return torch_npu.npu_grouped_matmul(
-            [intermediate_hidden_states],
-            [experts.w2_weight],
-            bias=None,
-            group_list=expert_tokens,
-            split_item=3,
-            group_type=0,
-            group_list_type=group_list_type,
-        )[0]
+        return npu_grouped_moe_experts_bf16(
+            hidden_states,
+            experts,
+            expert_tokens,
+            group_list_type,
+        )
 
 
 @MoERunner.register_oot
@@ -396,6 +389,7 @@ class NPUFusedMoERunner(MoERunner):
         scoring_func: str = "softmax",
         routed_scaling_factor: Optional[torch.Tensor] = None,
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        force_load_balance: bool = False,
     ):
         attn_metadata = get_forward_context().attn_metadata
         if attn_metadata is None:
@@ -420,18 +414,47 @@ class NPUFusedMoERunner(MoERunner):
                 raise ValueError("Unsupported topk_group is None")
             if num_expert_group is None:
                 raise ValueError("Unsupported num_expert_group is None")
-            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
-                router_logits.float(),
-                k=top_k,
-                bias=e_score_correction_bias,
-                k_group=topk_group,
-                group_count=num_expert_group,
-                group_select_mode=1,
-                renorm=0,
-                norm_type=1,
-                routed_scaling_factor=routed_scaling_factor,
-                eps=1e-20,
-            )
+            if on_ascend950() and model_extra_config.operator_opt_config.enable_precision_strong_consistency:
+                scores = torch.sigmoid(router_logits.float())
+                scores_for_routing = scores
+                if e_score_correction_bias is not None:
+                    scores_for_routing = scores + e_score_correction_bias
+                experts_per_group = scores.shape[-1] // num_expert_group
+                group_scores = scores_for_routing.view(
+                    scores.shape[0], num_expert_group, experts_per_group
+                ).amax(dim=-1)
+                _, group_idx = torch.topk(
+                    group_scores, k=topk_group, dim=-1
+                )
+                group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+                group_mask.scatter_(1, group_idx, True)
+                score_mask = group_mask.unsqueeze(-1).expand(
+                    -1, -1, experts_per_group
+                ).reshape_as(scores)
+                routed_scores = scores_for_routing.masked_fill(~score_mask, float("-inf"))
+                _, topk_ids = torch.topk(routed_scores, k=top_k, dim=-1)
+                topk_weights = torch.gather(scores, dim=1, index=topk_ids)
+                if renormalize:
+                    topk_weights = topk_weights / (
+                        topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+                    )
+                topk_weights = topk_weights * (
+                    1.0 if routed_scaling_factor is None else routed_scaling_factor
+                )
+                topk_ids = topk_ids.int()
+            else:
+                topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
+                    router_logits.float(),
+                    k=top_k,
+                    bias=e_score_correction_bias,
+                    k_group=topk_group,
+                    group_count=num_expert_group,
+                    group_select_mode=1,
+                    renorm=0,
+                    norm_type=1,
+                    routed_scaling_factor=routed_scaling_factor,
+                    eps=1e-20,
+                )
         elif custom_routing_function is None:
             topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
                 router_logits.float(),
@@ -446,6 +469,14 @@ class NPUFusedMoERunner(MoERunner):
                 gating_output=router_logits, topk=top_k, renormalize=renormalize
             )
 
+        if force_load_balance:
+            # Preserve gate weights; This deliberately changes model routing.
+            topk_ids = (
+                torch.arange(
+                    topk_ids.numel(), device=topk_ids.device, dtype=topk_ids.dtype
+                ).view_as(topk_ids)
+                % router_logits.shape[-1]
+            )
         return topk_weights, topk_ids
 
     def set_eplb_state(

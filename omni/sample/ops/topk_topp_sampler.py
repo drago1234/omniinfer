@@ -18,7 +18,6 @@ from vllm.platforms import CpuArchEnum, current_platform
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler as V1TopKTopPSampler
 
 from omni_npu.model_config.config_loader.loader import model_extra_config
-from omni_npu.v1.utils import on_ascend950
 from omni_npu.layers.utils import named_stream
 
 logger = init_logger(__name__)
@@ -176,11 +175,8 @@ def random_sample(
 class NPUTopKTopPSampler(V1TopKTopPSampler):
     def __init__(self, logprobs_mode: LogprobsMode = "raw_logprobs", sampler=None) -> None:
         super().__init__(logprobs_mode)
-        if on_ascend950():
-            self.forward = self.forward_native
-        else:
-            self.apply_top_k_top_p = apply_top_k_top_p_npu
-            self.forward = self.forward_npu
+        self.apply_top_k_top_p = apply_top_k_top_p_npu
+        self.forward = self.forward_npu
         # Owning sampler: carries the noise side stream and the spec-decode
         # bonus_q stash (see generate_coins).
         self.sampler = sampler

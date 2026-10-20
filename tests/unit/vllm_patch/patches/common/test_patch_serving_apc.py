@@ -649,3 +649,28 @@ def test_sse_unicode_named_finish_rewrite(input_ascii):
 
 if __name__ == "__main__":
     run_standalone_tests(globals())
+
+
+def test_chat_full_relays_ec_transfer_params_from_engine_output():
+    serving = FakeServing(enable_details=True, kv_out={"remote_engine_id": "p0"})
+    params = {"mm_hash_endpoints": {"image": "tcp://p:5601"}}
+    output = types.SimpleNamespace(num_cached_tokens=480, ec_transfer_params=params)
+
+    result = asyncio.run(
+        apc.OpenAIServingChatFullAPCPatch.chat_completion_full_generator(
+            serving, FakeRequest(None), _agen([output]), "req-ec", "model",
+        )
+    )
+
+    assert result.ec_transfer_params == params
+
+
+def test_chat_full_leaves_missing_ec_transfer_params_unset():
+    serving = FakeServing(enable_details=True, kv_out={})
+    result = asyncio.run(
+        apc.OpenAIServingChatFullAPCPatch.chat_completion_full_generator(
+            serving, FakeRequest(None), _agen([FakeOutput(1)]), "req-none", "model",
+        )
+    )
+
+    assert not hasattr(result, "ec_transfer_params")

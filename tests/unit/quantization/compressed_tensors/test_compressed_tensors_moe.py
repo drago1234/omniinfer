@@ -335,6 +335,11 @@ def mock_dependencies(monkeypatch: pytest.MonkeyPatch):
         monkeypatch, "omni_npu.layers.fused_moe.fused_moe_method_base"
     )
     npu_base_module.NPUFusedMoEMethodBase = DummyNPUFusedMoEMethodBase
+    # layer.py and compressed_tensors_moe.py import the shared BF16 helper
+    # from here; give the stub a passthrough the tests can assert against.
+    npu_base_module.npu_grouped_moe_experts_bf16 = MagicMock(
+        return_value=torch.zeros(0)
+    )
 
     prepare_module = _make_module(
         monkeypatch, "omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize"
@@ -773,6 +778,38 @@ def test_apply_experts_quant_requires_dynamic_scale(compressed_moe_module):
 
     with pytest.raises(ValueError, match="dynamic per-token scale"):
         method.apply_experts(layer, _make_prepare_result(dynamic_scale=None))
+
+
+def test_apply_experts_unquantized_falls_back_to_bf16_helper(
+    compressed_moe_module, monkeypatch
+):
+    """quant_config is None: the BF16 grouped-matmul fallback delegates to
+    the shared helper, forwarding expert_tokens as counts (group_list_type=1)
+    and output_dtype=hidden_states.dtype."""
+    layer = MockMoELayer(use_ep=True)
+    layer.quant_config = None
+    method = _make_method(compressed_moe_module, layer)
+
+    helper_mock = compressed_moe_module.npu_grouped_moe_experts_bf16
+    helper_mock.reset_mock()
+    helper_mock.return_value = torch.full((3, 4), 5.0)
+    hidden_states = torch.ones(3, 4, dtype=torch.bfloat16)
+    expert_tokens = torch.tensor([2, 1], dtype=torch.int64)
+    prepare_result = _make_prepare_result(
+        dynamic_scale=torch.ones(1, 3), expert_tokens=expert_tokens
+    )
+    prepare_result.hidden_states_sorted_by_experts = hidden_states
+
+    out = method.apply_experts(layer, prepare_result)
+
+    assert torch.equal(out, torch.full((3, 4), 5.0))
+    helper_mock.assert_called_once()
+    call = helper_mock.call_args
+    assert call.args[0] is hidden_states
+    assert call.args[1] is layer.routed_experts
+    assert call.args[2] is expert_tokens
+    assert call.args[3] == 1  # group_list_type: EP path reads counts
+    assert call.kwargs["output_dtype"] is torch.bfloat16
 
 
 def test_apply_experts_swigluoai_passes_kernel_kwargs(

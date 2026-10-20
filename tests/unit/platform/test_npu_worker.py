@@ -1202,6 +1202,42 @@ class TestNpuWorker:
         _step(4, [])              # armed pure decode step
         worker.profiler.start.assert_called_once()
 
+    def test_execute_model_profiler_step_counts_only_forward_pass(self, monkeypatch):
+        """Empty scheduler steps do not advance the auto-profiler step counter."""
+        worker = self._create_worker(monkeypatch)
+        monkeypatch.setattr(worker, "_is_auto_profiler_mode", lambda: True)
+        mock_pp_group = MagicMock()
+        mock_pp_group.is_first_rank = True
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.get_pp_group",
+            lambda: mock_pp_group,
+        )
+        worker.model_runner.execute_model.return_value = ModelRunnerOutput(
+            req_ids=MagicMock(), req_id_to_index=MagicMock())
+        worker.profiler = MagicMock()
+        worker.profile_already_start = True
+        worker.profile_finished = False
+        worker.profile_step = 2
+        worker.profiler_stop_step = 100
+        worker.profiler_token_threshold = 4
+        worker.profiler_skip_requests = 0
+        worker.enable_prefill_profiler = False
+        worker._requests_seen = 1
+
+        worker.execute_model(SimpleNamespace(
+            total_num_scheduled_tokens=0,
+            scheduled_new_reqs=[],
+        ))
+        assert worker.profile_step == 2
+        worker.profiler.stop.assert_not_called()
+
+        worker.execute_model(SimpleNamespace(
+            total_num_scheduled_tokens=3,
+            scheduled_new_reqs=[],
+        ))
+        assert worker.profile_step == 3
+        worker.profiler.stop.assert_not_called()
+
     def test_init_profiler(self, monkeypatch):
         """The worker delegates profiler construction to NpuProfilerWrapper."""
         worker = self._create_worker(monkeypatch)
@@ -2058,3 +2094,26 @@ def test_kv_offload_reserved_bytes(config, reserved):
         assert _kv_offload_reserved_bytes(config) == reserved
     if reserved:
         fn.assert_called_once_with(16)
+
+
+@pytest.mark.parametrize(
+    ("on_a5", "batch_invariant", "expected_calls"),
+    [(True, True, [3]), (True, False, []), (False, True, [])],
+)
+def test_enable_batch_invariant_determinism_only_on_a5(
+    monkeypatch, on_a5, batch_invariant, expected_calls
+):
+    from omni_npu.worker import npu_worker as worker_mod
+
+    calls = []
+    monkeypatch.setattr(worker_mod, "on_ascend950", lambda: on_a5)
+    monkeypatch.setattr(
+        worker_mod.torch_npu.npu, "set_deterministic_level", calls.append, raising=False
+    )
+    extra = SimpleNamespace(
+        operator_opt_config=SimpleNamespace(use_batch_invariant_op=batch_invariant)
+    )
+
+    worker_mod._enable_batch_invariant_determinism(extra)
+
+    assert calls == expected_calls

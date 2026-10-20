@@ -25,7 +25,10 @@ from omni_npu.layers.fused_moe.config import hifloat8_moe_quant_config
 from omni_npu.layers.quantization.moe_apply import shared_expert_mlp
 from omni_npu.layers.fused_moe.fused_moe_method_base import NPUFusedMoEMethodBase
 from omni_npu.layers.fused_moe.layer import NPUFusedMoE
-from omni_npu.layers.fused_moe.shared_expert import activate_shared_expert_on_side_stream
+from omni_npu.layers.fused_moe.shared_expert import (
+    activate_shared_expert_on_side_stream,
+    shared_expert_core_limit,
+)
 from omni_npu.layers.mhc import cube_side_task_ops  # noqa: F401  registers cube-side ops
 from omni_npu.layers.utils import named_stream
 from omni_npu.model_config.config_loader.loader import model_extra_config
@@ -312,6 +315,11 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.shared_experts_stream = named_stream("sub_stream")
+        self.enable_agrs_finalize_metadata_overlap = getattr(
+            model_extra_config.operator_opt_config,
+            "enable_agrs_finalize_metadata_overlap",
+            False,
+        )
 
         self.n_routed_experts = layer.moe_config.num_experts
         self.prefix = layer.layer_name
@@ -488,6 +496,7 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
             scoring_func=scoring_func,
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
+            force_load_balance=getattr(layer, "use_moe_force_load_balance", False),
         )
 
         if not use_ep:
@@ -502,7 +511,11 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
                 )
                 if shared_experts is not None:
                     shared_output = shared_experts(x_slice)
-                    return shared_output, routed_output + shared_output
+                    # Built-in Pangu adds the shared output in its caller;
+                    # custom models consume the already-combined output.
+                    if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
+                        routed_output = routed_output + shared_output
+                    return shared_output, routed_output
                 return routed_output
             return fused_experts_tp(
                 layer=layer,
@@ -514,6 +527,17 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         prepare_permute_result = self.apply_prepare_permute(strategy_impl, layer, x_slice, topk_ids)
 
         use_grouped_matmul_finalize_routing = (strategy == "agrs" and prepare_permute_result.row_idx_type == 1)
+        finalize_metadata = None
+        overlap_metadata = (
+            strategy == "agrs"
+            and getattr(self, "enable_agrs_finalize_metadata_overlap", False)
+        )
+        if overlap_metadata:
+            self.shared_experts_stream.wait_stream(cur_stream)
+            with torch.npu.stream(self.shared_experts_stream):
+                finalize_metadata = self.prepare_finalize_metadata(
+                    strategy_impl, layer, topk_weights, prepare_permute_result
+                )
         output = self.apply_experts(
             layer=layer,
             prepare_permute_result=prepare_permute_result,
@@ -523,53 +547,83 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
 
         shared_output = None
         schedule = model_extra_config.operator_opt_config.shared_expert_parallel_schedule
-        if multi_stream and schedule == "with_routed_experts_cv":
-            # Shared experts already ran on the side stream interleaved with the
-            # routed-experts compute/vector path inside apply_experts; just unpack.
-            output, shared_output = output  # output of self.apply_experts is a tuple
-        elif multi_stream:
-            # default with_finalize: launch shared experts on the side stream so
-            # they overlap apply_unpermute_finalize below.
-            if shared_experts is not None:
-                cur_stream = torch.npu.current_stream()
+        shared_after_finalize = (
+            overlap_metadata
+            and shared_experts is not None
+            and multi_stream
+            and schedule == "with_finalize"
+        )
+
+        if not shared_after_finalize:
+            if multi_stream and schedule == "with_routed_experts_cv":
+                # Shared experts already ran on the side stream interleaved with the
+                # routed-experts compute/vector path inside apply_experts; just unpack.
+                output, shared_output = output  # output of self.apply_experts is a tuple
+            elif multi_stream:
+                # default with_finalize: launch shared experts on the side stream so
+                # they overlap apply_unpermute_finalize below.
+                if shared_experts is not None:
+                    cur_stream = torch.npu.current_stream()
+                    self.shared_experts_stream.wait_stream(cur_stream)
+                    with torch.npu.stream(self.shared_experts_stream):
+                        with shared_expert_core_limit(strategy == "dispatch_combine"):
+                            if shared_experts.gate_up_proj.tp_size > 1:
+                                shared_output = shared_experts(hidden_states)
+                            else:
+                                shared_output = shared_experts(x_slice)
+            else:
+                # Multi-stream disabled — run shared experts synchronously on the
+                # main stream. Schedule is ignored.
+                if shared_experts is not None:
+                    if shared_experts.gate_up_proj.tp_size > 1:
+                        shared_output = shared_experts(hidden_states)
+                    else:
+                        shared_output = shared_experts(x_slice)
+
+            if enable_prefetch:
+                self.shared_experts_stream.wait_stream(cur_stream)
+                with torch.npu.stream(self.shared_experts_stream):
+                    self.model_prefetch.prefetch("next_attn", shared_output, layer=layer)
+            shared_expert_callback = None
+        else:
+            def launch_shared_expert_after_finalize():
+                nonlocal shared_output
+                # FinalizeRouting is already submitted on the main stream. Make the
+                # shared stream depend on it, then overlap shared experts with RS.
                 self.shared_experts_stream.wait_stream(cur_stream)
                 with torch.npu.stream(self.shared_experts_stream):
                     if shared_experts.gate_up_proj.tp_size > 1:
                         shared_output = shared_experts(hidden_states)
                     else:
                         shared_output = shared_experts(x_slice)
-        else:
-            # Multi-stream disabled — run shared experts synchronously on the
-            # main stream. Schedule is ignored.
-            if shared_experts is not None:
-                if shared_experts.gate_up_proj.tp_size > 1:
-                    shared_output = shared_experts(hidden_states)
-                else:
-                    shared_output = shared_experts(x_slice)
+                    if enable_prefetch:
+                        self.model_prefetch.prefetch(
+                            "next_attn", shared_output, layer=layer
+                        )
+            shared_expert_callback = launch_shared_expert_after_finalize
 
-        if enable_prefetch:
-            self.shared_experts_stream.wait_stream(cur_stream)
-            with torch.npu.stream(self.shared_experts_stream):
-                self.model_prefetch.prefetch("next_attn", shared_output, layer=layer)
+        if overlap_metadata:
+            cur_stream.wait_stream(self.shared_experts_stream)
 
         routed_output = self.apply_unpermute_finalize(
-            strategy_impl, layer, output, topk_ids, topk_weights, prepare_permute_result,
+            strategy_impl,
+            layer,
+            output,
+            topk_ids,
+            topk_weights,
+            prepare_permute_result,
+            finalize_metadata=finalize_metadata,
+            post_finalize_callback=shared_expert_callback,
         )
 
         use_custom_model_add = "omni_custom_models" in os.environ.get("VLLM_PLUGINS", "")
-        if multi_stream and schedule == "with_finalize":
-            if shared_experts is not None:
+        if schedule == "with_finalize" and shared_experts is not None:
+            if multi_stream:
                 cur_stream.wait_stream(self.shared_experts_stream)
-                if shared_experts.gate_up_proj.tp_size > 1:
-                    shared_output = tensor_model_parallel_all_reduce(shared_output)
-                elif use_custom_model_add:
-                    routed_output = routed_output + shared_output
-        elif schedule == "with_finalize":
-            if shared_experts is not None:
-                if shared_experts.gate_up_proj.tp_size > 1:
-                    shared_output = tensor_model_parallel_all_reduce(shared_output)
-                elif use_custom_model_add:
-                    routed_output = routed_output + shared_output
+            if shared_experts.gate_up_proj.tp_size > 1:
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
+            elif use_custom_model_add:
+                routed_output = routed_output + shared_output
 
         if is_need_slice:
             routed_output = tensor_model_parallel_all_gather(routed_output, dim=0)[:orig_num_tokens]
@@ -601,7 +655,8 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
             hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
         run_shared_with_cv = (
-            model_extra_config.operator_opt_config.shared_expert_multi_stream
+            use_ep
+            and model_extra_config.operator_opt_config.shared_expert_multi_stream
             and model_extra_config.operator_opt_config.shared_expert_parallel_schedule == "with_routed_experts_cv"
         )
 
@@ -628,7 +683,10 @@ class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
 
             self.shared_experts_stream.wait_stream(torch.npu.current_stream())
             with torch.npu.stream(self.shared_experts_stream):
-                shared_expert_results = shared_experts.down_proj({'x_hif8': shared_expert_act})
+                shared_result = shared_experts.down_proj({'x_hif8': shared_expert_act})
+                shared_expert_results = (
+                    shared_result[0] if isinstance(shared_result, tuple) else shared_result
+                )
 
         intermediate_hidden_states = torch_npu.npu_swiglu(gate_up_proj)
         intermediate_hidden_states = torch_npu.npu_dtype_cast(intermediate_hidden_states, torch_npu.hifloat8)
