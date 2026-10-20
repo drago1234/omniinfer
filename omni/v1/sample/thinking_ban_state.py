@@ -5,12 +5,10 @@
 
 Suppresses Pangu's tool-call boundary failure mode under spec-decode:
 
-* While a request is **committed inside** ``<think>``, bans
-  ``<|tool_call_start|>`` on every logits row of the step (including MTP
-  target/bonus rows). A draft ``</think>`` in the same step does **not**
-  unlock the tool marker — the close must be accepted first.
-  Also bans ``<|tool_call_end|>`` in this state when
-  ``ban_tool_end_in_thinking`` is opted-in.
+* While a request is **committed inside** ``<think>``, bans every token
+  listed in ``ban_tokens_in_thinking`` on every logits row of the step
+  (including MTP target/bonus rows). A draft ``</think>`` in the same step
+  does **not** lift the ban — the close must be accepted first.
 * Once ``</think>`` has been committed, bans further re-emission of
   ``</think>`` (prevents fragmenting the output).
 
@@ -53,58 +51,34 @@ def maybe_create_thinking_ban_state_holder(
     device: torch.device,
     is_pin_memory: bool | None = None,
 ) -> "ThinkingBanStateHolder | None":
-    """Factory: returns a holder iff at least one ban is opted-in and its
-    token id resolved.
+    """Factory: returns a holder iff ``ban_tokens_in_thinking`` resolved at
+    least one token id.
 
-    The three bans are independent: the holder is created when *any* is on,
-    and each side is applied only when its own flag is on and its token ids
-    resolved. A side whose tokenizer lookup failed is silently disabled rather
-    than aborting the other sides. Returns ``None`` only when no ban is
-    effectively active.
+    Entries missing from the vocab are skipped during
+    ``initialize_token_ids``. Returns ``None`` when the list is empty or no
+    id resolved.
     """
     if reasoning_config is None:
         return None
-    ban_start = getattr(reasoning_config, "ban_tool_start_in_thinking", False)
-    ban_end = getattr(reasoning_config, "ban_tool_end_in_thinking", False)
-    ban_seq_end = getattr(
-        reasoning_config, "ban_sequence_end_in_thinking", False
+    requested = list(
+        getattr(reasoning_config, "ban_tokens_in_thinking", None) or []
     )
-    if not (ban_start or ban_end or ban_seq_end):
+    if not requested:
         return None
-    tid = getattr(reasoning_config, "tool_call_start_token_id", None)
-    end_tid = getattr(reasoning_config, "tool_call_end_token_id", None)
-    seq_end_tids = tuple(
-        getattr(reasoning_config, "sequence_end_token_ids", ()) or ()
+    banned_tids = tuple(
+        getattr(reasoning_config, "banned_token_ids", ()) or ()
     )
-    if ban_start and tid is None:
+    if not banned_tids:
         logger.warning(
-            "ThinkingBanStateHolder: ban_tool_start_in_thinking=True but the "
-            "tokenizer had no <|tool_call_start|>/[unused11] when "
-            "initialize_token_ids ran; start ban disabled"
+            "ThinkingBanStateHolder: ban_tokens_in_thinking=%s but no token "
+            "id resolved (missing from vocab, or initialize_token_ids did "
+            "not run); ban disabled",
+            requested,
         )
-        ban_start = False
-    if ban_end and end_tid is None:
-        logger.warning(
-            "ThinkingBanStateHolder: ban_tool_end_in_thinking=True but "
-            "the tokenizer had no <|tool_call_end|>/[unused12] when "
-            "initialize_token_ids ran; end ban disabled"
-        )
-        ban_end = False
-    if ban_seq_end and not seq_end_tids:
-        logger.warning(
-            "ThinkingBanStateHolder: ban_sequence_end_in_thinking=True but "
-            "the tokenizer had neither <|message_end|> nor "
-            "<|pangu_text_end|> when initialize_token_ids ran; "
-            "sequence-end ban disabled"
-        )
-        ban_seq_end = False
-    if not (ban_start or ban_end or ban_seq_end):
         return None
     return ThinkingBanStateHolder(
         reasoning_config=reasoning_config,
-        tool_call_start_tid=tid,
-        tool_call_end_tid=end_tid,
-        sequence_end_tids=seq_end_tids,
+        banned_tids=banned_tids,
         max_num_seqs=max_num_seqs,
         num_spec_tokens=num_spec_tokens,
         device=device,
@@ -129,9 +103,7 @@ class ThinkingBanStateHolder:
 
     Apply rules:
 
-    * ``IN_THINK``   → ban ``<|tool_call_start|>`` (one column), and the
-      sequence-end tokens (``<|message_end|>`` / ``<|pangu_text_end|>``) so a
-      turn boundary cannot cut the answer off before ``</think>`` is written
+    * ``IN_THINK``   → ban every id in ``ban_tokens_in_thinking``
     * ``POST_THINK`` → ban the last token of ``</think>`` (one column)
     * ``PRE_THINK``  → no-op
     """
@@ -140,9 +112,7 @@ class ThinkingBanStateHolder:
         self,
         *,
         reasoning_config: "ReasoningConfig",
-        tool_call_start_tid: int,
-        tool_call_end_tid: int,
-        sequence_end_tids: tuple[int, ...] = (),
+        banned_tids: tuple[int, ...] = (),
         max_num_seqs: int,
         num_spec_tokens: int,
         device: torch.device,
@@ -154,30 +124,7 @@ class ThinkingBanStateHolder:
         self.device = device
         self.num_spec_tokens = num_spec_tokens
         self.in_spec_mode = num_spec_tokens > 0
-        self.ban_tool_call_start = getattr(
-            reasoning_config, "ban_tool_start_in_thinking", False
-        )
-        self.tool_call_start_tid = (
-            int(tool_call_start_tid)
-            if (self.ban_tool_call_start and tool_call_start_tid is not None)
-            else None
-        )
-        self.ban_tool_call_end = getattr(
-            reasoning_config, "ban_tool_end_in_thinking", False
-        )
-        self.tool_call_end_tid = (
-            int(tool_call_end_tid)
-            if (self.ban_tool_call_end and tool_call_end_tid is not None)
-            else None
-        )
-        self.ban_sequence_end = getattr(
-            reasoning_config, "ban_sequence_end_in_thinking", False
-        )
-        self.sequence_end_tids: tuple[int, ...] = (
-            tuple(int(t) for t in sequence_end_tids)
-            if self.ban_sequence_end
-            else ()
-        )
+        self.banned_tids: tuple[int, ...] = tuple(int(t) for t in banned_tids)
 
         rs = getattr(reasoning_config, "reasoning_start_token_ids", None)
         re_ = getattr(reasoning_config, "reasoning_end_token_ids", None)
@@ -209,18 +156,10 @@ class ThinkingBanStateHolder:
         self.cu_num_tokens: dict[int, int] = {}
 
         logger.info(
-            "ThinkingBanStateHolder enabled=%s "
-            "ban_tool_call_start=%s tool_call_start_tid=%s "
-            "ban_tool_call_end=%s tool_call_end_tid=%s "
-            "ban_sequence_end=%s sequence_end_tids=%s "
+            "ThinkingBanStateHolder enabled=%s banned_tids=%s "
             "think_start=%s think_end=%s num_spec_tokens=%d",
             self.is_enabled,
-            self.ban_tool_call_start,
-            self.tool_call_start_tid,
-            self.ban_tool_call_end,
-            self.tool_call_end_tid,
-            self.ban_sequence_end,
-            self.sequence_end_tids,
+            self.banned_tids,
             self.think_start_token_ids,
             self.think_end_token_ids,
             self.num_spec_tokens,
@@ -252,6 +191,47 @@ class ThinkingBanStateHolder:
         if last_start_pos > last_end_pos:
             return IN_THINK
         return POST_THINK
+
+    def _scan_markers(
+        self,
+        tokens: list[int],
+        start: int,
+        end: int,
+        prompt_len: int,
+        last_start: int,
+        last_end: int,
+    ) -> tuple[int, int]:
+        """Fold ``<think>`` / ``</think>`` hits in ``tokens[start:end]`` into
+        the running absolute positions.
+
+        Single-token markers (Pangu) only inspect the new slice. Multi-token
+        markers also look at the ``n - 1`` tokens before ``start``, because a
+        sentinel can straddle the previous committed prefix.
+        """
+        start_ids = self.think_start_token_ids
+        end_ids = self.think_end_token_ids
+        if len(start_ids) == 1 and len(end_ids) == 1:
+            start_tid = start_ids[0]
+            end_tid = end_ids[0]
+            for i in range(start, end):
+                tid = tokens[i]
+                abs_pos = prompt_len + i
+                if tid == start_tid:
+                    last_start = abs_pos
+                if tid == end_tid:
+                    last_end = abs_pos
+            return last_start, last_end
+
+        n = max(len(start_ids), len(end_ids), 1)
+        scan_from = max(0, start - (n - 1))
+        window = list(tokens[scan_from:end])
+        rel_s = self._find_last_sequence_index(window, start_ids)
+        rel_e = self._find_last_sequence_index(window, end_ids)
+        if rel_s >= 0:
+            last_start = max(last_start, prompt_len + scan_from + rel_s)
+        if rel_e >= 0:
+            last_end = max(last_end, prompt_len + scan_from + rel_e)
+        return last_start, last_end
 
     def _init_state_entry(
         self, prompt_tok_ids: list[int] | None
@@ -328,6 +308,11 @@ class ThinkingBanStateHolder:
         """Re-derive ``last_start_pos`` / ``last_end_pos`` from the running
         committed history (output minus the trailing spec suffix).
 
+        A longer committed history scans only the new suffix. An unchanged
+        length leaves the positions alone. A shorter history — unaccepted
+        drafts that were counted on a previous step — rescans from the prompt
+        baselines so ``POST_THINK`` cannot stick.
+
         Mirrors ``ThinkingBudgetStateHolder.update_state`` signature exactly,
         including the spec-suffix-stripping rule and the ``repeat_indices``
         layout used by the RejectionSampler path.
@@ -359,49 +344,40 @@ class ThinkingBanStateHolder:
                 state["spec_token_ids"] = []
 
             # ``output_tok_ids`` may already include the spec suffix from
-            # ``_combine_outputs_with_spec_tokens``; strip it to recover the
-            # truly-committed history (mirrors budget holder lines 181-186).
-            output = list(state["output_tok_ids"]) if state["output_tok_ids"] else []
+            # ``_combine_outputs_with_spec_tokens``. ``committed_len`` is the
+            # prefix that has actually been accepted.
+            raw = state["output_tok_ids"] or []
             spec_len = len(state["spec_token_ids"])
-            if spec_len > 0 and len(output) >= spec_len:
-                output = output[: -spec_len]
-
-            # Full rescan from prompt baselines + committed output. Avoids
-            # sticky POST_THINK when a prior MTP step accidentally advanced
-            # ``prev_output_length`` past the true committed length (e.g.
-            # drafts present in output while ``spec_token_ids`` was empty).
-            last_start = state.get(
-                "prompt_last_start_pos", state["last_start_pos"]
+            total = len(raw)
+            committed_len = (
+                total - spec_len if spec_len > 0 and total >= spec_len else total
             )
-            last_end = state.get("prompt_last_end_pos", state["last_end_pos"])
+            prev_len = state["prev_output_length"]
             prompt_len = state["prompt_len"]
-            if (
-                len(self.think_start_token_ids) == 1
-                and len(self.think_end_token_ids) == 1
-            ):
-                start_tid = self.think_start_token_ids[0]
-                end_tid = self.think_end_token_ids[0]
-                for i, tid in enumerate(output):
-                    abs_pos = prompt_len + i
-                    if tid == start_tid:
-                        last_start = abs_pos
-                    if tid == end_tid:
-                        last_end = abs_pos
-            else:
-                rel_s = self._find_last_sequence_index(
-                    output, self.think_start_token_ids
+            if committed_len < prev_len:
+                last_start = state.get(
+                    "prompt_last_start_pos", state["last_start_pos"]
                 )
-                rel_e = self._find_last_sequence_index(
-                    output, self.think_end_token_ids
+                last_end = state.get(
+                    "prompt_last_end_pos", state["last_end_pos"]
                 )
-                if rel_s >= 0:
-                    last_start = max(last_start, prompt_len + rel_s)
-                if rel_e >= 0:
-                    last_end = max(last_end, prompt_len + rel_e)
-
-            state["last_start_pos"] = last_start
-            state["last_end_pos"] = last_end
-            state["prev_output_length"] = len(output)
+                last_start, last_end = self._scan_markers(
+                    raw, 0, committed_len, prompt_len, last_start, last_end
+                )
+                state["last_start_pos"] = last_start
+                state["last_end_pos"] = last_end
+            elif committed_len > prev_len:
+                last_start, last_end = self._scan_markers(
+                    raw,
+                    prev_len,
+                    committed_len,
+                    prompt_len,
+                    state["last_start_pos"],
+                    state["last_end_pos"],
+                )
+                state["last_start_pos"] = last_start
+                state["last_end_pos"] = last_end
+            state["prev_output_length"] = committed_len
 
     def apply_to_logits(
         self,
@@ -498,17 +474,11 @@ class ThinkingBanStateHolder:
             for row, walked in rows:
                 if row >= logits.shape[0]:
                     break
-                # Committed IN_THINK → hard-ban tool markers and the sequence
-                # end tokens on every row of this step (target + bonus), even
-                # if a draft ``</think>`` would walk the speculative state to
-                # POST. Banning the sequence end here is what keeps a turn
-                # boundary from ending the stream before ``</think>`` lands.
+                # Committed IN_THINK → hard-ban the configured tokens on
+                # every row of this step (target + bonus), even if a draft
+                # ``</think>`` would walk the speculative state to POST.
                 if base_state == IN_THINK:
-                    if self.tool_call_start_tid is not None:
-                        logits[row, self.tool_call_start_tid] = float("-inf")
-                    if self.tool_call_end_tid is not None:
-                        logits[row, self.tool_call_end_tid] = float("-inf")
-                    for tid in self.sequence_end_tids:
+                    for tid in self.banned_tids:
                         logits[row, tid] = float("-inf")
                 if walked == POST_THINK and think_end_last is not None:
                     logits[row, think_end_last] = float("-inf")
@@ -520,7 +490,7 @@ class ThinkingBanStateHolder:
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
-        """Ban tool markers and sequence-end tokens on MTP **draft-proposer** logits.
+        """Ban ``ban_tokens_in_thinking`` on MTP **draft-proposer** logits.
 
         Draft sampling is typically 1 row per request (sequential MTP), or
         ``K`` request-major rows for parallel drafting. Unlike verify-time
@@ -530,11 +500,7 @@ class ThinkingBanStateHolder:
         """
         if not self.is_enabled or not self._state:
             return logits
-        if (
-            self.tool_call_start_tid is None
-            and self.tool_call_end_tid is None
-            and not self.sequence_end_tids
-        ):
+        if not self.banned_tids:
             return logits
 
         output_token_ids = getattr(sampling_metadata, "output_token_ids", None)
@@ -573,10 +539,6 @@ class ThinkingBanStateHolder:
                 row = base + r
                 if row >= n_rows:
                     break
-                if self.tool_call_start_tid is not None:
-                    logits[row, self.tool_call_start_tid] = float("-inf")
-                if self.tool_call_end_tid is not None:
-                    logits[row, self.tool_call_end_tid] = float("-inf")
-                for tid in self.sequence_end_tids:
+                for tid in self.banned_tids:
                     logits[row, tid] = float("-inf")
         return logits

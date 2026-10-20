@@ -19,7 +19,7 @@ import logging
 import sys
 import types
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 PATCH_PATH = (
@@ -57,8 +57,7 @@ class _ReasoningConfig:
     think_start_str: str = ""
     think_end_str: str = ""
     thinking_token_budget: "int | None" = None
-    ban_tool_start_in_thinking: bool = False
-    ban_tool_end_in_thinking: bool = False
+    ban_tokens_in_thinking: list[str] = field(default_factory=list)
 
     def initialize_token_ids(self, model_config) -> None:
         self.initialized_with = model_config

@@ -294,9 +294,14 @@ class OpenPanguDecoderLayer(nn.Module):
 
         _normalize_rope_parameters(config, max_position_embeddings=max_position_embeddings)
 
-        # No dsa_layers field means every layer is DSA.
-        is_dsa = (getattr(config, "index_topk", 0) or 0) > 0 and (
-            not hasattr(config, "dsa_layers") or layer_idx in config.dsa_layers
+        dsa_layers = config.dsa_layers if hasattr(config, "dsa_layers") else None
+        if dsa_layers is not None and not isinstance(dsa_layers, list):
+            raise TypeError("config.dsa_layers must be a list of layer indices")
+        has_dsa_index = (getattr(config, "index_topk", 0) or 0) > 0
+        # When index_topk is enabled, absent dsa_layers selects all layers for DSA;
+        # specified dsa_layers selects only the listed layer indices.
+        is_dsa = has_dsa_index and (
+            dsa_layers is None or layer_idx in dsa_layers
         )
         if layer_idx in get_cla_mapping(config):
             attn_cls = NPUDeepseekSparseCLAAttention if is_dsa else NPUDeepseekMLACLAAttention
@@ -904,7 +909,6 @@ class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):
         config = vllm_config.model_config.hf_config
 
         # Set MoE hyperparameters
-        self.expert_weights = []
         self.num_moe_layers = config.num_hidden_layers - config.first_k_dense_replace
         self.num_expert_groups = 1
 

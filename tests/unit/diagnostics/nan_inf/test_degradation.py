@@ -84,6 +84,43 @@ def test_scheduler_patch_chains_existing_update_from_output(monkeypatch):
     assert calls == [(scheduler, scheduler_output, model_runner_output)]
 
 
+@pytest.mark.parametrize("degraded", [False, True])
+def test_output_processor_patch_chains_existing_patch(monkeypatch, degraded):
+    reason = degradation.format_stop_reason(REPORT)
+    outputs = [EngineCoreOutput(
+        request_id="internal-id", new_token_ids=[],
+        finish_reason=FinishReason.ERROR if degraded else None,
+        stop_reason=reason if degraded else None,
+    )]
+    sentinel = object()
+    timestamp = 1.0
+    stats = object()
+    calls = []
+
+    class ExistingOutputProcessor:
+        _omni_npu_applied_patches = {
+            "process_outputs": "ECTransferOutputProcessorPatch"}
+
+        def process_outputs(self, engine_core_outputs, *args, **kwargs):
+            calls.append((engine_core_outputs, args, kwargs))
+            assert degradation.lookup_degraded("external-id") == (
+                reason if degraded else None)
+            self.request_states.clear()
+            return sentinel
+
+    patch = patch_nan_inf_degradation.NanInfDegradationOutputProcessorPatch
+    monkeypatch.setattr(patch, "_target", ExistingOutputProcessor)
+    monkeypatch.setattr(patch, "_upstream_process_outputs", None, raising=False)
+    patch.apply()
+    processor = ExistingOutputProcessor()
+    processor.request_states = {
+        "internal-id": SimpleNamespace(external_req_id="external-id")}
+
+    assert processor.process_outputs(
+        outputs, timestamp, iteration_stats=stats) is sentinel
+    assert calls == [(outputs, (timestamp,), {"iteration_stats": stats})]
+
+
 def test_get_report_and_reason():
     out = SimpleNamespace()
     assert degradation.get_report(out) is None
