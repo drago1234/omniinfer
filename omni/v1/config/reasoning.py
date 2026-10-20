@@ -90,12 +90,7 @@ class ReasoningConfig(VllmReasoningConfig):
         if self._natural_reasoning_end_token_ids is None:
             self._init_natural_reasoning_end_token_ids(model_config)
 
-        if not (
-            self.ban_tool_start_in_thinking
-            or self.ban_tool_end_in_thinking
-            or self.ban_sequence_end_in_thinking
-        ):
-        if not self.enabled or not self.ban_tokens_in_thinking:
+        if not self.ban_tokens_in_thinking:
             return
 
         tokenizer = cached_tokenizer_from_config(model_config=model_config)
@@ -118,6 +113,7 @@ class ReasoningConfig(VllmReasoningConfig):
                 "tokenizer vocab, skipped: %s",
                 missing,
             )
+        self._banned_token_ids = tuple(resolved)
 
     def _init_natural_reasoning_end_token_ids(
         self, model_config: ModelConfig
@@ -156,4 +152,3 @@ class ReasoningConfig(VllmReasoningConfig):
                 "Ensure the string is a valid token in the model's vocabulary."
             )
         self._natural_reasoning_end_token_ids = token_ids
-        self._banned_token_ids = tuple(resolved)

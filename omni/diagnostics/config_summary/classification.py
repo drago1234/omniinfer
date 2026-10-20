@@ -162,9 +162,6 @@ RUNTIME_FIELD_EXCLUDE = frozenset({
     "ReasoningConfig._reasoning_end_token_ids",
     # 0.30.0 natural-end backport (vllm#46727): same tokenizer-init-phase phase.
     "ReasoningConfig._natural_reasoning_end_token_ids",
-    "ReasoningConfig._tool_call_start_token_id",
-    "ReasoningConfig._tool_call_end_token_id",
-    "ReasoningConfig._sequence_end_token_ids",
     "ReasoningConfig._banned_token_ids",
 })
 
