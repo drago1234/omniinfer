@@ -14,6 +14,7 @@ from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
 class NPUMTPSpeculator(MTPSpeculator):
     def __init__(self, vllm_config, device):
+        self._dummy_request_inputs = False
         spec = vllm_config.speculative_config
         compilation = vllm_config.compilation_config
         decode_capture_sizes = compilation.cudagraph_capture_sizes
@@ -43,6 +44,21 @@ class NPUMTPSpeculator(MTPSpeculator):
         self.decode_config.compilation_config.max_cudagraph_capture_size = (
             max(decode_capture_sizes) if decode_capture_sizes else None
         )
+
+    def _copy_request_inputs(self, num_reqs, idx_mapping, temperature, seeds):
+        # Backport PR #56734 to the older propose signature: the upstream
+        # caller does not yet pass dummy_run to this method. propose updates
+        # the flag on every call; mark the persistent device indices before
+        # any later draft (including graph replay) can consume them.
+        super()._copy_request_inputs(num_reqs, idx_mapping, temperature, seeds)
+        if self._dummy_request_inputs:
+            self.idx_mapping.fill_(-1)
+        else:
+            self.idx_mapping[num_reqs:].fill_(-1)
+
+    def propose(self, *args, dummy_run=False, **kwargs):
+        self._dummy_request_inputs = dummy_run
+        return super().propose(*args, dummy_run=dummy_run, **kwargs)
 
     def init_cudagraph_manager(self, cudagraph_mode):
         self.prefill_cudagraph_manager = PrefillSpeculatorCudaGraphManager(

@@ -36,6 +36,39 @@ def make_speculator(monkeypatch):
     return lambda cfg: mtp_module.NPUMTPSpeculator(cfg, "test-device")
 
 
+def test_dummy_request_indices_reset_between_proposals(make_speculator, monkeypatch):
+    """看护 backport 的 dummy 标记、真实请求恢复以及图 padding 索引清理。"""
+    spec = make_speculator(config())
+    assert spec._dummy_request_inputs is False
+    spec.idx_mapping = torch.zeros(3, dtype=torch.int32)
+    spec.temperature = torch.zeros(3)
+    spec.seeds = torch.zeros(3, dtype=torch.int64)
+    spec.draft_logits = None  # 无 logits buffer 时也必须清理 padding 行。
+    indices = torch.tensor([1, 0], dtype=torch.int32)
+    temperature, seeds = torch.tensor([0.2, 0.4, 0.6]), torch.arange(3)
+    batch, result = object(), object()
+
+    def propose(self, input_batch, *, dummy_run=False, skip_attn_for_dummy_run=False):
+        assert input_batch is batch
+        assert dummy_run is self._dummy_request_inputs
+        assert skip_attn_for_dummy_run is True
+        # 仅替代模型执行，使用真实上游 copy 和本仓 override。
+        self._copy_request_inputs(2, indices, temperature, seeds)
+        return result
+
+    monkeypatch.setattr(mtp_module.MTPSpeculator, "propose", propose)
+    ptr = spec.idx_mapping.data_ptr()
+    for dummy in (True, False, True):
+        spec.idx_mapping.fill_(2)  # 模拟上个 batch 留下的有效索引。
+        kwargs = {"dummy_run": True} if dummy else {}
+        assert spec.propose(batch, skip_attn_for_dummy_run=True, **kwargs) is result
+        assert spec.idx_mapping.tolist() == ([-1, -1, -1] if dummy else [1, 0, -1])
+        assert spec.idx_mapping.data_ptr() == ptr
+        assert indices.tolist() == [1, 0]
+        torch.testing.assert_close(spec.temperature, temperature)
+        torch.testing.assert_close(spec.seeds, seeds)
+
+
 def manager(cfg, q, mode):
     obj = object.__new__(CudaGraphManager)
     obj.vllm_config = cfg
