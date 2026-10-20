@@ -46,23 +46,15 @@ class ParamsWithArgs:
 def _make_reasoning_cfg(
     think_start: list[int] | None = None,
     think_end: list[int] | None = None,
-    ban: bool = True,
-    tool_call_start_tid: int | None = TOOL_CALL_START,
-    ban_end: bool = False,
-    tool_call_end_tid: int | None = TOOL_CALL_END,
-    ban_seq_end: bool = False,
-    seq_end_tids: tuple[int, ...] = SEQ_END_TIDS,
+    banned_tids: tuple[int, ...] = (TOOL_CALL_START,),
+    ban_tokens: list[str] | None = None,
 ) -> ReasoningConfig:
-    rc = ReasoningConfig(
-        ban_tool_start_in_thinking=ban,
-        ban_tool_end_in_thinking=ban_end,
-        ban_sequence_end_in_thinking=ban_seq_end,
-    )
+    if ban_tokens is None:
+        ban_tokens = [f"<tok-{tid}>" for tid in banned_tids]
+    rc = ReasoningConfig(ban_tokens_in_thinking=list(ban_tokens))
     rc._reasoning_start_token_ids = [THINK_START] if think_start is None else think_start
     rc._reasoning_end_token_ids = [THINK_END] if think_end is None else think_end
-    rc._tool_call_start_token_id = tool_call_start_tid
-    rc._tool_call_end_token_id = tool_call_end_tid
-    rc._sequence_end_token_ids = tuple(seq_end_tids) if ban_seq_end else ()
+    rc._banned_token_ids = tuple(banned_tids)
     rc._enabled = True
     return rc
 
@@ -71,29 +63,19 @@ def _make_holder(
     *,
     think_start: list[int] | None = None,
     think_end: list[int] | None = None,
-    tool_call_start_tid: int = TOOL_CALL_START,
+    banned_tids: tuple[int, ...] = (TOOL_CALL_START,),
+    ban_tokens: list[str] | None = None,
     num_spec_tokens: int = 0,
     device: torch.device | None = None,
-    ban: bool = True,
-    ban_end: bool = False,
-    tool_call_end_tid: int | None = TOOL_CALL_END,
-    ban_seq_end: bool = False,
-    seq_end_tids: tuple[int, ...] = SEQ_END_TIDS,
 ) -> ThinkingBanStateHolder:
     return ThinkingBanStateHolder(
         reasoning_config=_make_reasoning_cfg(
             think_start,
             think_end,
-            ban=ban,
-            tool_call_start_tid=tool_call_start_tid,
-            ban_end=ban_end,
-            tool_call_end_tid=tool_call_end_tid,
-            ban_seq_end=ban_seq_end,
-            seq_end_tids=seq_end_tids,
+            banned_tids=banned_tids,
+            ban_tokens=ban_tokens,
         ),
-        tool_call_start_tid=tool_call_start_tid,
-        tool_call_end_tid=tool_call_end_tid if ban_end else None,
-        sequence_end_tids=seq_end_tids if ban_seq_end else (),
+        banned_tids=banned_tids,
         max_num_seqs=4,
         num_spec_tokens=num_spec_tokens,
         device=device or torch.device("cpu"),
@@ -136,134 +118,36 @@ class TestMaybeCreateHolder(unittest.TestCase):
             )
         )
 
-    def test_none_when_flag_is_off(self) -> None:
-        rc = _make_reasoning_cfg(ban=False)
+    def test_none_when_ban_list_is_empty(self) -> None:
+        rc = _make_reasoning_cfg(banned_tids=(), ban_tokens=[])
         self.assertIsNone(
             maybe_create_thinking_ban_state_holder(
                 rc, 2, 0, torch.device("cpu"), False
             )
         )
 
-    def test_none_when_tool_call_start_tid_unresolved(self) -> None:
-        # Flag on but tokenizer couldn't find <|tool_call_start|> /
-        # [unused11] (so initialize_token_ids left the field at None).
-        rc = _make_reasoning_cfg(ban=True, tool_call_start_tid=None)
+    def test_none_when_no_id_resolved(self) -> None:
+        # The list named a token, but initialize_token_ids left no id.
+        rc = _make_reasoning_cfg(
+            banned_tids=(), ban_tokens=["<|message_end|>"]
+        )
         self.assertIsNone(
             maybe_create_thinking_ban_state_holder(
                 rc, 2, 0, torch.device("cpu"), False
             )
         )
 
-    def test_returns_holder_when_resolved(self) -> None:
-        rc = _make_reasoning_cfg(ban=True, tool_call_start_tid=42)
+    def test_returns_holder_with_resolved_ids(self) -> None:
+        rc = _make_reasoning_cfg(
+            banned_tids=(42, 500),
+            ban_tokens=["<|tool_call_start|>", "<|message_end|>"],
+        )
         h = maybe_create_thinking_ban_state_holder(
             rc, 2, 1, torch.device("cpu"), False
         )
         self.assertIsInstance(h, ThinkingBanStateHolder)
-        self.assertEqual(h.tool_call_start_tid, 42)
+        self.assertEqual(h.banned_tids, (42, 500))
         self.assertTrue(h.in_spec_mode)
-
-    # --- independence: end-only -------------------------------------------
-
-    def test_end_only_creates_holder(self) -> None:
-        # Only the end ban is on; the start ban is off. The holder must still
-        # be created (independence), with start tid None and end tid resolved.
-        rc = _make_reasoning_cfg(ban=False, ban_end=True, tool_call_end_tid=888)
-        h = maybe_create_thinking_ban_state_holder(
-            rc, 2, 0, torch.device("cpu"), False
-        )
-        self.assertIsInstance(h, ThinkingBanStateHolder)
-        self.assertEqual(h.tool_call_end_tid, 888)
-        self.assertIsNone(h.tool_call_start_tid)
-        self.assertFalse(h.ban_tool_call_start)
-        self.assertTrue(h.ban_tool_call_end)
-
-    def test_end_only_unresolved_returns_none(self) -> None:
-        # End ban on but tokenizer had no <|tool_call_end|>, and start ban off
-        # → neither side active → None.
-        rc = _make_reasoning_cfg(ban=False, ban_end=True, tool_call_end_tid=None)
-        self.assertIsNone(
-            maybe_create_thinking_ban_state_holder(
-                rc, 2, 0, torch.device("cpu"), False
-            )
-        )
-
-    def test_start_unresolved_but_end_on_keeps_end(self) -> None:
-        # Start ban on but its id unresolved; end ban on and resolved. The
-        # holder is created for the end side only (start silently disabled).
-        rc = _make_reasoning_cfg(
-            ban=True, tool_call_start_tid=None,
-            ban_end=True, tool_call_end_tid=888,
-        )
-        h = maybe_create_thinking_ban_state_holder(
-            rc, 2, 0, torch.device("cpu"), False
-        )
-        self.assertIsInstance(h, ThinkingBanStateHolder)
-        self.assertIsNone(h.tool_call_start_tid)
-        self.assertEqual(h.tool_call_end_tid, 888)
-
-    # --- independence: sequence-end only -----------------------------------
-
-    def test_seq_end_only_creates_holder(self) -> None:
-        # Only the sequence-end ban is on; both tool bans are off. The holder
-        # must still be created, with both tool tids None.
-        rc = _make_reasoning_cfg(
-            ban=False, ban_end=False,
-            ban_seq_end=True, seq_end_tids=(500, 501),
-        )
-        h = maybe_create_thinking_ban_state_holder(
-            rc, 2, 0, torch.device("cpu"), False
-        )
-        self.assertIsInstance(h, ThinkingBanStateHolder)
-        self.assertIsNone(h.tool_call_start_tid)
-        self.assertIsNone(h.tool_call_end_tid)
-        self.assertFalse(h.ban_tool_call_start)
-        self.assertFalse(h.ban_tool_call_end)
-        self.assertTrue(h.ban_sequence_end)
-        self.assertEqual(h.sequence_end_tids, (500, 501))
-
-    def test_seq_end_unresolved_returns_none(self) -> None:
-        # Sequence-end ban on but its ids unresolved, and both tool bans off
-        # → no side is active → None.
-        rc = _make_reasoning_cfg(
-            ban=False, ban_end=False,
-            ban_seq_end=True, seq_end_tids=(),
-        )
-        self.assertIsNone(
-            maybe_create_thinking_ban_state_holder(
-                rc, 2, 0, torch.device("cpu"), False
-            )
-        )
-
-    def test_seq_end_unresolved_others_on_keeps_others(self) -> None:
-        # Sequence-end ids missing, but the start ban is on and resolved. The
-        # holder survives for the start side; the sequence-end side is dropped.
-        rc = _make_reasoning_cfg(
-            ban=True, tool_call_start_tid=42,
-            ban_end=False,
-            ban_seq_end=True, seq_end_tids=(),
-        )
-        h = maybe_create_thinking_ban_state_holder(
-            rc, 2, 0, torch.device("cpu"), False
-        )
-        self.assertIsInstance(h, ThinkingBanStateHolder)
-        self.assertEqual(h.tool_call_start_tid, 42)
-        self.assertEqual(h.sequence_end_tids, ())
-
-    def test_all_three_bans_independent(self) -> None:
-        # All three on and resolved → each side carries its own id(s).
-        rc = _make_reasoning_cfg(
-            ban=True, tool_call_start_tid=42,
-            ban_end=True, tool_call_end_tid=43,
-            ban_seq_end=True, seq_end_tids=(500, 501),
-        )
-        h = maybe_create_thinking_ban_state_holder(
-            rc, 2, 0, torch.device("cpu"), False
-        )
-        self.assertIsInstance(h, ThinkingBanStateHolder)
-        self.assertEqual(h.tool_call_start_tid, 42)
-        self.assertEqual(h.tool_call_end_tid, 43)
-        self.assertEqual(h.sequence_end_tids, (500, 501))
 
 
 # -------------------------------------------------------- pure helpers / FSM
@@ -390,8 +274,7 @@ class TestSyncBatch(unittest.TestCase):
         # An empty-sentinel holder is is_enabled=False and refuses all updates.
         h = ThinkingBanStateHolder(
             reasoning_config=_make_reasoning_cfg(think_start=[], think_end=[]),
-            tool_call_start_tid=TOOL_CALL_START,
-            tool_call_end_tid=TOOL_CALL_END,
+            banned_tids=(TOOL_CALL_START,),
             max_num_seqs=4,
             num_spec_tokens=0,
             device=torch.device("cpu"),
@@ -483,8 +366,7 @@ class TestUpdateState(unittest.TestCase):
     def test_no_op_when_disabled(self) -> None:
         h = ThinkingBanStateHolder(
             reasoning_config=_make_reasoning_cfg(think_start=[], think_end=[]),
-            tool_call_start_tid=TOOL_CALL_START,
-            tool_call_end_tid=TOOL_CALL_END,
+            banned_tids=(TOOL_CALL_START,),
             max_num_seqs=4,
             num_spec_tokens=0,
             device=torch.device("cpu"),
@@ -563,6 +445,64 @@ class TestUpdateState(unittest.TestCase):
         self.assertGreaterEqual(self.h._state[0]["last_end_pos"], 0)
         # Req 1 had prompt [THINK_START] then committed [5, 6] — no end seen.
         self.assertEqual(self.h._state[1]["last_end_pos"], -1)
+
+    def test_growth_does_not_rescan_prefix(self) -> None:
+        # A poisoned position survives a longer history. A full rescan from
+        # the prompt baseline would put last_start_pos back to -1.
+        self._add(0, [1, 2])
+        self.h.update_state(output_token_ids=[[5]], spec_token_ids=None)
+        self.h._state[0]["last_start_pos"] = 999
+        self.h.update_state(output_token_ids=[[5, 6]], spec_token_ids=None)
+        self.assertEqual(self.h._state[0]["last_start_pos"], 999)
+        self.assertEqual(self.h._state[0]["prev_output_length"], 2)
+
+    def test_unchanged_length_does_not_scan(self) -> None:
+        self._add(0, [1, 2])
+        self.h.update_state(output_token_ids=[[5]], spec_token_ids=None)
+        self.h._state[0]["last_end_pos"] = 777
+        self.h.update_state(output_token_ids=[[5]], spec_token_ids=None)
+        self.assertEqual(self.h._state[0]["last_end_pos"], 777)
+        self.assertEqual(self.h._state[0]["prev_output_length"], 1)
+
+    def test_shrink_rescans_from_prompt_baseline(self) -> None:
+        # prev_output_length ran ahead because a draft </think> was counted.
+        # The shorter committed list must drop that end and return to IN_THINK.
+        self._add(0, [THINK_START])
+        self.h.update_state(
+            output_token_ids=[[5, 6, THINK_END]], spec_token_ids=None
+        )
+        self.assertEqual(self.h._state[0]["last_end_pos"], 3)
+        self.h.update_state(output_token_ids=[[5, 6]], spec_token_ids=None)
+        state = self.h._state[0]
+        self.assertEqual(state["last_start_pos"], 0)
+        self.assertEqual(state["last_end_pos"], -1)
+        self.assertEqual(state["prev_output_length"], 2)
+        self.assertEqual(
+            ThinkingBanStateHolder._derive_state(
+                state["last_start_pos"], state["last_end_pos"]
+            ),
+            IN_THINK,
+        )
+
+    def test_multi_token_marker_across_growth_boundary(self) -> None:
+        # </think> is two ids. The new token completes a pair that started in
+        # the previous committed prefix, so the scan must look back n - 1.
+        end_a, end_b = 201, 202
+        h = _make_holder(think_end=[end_a, end_b])
+        h.sync_batch(
+            _batch_update(added=[(0, ParamsWithArgs(), [THINK_START], [])])
+        )
+        h.update_state(output_token_ids=[[end_a]], spec_token_ids=None)
+        self.assertEqual(h._state[0]["last_end_pos"], -1)
+        h.update_state(output_token_ids=[[end_a, end_b]], spec_token_ids=None)
+        state = h._state[0]
+        self.assertEqual(state["last_end_pos"], 1)
+        self.assertEqual(
+            ThinkingBanStateHolder._derive_state(
+                state["last_start_pos"], state["last_end_pos"]
+            ),
+            POST_THINK,
+        )
 
 
 # ------------------------------------------------------------ apply_to_logits
@@ -688,174 +628,50 @@ class TestApplyToLogitsSpec(unittest.TestCase):
         self.assertTrue(torch.equal(logits, before))
 
 
-# ------------------------------------------------- ban_tool_end_in_thinking
+# --------------------------------------------------------- ban token list
 
 
-class TestApplyToLogitsToolCallEnd(unittest.TestCase):
-    """``ban_tool_end_in_thinking`` bans ``<|tool_call_end|>`` in IN_THINK;
-    ``ban_tool_start_in_thinking`` bans ``<|tool_call_start|>`` in IN_THINK. The
-    two are independent: each fires only when its own flag is on."""
-
-    def _add(self, h: ThinkingBanStateHolder, idx: int, prompt: list[int]) -> None:
-        h.sync_batch(
-            _batch_update(added=[(idx, ParamsWithArgs(), prompt, [])])
-        )
-
-    def test_end_ban_off_leaves_tool_call_end_untouched(self) -> None:
-        # Default holder: ban_end=False → tool_call_end not banned even IN_THINK.
-        h = _make_holder(ban_end=False)
-        self._add(h, 0, [THINK_START, 1])  # IN_THINK
-        logits = torch.zeros(1, VOCAB_SIZE)
-        h.apply_to_logits(logits, predict_bonus_token=False, spec_token_ids=None)
-        self.assertEqual(logits[0, TOOL_CALL_START].item(), float("-inf"))
-        # tool_call_end NOT banned because the end ban is off.
-        self.assertEqual(logits[0, TOOL_CALL_END].item(), 0.0)
-
-    def test_in_think_bans_tool_call_end(self) -> None:
-        h = _make_holder(ban_end=True)
-        self._add(h, 0, [THINK_START, 1])  # IN_THINK
-        logits = torch.zeros(1, VOCAB_SIZE)
-        h.apply_to_logits(logits, predict_bonus_token=False, spec_token_ids=None)
-        self.assertEqual(logits[0, TOOL_CALL_END].item(), float("-inf"))
-        # The start ban still applies alongside.
-        self.assertEqual(logits[0, TOOL_CALL_START].item(), float("-inf"))
-
-    def test_end_only_bans_end_not_start(self) -> None:
-        # Only the end ban is on (ban_tool_start_in_thinking=False). In IN_THINK
-        # tool_call_end is banned but tool_call_start is left free.
-        h = _make_holder(ban=False, ban_end=True)
-        self.assertIsNone(h.tool_call_start_tid)
-        self._add(h, 0, [THINK_START, 1])  # IN_THINK
-        logits = torch.zeros(1, VOCAB_SIZE)
-        h.apply_to_logits(logits, predict_bonus_token=False, spec_token_ids=None)
-        self.assertEqual(logits[0, TOOL_CALL_END].item(), float("-inf"))
-        self.assertEqual(logits[0, TOOL_CALL_START].item(), 0.0)
-
-    def test_start_only_bans_start_not_end(self) -> None:
-        # Only the start ban is on. In IN_THINK tool_call_start is banned but
-        # tool_call_end is left free.
-        h = _make_holder(ban=True, ban_end=False)
-        self._add(h, 0, [THINK_START, 1])  # IN_THINK
-        logits = torch.zeros(1, VOCAB_SIZE)
-        h.apply_to_logits(logits, predict_bonus_token=False, spec_token_ids=None)
-        self.assertEqual(logits[0, TOOL_CALL_START].item(), float("-inf"))
-        self.assertEqual(logits[0, TOOL_CALL_END].item(), 0.0)
-
-    def test_post_think_does_not_ban_tool_call_end(self) -> None:
-        # POST_THINK bans think_end only; tool_call_end stays free so the model
-        # can legitimately close a tool call after reasoning.
-        h = _make_holder(ban_end=True)
-        self._add(h, 0, [THINK_START, 1, THINK_END])  # POST_THINK
-        logits = torch.zeros(1, VOCAB_SIZE)
-        h.apply_to_logits(logits, predict_bonus_token=False, spec_token_ids=None)
-        self.assertEqual(logits[0, THINK_END].item(), float("-inf"))
-        self.assertEqual(logits[0, TOOL_CALL_END].item(), 0.0)
-        self.assertEqual(logits[0, TOOL_CALL_START].item(), 0.0)
-
-    def test_pre_think_does_not_ban_tool_call_end(self) -> None:
-        h = _make_holder(ban_end=True)
-        self._add(h, 0, [1, 2])  # PRE_THINK
-        logits = torch.zeros(1, VOCAB_SIZE)
-        out = h.apply_to_logits(logits, predict_bonus_token=False, spec_token_ids=None)
-        self.assertTrue(torch.equal(out, torch.zeros(1, VOCAB_SIZE)))
-
-    def test_unresolved_end_tid_is_silent_noop(self) -> None:
-        # ban_end=True but tokenizer had no <|tool_call_end|> → tool_call_end_tid
-        # is None → no extra masking beyond the start ban.
-        h = _make_holder(ban_end=True, tool_call_end_tid=None)
-        self.assertIsNone(h.tool_call_end_tid)
-        self._add(h, 0, [THINK_START, 1])  # IN_THINK
-        logits = torch.zeros(1, VOCAB_SIZE)
-        h.apply_to_logits(logits, predict_bonus_token=False, spec_token_ids=None)
-        self.assertEqual(logits[0, TOOL_CALL_START].item(), float("-inf"))
-        self.assertEqual(logits[0, TOOL_CALL_END].item(), 0.0)
-
-    def test_spec_target_rows_walk_drafts_banning_end(self) -> None:
-        # K=3, base IN_THINK. Draft [., </think>, x]: row 2 walks to POST, but
-        # the committed IN_THINK state hard-bans tool markers on every row.
-        h = _make_holder(num_spec_tokens=3, ban_end=True)
-        self._add(h, 0, [THINK_START])
-        spec_tokens = [[42, THINK_END, 5]]
-        logits = torch.zeros(3, VOCAB_SIZE)
-        h.apply_to_logits(
-            logits, predict_bonus_token=False, spec_token_ids=spec_tokens
-        )
-        self.assertEqual(logits[0, TOOL_CALL_END].item(), float("-inf"))
-        self.assertEqual(logits[1, TOOL_CALL_END].item(), float("-inf"))
-        # Row 2 walked to POST_THINK, but committed IN_THINK still bans it.
-        self.assertEqual(logits[2, TOOL_CALL_END].item(), float("-inf"))
-
-    def test_spec_bonus_row_bans_end_when_still_in_think(self) -> None:
-        # predict_bonus_token=True, all drafts are non-sentinels → final IN_THINK.
-        h = _make_holder(num_spec_tokens=3, ban_end=True)
-        self._add(h, 0, [THINK_START])
-        spec_tokens = [[42, 43, 44]]
-        logits = torch.zeros(1, VOCAB_SIZE)
-        h.apply_to_logits(
-            logits, predict_bonus_token=True, spec_token_ids=spec_tokens
-        )
-        self.assertEqual(logits[0, TOOL_CALL_END].item(), float("-inf"))
+_LISTED = (TOOL_CALL_START, TOOL_CALL_END, SEQ_END_A)
 
 
-# -------------------------------------------------- ban_sequence_end_in_thinking
-
-
-class TestApplyToLogitsSequenceEnd(unittest.TestCase):
-    """``ban_sequence_end_in_thinking`` bans Pangu's two sequence terminators
-    (``<|message_end|>`` / ``<|pangu_text_end|>``) while reasoning is open, so a
-    turn boundary cannot cut the stream off before ``</think>`` is written."""
+class TestApplyToLogitsBanList(unittest.TestCase):
+    """Ids in ``banned_tids`` are masked only while the request is IN_THINK."""
 
     def _add(self, h: ThinkingBanStateHolder, idx: int, prompt: list[int]) -> None:
         h.sync_batch(
             _batch_update(added=[(idx, ParamsWithArgs(), prompt, [])])
         )
 
-    def test_in_think_bans_both_seq_ends(self) -> None:
-        h = _make_holder(ban=False, ban_end=False, ban_seq_end=True)
-        self._add(h, 0, [THINK_START, 1])  # IN_THINK
+    def test_in_think_bans_listed_ids_only(self) -> None:
+        h = _make_holder(banned_tids=_LISTED)
+        self._add(h, 0, [THINK_START, 1])
         logits = torch.zeros(1, VOCAB_SIZE)
         h.apply_to_logits(logits, predict_bonus_token=False, spec_token_ids=None)
-        self.assertEqual(logits[0, SEQ_END_A].item(), float("-inf"))
-        self.assertEqual(logits[0, SEQ_END_B].item(), float("-inf"))
-        # Other columns untouched.
-        self.assertEqual(logits[0, 0].item(), 0.0)
+        for tid in _LISTED:
+            self.assertEqual(logits[0, tid].item(), float("-inf"))
+        self.assertEqual(logits[0, SEQ_END_B].item(), 0.0)
         self.assertEqual(logits[0, THINK_END].item(), 0.0)
 
-    def test_post_think_does_not_ban_seq_end(self) -> None:
-        # Once </think> has been committed the ban must lift, otherwise the
-        # model could never end the turn at all.
-        h = _make_holder(ban=False, ban_end=False, ban_seq_end=True)
-        self._add(h, 0, [THINK_START, 1, THINK_END])  # POST_THINK
+    def test_post_think_lifts_list_and_bans_think_end(self) -> None:
+        h = _make_holder(banned_tids=_LISTED)
+        self._add(h, 0, [THINK_START, 1, THINK_END])
         logits = torch.zeros(1, VOCAB_SIZE)
         h.apply_to_logits(logits, predict_bonus_token=False, spec_token_ids=None)
-        self.assertEqual(logits[0, SEQ_END_A].item(), 0.0)
-        self.assertEqual(logits[0, SEQ_END_B].item(), 0.0)
-        # POST_THINK still bans re-emitting </think>.
+        for tid in _LISTED:
+            self.assertEqual(logits[0, tid].item(), 0.0)
         self.assertEqual(logits[0, THINK_END].item(), float("-inf"))
 
-    def test_pre_think_does_not_ban_seq_end(self) -> None:
-        h = _make_holder(ban=False, ban_end=False, ban_seq_end=True)
-        self._add(h, 0, [1, 2])  # PRE_THINK
+    def test_pre_think_leaves_logits_untouched(self) -> None:
+        h = _make_holder(banned_tids=_LISTED)
+        self._add(h, 0, [1, 2])
         logits = torch.zeros(1, VOCAB_SIZE)
         out = h.apply_to_logits(
             logits, predict_bonus_token=False, spec_token_ids=None
         )
         self.assertTrue(torch.equal(out, torch.zeros(1, VOCAB_SIZE)))
 
-    def test_seq_end_ban_off_leaves_untouched(self) -> None:
-        h = _make_holder(ban=False, ban_end=False, ban_seq_end=False)
-        self._add(h, 0, [THINK_START, 1])  # IN_THINK
-        logits = torch.zeros(1, VOCAB_SIZE)
-        h.apply_to_logits(logits, predict_bonus_token=False, spec_token_ids=None)
-        self.assertEqual(logits[0, SEQ_END_A].item(), 0.0)
-        self.assertEqual(logits[0, SEQ_END_B].item(), 0.0)
-
-    def test_spec_target_rows_all_ban_seq_end(self) -> None:
-        # K=3, base IN_THINK, drafts [., </think>, x]. Row 2 walks to POST, but
-        # the ban is gated on the *committed* state: the draft </think> has not
-        # been accepted yet, so every row of this step stays banned.
-        h = _make_holder(num_spec_tokens=3, ban=False, ban_end=False,
-                         ban_seq_end=True)
+    def test_spec_target_rows_ban_list_while_committed_in_think(self) -> None:
+        h = _make_holder(num_spec_tokens=3, banned_tids=_LISTED)
         self._add(h, 0, [THINK_START])
         spec_tokens = [[42, THINK_END, 5]]
         logits = torch.zeros(3, VOCAB_SIZE)
@@ -863,20 +679,21 @@ class TestApplyToLogitsSequenceEnd(unittest.TestCase):
             logits, predict_bonus_token=False, spec_token_ids=spec_tokens
         )
         for row in range(3):
-            self.assertEqual(logits[row, SEQ_END_A].item(), float("-inf"))
-            self.assertEqual(logits[row, SEQ_END_B].item(), float("-inf"))
+            for tid in _LISTED:
+                self.assertEqual(logits[row, tid].item(), float("-inf"))
+        self.assertEqual(logits[2, THINK_END].item(), float("-inf"))
 
-    def test_spec_bonus_row_bans_seq_end(self) -> None:
-        h = _make_holder(num_spec_tokens=3, ban=False, ban_end=False,
-                         ban_seq_end=True)
+    def test_spec_bonus_row_bans_list_while_committed_in_think(self) -> None:
+        h = _make_holder(num_spec_tokens=3, banned_tids=_LISTED)
         self._add(h, 0, [THINK_START])
-        spec_tokens = [[42, 43, 44]]
+        spec_tokens = [[42, THINK_END, 5]]
         logits = torch.zeros(1, VOCAB_SIZE)
         h.apply_to_logits(
             logits, predict_bonus_token=True, spec_token_ids=spec_tokens
         )
-        self.assertEqual(logits[0, SEQ_END_A].item(), float("-inf"))
-        self.assertEqual(logits[0, SEQ_END_B].item(), float("-inf"))
+        for tid in _LISTED:
+            self.assertEqual(logits[0, tid].item(), float("-inf"))
+        self.assertEqual(logits[0, THINK_END].item(), float("-inf"))
 
 
 # ------------------------------------------------------------- apply_draft_ban
@@ -891,42 +708,28 @@ class _FakeSamplingMeta:
 
 
 class TestApplyDraftBan(unittest.TestCase):
-    """MTP **draft-proposer** side of the ban. The drafter must not propose a
-    sequence terminator either: the target would reject it, wasting a draft
-    slot, and a leaked acceptance would end the stream early."""
-
     def _add(self, h: ThinkingBanStateHolder, idx: int, prompt: list[int]) -> None:
         h.sync_batch(
             _batch_update(added=[(idx, ParamsWithArgs(), prompt, [])])
         )
 
-    def test_draft_ban_masks_seq_end_when_only_seq_end_on(self) -> None:
-        # Only the sequence-end ban is on → both tool tids are None. The draft
-        # path must still mask: the early-return guard has to account for the
-        # sequence-end side too.
-        h = _make_holder(ban=False, ban_end=False, ban_seq_end=True)
-        self.assertIsNone(h.tool_call_start_tid)
-        self.assertIsNone(h.tool_call_end_tid)
-        self._add(h, 0, [THINK_START, 1])  # IN_THINK
+    def test_draft_ban_masks_listed_ids_in_think(self) -> None:
+        h = _make_holder(banned_tids=_LISTED)
+        self._add(h, 0, [THINK_START, 1])
         logits = torch.zeros(1, VOCAB_SIZE)
-        meta = _FakeSamplingMeta([[THINK_START, 1]])
-        h.apply_draft_ban(logits, meta)
-        self.assertEqual(logits[0, SEQ_END_A].item(), float("-inf"))
-        self.assertEqual(logits[0, SEQ_END_B].item(), float("-inf"))
-
-    def test_draft_ban_noop_when_no_ban_active(self) -> None:
-        # Holder exists (start ban on) but no sequence-end ids → the draft path
-        # returns the tensor unchanged for an IN_THINK request without tool
-        # markers configured.
-        h = _make_holder(ban=False, ban_end=False, ban_seq_end=False)
-        self.assertEqual(h.sequence_end_tids, ())
-        self._add(h, 0, [THINK_START, 1])  # IN_THINK
-        logits = torch.zeros(1, VOCAB_SIZE)
-        meta = _FakeSamplingMeta([[THINK_START, 1]])
-        out = h.apply_draft_ban(logits, meta)
-        self.assertIs(out, logits)
-        self.assertEqual(logits[0, SEQ_END_A].item(), 0.0)
+        h.apply_draft_ban(logits, _FakeSamplingMeta([[THINK_START, 1]]))
+        for tid in _LISTED:
+            self.assertEqual(logits[0, tid].item(), float("-inf"))
         self.assertEqual(logits[0, SEQ_END_B].item(), 0.0)
+
+    def test_draft_ban_noop_when_list_empty(self) -> None:
+        h = _make_holder(banned_tids=())
+        self.assertEqual(h.banned_tids, ())
+        self._add(h, 0, [THINK_START, 1])
+        logits = torch.zeros(1, VOCAB_SIZE)
+        out = h.apply_draft_ban(logits, _FakeSamplingMeta([[THINK_START, 1]]))
+        self.assertIs(out, logits)
+        self.assertEqual(logits[0, TOOL_CALL_START].item(), 0.0)
 
 
 if __name__ == "__main__":

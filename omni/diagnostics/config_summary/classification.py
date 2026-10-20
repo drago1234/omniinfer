@@ -157,12 +157,10 @@ RUNTIME_FIELD_EXCLUDE = frozenset({
     # excluding them keeps the hash free of tokenizer-init-phase drift noise.
     # Keyed by ClassName.field, so these cover BOTH vllm.config.ReasoningConfig
     # (reasoning.py:29-40) and the omni-npu custom ReasoningConfig
-    # (src/omni_npu/v1/config/reasoning.py:36-47, which adds tool-call fields).
+    # (src/omni_npu/v1/config/reasoning.py, which adds ban_tokens_in_thinking).
     "ReasoningConfig._reasoning_start_token_ids",
     "ReasoningConfig._reasoning_end_token_ids",
-    "ReasoningConfig._tool_call_start_token_id",
-    "ReasoningConfig._tool_call_end_token_id",
-    "ReasoningConfig._sequence_end_token_ids",
+    "ReasoningConfig._banned_token_ids",
 })
 
 # Object-valued attributes that are *known config carriers*: the adapter chain
