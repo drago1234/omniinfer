@@ -3,7 +3,6 @@
 
 """Thin NPU input hooks for realtime KV reuse from omni-models."""
 from vllm.v1.outputs import ModelRunnerOutput
-from omni_models.models.openpangu_vl.realtime_video.metadata import NORMALIZED_IMAGE_ATTR
 from omni_models.models.openpangu_vl.realtime_video.kv_worker import (
     copy_worker as realtime_copy_worker,
     init_mrope_worker as realtime_init_mrope_worker,

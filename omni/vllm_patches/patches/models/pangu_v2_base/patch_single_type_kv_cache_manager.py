@@ -78,6 +78,7 @@ class MomeManager(MambaManager):
     ) -> None:
         super().__init__(kv_cache_spec, block_pool, **kwargs)
         self.kernel_size = kv_cache_spec.kernel_size
+        self.num_spec_tokens = kv_cache_spec.num_spec_tokens
         self.num_extra_reserved_blocks = kv_cache_spec.num_extra_reserved_blocks
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -90,6 +91,24 @@ class MomeManager(MambaManager):
             + self.num_extra_reserved_blocks * self.block_size
         )
         return max(0, num_computed_tokens - num_retained)
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        # num_spec_tokens is a token count: draft tokens already folded into
+        # num_computed_tokens. They may still be rejected, so discount them
+        # before a block is freed.
+        # num_speculative_blocks is a block count. Mamba subtracts that field
+        # in the parent and also reserves that many extra blocks at allocation.
+        # MomeSpec leaves it at 0; MoME drafts fit in the conv window and must
+        # not be treated as extra blocks.
+        num_computed_tokens = max(0, num_computed_tokens - self.num_spec_tokens)
+        super().remove_skipped_blocks(
+            request_id, num_computed_tokens, num_prompt_tokens
+        )
 
 
 class ShareKVSlidingWindowManager(SlidingWindowManager):

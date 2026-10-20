@@ -4,7 +4,10 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
 from omni_npu.vllm_patches.patches.models.pangu_v2_base.patch_single_type_kv_cache_manager import (
+    MomeManager,
     SingleTypeKVCacheManagerExternalAllocPatch,
 )
 
@@ -78,3 +81,43 @@ def test_negative_allocation_is_clamped_to_zero():
 
     mgr.block_pool.get_new_blocks.assert_called_once_with(0)
     assert mgr.req_to_blocks["req"] == existing
+
+
+def _mome_manager(num_spec_tokens):
+    mgr = object.__new__(MomeManager)
+    mgr.num_spec_tokens = num_spec_tokens
+    return mgr
+
+
+def _capture_parent_remove(monkeypatch):
+    seen = {}
+
+    def _parent(self, request_id, num_computed_tokens, num_prompt_tokens=None):
+        seen["request_id"] = request_id
+        seen["num_computed_tokens"] = num_computed_tokens
+        seen["num_prompt_tokens"] = num_prompt_tokens
+
+    monkeypatch.setattr(MambaManager, "remove_skipped_blocks", _parent)
+    return seen
+
+
+def test_remove_skipped_blocks_discounts_spec_tokens_not_blocks(monkeypatch):
+    seen = _capture_parent_remove(monkeypatch)
+
+    _mome_manager(3).remove_skipped_blocks("req", 10, 6)
+
+    assert seen == {
+        "request_id": "req",
+        "num_computed_tokens": 7,
+        "num_prompt_tokens": 6,
+    }
+
+
+def test_remove_skipped_blocks_clamps_discount_at_zero(monkeypatch):
+    seen = _capture_parent_remove(monkeypatch)
+
+    _mome_manager(8).remove_skipped_blocks("req", 3)
+
+    assert seen["request_id"] == "req"
+    assert seen["num_computed_tokens"] == 0
+    assert seen["num_prompt_tokens"] is None
