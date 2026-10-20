@@ -97,6 +97,9 @@
         # EXTRA_ARGS="${EXTRA_ARGS} --profiler-config.torch_profiler_with_stack false"
         EXTRA_ARGS="${EXTRA_ARGS} --no-disable-hybrid-kv-cache-manager --max-num-batched-tokens 4096"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-expert-parallel --max-num-seqs 4"
+        EPLB_CONFIG='{"use_async":true,"communicator":"hixl","num_redundant_experts":0,"log_balancedness":false,"step_interval":100}'
+        EXTRA_ARGS="${EXTRA_ARGS} --enable-eplb"
+        EXTRA_ARGS="${EXTRA_ARGS} --eplb-config ${EPLB_CONFIG}"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prompt-tokens-details --enable-chunked-prefill"
         EXTRA_ARGS="${EXTRA_ARGS} --dtype bfloat16 --enforce-eager"
         EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
