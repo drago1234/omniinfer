@@ -141,6 +141,46 @@ class TestMRv2KernelCases:
         assert torch.equal(first, actual[:, :1])
         assert torch.equal(actual[0], actual[5])
 
+    @pytest.mark.parametrize("vocab", [1, 1031])
+    @pytest.mark.parametrize("changed_input", ["seed", "position"])
+    def test_rng_repeats_after_metadata_update_and_restore(self, kernels, vocab, changed_input):
+        # Determinism is indexed by request metadata, not call history.
+        seeds = torch.tensor([17, 29])
+        positions = torch.tensor([99, 2**32 + 99, 0, 99])
+        mapping = torch.tensor([0, 1, -1, 0], dtype=torch.int32)
+
+        def run():
+            return kernels.rng.make_uniform(4, vocab, "cpu", mapping, seeds, positions)
+
+        baseline = run()
+        assert torch.equal(baseline, uniform_reference(mapping, seeds, positions, vocab))
+        for _ in range(3):
+            assert torch.equal(run(), baseline)
+        metadata, index = (seeds, 0) if changed_input == "seed" else (positions, 1)
+        original = metadata[index].clone()
+        metadata[index] += 2**32  # Exercise the high word independently.
+        changed = run()
+        assert torch.equal(changed, uniform_reference(mapping, seeds, positions, vocab))
+        affected = [0, 3] if changed_input == "seed" else [1]
+        unaffected = [i for i in range(4) if i not in affected]
+        assert not torch.equal(changed[affected], baseline[affected])
+        assert torch.equal(changed[unaffected], baseline[unaffected])
+        metadata[index] = original
+        assert torch.equal(run(), baseline)
+
+    @pytest.mark.parametrize("vocab", [1, 1031])
+    def test_rng_request_slot_relocation(self, kernels, vocab):
+        seeds = torch.tensor([17, -1, 2**32 + 29])
+        positions = torch.tensor([8192, 17, 2**32 + 9, 0, 8192])
+        mapping = torch.tensor([0, 1, 2, -1, 0], dtype=torch.int32)
+        baseline = kernels.rng.make_uniform(5, vocab, "cpu", mapping, seeds, positions)
+        relocated = torch.where(mapping >= 0, 2 - mapping, mapping)
+        actual = kernels.rng.make_uniform(
+            5, vocab, "cpu", relocated, seeds.flip(0).contiguous(), positions,
+        )
+        assert torch.equal(actual, baseline)
+        assert torch.equal(actual, uniform_reference(mapping, seeds, positions, vocab))
+
     def test_acceptance_tile_tail_and_selected_rejection_rows(self, kernels):
         n = 259
         mapping = torch.arange(n, dtype=torch.int32) % 3
