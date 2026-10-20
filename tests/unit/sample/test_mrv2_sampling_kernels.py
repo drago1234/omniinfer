@@ -26,6 +26,27 @@ SOURCE_FILES = (
 CHILD_ENV = "OMNI_MRV2_KERNEL_UT_CHILD"
 
 
+class _InterpreterLaunchAdapter:
+    """Strip the Ascend compiler flag at the test-only launch boundary.
+
+    Interpreter keyword filtering differs between Triton distributions. Keep
+    their internals untouched and execute the original kernel with every
+    kernel argument preserved.
+    """
+
+    def __init__(self, kernel):
+        self.kernel = kernel
+
+    def __getitem__(self, grid):
+        launch = self.kernel[grid]
+
+        def run(*args, **kwargs):
+            kwargs.pop("sanitize_overflow", None)
+            return launch(*args, **kwargs)
+
+        return run
+
+
 @pytest.fixture
 def kernels(monkeypatch):
     root = Path(__file__).resolve().parents[3]
@@ -38,12 +59,6 @@ def kernels(monkeypatch):
         import triton
         import triton.language as tl
         from triton.runtime.interpreter import InterpretedFunction
-        import triton.runtime.interpreter as interpreter
-
-        # Ascend accepts this compiler option, but 3.2's CPU launcher does not
-        # list it as reserved. Strip only the compiler flag, not kernel inputs.
-        imports.setattr(interpreter, "RESERVED_KWS",
-                        tuple(interpreter.RESERVED_KWS) + ("sanitize_overflow",))
 
         utils = ModuleType("vllm.triton_utils")
         utils.triton, utils.tl = triton, tl
@@ -78,6 +93,10 @@ def kernels(monkeypatch):
             modules[Path(relative).stem] = load(name, root / "omni" / relative)
         assert isinstance(modules["position_sampling_rng"]._batched_uniform, InterpretedFunction)
         assert isinstance(modules["sampler"]._gumbel_sample_kernel, InterpretedFunction)
+        imports.setattr(
+            modules["position_sampling_rng"], "_batched_uniform",
+            _InterpreterLaunchAdapter(modules["position_sampling_rng"]._batched_uniform),
+        )
         yield SimpleNamespace(rng=modules["position_sampling_rng"],
                               sampler=modules["sampler"],
                               rejection=modules["rejection_sampler_utils"], native=native)
