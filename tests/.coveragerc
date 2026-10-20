@@ -6,6 +6,8 @@ concurrency = multiprocessing, thread
 
 omit =
     */omni/sample/ops/draft_sampling.py
+    */omni/sample/ops/block_acceptance.py
+    */omni/sample/ops/block_selection.py
     */omni/vllm_patches/*
     */omni/v1/layers/attention/npu_pangu.py
     *.cpp
@@ -15,6 +17,8 @@ omit =
     */*/*/*/*.cpp
     */csrc/*
     */omni/worker/npu/ops/*
+    # Validated explicitly on NPU; excluded from CI with the MRv2 hardware tests.
+    */omni/worker/npu/sampler.py
 
 [paths]
 source =

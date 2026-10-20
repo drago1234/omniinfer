@@ -26,7 +26,13 @@ import pytest
 # Paths are relative to this conftest.py, independent of the pytest cwd.
 collect_ignore = [
     "integration/test_draft_sampling_npu.py",
-    "unit/sample/test_draft_sampling_kernels.py",
+    "integration/test_draft_sampling_kernels.py",
+    "integration/test_block_sampling_kernels.py",
+    # Sampling kernels require a supported torch/CANN/Triton NPU environment.
+    # Run these files explicitly for single-device validation.
+    "integration/test_mrv2_sampling_kernels.py",
+    "integration/test_mrv2_topk_topp_npu.py",
+    "integration/test_mrv2_position_rng_npu.py",
 ]
 
 

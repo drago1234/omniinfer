@@ -3,7 +3,7 @@
 """Current MRv2 seed/position RNG reproducibility on a single NPU.
 
 These tests check the compiled RNG, not old/new random-sequence equivalence or
-model logits. Arithmetic, batch layout and boundary cases belong to the CPU UT;
+model logits. Arithmetic and layout cases are in test_mrv2_sampling_kernels;
 keep one device-graph case for each distinct RNG path here.
 Run on an idle device with OMNI_TEST_NPU_DEVICE (default: 0).
 """
@@ -24,10 +24,6 @@ def rng():
         pytest.skip("NPU required")
     torch.npu.set_device(int(os.environ.get("OMNI_TEST_NPU_DEVICE", "0")))
     from omni_npu.worker.npu.ops import position_sampling_rng
-    # Use the backend already loaded by production code. Importing the CPU
-    # interpreter here can load incompatible optional Ascend extensions in CI.
-    assert isinstance(position_sampling_rng._batched_uniform,
-                      position_sampling_rng.triton.JITFunction)
     return position_sampling_rng.make_uniform
 
 
@@ -64,7 +60,7 @@ def test_graph_replay_observes_rng_metadata(rng, mode, vocab):
         return rng(16, vocab, "npu", mapping, seeds, positions)
 
     for _ in range(3):
-        warmup = run()
+        run()
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):

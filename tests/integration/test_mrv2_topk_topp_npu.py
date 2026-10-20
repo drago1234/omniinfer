@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """NPU top-k/top-p filtering: FP32 semantics, layouts and graph replay.
 
 Run on an idle device with OMNI_TEST_NPU_DEVICE (default: 0).
@@ -10,6 +12,8 @@ torch_npu = pytest.importorskip("torch_npu")
 from omni_npu.worker.npu.sampler import apply_top_k_top_p
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
+
+pytestmark = [pytest.mark.integration, pytest.mark.npu]
 
 @pytest.fixture(scope="module", autouse=True)
 def npu_device():
