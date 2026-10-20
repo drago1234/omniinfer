@@ -338,8 +338,7 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Env-var fallback for the --reasoning-config CLI flag. Value must be the
     # same JSON string the CLI accepts (see v1/config/reasoning.py:
     # ReasoningConfig fields reasoning_start_str / reasoning_end_str /
-    # thinking_token_budget / ban_tool_start_in_thinking /
-    # ban_tool_end_in_thinking).
+    # thinking_token_budget / ban_tokens_in_thinking).
     # Priority: env > CLI > disabled. A malformed env value logs an error and
     # leaves the CLI value in place.
     # Consumers: patch_thinking_limit.py (_reasoning_config_from_env).
