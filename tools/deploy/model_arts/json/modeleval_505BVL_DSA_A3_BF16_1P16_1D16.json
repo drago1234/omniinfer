@@ -1,5 +1,5 @@
 {
-  "name": "lowlatency_505BVL_MLA_A3_BF16_1P16_1D16",
+  "name": "modeleval_505BVL_DSA_A3_BF16_1P16_1D16",
   "version": "1.0.0",
   "description": "",
   "type": "REAL_TIME",
@@ -49,7 +49,7 @@
       "system_log_dump_enable": false,
       "unit_configs": [
         {
-          "cmd": "bash /workspace/omniinfer/tools/deploy/model_arts/proxy.sh --core-num 4 --start-core-index 16 --client-max-body-size 1000M --client-body-buffer-size 50M --subrequest-output-buffer-size 100M --omni-proxy-pd-policy sequential --omni-proxy-max-batch-num-token 100000 --omni-proxy-prefill-max-num-seqs 4 --omni-proxy-decode-max-num-seqs 8 && echo '{\"connector_type\":\"NetworkMMFeatureConnector\",\"remote_endpoints\":[D_EPS_HOLDER],\"exclude_fields\":\"\"}' > /tmp/p_mm.json && D_EPS=$(python3 /workspace/omniinfer/tools/deploy/model_arts/get_node_ip_list.py | tr ';' '\\n' | tail -n \"${DECODE_INSTANCE_NUM:-1}\" | tr '\\n' ',' | sed 's/,$//' | tr ',' '\\n' | sed 's|^|\"tcp://|; s|$|:5555\"|' | paste -sd, -) && sed -i \"s|D_EPS_HOLDER|${D_EPS}|\" /tmp/p_mm.json && bash /workspace/omniinfer/tools/deploy/model_arts/prefill.sh --enable-logging-iteration-details --max-model-len 131072 --block-size 128 --no-disable-hybrid-kv-cache-manager --max-num-batched-tokens 8192 --enforce-eager --enable-expert-parallel --max-num-seqs 4 --no-enable-prefix-caching --dtype bfloat16 --mm-processor-cache-gb 0 --mm-encoder-tp-mode data --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' --hf-overrides '{\"model_architectures\":\"OpenPanguV2ForCausalLM\",\"text_config\":{\"model_architectures\":\"OpenPanguV2ForCausalLM\"}}' --allowed-local-media-path / --media-io-kwargs '{\"image\":{\"rgba_background_color\":[128,128,128]},\"video\":{\"num_frames\":32,\"sample_fps\":1}}'  --mm-feature-transfer-config \"$(cat /tmp/p_mm.json)\" && sleep infinity ",
+          "cmd": "bash /workspace/omniinfer/tools/deploy/model_arts/proxy.sh --core-num 4 --start-core-index 16 --client-max-body-size 1000M --client-body-buffer-size 50M --subrequest-output-buffer-size 100M --omni-proxy-pd-policy sequential --omni-proxy-max-batch-num-token 100000 --omni-proxy-prefill-max-num-seqs 4 --omni-proxy-decode-max-num-seqs 8 && bash /workspace/omniinfer/tools/deploy/model_arts/prefill.sh --enable-logging-iteration-details --max-model-len 131072 --block-size 128 --no-disable-hybrid-kv-cache-manager --max-num-batched-tokens 8192 --enforce-eager --enable-expert-parallel --max-num-seqs 4 --no-enable-prefix-caching --dtype bfloat16 --mm-processor-cache-gb 0 --mm-encoder-tp-mode data --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' --hf-overrides '{\"model_architectures\":\"OpenPanguV2ForCausalLM\",\"text_config\":{\"model_architectures\":\"OpenPanguV2ForCausalLM\"}}' --allowed-local-media-path / --media-io-kwargs '{\"image\":{\"rgba_background_color\":[128,128,128]},\"video\":{\"num_frames\":128,\"sample_fps\":2}}' && sleep infinity ",
           "codes": [],
           "count": 2,
           "custom_spec": {
@@ -71,18 +71,16 @@
             "OMNI_NPU_PATCHES_DIR": "pangu_v2_hybrid,pangu_v2_moe,openpangu_v1_vl",
             "OMNI_VLLM_PATCHES": "ALL",
             "VLLM_VIDEO_LOADER_BACKEND": "npu_opencv_dynamic",
-            "TORCH_COMPILE_DISABLE": "1",
             "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
             "PREFILL_INSTANCE_NUM": "1",
             "DECODE_INSTANCE_NUM": "1",
             "MODEL_NAME": "pangu_ultra_moe",
             "OMNI_LLMDATADIST_LINK_RECYCLE_DELAY": "36000",
-            "MODEL_PATH": "/mnt/bucket-910c-6055/suisiyue/model/505B_stageSFT_exp300_0522_hf",
+            "MODEL_PATH": "/mnt/bucket-910c-6055/suisiyue/model/505BVL-512K-dsa-sparse-training-v160-mr4900-iter-0000080_hf",
             "ENABLE_OMNI_CACHE": "0",
             "LOG_PATH": "/home/ma-user/",
             "HCCL_EXEC_TIMEOUT": "600",
             "ASCEND_GLOBAL_LOG_LEVEL": "3",
-            "OMNI_PIGGYBACK_INPUT_IDS": "1",
             "OMNI_SKIP_DECODE_TOKENIZE": "0",
             "OMNI_REUSE_PREFILLED_TOKENS": "0",
             "USING_SAMPLING_TENSOR_CACHE": "1",
@@ -126,7 +124,7 @@
           "termination_grace": {}
         },
         {
-          "cmd": "bash /workspace/omniinfer/tools/deploy/model_arts/decode.sh --enable-logging-iteration-details --max-model-len 131072 --block-size 128 --additional-config '{\"npugraph_ex_config\":{\"enable\":true,\"super_kernel_optimize\":false,\"static_kernel_compile\":true}}' --no-disable-hybrid-kv-cache-manager --enable-expert-parallel --max-num-seqs 8 --max-num-batched-tokens 32 --no-enable-prefix-caching --distributed-executor-backend mp --dtype bfloat16 --mm-processor-cache-gb 0 --compilation-config '{\"mode\":3,\"cudagraph_mode\":\"FULL\",\"cudagraph_capture_sizes\":[8,32],\"backend\":\"\",\"compile_sizes\":[8,32]}' --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' --hf-overrides '{\"model_architectures\":\"OpenPanguV2ForCausalLM\",\"text_config\":{\"model_architectures\":\"OpenPanguV2ForCausalLM\"}}' --allowed-local-media-path / --media-io-kwargs '{\"image\":{\"rgba_background_color\":[128,128,128]},\"video\":{\"num_frames\":32,\"sample_fps\":1}}' --no-disable-nccl-for-dp-synchronization  --mm-feature-transfer-config '{\"connectors\":{\"local\":{\"connector_type\":\"DiskMMFeatureConnector\"},\"remote\":{\"connector_type\":\"NetworkMMFeatureConnector\",\"is_producer\":false,\"local_endpoint\":\"tcp://0.0.0.0:5555\"}}}' && sleep infinity",
+          "cmd": "bash /workspace/omniinfer/tools/deploy/model_arts/decode.sh --enable-logging-iteration-details --max-model-len 131072 --block-size 128 --additional-config '{\"npugraph_ex_config\":{\"enable\":true,\"super_kernel_optimize\":false,\"static_kernel_compile\":true}}' --no-disable-hybrid-kv-cache-manager --enable-expert-parallel --max-num-seqs 8 --max-num-batched-tokens 32 --no-enable-prefix-caching --distributed-executor-backend mp --dtype bfloat16 --mm-processor-cache-gb 0 --compilation-config '{\"mode\":3,\"cudagraph_mode\":\"FULL\",\"cudagraph_capture_sizes\":[8,32],\"backend\":\"\",\"compile_sizes\":[8,32]}' --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' --hf-overrides '{\"model_architectures\":\"OpenPanguV2ForCausalLM\",\"text_config\":{\"model_architectures\":\"OpenPanguV2ForCausalLM\"}}' --allowed-local-media-path / --media-io-kwargs '{\"image\":{\"rgba_background_color\":[128,128,128]},\"video\":{\"num_frames\":128,\"sample_fps\":2}}' && sleep infinity",
           "codes": [],
           "count": 2,
           "custom_spec": {
@@ -148,18 +146,16 @@
             "OMNI_NPU_PATCHES_DIR": "pangu_v2_hybrid,pangu_v2_moe,openpangu_v1_vl",
             "OMNI_VLLM_PATCHES": "ALL",
             "VLLM_VIDEO_LOADER_BACKEND": "npu_opencv_dynamic",
-            "TORCH_COMPILE_DISABLE": "1",
             "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
             "PREFILL_INSTANCE_NUM": "1",
             "DECODE_INSTANCE_NUM": "1",
             "MODEL_NAME": "pangu_ultra_moe",
             "OMNI_LLMDATADIST_LINK_RECYCLE_DELAY": "36000",
-            "MODEL_PATH": "/mnt/bucket-910c-6055/suisiyue/model/505B_stageSFT_exp300_0522_hf",
+            "MODEL_PATH": "/mnt/bucket-910c-6055/suisiyue/model/505BVL-512K-dsa-sparse-training-v160-mr4900-iter-0000080_hf",
             "ENABLE_OMNI_CACHE": "0",
             "LOG_PATH": "/home/ma-user/",
             "HCCL_EXEC_TIMEOUT": "600",
             "ASCEND_GLOBAL_LOG_LEVEL": "3",
-            "OMNI_PIGGYBACK_INPUT_IDS": "1",
             "OMNI_SKIP_DECODE_TOKENIZE": "0",
             "OMNI_REUSE_PREFILLED_TOKENS": "0",
             "USING_SAMPLING_TENSOR_CACHE": "1",
@@ -207,7 +203,7 @@
       ],
       "weight": 100,
       "workload_type": "LWS",
-      "name": "deploy-pangu-505b-vl-kv-offload-1p16-1d16",
+      "name": "deploy-pangu-505b-vl-1p16-1d16",
       "secret_name": "aifm-infra-infer_MA_secret"
     }
   ],
@@ -226,7 +222,7 @@
     },
     "service_limit": {
       "rate_limit": {
-        "num": 200,
+        "num": 1000,
         "unit": "SECONDS"
       },
       "request_size_limit": 20,
