@@ -2356,7 +2356,35 @@ def npu_dsa_forward(
             ]
     else:
         out = lazy_zero_like(hs)
-        if self.ena_cp:
+        if (
+            self.ena_cp
+            and prefill is not None
+            and getattr(attn_metadata, "prefill_graph_width", None) is not None
+        ):
+            # The builder laid this batch out for a FULL graph and left out the
+            # CP metadata, whose layout a graph cannot follow. That needs the
+            # whole sequence: run plain prefill with SP disabled. sp_disabled
+            # returns all-gathered hidden states, so topk_indices_buffer is
+            # gathered and split back too, as in the has_decode branch above.
+            sp_enabled = self.ena_sp
+            if sp_enabled:
+                topk_indices_buffer = get_tp_group().all_gather(
+                    topk_indices_buffer, dim=0
+                )
+            with sp_disabled(self, hs) as (x, y, out):
+                y[p_slice], topk_indices_buffer[p_slice] = self._forward_prefill(
+                    x[p_slice],
+                    cos[p_slice],
+                    sin[p_slice],
+                    prefill,
+                    kv_cache,
+                    topk_indices_buffer[p_slice],
+                )
+            if sp_enabled:
+                topk_indices_buffer = topk_indices_buffer.split(hs.size(0))[
+                    get_tp_group().rank_in_group
+                ]
+        elif self.ena_cp:
             out[:], topk_indices_buffer = self._forward_prefill_cp(
                 hs,
                 cos,

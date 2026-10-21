@@ -488,6 +488,42 @@ class TestACLGraphWrapper:
         assert batch_descriptor in default_aclgraph_wrapper.concrete_aclgraph_entries
         assert default_aclgraph_wrapper.runnable.call_count == 2
 
+    def test_replay_is_skipped_for_a_batch_the_capture_cannot_serve(
+        self, default_aclgraph_wrapper
+    ):
+        # The key carries only the padded token count, so a decode or mixed
+        # batch would otherwise land on a prefill entry and replay it.
+        w = default_aclgraph_wrapper
+        w.runtime_mode = CUDAGraphMode.FULL
+        w._forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
+        desc = w._forward_context.batch_descriptor
+        entry = ACLGraphEntry(batch_descriptor=desc, aclgraph=MagicMock(), output=None)
+        w.concrete_aclgraph_entries = {desc: entry}
+        w.runnable = MagicMock(return_value=torch.tensor([1.0]))
+        with patch.object(acl_graph_mod.model_extra_config.operator_opt_config,
+                          "enable_prefill_cudagraph", True), \
+             patch.object(acl_graph_mod, "run_eager", return_value=True):
+            assert torch.equal(w(torch.tensor([1.0])), torch.tensor([1.0]))
+        entry.aclgraph.replay.assert_not_called()
+
+    def test_capture_runs_at_task_queue_level_one(self, default_aclgraph_wrapper):
+        # Level 2 dispatches ops from a side thread, which a capture cannot use.
+        w = default_aclgraph_wrapper
+        w._forward_context.cudagraph_runtime_mode = w.runtime_mode
+        w.concrete_aclgraph_entries = {}
+        w.runnable = MagicMock(return_value=torch.tensor([1.0]))
+        npu = MagicMock(spec=["get_task_queue_enable", "set_task_queue_enable"])
+        npu.get_task_queue_enable.return_value = 2
+        with patch.object(acl_graph_mod.model_extra_config.operator_opt_config,
+                          "enable_prefill_cudagraph", True), \
+             patch.object(acl_graph_mod, "run_eager", return_value=False), \
+             patch.object(acl_graph_mod.torch_npu, "npu", npu), \
+             patch("omni_npu.compilation.acl_graph.ensure_weak_ref_graph_params"):
+            w(torch.tensor([1.0]))
+        set_calls = [c.args for c in npu.set_task_queue_enable.call_args_list]
+        assert set_calls == [(1,), (2,)]
+
+
 class TestACLGraphWrapperUpdateMethods:
     """Test class for ACLGraphWrapper update methods."""
 

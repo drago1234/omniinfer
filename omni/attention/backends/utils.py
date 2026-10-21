@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import dataclasses
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from functools import wraps
@@ -55,6 +56,58 @@ def split_decodes_and_prefills(
 
 # NOTE: Cache for entry points to avoid repeated lookups
 _PLUGIN_BACKEND_CACHE = None  # type: dict[str, type] | None
+
+
+def graph_prefill_width(compilation_config, num_decodes, num_tokens):
+    """Width of the captured graph that would serve this prefill batch, if any.
+
+    The one predicate for "may a FULL graph serve this prefill batch"; builders
+    lay the batch out accordingly and the forwards follow that layout. ``None``
+    rules a graph out: a batch with decodes has an offset view instead of the
+    persistent buffer, and one the dispatcher did not pad has no capture to
+    replay. Otherwise the answer is the padded row count the kernels run over.
+    """
+    if num_decodes:
+        return None
+    if not model_extra_config.operator_opt_config.enable_prefill_cudagraph:
+        return None
+    if not compilation_config.cudagraph_mode.has_full_cudagraphs():
+        return None
+    # Exactly a capture size, which reads the dispatcher's decision instead of
+    # guessing it: the runner pads the attention metadata to the descriptor's
+    # token count only when it dispatched FULL, and that count is one of these
+    # sizes. Anything else is a step the graph will not serve, whether it is
+    # too wide or the dispatcher refused for a reason this cannot see.
+    if num_tokens in (compilation_config.cudagraph_capture_sizes or ()):
+        return num_tokens
+    return None
+
+
+def should_capture_as_prefill():
+    """Whether capture batches have to be laid out as prefill.
+
+    The switch alone decides, so this is the capture-side half of
+    graph_prefill_width: with it on every FULL replay this instance serves is
+    a pure prefill one, and the rest falls back to eager. Reading the dummy
+    batch's shape instead would disagree with that whenever a capture size is
+    small enough to leave one token per request, which looks like decode.
+    """
+    return model_extra_config.operator_opt_config.enable_prefill_cudagraph
+
+
+def widen_capture_query_len(common_attn_metadata):
+    """Give a capture batch the longest query length the graph may replay.
+
+    ``max_query_len`` is frozen into the graph as a launch scalar (mome_conv
+    takes it directly), and the dummy batch spreads its tokens over
+    ``max_num_seqs`` requests, far below what a real request will ask for.
+    """
+    if common_attn_metadata.max_query_len >= common_attn_metadata.num_actual_tokens:
+        return common_attn_metadata
+    return dataclasses.replace(
+        common_attn_metadata,
+        max_query_len=common_attn_metadata.num_actual_tokens,
+    )
 
 
 def cache_fit_shape(cache: torch.Tensor, mode: str = "3D"):
@@ -1134,13 +1187,16 @@ def sp_disabled(
         sp_group = sp_group or get_tp_group()
         x = sp_group.all_gather(hidden_states, dim=0)
         y = lazy_zero_like(x)
-        yield x, y, out
-        y = y.tensor().split(hidden_states.size(0))
-        out[:] = y[sp_group.rank_in_group]
-
-        self.ena_sp = True
-        if hasattr(self.o_proj, "y_transform"):
-            self.o_proj.y_transform = y_transform
+        try:
+            yield x, y, out
+            y = y.tensor().split(hidden_states.size(0))
+            out[:] = y[sp_group.rank_in_group]
+        finally:
+            # Restore even on the way out of an exception: leaving the layer
+            # at ena_sp False would silently change every later forward.
+            self.ena_sp = True
+            if hasattr(self.o_proj, "y_transform"):
+                self.o_proj.y_transform = y_transform
     else:
         yield hidden_states, out, out
 

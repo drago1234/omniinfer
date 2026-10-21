@@ -10,36 +10,41 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.config import CUDAGraphMode
 
+from omni_npu.model_config.config_loader.loader import model_extra_config
+
 
 logger = init_logger(__name__)
 
 _COMPILE_DECORATORS_PATCHED = False
 
 
-def _bypass_prefill(self, *args, **kwargs):
+def run_eager():
+    """Whether this forward must skip the compiled call.
+
+    FULL is the only runtime mode whose captured graphs this path can use, and
+    the dispatch key carries only the padded token count, so batch composition
+    is checked here. ``enable_prefill_cudagraph`` makes the captures
+    prefill-shaped: then pure prefill replays and the rest stays eager.
     """
-    patch vllm's _support_torch_compile's __call__
-    If any prefill request exists, torch.all_to_all_single will be used
-    in MoE layers, which involves CPU operations and cannot be compiled.
-    We use the non-compiled forward for this case.
-    """
-    attn_metadata = get_forward_context().attn_metadata
-    has_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
-    # FIXME (zhao): currently we only support full cudagraph mode for compiled graphs.
-    if has_prefill or get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL:
-        logger.debug(f"<<< use original forward")
-        return True, self.forward(*args, **kwargs)
-    return False, None
+    forward_context = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if (
+        attn_metadata is None
+        or forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL
+    ):
+        return True
+    metadata = attn_metadata[next(iter(attn_metadata))]
+    if not model_extra_config.operator_opt_config.enable_prefill_cudagraph:
+        return metadata.num_prefills > 0
+    return metadata.num_prefills == 0 or metadata.num_decodes > 0
 
 
 def _wrap_call(original_call):
     @functools.wraps(original_call)
     def _new_call(self, *args, **kwargs):
-        hit, retval = _bypass_prefill(self, *args, **kwargs)
-        logger.debug(f"<<< hit={hit}, retval is Tensor, shape={retval.shape if hasattr(retval, 'shape') else 'N/A'}")
-        if hit:
-            return retval
-        logger.debug(f"<<< hit={hit}, use original_call")
+        if run_eager():
+            logger.debug("<<< use original forward")
+            return self.forward(*args, **kwargs)
         model_output = original_call(self, *args, **kwargs)
         if isinstance(model_output, (tuple, list)) and len(model_output) == 1:
             hidden_states = model_output[0]

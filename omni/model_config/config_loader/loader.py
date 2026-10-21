@@ -18,6 +18,7 @@ from omni_npu.configs import OmniAdditionalConfig
 from .features import (
     apply_eager_mode_config,
     apply_omni_cache,
+    apply_prefill_cudagraph,
     apply_seq_parallel,
 )
 
@@ -231,6 +232,12 @@ class ModelOperatorOptConfig:
     swa_prefill_absorb_max_tokens: int = 8192  # Ascend 950 SWA global prefill tokens; 0 keeps standard path
     optimize_first_chunk: bool = False # Whether turn off PA (non-absorb mode) and use MoME SP for the first chunk
     use_w4a8_enk_gmm: bool = False # W4A8 MoE EnK 优化，仅对称量化，默认关闭
+    # Let prefill batches run inside the ACL graph (P side). Off keeps the
+    # upstream split, prefill always eager. On, a pure-prefill batch within the
+    # largest captured size keeps its per-request metadata in the persistent
+    # buffers and drops the host-rebuilt SP/CP layout; wider batches stay
+    # eager with SP/CP intact.
+    enable_prefill_cudagraph: bool = False
 
     def __post_init__(self):
         if self.engram_table_location != "cpu_shared":
@@ -558,6 +565,7 @@ def _validate_config(vllm_config):
     global model_extra_config
     apply_eager_mode_config(model_extra_config)
     apply_omni_cache(vllm_config.additional_config)
+    apply_prefill_cudagraph(model_extra_config)
     apply_seq_parallel(model_extra_config)
     _validate_precision_strong_consistency(vllm_config)
 

@@ -353,6 +353,7 @@ def test_mixed_forward_restores_shared_metadata(case, monkeypatch):
     # "global" through attn.layer_name.
     a.attn.layer_name = "global.attn"
     a.is_cp_layer = a.is_attn_sp_layer = a.enable_flashcomm2 = False
+    a.vllm_config = SimpleNamespace(compilation_config=None)
     a.is_flashcomm2_layer = False
     a.tp_size = 1
     a.moe_comm_strategy = "allreduce"
