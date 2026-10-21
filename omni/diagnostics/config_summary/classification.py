@@ -160,6 +160,8 @@ RUNTIME_FIELD_EXCLUDE = frozenset({
     # (src/omni_npu/v1/config/reasoning.py, which adds ban_tokens_in_thinking).
     "ReasoningConfig._reasoning_start_token_ids",
     "ReasoningConfig._reasoning_end_token_ids",
+    # 0.30.0 natural-end backport (vllm#46727): same tokenizer-init-phase phase.
+    "ReasoningConfig._natural_reasoning_end_token_ids",
     "ReasoningConfig._banned_token_ids",
 })
 
