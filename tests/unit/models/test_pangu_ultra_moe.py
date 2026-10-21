@@ -43,6 +43,7 @@ def _forward_on_first_last_rank(model, inputs_embeds):
 
 
 def _bind_single_decoder_layer(model, layer, **attrs):
+    model.engram_hash = None
     model.layers = nn.ModuleList([layer])
     model.start_layer = 0
     model.end_layer = 1
@@ -54,6 +55,7 @@ def _layer_with_rotary():
     layer = nn.Module()
     rotary = MagicMock()
     rotary.get_cos_sin.return_value = (object(), object())
+    layer.engram = None
     layer.self_attn = SimpleNamespace(rotary_emb=rotary)
     return layer
 
@@ -243,7 +245,7 @@ class TestPanguUltraMoeDecoderLayer(unittest.TestCase):
             (hidden, None, topk),
         )
         layer.forward_mhc.assert_called_once_with(
-            hidden, cos, sin, residual, topk
+            hidden, cos, sin, residual, topk, None
         )
 
         layer.use_mhc = False
@@ -261,6 +263,7 @@ class TestPanguUltraMoeDecoderLayer(unittest.TestCase):
             ultra_mod.OpenPanguDecoderLayer
         )
         nn.Module.__init__(layer)
+        layer.engram = None
         hidden = object()
         residual = object()
         attn_out = object()
@@ -287,6 +290,7 @@ class TestPanguUltraMoeDecoderLayer(unittest.TestCase):
             ultra_mod.OpenPanguDecoderLayer
         )
         nn.Module.__init__(layer)
+        layer.engram = None
         hidden = object()
         residual = object()
         attn_out = object()
@@ -315,6 +319,7 @@ class TestPanguUltraMoeDecoderLayer(unittest.TestCase):
             ultra_mod.OpenPanguDecoderLayer
         )
         nn.Module.__init__(layer)
+        layer.engram = None
 
         hidden_states = object()
         residual = object()
@@ -376,7 +381,7 @@ class TestPanguUltraMoeDecoderLayer(unittest.TestCase):
             next_h_post,
             next_h_res,
         )
-        layer._mhc_tail_refs = (next_mhc, next_norm, "next_key", False)
+        layer._mhc_tail_refs = (next_mhc, next_norm, "next_key", False, None)
 
         result = layer.forward_mhc_fused(
             hidden_states,
@@ -496,6 +501,7 @@ class TestPanguUltraMoeDecoderLayer(unittest.TestCase):
             ultra_mod.OpenPanguDecoderLayer
         )
         nn.Module.__init__(layer)
+        layer.engram = None
         hidden_states = object()
         cos = object()
         sin = object()
@@ -580,6 +586,7 @@ class TestPanguUltraMoeDecoderLayer(unittest.TestCase):
             ultra_mod.OpenPanguDecoderLayer
         )
         nn.Module.__init__(layer)
+        layer.engram = None
 
         hidden_states = torch.randn(2, 4)
         mixed_hidden = object()
@@ -614,6 +621,10 @@ class TestPanguUltraMoeDecoderLayer(unittest.TestCase):
     def test_moe_forward_uses_fp32_activation_for_fused_router(self):
         moe = ultra_mod.OpenPanguMoE.__new__(ultra_mod.OpenPanguMoE)
         nn.Module.__init__(moe)
+        moe.routed_expert_down_proj = None
+        moe.routed_expert_up_proj = None
+        moe.routed_expert_norm = None
+        moe.gate_in_fp32 = True
         moe.is_sequence_parallel = False
         moe.gate = MagicMock()
         moe.experts = MagicMock()
@@ -668,6 +679,7 @@ class TestOpenPanguModelMHCWiring(unittest.TestCase):
     @staticmethod
     def _layer(index):
         layer = nn.Module()
+        layer.engram = None
         layer.use_mhc_fusion_op = True
         layer.attn_mhc_module = nn.Identity()
         layer.input_layernorm = nn.Identity()
@@ -693,11 +705,11 @@ class TestOpenPanguModelMHCWiring(unittest.TestCase):
         first_tail = layers[0]._mhc_tail_refs
         self.assertIs(first_tail[0], layers[1].attn_mhc_module)
         self.assertIs(first_tail[1], layers[1].input_layernorm)
-        self.assertEqual(first_tail[2:], ("attn_1", False))
+        self.assertEqual(first_tail[2:], ("attn_1", False, None))
         last_tail = layers[1]._mhc_tail_refs
         self.assertIs(last_tail[0], merge_mhc)
         self.assertIs(last_tail[1], final_norm)
-        self.assertEqual(last_tail[2:], (None, True))
+        self.assertEqual(last_tail[2:], (None, True, None))
 
     def test_init_stops_fused_state_at_pipeline_boundary(self):
         cfg = self._config()
@@ -713,7 +725,7 @@ class TestOpenPanguModelMHCWiring(unittest.TestCase):
             model = ultra_mod.OpenPanguModel(vllm_config=_mhc_vllm_config(cfg))
 
         self.assertTrue(model.use_mhc_fusion_op)
-        self.assertEqual(layer._mhc_tail_refs, (None, None, None, False))
+        self.assertEqual(layer._mhc_tail_refs, (None, None, None, False, None))
 
     def test_forward_dispatches_fused_mhc_across_local_layers(self):
         model = ultra_mod.OpenPanguModel.__new__(ultra_mod.OpenPanguModel)
@@ -721,6 +733,7 @@ class TestOpenPanguModelMHCWiring(unittest.TestCase):
         model.config = SimpleNamespace()
         layer_0 = nn.Module()
         layer_1 = nn.Module()
+        layer_0.engram = layer_1.engram = None
         rotary = MagicMock()
         cos = object()
         sin = object()
@@ -733,6 +746,7 @@ class TestOpenPanguModelMHCWiring(unittest.TestCase):
         layer_0.forward_mhc_fused = MagicMock()
         layer_1.forward_mhc_fused = MagicMock()
         model.layers = nn.ModuleList([layer_0, layer_1])
+        model.engram_hash = None
         model.start_layer = 0
         model.end_layer = 2
         model.use_mhc = True
@@ -786,7 +800,7 @@ class TestOpenPanguModelMHCWiring(unittest.TestCase):
             )
 
         self.assertIs(result, final_hidden)
-        layer_0.mhc_head.assert_called_once_with(inputs_embeds)
+        layer_0.mhc_head.assert_called_once_with(inputs_embeds, None)
         first_call = layer_0.forward_mhc_fused.call_args
         self.assertEqual(
             first_call.args,
@@ -821,6 +835,7 @@ def _fused_decoder_layer(tail_refs, *, gate_in_fp32=False, has_block_norm=False)
     """Bare decoder layer with mocked MHC modules for fused-path unit tests."""
     layer = ultra_mod.OpenPanguDecoderLayer.__new__(ultra_mod.OpenPanguDecoderLayer)
     nn.Module.__init__(layer)
+    layer.engram = None
     layer.self_attn = MagicMock(return_value=(object(), None))
     layer.mlp = MagicMock(return_value=object())
     if gate_in_fp32:
@@ -857,8 +872,130 @@ def _fused_decoder_layer(tail_refs, *, gate_in_fp32=False, has_block_norm=False)
     layer.mlp_mhc_module.mhc_sandwich_norm_post_preonly.return_value = (
         object(), object()
     )
-    layer._mhc_tail_refs = tail_refs
+    layer._mhc_tail_refs = (*tail_refs, None) if tail_refs is not None else None
     return layer
+
+
+class TestPanguUltraLatentMoE(unittest.TestCase):
+    def test_latent_moe_routes_full_width_then_projects_and_adds_shared(self):
+        layer = ultra_mod.OpenPanguMoE.__new__(ultra_mod.OpenPanguMoE)
+        nn.Module.__init__(layer)
+        layer.is_sequence_parallel = False
+        layer.ep_size = 2
+        layer.gate_in_fp32 = True
+        layer.gate = MagicMock(return_value=(torch.ones(2, 3), None))
+        layer.routed_expert_down_proj = nn.Linear(4, 2, bias=False)
+        layer.routed_expert_up_proj = nn.Linear(2, 4, bias=False)
+        layer.routed_expert_norm = nn.RMSNorm(2, eps=1e-5)
+        layer.shared_experts = nn.Identity()
+        hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        routed = layer.routed_expert_down_proj(hidden) * 2
+        layer.experts = MagicMock(return_value=(hidden, routed))
+        reduced = routed + torch.tensor([[1., -2.], [3., -4.]])
+        ep_group = SimpleNamespace(all_reduce=MagicMock(return_value=reduced))
+        for allreduce in (False, True):
+            with self.subTest(allreduce=allreduce), patch.object(
+                ultra_mod.model_extra_config.operator_opt_config,
+                "enable_moe_allreduce", allreduce,
+            ), patch.object(ultra_mod, "get_ep_group", return_value=ep_group):
+                ep_group.all_reduce.reset_mock()
+                expected = layer.routed_expert_up_proj(
+                    layer.routed_expert_norm(reduced if allreduce else routed)
+                ) + hidden
+                torch.testing.assert_close(layer(hidden), expected)
+                torch.testing.assert_close(layer.gate.call_args.args[0], hidden)
+                torch.testing.assert_close(layer.experts.call_args.kwargs["hidden_states"], hidden)
+                if allreduce:
+                    ep_group.all_reduce.assert_called_once_with(routed)
+                else:
+                    ep_group.all_reduce.assert_not_called()
+
+
+class TestPanguUltraV3Engram(unittest.TestCase):
+    def test_model_binds_history_and_loads_engram_parameters(self):
+        cfg = TestOpenPanguModelMHCWiring._config()
+        cfg.engram_layer_ids = [1]
+        cfg.engram_max_ngram_size = 2
+        cfg.engram_vocab_size = 11
+        cfg.engram_n_head_per_ngram = 2
+        cfg.engram_n_embed_per_ngram = 4
+        cfg.engram_pad_id = 0
+        cfg.n_routed_experts = 1
+        layers = nn.ModuleList([TestOpenPanguModelMHCWiring._layer(i) for i in range(2)])
+        attention = nn.Module()
+        attention.layer_name = "model.layers.0.self_attn.attn"
+        attention.kv_cache = (torch.zeros(3, 4, 1), torch.zeros(3, 4, 2))
+        layers[0].self_attn = SimpleNamespace(attn=attention)
+        engram = nn.Module()
+        engram.use_sequence_parallel = False
+        engram.embed_tokens = nn.Embedding(24, 2, dtype=torch.bfloat16)
+        engram.wkv = nn.Linear(4, 3 * cfg.hidden_size, bias=False, dtype=torch.bfloat16)
+        engram.k_weight = nn.Parameter(torch.ones(2, cfg.hidden_size, dtype=torch.bfloat16))
+        engram.q_weight = nn.Parameter(torch.ones_like(engram.k_weight))
+        layers[1].engram = engram
+        layers[1].post_self_attn_engram_layernorm = ultra_mod.PanGuEngramPostNorm(cfg.hidden_size)
+        vllm_config = _mhc_vllm_config(cfg)
+        vllm_config.model_config.dtype = torch.bfloat16
+        pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+        with _patch_open_pangu_model_init(pp_group, layers, 0, 2), patch.object(
+            ultra_mod, "get_engram_shared_group", return_value=object()
+        ), patch.object(ultra_mod, "RMSNorm", return_value=nn.Identity()), patch.object(
+            ultra_mod, "NPUmHCRL", return_value=nn.Identity()
+        ):
+            model = ultra_mod.OpenPanguModel(vllm_config=vllm_config)
+        self.assertEqual(model.engram_hash.cache_prefix, attention.layer_name)
+        from omni_npu.layers import engram as engram_layer
+        self.assertIs(engram_layer._engram_model_owners[model._prepare_key], model)
+        self.assertIs(layers[0]._mhc_tail_refs[4], engram)
+        model.engram_hash.block_size = 4
+        self.assertTrue(model.engram_hash.ensure_cache())
+        self.assertEqual(model.engram_hash._cache.shape, (12,))
+
+        owner = ultra_mod.OpenPanguMoEModel.__new__(ultra_mod.OpenPanguMoEModel)
+        nn.Module.__init__(owner)
+        owner.config, owner.model, owner.num_redundant_experts = cfg, model, 0
+        owner.post_weight_load = MagicMock()
+        self.assertEqual(owner.token_lookback_depth, 1)
+        table_loader = MagicMock(side_effect=ultra_mod.default_weight_loader)
+        engram.embed_tokens.weight.weight_loader = table_loader
+        targets = {
+            name: param for name, param in owner.named_parameters()
+            if ".engram." in name or ".post_self_attn_engram_layernorm." in name
+        }
+        weights = {
+            name.replace(".engram.embed_tokens.weight", ".engram.embed.weight"): torch.full_like(param, index + 1)
+            for index, (name, param) in enumerate(targets.items())
+        }
+        with patch.object(ultra_mod, "fused_moe_make_expert_params_mapping", return_value=[]), patch.object(
+            ultra_mod, "mark_split_q_up_params_loaded"
+        ), torch.no_grad():
+            loaded = owner.load_weights(weights.items())
+        self.assertEqual(loaded, set(targets))
+        for name, param in targets.items():
+            torch.testing.assert_close(
+                param, weights[name.replace(".engram.embed_tokens.weight", ".engram.embed.weight")]
+            )
+        table_loader.assert_called_once()
+        self.assertIs(table_loader.call_args.args[0], engram.embed_tokens.weight)
+
+    def test_engram_selects_layer_hashes_before_mhc_pre(self):
+        layer = ultra_mod.OpenPanguDecoderLayer.__new__(ultra_mod.OpenPanguDecoderLayer)
+        nn.Module.__init__(layer)
+        hidden = torch.ones(2, 8)
+        layer.hidden_size = 4
+        hashes = torch.arange(12).reshape(2, 2, 3)
+        layer.engram = MagicMock(return_value=hidden * 2)
+        layer.engram.layer_hash_index = 1
+        layer.post_self_attn_engram_layernorm = MagicMock(side_effect=lambda x: x)
+        layer.attn_mhc_task_key = "attn"
+        layer.attn_mhc_module = MagicMock()
+        layer.attn_mhc_module.mhc_pre.side_effect = lambda x: (x, object(), object())
+        layer.input_layernorm = nn.Identity()
+        output, residual, _, _ = layer.mhc_head(hidden, hashes)
+        torch.testing.assert_close(layer.engram.call_args.args[1], hashes[:, 1])
+        self.assertEqual(layer.post_self_attn_engram_layernorm.call_args.args[0].shape, (4, 4))
+        torch.testing.assert_close(output, hidden * 3)
+        torch.testing.assert_close(residual, output)
 
 
 class TestPanguUltraMoeFusedMhcBranches(unittest.TestCase):
@@ -870,16 +1007,23 @@ class TestPanguUltraMoeFusedMhcBranches(unittest.TestCase):
                 object(), object(), None, None, object(), object()
             )
 
-    def test_fused_path_finishes_partition_tail_without_next_layer(self):
-        """A PP partition with no next MHC module runs the local tail epilog."""
-        layer = _fused_decoder_layer(None)
-        finished = (object(), None, None, None)
-        layer._finish_mhc_partition_tail = MagicMock(return_value=finished)
-        result = layer.forward_mhc_fused(
-            object(), object(), object(), object(), object(), object()
-        )
-        self.assertEqual(result, (*finished, None))
-        layer._finish_mhc_partition_tail.assert_called_once()
+    def test_fused_path_finishes_pp_or_engram_boundary(self):
+        """Finish residual streams at a PP boundary or before the next Engram."""
+        for engram_boundary in (False, True):
+            with self.subTest(engram_boundary=engram_boundary):
+                layer = _fused_decoder_layer(
+                    (object(), object(), "next", False) if engram_boundary else None
+                )
+                if engram_boundary:
+                    layer._mhc_tail_refs = (*layer._mhc_tail_refs[:4], object())
+                finished = (object(), None, None, None)
+                layer._finish_mhc_partition_tail = MagicMock(return_value=finished)
+                result = layer.forward_mhc_fused(
+                    object(), object(), object(), object(), object(), object()
+                )
+                self.assertEqual(result, (*finished, None))
+                layer._finish_mhc_partition_tail.assert_called_once()
+                layer.mlp_mhc_module.mhc_sandwich_norm_post_preonly.assert_not_called()
 
     def test_fused_path_returns_none_state_on_model_tail(self):
         """The last layer drops residual/h_post/h_res after the sandwich."""
@@ -974,6 +1118,7 @@ class TestPanguUltraMoeFusedMhcBranches(unittest.TestCase):
             ultra_mod.OpenPanguDecoderLayer
         )
         nn.Module.__init__(layer)
+        layer.engram = None
         hidden = object()
         residual = object()
         h_post = object()
@@ -1023,7 +1168,7 @@ class TestPanguUltraMoeFusedMhcBranches(unittest.TestCase):
         layer = _layer_with_rotary()
         captured = {}
 
-        def _layer_forward(hidden, cos, sin, residual, topk):
+        def _layer_forward(hidden, cos, sin, residual, topk, engram_hash_ids=None):
             captured["topk"] = topk
             return hidden, residual, topk
 
@@ -1051,7 +1196,7 @@ class TestPanguUltraMoeFusedMhcBranches(unittest.TestCase):
         topk = torch.ones(3, 1, 4, dtype=torch.int32)
         captured = {}
 
-        def _layer_forward(hidden, cos, sin, residual, topk_buf):
+        def _layer_forward(hidden, cos, sin, residual, topk_buf, engram_hash_ids=None):
             captured["topk"] = topk_buf
             return hidden, residual, topk_buf
 
@@ -1318,11 +1463,14 @@ class TestPanguUltraMoeV3Wiring(unittest.TestCase):
         cfg = TestOpenPanguMoERouterGatingInFp32._make_config()
         cfg.model_type = "openpangu_v3"
         cfg.routed_scaling_factor = 2.5
-        ultra_mod.OpenPanguMoE(
+        cfg.routed_expert_hidden_size = 8
+        moe = ultra_mod.OpenPanguMoE(
             cfg, TestOpenPanguMoERouterGatingInFp32._make_parallel_config(),
             quant_config=None, prefix="moe",
         )
         assert ultra_mod.NPUSharedFusedMoE.call_args.kwargs["routed_scaling_factor"] == 2.5
+        assert ultra_mod.NPUSharedFusedMoE.call_args.kwargs["shared_experts"] is moe.shared_experts
+        assert ultra_mod.NPUSharedFusedMoE.call_args.kwargs["routed_input_transform"] is moe.routed_expert_down_proj
 
     def test_v3_causal_lm_keeps_no_mome_state(self):
         from vllm.v1.worker.gpu.model_states.default import DefaultModelState

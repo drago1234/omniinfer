@@ -34,6 +34,15 @@ from omni_npu.v1.distributed.parallel_state_ext import (
 logger = init_logger(__name__)
 
 
+def _sorted_topk_weights(topk_weights: torch.Tensor, expanded_row_idx: torch.Tensor) -> torch.Tensor:
+    """Map source token/expert probabilities to sorted rows; -1 denotes remote experts."""
+    return torch.zeros_like(topk_weights, dtype=torch.float32).flatten().scatter_add(
+        0,
+        expanded_row_idx.flatten().clamp_min(0).long(),
+        topk_weights.float().flatten() * (expanded_row_idx.flatten() >= 0),
+    )
+
+
 def _uses_mxfp_activation(moe_quant_config) -> bool:
     return bool(
         moe_quant_config
@@ -57,6 +66,7 @@ class PreparePermuteResult:
     expert_tokens: torch.Tensor
     dynamic_scale: Optional[torch.Tensor]
     avg_tokens_per_expert: Optional[torch.Tensor] = None
+    expanded_topk_weights: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -221,6 +231,14 @@ class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                 per_token_scales=gathered_pertoken_scale,
             )
         )
+        expanded_topk_weights = None
+        if layer.use_swiglu_group_fusion:
+            send_topk_weights = _sorted_topk_weights(options.topk_weights, expanded_row_idx)
+            expanded_topk_weights = send_topk_weights.new_empty(gathered_tokens.shape[0])
+            dist.all_to_all_single(
+                expanded_topk_weights, send_topk_weights, output_splits, input_splits, group=get_ep_group().device_group
+            )
+            expanded_topk_weights = expanded_topk_weights.index_select(0, gathered_idxs_unsort.long())
 
         if use_hifloat8:
             hidden_states_sorted_by_experts = torch_npu.npu_dtype_cast(
@@ -235,6 +253,7 @@ class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
             )
 
         return All2AllPreparePermuteResult(
+            expanded_topk_weights=expanded_topk_weights,
             gathered_idxs_unsort=gathered_idxs_unsort,
             expanded_x=expanded_x,
             expanded_row_idx=expanded_row_idx,
@@ -490,7 +509,14 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
         if _uses_hifloat_activation(moe_quant_config):
             # init routing output dirty dynamic_scale even its input scale=None
             dynamic_scale = None
+        expanded_topk_weights = None
+        if layer.use_swiglu_group_fusion:
+            if gathered_topk_weights is None:
+                gathered_topk_weights = get_ep_group().all_gather(options.topk_weights, dim=0)
+            expanded_topk_weights = _sorted_topk_weights(gathered_topk_weights, expanded_row_idx)
+            gathered_topk_weights = torch.ones_like(gathered_topk_weights)
         return AGRSPreparePermuteResult(
+            expanded_topk_weights=expanded_topk_weights,
             hidden_states_sorted_by_experts=expanded_x,
             expert_tokens=expert_tokens,
             dynamic_scale=dynamic_scale,
@@ -653,7 +679,8 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
 class AllReducePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
 
     def prepare_permute(
-        self, layer: torch.nn.Module, x: torch.Tensor, topk_ids: torch.Tensor
+        self, layer: torch.nn.Module, x: torch.Tensor, topk_ids: torch.Tensor,
+        options: PreparePermuteOptions | None = None,
     ) -> AllReducePreparePermuteResult:
         x = x.view(-1, x.shape[-1])
         topk_ids = topk_ids.int()
@@ -678,6 +705,10 @@ class AllReducePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
         )
         
         return AllReducePreparePermuteResult(
+            expanded_topk_weights=(
+                _sorted_topk_weights(options.topk_weights, expanded_row_idx)
+                if layer.use_swiglu_group_fusion else None
+            ),
             hidden_states_sorted_by_experts=expanded_x,
             expert_tokens=expert_tokens,
             dynamic_scale=None,
@@ -780,6 +811,7 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
             ep_world_size=self.ep_size,
             ep_rank_id=self.ep_rank,
             x_active_mask=self._get_mc2_mask(topk_ids.shape[0]),
+            expert_scales=options.topk_weights.float() if layer.use_swiglu_group_fusion else None,
             **dispatch_quant_kwargs,
         )
 
@@ -792,6 +824,7 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
             dynamic_scale = None
 
         return DispatchCombinePreparePermuteResult(
+            expanded_topk_weights=output[6] if layer.use_swiglu_group_fusion else None,
             hidden_states_sorted_by_experts=expand_x,
             expert_tokens=expert_token_nums.to(torch.int64),
             tp_recv_counts=tp_recv_counts,

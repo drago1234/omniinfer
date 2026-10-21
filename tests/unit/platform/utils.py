@@ -58,6 +58,7 @@ def create_vllm_config(
     model_config.attention_chunk_size = 16
     model_config.dtype = torch.float16
     model_config.uses_xdrope_dim = 0
+    model_config.hf_config.engram_layer_ids = []
     cache_config = CacheConfig(
         block_size=block_size,
         gpu_memory_utilization=0.9,

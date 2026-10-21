@@ -39,6 +39,7 @@ def _forward_allgather(moe, *args, **kwargs):
 def _make_quant_moe(gmm_fr_token_threshold):
     """Bare int8 OpenPanguV2MOE; `threshold` decides the GMM-FR branch."""
     moe = model_mod.OpenPanguV2MOE.__new__(model_mod.OpenPanguV2MOE)
+    moe.routed_expert_down_proj = moe.routed_expert_up_proj = moe.routed_expert_norm = None
     setattr(moe, "_is_quant", True)
     setattr(moe, "_is_w4a8", False)
     moe.side_stream = None

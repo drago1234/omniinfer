@@ -80,6 +80,7 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
+        shared_experts_input: torch.Tensor | None = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
 
         orig_num_tokens = hidden_states.shape[0]
@@ -192,6 +193,8 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
             strategy_impl, layer, x_slice, topk_ids,
             options=PreparePermuteOptions(topk_weights=topk_weights),
         )
+        if prepare_permute_result.expanded_topk_weights is not None:
+            topk_weights = torch.ones_like(topk_weights)
         finalize_metadata = None
         overlap_experts = (
             strategy == "agrs" and self.enable_agrs_finalize_metadata_overlap and self.agrs_overlap_stream is not None
@@ -217,23 +220,18 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
 
         shared_output = None
         if shared_experts is not None:
+            # vLLM keeps the original input for shared experts when routed
+            # experts use a latent projection with a different hidden width.
+            shared_input = shared_experts_input
+            if shared_input is None:
+                shared_input = hidden_states if shared_experts.gate_up_proj.tp_size > 1 else x_slice
             if shared_expert_multi_stream:
                 self.sub_stream.wait_stream(cur_stream)
                 with torch.npu.stream(self.sub_stream):
                     with shared_expert_core_limit(strategy == "dispatch_combine"):
-                        if shared_experts.gate_up_proj.tp_size > 1:
-                            # Shared experts with TP>1 require full hidden_states;
-                            # output is all-reduced later.
-                            shared_output = shared_experts(hidden_states)
-                        else:
-                            shared_output = shared_experts(x_slice)
+                        shared_output = shared_experts(shared_input)
             else:
-                if shared_experts.gate_up_proj.tp_size > 1:
-                    # Shared experts with TP>1 require full hidden_states;
-                    # output is all-reduced later.
-                    shared_output = shared_experts(hidden_states)
-                else:
-                    shared_output = shared_experts(x_slice)
+                shared_output = shared_experts(shared_input)
 
         if enable_prefetch:
             self.sub_stream.wait_stream(cur_stream)
@@ -255,7 +253,11 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
         if shared_expert_multi_stream or enable_prefetch:
             cur_stream.wait_stream(self.sub_stream)
 
-        use_custom_model_add = "omni_custom_models" in os.environ.get("VLLM_PLUGINS", "")
+        # Latent routed output must be projected back before adding shared output.
+        use_custom_model_add = (
+            shared_experts_input is None
+            and "omni_custom_models" in os.environ.get("VLLM_PLUGINS", "")
+        )
         share_expert_tp = shared_experts.gate_up_proj.tp_size if shared_experts is not None else 1
         if shared_experts is not None:
             if share_expert_tp > 1:
@@ -350,6 +352,8 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
             experts,
             expert_tokens,
             group_list_type,
+            act_fn=getattr(experts, "act_fn", None),
+            expanded_topk_weights=prepare_permute_result.expanded_topk_weights,
         )
 
 
@@ -358,6 +362,11 @@ class NPUFusedMoERunner(MoERunner):
     def maybe_init_modular_kernel(self) -> None:
         return None
 
+    @property
+    def use_swiglu_group_fusion(self) -> bool:
+        act_fn = getattr(self.routed_experts, "act_fn", None)
+        return act_fn is not None and act_fn.use_swiglu_group_fusion
+
     @attn_decorator(type="moe_ffn")
     def forward(
         self,
@@ -365,6 +374,9 @@ class NPUFusedMoERunner(MoERunner):
         router_logits: Optional[torch.Tensor] = None,
         input_ids: torch.Tensor | None = None,
     ):
+        shared_experts_input = None
+        if self.routed_input_transform is not None:
+            hidden_states, shared_experts_input = self.apply_routed_input_transform(hidden_states)
         if self._shared_experts is None:
             return torch.ops.vllm.npu_moe_forward(
                 hidden_states=hidden_states,
@@ -375,6 +387,7 @@ class NPUFusedMoERunner(MoERunner):
             hidden_states=hidden_states,
             router_logits=router_logits,
             layer_name=self.layer_name,
+            shared_experts_input=shared_experts_input,
         )
 
     @staticmethod
@@ -612,7 +625,14 @@ class NPUSharedFusedMoE(_NPUFusedMoEFactory):
         )
 
 
-def _npu_moe_apply(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+def _npu_moe_apply(
+    self: NPUFusedMoERunner, hidden_states: torch.Tensor, router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    shared_input_kwargs = (
+        {"shared_experts_input": shared_experts_input}
+        if shared_experts_input is not None else {}
+    )
     return self.routed_experts.quant_method.apply(
         layer=self,
         hidden_states=hidden_states,
@@ -630,6 +650,7 @@ def _npu_moe_apply(self, hidden_states: torch.Tensor, router_logits: torch.Tenso
         e_score_correction_bias=self.routed_experts.e_score_correction_bias,
         activation=self.routed_experts.activation.value,
         apply_router_weight_on_input=self.routed_experts.apply_router_weight_on_input,
+        **shared_input_kwargs,
     )
 
 
@@ -656,19 +677,21 @@ def npu_moe_forward_shared(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
+    shared_experts_input: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     forward_context = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     assert self.shared_experts is not None
-    return _npu_moe_apply(self, hidden_states, router_logits)
+    return _npu_moe_apply(self, hidden_states, router_logits, shared_experts_input)
 
 
 def npu_moe_forward_shared_fake(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
+    shared_experts_input: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    shared_out = torch.empty_like(hidden_states)
+    shared_out = torch.empty_like(shared_experts_input if shared_experts_input is not None else hidden_states)
     fused_out = torch.empty_like(hidden_states)
     return shared_out, fused_out
 

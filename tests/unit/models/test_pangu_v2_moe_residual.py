@@ -36,6 +36,7 @@ def _bare_decoder_layer(*, use_mhc: bool = False):
     layer.use_mhc = use_mhc
     layer.use_mhc_fusion_op = False
     layer.use_mega_mhc_fusion_op = False
+    layer.engram = None
     layer.use_post_norm = False
     layer.side_stream = None
     layer.hidden_size = 4

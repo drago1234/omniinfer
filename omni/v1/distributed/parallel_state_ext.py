@@ -19,13 +19,15 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
-from vllm.config import get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.platforms import current_platform
 
 from vllm.distributed import parallel_state
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     get_tp_group,
+    get_dp_group,
+    in_the_same_node_as,
     get_world_group as _get_world_group,
     init_model_parallel_group,
 )
@@ -69,6 +71,8 @@ __all__ = [
     "get_local_group_from_list",
     "get_round_cross_group_from_list",
     "get_moe_dispatch_ep_group",
+    "initialize_engram_model_parallel",
+    "initialize_engram_shared_group",
     "destroy_parallel_state_ext_groups",
 ]
 
@@ -93,16 +97,94 @@ _TP_SIZE_OR_RANKS_GROUP_CACHE: dict[tuple[tuple[int, ...], ...], GroupCoordinato
 _TENSOR_TRANSFORM_KEYS = ("x_transform", "y_transform")
 
 
-def destroy_parallel_state_ext_groups() -> None:
-    """Destroy the Ascend A2 (910B) extension groups owned by this module.
+# Engram groups follow vLLM's coordinator/communicator lifecycle.
+_ENGRAM_SHARED: GroupCoordinator | None = None
 
-    These three lists are only populated on Ascend910B, by
+
+def _engram_group_from_local_ranks(
+    ranks: list[int], backend: str = "gloo", name: str = "engram_shared"
+) -> GroupCoordinator:
+    # GroupCoordinator creates groups in a global order. All world ranks must
+    # enter, including PP stages without a local Engram layer.
+    world = _get_world_group()
+    memberships = [None] * world.world_size
+    dist.all_gather_object(memberships, ranks, group=world.cpu_group)
+    groups = sorted({tuple(members) for members in memberships})
+    flat = [rank for members in groups for rank in members]
+    if sorted(flat) != sorted(world.ranks):
+        raise RuntimeError("Engram groups must partition the distributed world")
+    group_ranks = [list(members) for members in groups]
+    # This group broadcasts file paths, gathers errors, and synchronizes shared-table loading.
+    return GroupCoordinator(
+        group_ranks,
+        world.local_rank,
+        backend,
+        use_device_communicator=False,
+        group_name=name,
+    )
+
+
+def initialize_engram_shared_group(shard_heads: bool) -> GroupCoordinator:
+    global _ENGRAM_SHARED
+    if _ENGRAM_SHARED is None:
+        world = _get_world_group()
+        parent = get_dp_group()
+        # Candidate ranks need the same table contents; shared-memory access is checked below.
+        candidates = set(parent.ranks)
+        if not shard_heads:
+            tp_memberships = [None] * world.world_size
+            dist.all_gather_object(tp_memberships, get_tp_group().ranks, group=world.cpu_group)
+            candidates = {peer for rank in parent.ranks for peer in tp_memberships[world.ranks.index(rank)]}
+        assigned = set()
+        local = None
+        for source in range(world.world_size):
+            if source in assigned:
+                continue
+            same_node = in_the_same_node_as(world.cpu_group, source_rank=source)
+            peers = [i for i, same in enumerate(same_node) if same]
+            assigned.update(peers)
+            if world.rank_in_group in peers:
+                local = sorted(candidates.intersection(world.ranks[i] for i in peers))
+        if not local:
+            raise RuntimeError("Could not determine Engram shared-memory ranks")
+        _ENGRAM_SHARED = _engram_group_from_local_ranks(local)
+    return _ENGRAM_SHARED
+
+
+def get_engram_shared_group() -> GroupCoordinator:
+    if _ENGRAM_SHARED is None:
+        raise RuntimeError("Engram shared group is not initialized")
+    return _ENGRAM_SHARED
+
+
+def initialize_engram_model_parallel(vllm_config: VllmConfig) -> None:
+    """Create Engram groups during model-parallel initialization, after JSON load."""
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    layers = getattr(hf_config, "engram_layer_ids", None)
+    if not layers:
+        return
+    from omni_npu.model_config.config_loader.loader import model_extra_config
+
+    options = model_extra_config.operator_opt_config
+    initialize_engram_shared_group(options.engram_head_sharding != "none")
+
+
+def destroy_parallel_state_ext_groups() -> None:
+    """Destroy Engram and Ascend A2 extension groups owned by this module.
+
+    Called before vLLM's model-parallel cleanup.
+    The three A2 lists are only populated on Ascend910B, by
     `initialize_local_comm_group_list` / `initialize_round_swap_comm_group_list` /
     `initialize_cross_comm_group_list` (called from `ParallelStatePatch.
     initialize_model_parallel`). On non-A2 devices they stay `None`, so each
     block below is a no-op. Does not touch `_LOCAL_WORLD` or `_LAYER_COMM_DICT`,
     which belong to the separate layer-parallel feature.
     """
+    global _ENGRAM_SHARED
+    if _ENGRAM_SHARED is not None:
+        _ENGRAM_SHARED.destroy()
+    _ENGRAM_SHARED = None
+
     # Created by initialize_local_comm_group_list (single-node A2 groups).
     global _LOCAL_COMM_LIST
     if _LOCAL_COMM_LIST:

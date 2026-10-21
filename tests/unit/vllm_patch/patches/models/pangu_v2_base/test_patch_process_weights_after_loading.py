@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 
 import torch
+import pytest
 
 from omni_npu.vllm_patches.patches.models.pangu_v2_base import (
     patch_process_weights_after_loading as patch_mod,
@@ -88,3 +89,21 @@ def test_process_weights_patch_registration_targets_both_import_sites():
         patch_mod.PanguV2MoeProcessWeightsBaseLoaderPatch.process_weights_after_loading
         is patch_mod._patched_process_weights_after_loading
     )
+
+
+def test_engram_post_load_never_moves_shared_host_weights(monkeypatch):
+    from torch import nn
+
+    engram = patch_mod.PanGuEngramFusion.__new__(patch_mod.PanGuEngramFusion)
+    nn.Module.__init__(engram)
+    events = []
+    engram.process_weights_after_loading = lambda: events.append("engram")
+    model = nn.Module()
+    model.add_module("engram", engram)
+    monkeypatch.setattr(patch_mod, "_ORIGINAL_PROCESS_WEIGHTS_AFTER_LOADING", lambda *args: events.append("upstream"))
+    monkeypatch.setattr(patch_mod.model_loader_utils, "device_loading_context", lambda *args: (
+        pytest.fail("Engram shared weights must stay on their host storage")
+    ))
+    patch_mod._patched_process_weights_after_loading(model, object(), torch.device("npu:0"))
+    assert events == ["upstream", "engram"]
+    assert model.process_weights_after_loading_already_called

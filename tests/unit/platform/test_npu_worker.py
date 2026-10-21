@@ -369,7 +369,9 @@ def test_init_device_forwards_world_ranks(monkeypatch, world_ranks):
         # "ray" keeps init_device out of the local-rank remapping branch, so
         # the local_rank asserted below is the one that was passed in.
         parallel_config=SimpleNamespace(distributed_executor_backend="ray"),
-        model_config=SimpleNamespace(dtype="float16"),
+        model_config=SimpleNamespace(
+            dtype="float16", hf_config=SimpleNamespace(engram_layer_ids=[])
+        ),
         vllm_config="vllm-config-sentinel",
         rank=1,
         local_rank=1,

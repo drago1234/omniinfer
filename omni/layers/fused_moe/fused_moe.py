@@ -10,10 +10,14 @@ from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import (
     _uses_hifloat_activation,
     _uses_mxfp_activation,
+    _sorted_topk_weights,
 )
 
 
-def _apply_experts(layer: torch.nn.Module, h: torch.Tensor, expert_tokens: torch.Tensor, pertoken_scale=None):
+def _apply_experts(
+    layer: torch.nn.Module, h: torch.Tensor, expert_tokens: torch.Tensor,
+    pertoken_scale: torch.Tensor | None = None, expanded_topk_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import PreparePermuteResult
 
     experts = layer.routed_experts
@@ -23,6 +27,7 @@ def _apply_experts(layer: torch.nn.Module, h: torch.Tensor, expert_tokens: torch
             hidden_states_sorted_by_experts=h,
             expert_tokens=expert_tokens,
             dynamic_scale=pertoken_scale,
+            expanded_topk_weights=expanded_topk_weights,
         ),
         activation=experts.activation.value,
     )
@@ -158,7 +163,13 @@ def fused_experts_tp(
         else:
             sorted_tokens, pertoken_scale = torch_npu.npu_dynamic_quant(sorted_tokens)
 
-    out = _apply_experts(layer, sorted_tokens, expert_tokens, pertoken_scale)
+    expanded_topk_weights = None
+    if layer.use_swiglu_group_fusion:
+        # V1 numbers source rows in top-k-major order; V2 uses token-major order.
+        source_topk_weights = topk_weights if use_routing_v2 else topk_weights.T.contiguous()
+        expanded_topk_weights = _sorted_topk_weights(source_topk_weights, expanded_src_to_dst_row)
+        topk_weights = torch.ones_like(topk_weights)
+    out = _apply_experts(layer, sorted_tokens, expert_tokens, pertoken_scale, expanded_topk_weights)
 
     if use_routing_v2:
         return torch_npu.npu_moe_finalize_routing(

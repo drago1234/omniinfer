@@ -8,6 +8,7 @@ from typing import cast
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 
 from vllm.logger import init_logger
 from vllm.compilation.decorators import support_torch_compile
@@ -22,6 +23,10 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from omni_npu.layers.fused_moe.layer import NPUSharedFusedMoE
+from omni_npu.layers.engram import (
+    EngramLayout, PanGuEngramConfig, PanGuEngramFusion, PanGuEngramPostNorm,
+    PanGuEngramModelMixin,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -50,8 +55,10 @@ from vllm.model_executor.models.utils import (
     sequence_parallel_chunk,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.distributed.parallel_state import GroupCoordinator
 
 from omni_npu.model_config.config_loader.loader import model_extra_config
+from omni_npu.v1.distributed.parallel_state_ext import get_engram_shared_group
 from omni_npu.layers.mhc.mhc_rl import NPUmHCRL
 from omni_npu.plugin_decorators import post_model_forward_decorator
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
@@ -86,7 +93,18 @@ logger = init_logger(__name__)
 
 class OpenPanguMLP(FusedMLP):
     """Dense FFN block used by Pangu layers (and shared experts)."""
-    pass
+
+    def __init__(
+        self, hidden_size: int, intermediate_size: int, hidden_act: str,
+        quant_config: QuantizationConfig | None = None, disable_tp: bool = False,
+        reduce_results: bool = True, prefix: str = "", swiglu_limit: float | None = None,
+    ) -> None:
+        swiglu_limit = swiglu_limit if swiglu_limit is not None and swiglu_limit > 0 else None
+        if quant_config is not None and swiglu_limit is not None:
+            raise NotImplementedError("SwiGLU clamp requires unquantized MLPs")
+        super().__init__(hidden_size, intermediate_size, hidden_act, quant_config, disable_tp, reduce_results, prefix)
+        if swiglu_limit is not None:
+            self.act_fn = SiluAndMulWithClamp(swiglu_limit)
 
 
 class OpenPanguMoE(nn.Module):
@@ -110,6 +128,25 @@ class OpenPanguMoE(nn.Module):
         self.model_type: str = config.model_type
 
         self.is_sequence_parallel = False
+        latent_size = getattr(config, "routed_expert_hidden_size", None)
+        swiglu_limit = getattr(config, "swiglu_limit", None)
+        swiglu_limit = swiglu_limit if swiglu_limit is not None and swiglu_limit > 0 else None
+        if quant_config is not None and (latent_size is not None or swiglu_limit is not None):
+            raise NotImplementedError("Latent MoE and SwiGLU clamp require unquantized experts")
+        self.routed_expert_down_proj = None
+        self.routed_expert_up_proj = None
+        self.routed_expert_norm = None
+        if latent_size is not None:
+            self.routed_expert_down_proj = ReplicatedLinear(
+                config.hidden_size, latent_size, bias=False, return_bias=False,
+                prefix=f"{prefix}.routed_expert_down_proj",
+            )
+            self.routed_expert_up_proj = ReplicatedLinear(
+                latent_size, config.hidden_size, bias=False, return_bias=False,
+                prefix=f"{prefix}.routed_expert_up_proj",
+            )
+            if getattr(config, "latent_moe_use_norm", False):
+                self.routed_expert_norm = RMSNorm(latent_size, eps=config.rms_norm_eps)
         check_ffn_act_fn(config.hidden_act)
         # MHC fusion must not silently change the master-side gate precision.
         self.gate_in_fp32 = bool(
@@ -157,6 +194,7 @@ class OpenPanguMoE(nn.Module):
                 disable_tp=True,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
+                swiglu_limit=swiglu_limit,
             )
         else:
             self.shared_experts = None
@@ -170,10 +208,11 @@ class OpenPanguMoE(nn.Module):
         ):
             self.experts = NPUSharedFusedMoE(
                 shared_experts=self.shared_experts,
-                gate=self.gate,
+                routed_input_transform=self.routed_expert_down_proj,
+                gate=self.gate if latent_size is None else None,
                 num_experts=config.n_routed_experts,
                 top_k=config.num_experts_per_tok,
-                hidden_size=config.hidden_size,
+                hidden_size=latent_size if latent_size is not None else config.hidden_size,
                 intermediate_size=config.moe_intermediate_size,
                 reduce_results=False,
                 renormalize=config.norm_topk_prob,
@@ -183,7 +222,7 @@ class OpenPanguMoE(nn.Module):
                 topk_group=1,
                 prefix=f"{prefix}.experts",
                 scoring_func="sigmoid",
-                # we do scaling outside, set factor to 1.0 to avoid double mul
+                # Apply the model's scaling factor in expert routing.
                 routed_scaling_factor=self.routed_scaling_factor,
                 e_score_correction_bias=self.gate.e_score_correction_bias,
                 enable_eplb=self.enable_eplb,
@@ -193,10 +232,11 @@ class OpenPanguMoE(nn.Module):
         else:
             self.experts = NPUSharedFusedMoE(
                 shared_experts=self.shared_experts,
-                gate=self.gate,
+                routed_input_transform=self.routed_expert_down_proj,
+                gate=self.gate if latent_size is None else None,
                 num_experts=config.n_routed_experts,
                 top_k=config.num_experts_per_tok,
-                hidden_size=config.hidden_size,
+                hidden_size=latent_size if latent_size is not None else config.hidden_size,
                 intermediate_size=config.moe_intermediate_size,
                 reduce_results=False,
                 renormalize=config.norm_topk_prob,
@@ -217,6 +257,8 @@ class OpenPanguMoE(nn.Module):
         # precomputed router logits so dummy/profile routing sees n_experts
         # rather than hidden_size as the last dim.
         self.experts.use_precomputed_router_logits = True
+        if swiglu_limit is not None:
+            self.experts.routed_experts.act_fn = SiluAndMulWithClamp(swiglu_limit)
         # Benchmark-only routing override, matching OpenPanguV2MOE.
         self.experts.use_moe_force_load_balance = (
             os.environ.get("USE_MOE_FORCE_LOAD_BALANCE", "False").lower() == "true"
@@ -243,17 +285,32 @@ class OpenPanguMoE(nn.Module):
                 )
 
         router_logits = None
-        if hidden_states_fp32 is not None:
+        if hidden_states_fp32 is not None or self.routed_expert_down_proj is not None:
+            router_input = hidden_states_fp32 if hidden_states_fp32 is not None else hidden_states
+            if self.gate_in_fp32:
+                router_input = router_input.float()
             router_logits, _ = self.gate(
-                hidden_states_fp32.view(-1, hidden_dim)
+                router_input.view(-1, hidden_dim)
             )
-
 
         fused_moe_out = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
 
-        shared_output, final_hidden_states = fused_moe_out
+        if self.routed_expert_up_proj is not None:
+            if self.shared_experts is not None:
+                shared_output, fused_moe_out = fused_moe_out
+            if model_extra_config.operator_opt_config.enable_moe_allreduce and self.ep_size > 1:
+                # Allreduce routing returns local expert contributions. Sum them
+                # before the nonlinear latent norm and the replicated up projection.
+                fused_moe_out = get_ep_group().all_reduce(fused_moe_out)
+            if self.routed_expert_norm is not None:
+                fused_moe_out = self.routed_expert_norm(fused_moe_out)
+            final_hidden_states = self.routed_expert_up_proj(fused_moe_out)
+            if self.shared_experts is not None:
+                final_hidden_states = final_hidden_states + shared_output
+        else:
+            shared_output, final_hidden_states = fused_moe_out
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -270,6 +327,8 @@ class OpenPanguDecoderLayer(nn.Module):
         config: PretrainedConfig | None,
         prefix: str,
         vllm_config: VllmConfig,
+        engram_layout: EngramLayout | None = None,
+        engram_group: GroupCoordinator | None = None,
     ) -> None:
         super().__init__()
 
@@ -284,6 +343,15 @@ class OpenPanguDecoderLayer(nn.Module):
 
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
+        self.engram = (
+            PanGuEngramFusion(engram_layout, layer_idx, engram_group,
+                             use_sequence_parallel=model_extra_config.parall_config.ena_seq_parallel)
+            if engram_layout is not None and layer_idx in engram_layout.layer_ids else None
+        )
+        self.post_self_attn_engram_layernorm = (
+            PanGuEngramPostNorm(config.hidden_size, config.rms_norm_eps)
+            if self.engram is not None and engram_layout.config.post_norm else None
+        )
 
         self.use_mla = _has_mla_config(config)
         if not self.use_mla:
@@ -404,10 +472,11 @@ class OpenPanguDecoderLayer(nn.Module):
         sin: torch.Tensor,
         residual: torch.Tensor | None,
         topk_indices_buffer: torch.Tensor | None = None,
+        engram_hash_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         if self.use_mhc:
             return self.forward_mhc(
-                hidden_states, cos, sin, residual, topk_indices_buffer
+                hidden_states, cos, sin, residual, topk_indices_buffer, engram_hash_ids
             )
         return self.forward_normal(
             hidden_states, cos, sin, residual, topk_indices_buffer
@@ -454,7 +523,9 @@ class OpenPanguDecoderLayer(nn.Module):
         sin: torch.Tensor,
         residual: torch.Tensor | None,
         topk_indices_buffer: torch.Tensor | None = None,
+        engram_hash_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None, torch.Tensor | None]:
+        hidden_states = self._apply_engram(hidden_states, engram_hash_ids)
         residual = hidden_states
         hidden_states, h_post, h_res = self.attn_mhc_module.mhc_pre(hidden_states)
         h_res = self.attn_mhc_module.maybe_register_sinkhorn(
@@ -494,13 +565,15 @@ class OpenPanguDecoderLayer(nn.Module):
     def mhc_head(
         self,
         hidden_states: torch.Tensor,
+        engram_hash_ids: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Prepare the first local attention block for the fused MHC path."""
+        """Apply optional Engram, then prepare attention mHC pre and input norm."""
+        hidden_states = self._apply_engram(hidden_states, engram_hash_ids)
         residual = hidden_states.clone()
         hidden_states, h_post, h_res = self.attn_mhc_module.mhc_pre(
             hidden_states
@@ -511,6 +584,21 @@ class OpenPanguDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         return hidden_states, residual, h_post, h_res
 
+    def _apply_engram(
+        self, hidden_states: torch.Tensor, engram_hash_ids: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Add the current layer's Engram memory before attention mHC pre-processing."""
+        if self.engram is None or engram_hash_ids is None:
+            return hidden_states
+        # The gated Engram update preserves the input's mHC stream layout.
+        output = self.engram(hidden_states, engram_hash_ids[:, self.engram.layer_hash_index])
+        if self.post_self_attn_engram_layernorm is not None:
+            # Normalize each hidden-size stream, then restore the original layout.
+            output = self.post_self_attn_engram_layernorm(
+                output.reshape(-1, self.hidden_size)
+            ).reshape(output.shape)
+        return hidden_states + output
+
     def _finish_mhc_partition_tail(
         self,
         hidden_states: torch.Tensor,
@@ -518,7 +606,7 @@ class OpenPanguDecoderLayer(nn.Module):
         h_post: torch.Tensor,
         h_res: torch.Tensor,
     ) -> tuple[torch.Tensor, None, None, None]:
-        """Finish a PP partition after its side-stream MHC work is ready."""
+        """Finish FFN normalization and mHC post before a PP boundary or the next Engram."""
         hidden_states = self.post_mlp_layernorm(hidden_states)
         hidden_states = self.mlp_mhc_module.mhc_post(
             hidden_states, h_post, residual, h_res
@@ -614,9 +702,15 @@ class OpenPanguDecoderLayer(nn.Module):
                 topk_indices_buffer,
             )
 
-        next_mhc_module, next_norm_module, next_task_key, is_model_tail = (
+        next_mhc_module, next_norm_module, next_task_key, is_model_tail, next_engram = (
             self._mhc_tail_refs
         )
+        if next_engram is not None:
+            # Engram needs the complete residual streams before the next mHC pre.
+            hidden_states, residual, h_post, h_res = self._finish_mhc_partition_tail(
+                hidden_states, residual, h_post, h_res
+            )
+            return hidden_states, residual, h_post, h_res, topk_indices_buffer
         hidden_states, residual = (
             self.mlp_mhc_module.mhc_sandwich_norm_post_preonly(
                 hidden_states,
@@ -647,8 +741,16 @@ class OpenPanguDecoderLayer(nn.Module):
         return hidden_states, residual, h_post, h_res, topk_indices_buffer
 
 
-@support_torch_compile
-class OpenPanguModel(nn.Module):
+# Lookback rows have fixed request capacity, independent of the token bucket.
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
+class OpenPanguModel(PanGuEngramModelMixin, nn.Module):
     fall_back_to_pt_during_load = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -660,8 +762,10 @@ class OpenPanguModel(nn.Module):
         self.config = config
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        engram_config = PanGuEngramConfig.from_vllm_config(vllm_config)
+        self.engram_layout = EngramLayout(engram_config) if engram_config is not None else None
+        engram_group = get_engram_shared_group() if self.engram_layout is not None else None
 
         if get_pp_group().is_first_rank or (
             config.tie_word_embeddings and get_pp_group().is_last_rank
@@ -677,7 +781,7 @@ class OpenPanguModel(nn.Module):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: OpenPanguDecoderLayer(config, prefix, vllm_config),
+            lambda prefix: OpenPanguDecoderLayer(config, prefix, vllm_config, self.engram_layout, engram_group),
             prefix=f"{prefix}.layers",
         )
 
@@ -689,6 +793,7 @@ class OpenPanguModel(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
         self.use_mhc = getattr(config, "use_mhc", False)
+        self._init_engram_hash()
         if self.use_mhc:
             self.num_stream = getattr(config, "mhc_num_stream", 4)
             self.merge_mhc_module = NPUmHCRL(
@@ -716,6 +821,7 @@ class OpenPanguModel(nn.Module):
                         next_layer.input_layernorm,
                         next_layer.attn_mhc_task_key,
                         False,
+                        next_layer.engram,
                     )
                 elif i == last_layer_idx and get_pp_group().is_last_rank:
                     layer._mhc_tail_refs = (
@@ -723,10 +829,11 @@ class OpenPanguModel(nn.Module):
                         self.norm,
                         None,
                         True,
+                        None,
                     )
                 else:
                     # Do not carry h_post/h_res across a PP boundary.
-                    layer._mhc_tail_refs = (None, None, None, False)
+                    layer._mhc_tail_refs = (None, None, None, False, None)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids, enable_scatter=model_extra_config.parall_config.ena_seq_parallel)
@@ -737,7 +844,14 @@ class OpenPanguModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        if self.engram_hash is not None and input_ids is None:
+            raise ValueError("PanGu Engram requires raw token IDs")
+        engram_hash_ids = (
+            self.prepare_model_embeddings(input_ids, positions, lookback_token_ids)
+            if self.engram_hash is not None else None
+        )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -777,8 +891,11 @@ class OpenPanguModel(nn.Module):
         if use_fused_mhc:
             hidden_states, residual, h_post, h_res = self.layers[
                 self.start_layer
-            ].mhc_head(hidden_states)
+            ].mhc_head(hidden_states, engram_hash_ids)
             for i in range(self.start_layer, self.end_layer):
+                needs_mhc_head = i > self.start_layer and self.layers[i].engram is not None
+                if needs_mhc_head:
+                    hidden_states, residual, h_post, h_res = self.layers[i].mhc_head(hidden_states, engram_hash_ids)
                 (
                     hidden_states,
                     residual,
@@ -792,7 +909,7 @@ class OpenPanguModel(nn.Module):
                     h_res,
                     cos,
                     sin,
-                    h_res_from_fused_split=i > self.start_layer,
+                    h_res_from_fused_split=i > self.start_layer and not needs_mhc_head,
                     topk_indices_buffer=topk_indices_buffer,
                 )
         else:
@@ -804,6 +921,7 @@ class OpenPanguModel(nn.Module):
                     sin,
                     residual,
                     topk_indices_buffer,
+                    engram_hash_ids,
                 )
 
         if not get_pp_group().is_last_rank:
@@ -872,6 +990,11 @@ class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    @property
+    def token_lookback_depth(self) -> int:
+        engram_hash = self.model.engram_hash
+        return engram_hash.layout.max_ngram_size - 1 if engram_hash is not None else 0
+
     @post_model_forward_decorator
     def forward(
         self,
@@ -879,9 +1002,10 @@ class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids, positions, intermediate_tensors, inputs_embeds, lookback_token_ids
         )
         return hidden_states
 
@@ -1047,6 +1171,9 @@ class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):
         for name, loaded_weight in weights:
             if _skip_weight(name):
                 continue
+
+            # Match vLLM's WeightsMapper rule: embed.weight -> embed_tokens.weight.
+            name = name.replace(".engram.embed.weight", ".engram.embed_tokens.weight")
 
             loaded_name = _try_load_stacked(name, loaded_weight)
             if loaded_name is not None:

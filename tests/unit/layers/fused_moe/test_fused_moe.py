@@ -11,6 +11,7 @@ import torch
 
 
 def _moe_layer(**kwargs):
+    kwargs.setdefault("use_swiglu_group_fusion", False)
     layer = SimpleNamespace(**kwargs)
     if getattr(layer, "routed_experts", None) is None:
         layer.routed_experts = layer
@@ -153,6 +154,30 @@ def test_grouped_topk_invalid_scoring_func_raises(fused_module):
             topk_group=1,
             scoring_func="invalid",
         )
+
+
+@pytest.mark.parametrize("routing_v2", [False, True])
+def test_fused_experts_tp_weights_activation_once(fused_module, monkeypatch, routing_v2):
+    module, stubs = fused_module
+    monkeypatch.setattr(module.model_extra_config.operator_opt_config,
+                        "enable_moe_init_routing_v2", routing_v2)
+    layer = _moe_layer(
+        global_num_experts=2, quant_config=None, quant_method=MagicMock(), use_swiglu_group_fusion=True
+    )
+    rows = torch.tensor([2, 0, 3, 1], dtype=torch.int32)
+    sorted_tokens = torch.ones(4, 2)
+    layer.quant_method.apply_experts.return_value = sorted_tokens
+    stubs.torch_npu.npu_moe_init_routing.return_value = (sorted_tokens, rows, torch.zeros(4, dtype=torch.int32))
+    stubs.torch_npu.npu_moe_init_routing_v2.return_value = (sorted_tokens, rows, torch.tensor([2, 4]), None)
+    stubs.torch_npu.npu_moe_compute_expert_tokens.return_value = torch.tensor([2, 4])
+    weights = torch.tensor([[0.1, 0.2], [0.3, 0.4]])
+    module.fused_experts_tp(layer, torch.ones(2, 2), torch.zeros(2, 2, dtype=torch.int32), weights)
+    expected = torch.tensor([0.2, 0.4, 0.1, 0.3] if routing_v2 else [0.3, 0.4, 0.1, 0.2])
+    prepare_result = layer.quant_method.apply_experts.call_args.kwargs["prepare_permute_result"]
+    torch.testing.assert_close(prepare_result.expanded_topk_weights, expected)
+    finalize_call = stubs.torch_npu.npu_moe_finalize_routing.call_args
+    scales = finalize_call.kwargs["scales"] if routing_v2 else finalize_call.args[4]
+    torch.testing.assert_close(scales, torch.ones_like(weights))
 
 
 @pytest.mark.unit
@@ -338,7 +363,7 @@ def test_fused_experts_tp_with_mxfp_quant(fused_module):
         quant_config=object(),
         quant_method=MagicMock(),
     )
-    layer = SimpleNamespace(routed_experts=experts)
+    layer = _moe_layer(routed_experts=experts)
     experts.quant_method.moe_quant_config.use_mxfp8_w8a8 = True
     experts.quant_method.moe_quant_config.use_hifloat8_w8a8 = False
     sorted_tokens = torch.ones(3, 2)
@@ -382,7 +407,7 @@ def test_fused_experts_tp_with_hifloat8_casts_without_scale(fused_module):
         quant_config=object(),
         quant_method=MagicMock(),
     )
-    layer = SimpleNamespace(routed_experts=experts)
+    layer = _moe_layer(routed_experts=experts)
     experts.quant_method.moe_quant_config.use_hifloat8_w8a8 = True
     experts.quant_method.moe_quant_config.use_mxfp8_w8a8 = False
     experts.quant_method.moe_quant_config.use_mxfp4_w4a8 = False

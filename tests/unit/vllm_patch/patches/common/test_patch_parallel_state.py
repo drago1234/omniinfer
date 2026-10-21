@@ -14,6 +14,33 @@ from omni_npu.vllm_patches.patches.common.patch_parallel_state import (
 )
 
 
+def test_engram_initialization_runs_after_standard_groups(monkeypatch):
+    import vllm.config
+
+    events = []
+    config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=1, enable_elastic_ep=False),
+                             model_config=SimpleNamespace(is_moe=False))
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(patch_parallel_state, "get_world_group", lambda: SimpleNamespace(
+        ranks=[0], rank=0, local_rank=0, device_group=object()
+    ))
+    for name in ("_TP", "_DCP", "_PCP", "_PP", "_DP", "_EP", "_EPLB", "_MOE_DISPATCH_EP"):
+        monkeypatch.setattr(patch_parallel_state.parallel_state, name, None, raising=False)
+
+    def group(*args, group_name, **kwargs):
+        events.append(group_name)
+        return SimpleNamespace(rank_in_group=0)
+
+    monkeypatch.setattr(patch_parallel_state, "init_model_parallel_group", group)
+    monkeypatch.setattr(patch_parallel_state, "initialize_engram_model_parallel", lambda value: (
+        events.append("engram") if value is config else pytest.fail("wrong config")
+    ))
+    monkeypatch.setattr(patch_parallel_state.torch_npu.npu, "get_device_name", lambda index: "Ascend910B")
+    patch_parallel_state.ParallelStatePatch.initialize_model_parallel(backend="gloo")
+    assert events == ["tp", "dcp", "pcp", "pp", "dp", "engram"]
+
+
 def _make_platform(logical_to_visible, *, out_of_tree=True):
     return SimpleNamespace(
         device_name="npu",

@@ -2159,6 +2159,7 @@ class TestOpenPanguV2DecoderAndMoE(unittest.TestCase):
 
     def test_dispatch_combine_splits_over_configured_max_batch(self):
         moe = model_mod.OpenPanguV2MOE.__new__(model_mod.OpenPanguV2MOE)
+        moe.routed_expert_down_proj = moe.routed_expert_up_proj = moe.routed_expert_norm = None
         moe.ep_comm_name = "ep"
         moe.side_stream = None
         moe.gate = MagicMock(return_value=(torch.zeros(4, 2), None))
@@ -2198,6 +2199,7 @@ class TestOpenPanguV2DecoderAndMoE(unittest.TestCase):
     def test_dispatch_combine_force_load_balance_overrides_topk_ids(self):
         """use_moe_force_load_balance replaces gating ids with round-robin ids."""
         moe = model_mod.OpenPanguV2MOE.__new__(model_mod.OpenPanguV2MOE)
+        moe.routed_expert_down_proj = moe.routed_expert_up_proj = moe.routed_expert_norm = None
         moe.ep_comm_name = "ep"
         moe.side_stream = None
         moe.gate = MagicMock(return_value=(torch.zeros(4, 2), None))
