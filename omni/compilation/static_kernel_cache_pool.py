@@ -180,21 +180,16 @@ def _barrier_once(group: Any = None) -> None:
 def maybe_pull_static_kernel_cache(vllm_config: Any) -> None:
     """Pull hook — see module docstring. Never raises.
 
-    Every past-the-gate process kills the reuse marker up-front
-    (idempotent); the pod's rank 0 then runs the bounded pull and
-    rewrites the marker only on a gate-passed HIT. Every path that
-    resolves the pod group reaches exactly one pod-local barrier, so
-    every process's boot-static decision observes the marker outcome.
+    The pod's rank 0 clears any stale reuse marker right before its
+    bounded pull and rewrites the marker only on a gate-passed HIT; the
+    other members never touch it. Every path that resolves the pod group
+    reaches exactly one pod-local barrier, so every process's
+    boot-static decision observes the marker outcome.
     """
     try:
         cfgdict = _sk_config()
         if not cfgdict or not cfgdict.get("static_kernel_cache_enable", False):
             return  # gate off: every rank exits here, no rendezvous needed
-
-        # The marker dies before anything can fail, coordination failure
-        # included: only a gate-passed HIT below rewrites it, so no boot
-        # ever rides a stale marker into ungated local reuse.
-        _kill_pool_marker(cfgdict)
 
         # Collective setup precedes any rank branching (see _pod_group).
         pod_group = _pod_group()
@@ -202,6 +197,15 @@ def maybe_pull_static_kernel_cache(vllm_config: Any) -> None:
         try:
             if not _is_pod_rank0(pod_group):
                 return  # the other members rendezvous in the finally below
+
+            # The marker dies only here — in the pod's rank 0, before its
+            # pull. The old shape (kill in every member's entry) raced the
+            # rank-0 post-pull rewrite: a slowly spawned sibling deleted the
+            # freshly written marker after a pull HIT and the whole pod fell
+            # back to full compile (s10 hot boot 2026-10-20). Stale markers
+            # cannot arise on a fresh per-boot cache dir anyway, and the HIT
+            # landing rebuilds the entire product directory.
+            _kill_pool_marker(cfgdict)
 
             # Only the pod's rank 0 talks to the pool: concurrent store
             # setups race on the Ascend transfer engine's listen port.
