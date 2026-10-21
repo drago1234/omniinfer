@@ -76,6 +76,7 @@ from omni_npu.compilation.acl_graph import (
 )
 from omni_npu.configs import OmniAdditionalConfig
 from omni_npu.layers.fused_moe import routed_experts_handle
+from omni_npu.layers.engram import PanGuEngramConfig
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.sample.sampler import NPUSamplerV1, ENABLE_NPU_PENALTY_CACHE
 from omni_npu.sample.rejection_sampler import NPURejectionSampler
@@ -200,6 +201,46 @@ class NPUModelRunner(GPUModelRunner):
         # Number of valid entries in req_indices for the in-flight
         # _prepare_inputs; None outside it (dummy runs, capture).
         self._req_indices_valid_tokens: int | None = None
+        self._init_engram_lookup()
+
+    def _init_engram_lookup(self) -> None:
+        self.engram_config = PanGuEngramConfig.from_vllm_config(self.vllm_config)
+        if self.engram_config is not None:
+            start, end = self.model_config.get_layers_start_end_indices(self.parallel_config)
+            local_layers = tuple(layer_idx for layer_idx in self.engram_config.layer_ids if start <= layer_idx < end)
+            if not local_layers:
+                self.engram_config = None
+        self.lookback_token_ids = None
+        self._lookback_copy_event = None
+
+    def _prepare_lookback_token_ids(self, num_reqs: int) -> torch.Tensor:
+        # Same policy as vLLM's legacy runner: only known prompt IDs come from
+        # CPU; generated history comes from the device slot cache.
+        if self._lookback_copy_event is not None:
+            self._lookback_copy_event.synchronize()
+        buf = self.lookback_token_ids
+        # CPU tensor, NumPy view, and NPU tensor all have shape [max_num_reqs, lookback_depth].
+        buf.np.fill(-1)
+        lookback_depth = buf.np.shape[1]
+        starts = self.input_batch.num_computed_tokens_cpu[:num_reqs, None]
+        pos = starts - np.arange(1, lookback_depth + 1)
+        prompt_lens = self.input_batch.num_prompt_tokens[:num_reqs, None]
+        valid = (pos >= 0) & (pos < prompt_lens)
+        rows, cols = np.nonzero(valid)
+        buf.np[rows, cols] = self.input_batch.token_ids_cpu[rows, pos[rows, cols]]
+        result = buf.copy_to_gpu(self.max_num_reqs)
+        if self._lookback_copy_event is None:
+            self._lookback_copy_event = torch.npu.Event()
+        self._lookback_copy_event.record()
+        return result
+
+    def _init_model_kwargs(self, num_reqs: int | None = None) -> dict[str, Any]:
+        model_kwargs = super()._init_model_kwargs()
+        if self.lookback_token_ids is not None:
+            if num_reqs is None:
+                num_reqs = self.input_batch.num_reqs
+            model_kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(num_reqs)
+        return model_kwargs
 
     def _bind_slot_mapping_req_indices(self) -> None:
         """Let this runner's block table reuse the request ids we upload.
@@ -718,6 +759,10 @@ class NPUModelRunner(GPUModelRunner):
             load_dummy_weights: load dummy weights instead of real weights.
         """
         super().load_model(load_dummy_weights)
+
+        lookback_depth = getattr(self.get_model(), "token_lookback_depth", 0)
+        if lookback_depth:
+            self.lookback_token_ids = self._make_buffer(self.max_num_reqs, lookback_depth, dtype=torch.int64)
 
         if hasattr(self.model, "model"):
             prefetch_post_load_hook = getattr(self.model.model, "prefetch_post_load", None)
@@ -1518,6 +1563,19 @@ class NPUModelRunner(GPUModelRunner):
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> dict[str, torch.Tensor]:
         kv_caches = super().initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
+        engram_hash_state = None
+        if self.engram_config is not None:
+            engram_hash_state = self.get_model().model.engram_hash
+        if engram_hash_state is not None:
+            # group_id indexes the KV group and its matching block table.
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+                # cache_prefix names the bound attention layer; layer_names lists this group's layers.
+                if engram_hash_state.cache_prefix in group.layer_names:
+                    engram_hash_state.block_size = self.input_batch.block_table[group_id].block_size
+                    engram_hash_state.ensure_cache()
+                    break
+            else:
+                raise ValueError("PanGu Engram requires its attention KV cache for token history")
         if has_kv_transfer_group():
             self.kv_caches_dict = kv_caches
         return kv_caches

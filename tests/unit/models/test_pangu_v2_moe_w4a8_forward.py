@@ -96,6 +96,7 @@ def _w4a8_experts(*, asymmetric=False):
 
 def _make_moe(*, asymmetric=False, gmm_fr_threshold=0, w4a8=True):
     moe = model_mod.OpenPanguV2MOE.__new__(model_mod.OpenPanguV2MOE)
+    moe.routed_expert_down_proj = moe.routed_expert_up_proj = moe.routed_expert_norm = None
     # _is_graph_mode is a read-only property over get_forward_context().
     moe._is_quant = True
     moe._is_w4a8 = w4a8
@@ -311,7 +312,7 @@ def _patch_all_to_all_single(stack):
 
 
 def _patch_distribute_dispatch(stack, dispatch=None):
-    stack.enter_context(
+    return stack.enter_context(
         patch.object(
             model_mod.torch_npu,
             "npu_moe_distribute_dispatch_v2",
@@ -550,13 +551,30 @@ def test_forward_allgather_w8a8_gmm_fr_path():
     assert fr_mock.call_args.kwargs["scale"] is moe.experts.w2_weight_scale
 
 
-def test_dispatch_combine_w8a8_path():
+@pytest.mark.parametrize(
+    "top_k,comm_alg",
+    [(12, "fullmesh_v2"), (13, "fullmesh_v1")],
+)
+def test_dispatch_combine_w8a8_path(top_k, comm_alg):
     """Dispatch/combine W8A8 else branch uses weight_scale and int32 GMM1."""
     moe = _make_moe(w4a8=False)
+    moe.experts.top_k = top_k
     captured = []
     dispatch = _dispatch_result()
-    out = _run_dispatch_combine(moe, captured, dispatch)
+    with ExitStack() as stack:
+        _patch_common_npu(stack)
+        _patch_grouped_matmul(stack, captured)
+        dispatch_mock = _patch_distribute_dispatch(stack, dispatch)
+        _patch_distribute_combine(stack)
+        out = moe._dispatch_combine_single_batch(
+            hidden_states=torch.ones(TOKENS, HIDDEN, dtype=torch.bfloat16),
+            topk_weights=torch.ones(TOKENS, top_k),
+            topk_ids=torch.zeros(TOKENS, top_k, dtype=torch.int32),
+            quant_mode=2,
+            ep_comm_name="test",
+        )
 
+    assert dispatch_mock.call_args.kwargs["comm_alg"] == comm_alg
     assert out.shape == (TOKENS, HIDDEN)
     assert len(captured) == 2
     assert captured[0]["output_dtype"] is torch.int32

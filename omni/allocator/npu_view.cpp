@@ -6,8 +6,8 @@
 // vLLM's UvaBuffer needs a device Tensor view of a pinned CPU tensor. The
 // pinned allocation is registered by torch_npu when
 // PYTORCH_NPU_ALLOC_CONF=pinned_mem_register:True is set before process start.
-// This extension only queries the existing CANN device pointer and wraps it as
-// a device=npu Tensor. It must not register or unregister host memory.
+// get_npu_view_from_cpu_tensor only queries that existing registration.
+// register_mapped_cpu_tensor separately owns registration of shared mmap storage.
 
 #include <torch/extension.h>
 #include <torch_npu/csrc/aten/common/from_blob.h>
@@ -16,8 +16,13 @@
 
 #include <cstdint>
 #include <limits>
+#include <memory>
 
 namespace py = pybind11;
+
+#ifndef TORCH_EXTENSION_NAME
+#define TORCH_EXTENSION_NAME npu_uva
+#endif
 
 namespace {
 
@@ -59,6 +64,59 @@ c10::Device make_npu_device(int64_t device_index) {
 
 }  // namespace
 
+// Unlike the pinned-allocator path below, Engram owns an existing MAP_SHARED
+// allocation. Keep both the registration and the CPU mmap alive through every
+// alias of the returned device tensor; never make a private pinned copy.
+struct SharedHostRegistration {
+  at::Tensor source;
+  int device;
+  bool registered = false;
+
+  ~SharedHostRegistration() {
+    if (!registered) {
+      return;
+    }
+    int previous = -1;
+    aclrtGetDevice(&previous);
+    if (aclrtSetDevice(device) == ACL_SUCCESS) {
+      const auto result = aclrtHostUnregister(source.data_ptr());
+      if (result != ACL_SUCCESS) {
+        TORCH_WARN("Engram aclrtHostUnregister failed on device ", device,
+                   ": ", result);
+      }
+    }
+    if (previous >= 0 && previous != device) {
+      aclrtSetDevice(previous);
+    }
+  }
+};
+
+at::Tensor register_mapped_cpu_tensor(const at::Tensor& source,
+                                      int64_t device_index) {
+  TORCH_CHECK(source.device().is_cpu() && source.is_contiguous(),
+              "Mapped host storage must be a contiguous CPU tensor");
+  TORCH_CHECK(source.numel() > 0, "Mapped host storage must not be empty");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(source.data_ptr()) % 4096 == 0,
+              "Mapped host storage must start at a 4 KiB aligned address");
+  const auto device = make_npu_device(device_index);
+  int current = -1;
+  ACL_CHECK(aclrtGetDevice(&current));
+  TORCH_CHECK(current == device_index,
+              "Register shared host storage in the owning NPU device context");
+  // Construct in place: a temporary registration would unregister too early.
+  auto owner = std::make_shared<SharedHostRegistration>();
+  owner->source = source;
+  owner->device = static_cast<int>(device_index);
+  ACL_CHECK(aclrtHostRegisterV2(source.data_ptr(), source.nbytes(),
+                             ACL_HOST_REG_PINNED | ACL_HOST_REG_MAPPED));
+  owner->registered = true;
+  void* ptr = get_registered_device_pointer(source);
+  auto deleter = [owner](void*) {};
+  return at_npu::native::from_blob(
+      ptr, source.sizes(), source.strides(), deleter,
+      source.options().device(device).pinned_memory(false), device);
+}
+
 uintptr_t get_device_pointer(const at::Tensor& cpu_tensor) {
   check_cpu_tensor(cpu_tensor);
   return reinterpret_cast<uintptr_t>(get_registered_device_pointer(cpu_tensor));
@@ -81,7 +139,11 @@ at::Tensor get_npu_view_from_cpu_tensor(const at::Tensor& cpu_tensor,
                                    npu_device);
 }
 
-PYBIND11_MODULE(npu_uva, m) {
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("register_mapped_cpu_tensor", &register_mapped_cpu_tensor,
+        py::arg("cpu_tensor"), py::arg("device_index"),
+        "Register unregistered shared CPU storage and return its owning NPU "
+        "alias. Keep an alias alive until all asynchronous reads complete.");
   m.def("get_device_pointer", &get_device_pointer, py::arg("cpu_tensor"),
         "Return the CANN device pointer for a registered pinned CPU tensor");
   m.def("get_npu_view_from_cpu_tensor", &get_npu_view_from_cpu_tensor,

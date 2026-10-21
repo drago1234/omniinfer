@@ -979,6 +979,7 @@ def test_hifloat_tp_executes_real_expert_pipeline_without_agrs_events(
     prepare.PreparePermuteResult = lambda **kw: SimpleNamespace(avg_tokens_per_expert=None, **kw)
     prepare._uses_hifloat_activation = lambda cfg: cfg.use_hifloat8_w8a8
     prepare._uses_mxfp_activation = lambda cfg: False
+    prepare._sorted_topk_weights = MagicMock()
     module_path = Path(__file__).resolve().parents[3] / "omni/layers/fused_moe/fused_moe.py"
     spec = importlib.util.spec_from_file_location("hifloat_tp_pipeline_under_test", module_path)
     fused = importlib.util.module_from_spec(spec)

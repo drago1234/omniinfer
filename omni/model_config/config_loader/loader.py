@@ -133,6 +133,12 @@ class ModelParallelConfig:
 @dataclass
 class ModelOperatorOptConfig:
     enable_mxfp8_comm_quant: bool = False
+    # Shared host table, serial NPU execution and optional TP head sharding.
+    engram_table_location: str = "cpu_shared"  # support cpu_shared only
+    engram_prefetch: bool = False  # support False only (serial lookup on the model stream)
+    engram_head_sharding: str = "tp"  # none / tp
+    use_engram_proj_gate_fusion_op: bool = False  # Fuse BF16 projection and gating when WKV is not TP-sharded.
+    use_swiglu_group_fusion_op: bool = False  # Fuse clamp, SwiGLU and routing weights for limited, unquantized experts.
     enable_kv_rmsnorm_rope_cache: bool = False
     enable_prefill_mla_absorb_pa: bool = False
     kv_nz: bool = False
@@ -227,6 +233,13 @@ class ModelOperatorOptConfig:
     use_w4a8_enk_gmm: bool = False # W4A8 MoE EnK 优化，仅对称量化，默认关闭
 
     def __post_init__(self):
+        if self.engram_table_location != "cpu_shared":
+            raise ValueError("Currently, engram_table_location must be 'cpu_shared'")
+        if self.engram_prefetch is not False:
+            raise ValueError("Currently, engram_prefetch must be False")
+        if self.engram_head_sharding not in ("none", "tp"):
+            raise ValueError("Currently, engram_head_sharding must be 'none' or 'tp'")
+
         if type(self.mome_sp_token_threshold) is not int or self.mome_sp_token_threshold < 0:
             raise ValueError("mome_sp_token_threshold must be a non-negative integer")
 

@@ -304,7 +304,7 @@ class OpenPanguV2MTP(nn.Module, SupportsPP):
             if high_throughout():
                 name = rewrite_mome_conv_name(name)
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if f".{weight_name}." not in name:
                     continue
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue

@@ -33,6 +33,7 @@ from vllm.logger import init_logger
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 from omni_npu.v1.distributed.parallel_state_ext import (
     destroy_parallel_state_ext_groups,
+    initialize_engram_model_parallel,
     initialize_round_swap_comm_group_list,
     initialize_local_comm_group_list,
     initialize_cross_comm_group_list
@@ -353,6 +354,8 @@ class ParallelStatePatch(VLLMPatch):
                         backend,
                         group_name="eplb",
                     )
+        initialize_engram_model_parallel(config)
+
         # If no EP group needed, _EP/_MOE_DISPATCH_EP/_EPLB remain None
 
         logger.info_once(

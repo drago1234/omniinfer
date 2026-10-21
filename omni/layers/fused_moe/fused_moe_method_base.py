@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 from abc import ABC, abstractmethod
+from typing import Callable
 
 import torch
 
@@ -19,13 +20,18 @@ def npu_grouped_moe_experts_bf16(
     expert_tokens: torch.Tensor,
     group_list_type: int,
     output_dtype: torch.dtype | None = None,
+    *,
+    act_fn: Callable[..., torch.Tensor] | None = None,
+    expanded_topk_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply unquantized BF16 routed experts via grouped matmul.
 
-    w13 grouped matmul -> swiglu -> w2 grouped matmul. ``group_list_type``
+    w13 grouped matmul -> activation -> w2 grouped matmul. ``group_list_type``
     picks the interpretation of ``expert_tokens``: 1 is per-expert counts
     (EP path), 0 is the cumulative sum (TP-only path). ``output_dtype`` is
     only forwarded when explicitly set, matching call sites that omit it.
+    ``act_fn`` optionally supplies the model activation; the default is SwiGLU.
+    Expanded routing weights are passed to activations that support weighted SwiGLU.
     """
     # Resolve torch_npu at call time so tests that stub sys.modules
     # ["torch_npu"] after this module was imported still take effect.
@@ -46,7 +52,11 @@ def npu_grouped_moe_experts_bf16(
         [experts.w13_weight],
         **matmul_kwargs,
     )[0]
-    intermediate_hidden_states = torch_npu.npu_swiglu(gate_up_proj)
+    activation = act_fn if act_fn is not None else torch_npu.npu_swiglu
+    intermediate_hidden_states = (
+        activation(gate_up_proj, weight=expanded_topk_weights)
+        if expanded_topk_weights is not None else activation(gate_up_proj)
+    )
     return torch_npu.npu_grouped_matmul(
         [intermediate_hidden_states],
         [experts.w2_weight],

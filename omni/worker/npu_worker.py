@@ -129,6 +129,12 @@ class NPUWorker(Worker):
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
+            # Engram group topology needs its JSON options before group creation.
+            # Preserve the existing initialization order for other models.
+            engram_layers = getattr(self.model_config.hf_config, "engram_layer_ids", None)
+            if engram_layers:
+                load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
+
             # Initialize the distributed environment BEFORE taking
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
@@ -148,7 +154,8 @@ class NPUWorker(Worker):
             )
 
             # Initialize the model best practice configs.
-            load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
+            if not engram_layers:
+                load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
             from omni_npu.model_config.config_loader import loader as _omni_loader
             _enable_batch_invariant_determinism(_omni_loader.model_extra_config)
 

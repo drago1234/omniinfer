@@ -2,6 +2,7 @@
 import logging
 import multiprocessing as mp
 from functools import reduce
+from types import MethodType
 from typing import Optional
 
 import numpy as np
@@ -46,6 +47,7 @@ class LoptParallelTokenizer:
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path, trust_remote_code=True, use_fast=True
         )
+        self._ensure_special_token_builder(self.tokenizer)
 
         self.pool = mp.Pool(
             pool_size,
@@ -54,6 +56,33 @@ class LoptParallelTokenizer:
         )
         self._finalizer = weakref.finalize(self, self.close)
         
+    @staticmethod
+    def build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
+        """Build special tokens using OpenPangu's original tokenizer rules.
+        Here, self is the tokenizer instance bound through MethodType.
+        """
+        if self._add_bos_token:
+            bos_token_ids = [self.bos_token_id]
+        else:
+            bos_token_ids = []
+        output = bos_token_ids + token_ids_0
+        if token_ids_1 is not None:
+            output = output + token_ids_1
+        if self.add_eos_token:
+            output = output + [self.eos_token_id]
+        return output
+
+    @staticmethod
+    def _ensure_special_token_builder(tokenizer) -> None:
+        """Bind the missing OpenPangu method at initialization for direct LoPT calls."""
+        if callable(getattr(tokenizer, "build_inputs_with_special_tokens", None)):
+            return
+        # Other tokenizers may use different special-token layouts.
+        if type(tokenizer).__name__ == "OpenPanguV2Tokenizer":
+            tokenizer.build_inputs_with_special_tokens = MethodType(
+                LoptParallelTokenizer.build_inputs_with_special_tokens, tokenizer
+            )
+
     def close(self):
         """close the multiprocessing pool if it exists"""
         if hasattr(self, 'pool') and self.pool is not None:

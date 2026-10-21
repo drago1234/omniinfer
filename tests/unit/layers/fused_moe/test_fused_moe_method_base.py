@@ -200,3 +200,33 @@ def test_npu_grouped_moe_experts_bf16_forwards_output_dtype(monkeypatch):
     for call in gmm_mock.call_args_list:
         assert call.kwargs["output_dtype"] == torch.bfloat16
         assert call.kwargs["group_list_type"] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("weighted", [False, True])
+def test_npu_grouped_moe_experts_bf16_uses_custom_activation(monkeypatch, weighted):
+    from omni_npu.layers.fused_moe.fused_moe_method_base import npu_grouped_moe_experts_bf16
+
+    gmm_mock, swiglu_mock = _make_bf16_helper_stub_torch_npu(monkeypatch)
+    hidden_states = torch.ones(3, 4)
+    experts = SimpleNamespace(w13_weight=torch.ones(2, 4, 4), w2_weight=torch.ones(2, 4, 4))
+    expert_tokens = torch.tensor([2, 1], dtype=torch.int64)
+    weights = torch.tensor([[0.2], [0.5], [0.7]]) if weighted else None
+
+    def activate(tensor, weight=None):
+        output = tensor * 2
+        return output if weight is None else output * weight
+
+    activation = MagicMock(side_effect=activate)
+    output = npu_grouped_moe_experts_bf16(
+        hidden_states, experts, expert_tokens, 1, act_fn=activation, expanded_topk_weights=weights
+    )
+
+    if weighted:
+        activation.assert_called_once_with(hidden_states, weight=weights)
+    else:
+        activation.assert_called_once_with(hidden_states)
+    expected = hidden_states * 2 if weights is None else hidden_states * 2 * weights
+    swiglu_mock.assert_not_called()
+    torch.testing.assert_close(gmm_mock.call_args_list[1].args[0][0], expected)
+    torch.testing.assert_close(output, expected)

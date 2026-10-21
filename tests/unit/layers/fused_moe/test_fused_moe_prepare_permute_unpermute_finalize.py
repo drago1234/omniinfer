@@ -92,6 +92,7 @@ def _a5_dispatch_selector(module, stubs, layer):
     module.get_forward_context = _empty_forward_context
     module.model_extra_config = SimpleNamespace(
         operator_opt_config=SimpleNamespace(
+            use_swiglu_group_fusion_op=True,
             decode_moe_dispatch_combine=True,
             enable_moe_agrs=False,
             enable_moe_allreduce=False,
@@ -258,6 +259,52 @@ def _set_all2all_routing_results(stubs, dynamic_scale):
         tokens_per_local_expert,
     )
     return sorted_states, tokens_per_local_expert
+
+
+@pytest.mark.parametrize("strategy", ["all2all", "agrs", "dispatch", "allreduce"])
+def test_clamped_swiglu_receives_probabilities_in_expert_order(prepare_module, monkeypatch, strategy):
+    module, stubs = prepare_module
+    monkeypatch.setattr(module.model_extra_config.operator_opt_config,
+                        "use_swiglu_group_fusion_op", True, raising=False)
+    layer = _moe_layer(
+        global_num_experts=4, local_num_experts=2, ep_size=2, top_k=1,
+        quant_config=None, w13_weight=torch.zeros(2, 1, 1),
+        quant_method=SimpleNamespace(moe_quant_config=None, num_of_redundant_experts=0),
+        use_swiglu_group_fusion=True,
+    )
+    weights = torch.tensor([[0.2], [0.8]])
+    expected = weights.flatten().flip(0)
+    handlers = {
+        "all2all": module.All2AllPrepPmtAndUnpmtFinal,
+        "agrs": module.AGRSPrepPmtAndUnpmtFinal,
+        "dispatch": module.DispatchCombinePrepPmtAndUnpmtFinal,
+        "allreduce": module.AllReducePrepPmtAndUnpmtFinal,
+    }
+    if strategy == "all2all":
+        _set_all2all_routing_results(stubs, None)
+    elif strategy == "dispatch":
+        stubs.torch_npu.npu_moe_distribute_dispatch_v2.return_value = (
+            torch.ones(2, 3), None, torch.zeros(2, dtype=torch.int32),
+            torch.tensor([1, 1]), torch.tensor([1, 1]), torch.tensor([1, 1]), expected,
+        )
+    else:
+        rows = torch.tensor([1, 0, 3, 2] if strategy == "agrs" else [1, 0], dtype=torch.int32)
+        stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
+            torch.ones(rows.numel(), 3), rows, torch.tensor([1, 1]), None,
+        )
+        if strategy == "agrs":
+            expected = expected.repeat(2)
+    result = handlers[strategy](layer).prepare_permute(
+        layer, torch.ones(2, 3), torch.tensor([[2], [3]], dtype=torch.int32),
+        module.PreparePermuteOptions(topk_weights=weights),
+    )
+    torch.testing.assert_close(result.expanded_topk_weights, expected)
+    if strategy == "dispatch":
+        torch.testing.assert_close(
+            stubs.torch_npu.npu_moe_distribute_dispatch_v2.call_args.kwargs["expert_scales"], weights,
+        )
+    elif strategy == "agrs":
+        torch.testing.assert_close(result.gathered_topk_weights, torch.ones(4, 1))
 
 
 def test_all2all_prepare_permute_no_quant(prepare_module):

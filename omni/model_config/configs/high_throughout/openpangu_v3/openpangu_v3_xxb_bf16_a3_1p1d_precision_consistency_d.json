@@ -52,7 +52,11 @@
         "enable_mhc_multistream": true,
         "use_mhc_fusion_op": false,
         "use_rope_fusion_op": false,
+        "use_swiglu_group_fusion_op": true,
+        "use_engram_proj_gate_fusion_op": true,
         "sampler_multi_stream": false,
-        "use_gpt_oss_sink_rescale": false
+        "use_gpt_oss_sink_rescale": false,
+        "engram_prefetch": false,
+        "engram_head_sharding": "none"
     }
 }
