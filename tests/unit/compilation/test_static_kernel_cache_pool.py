@@ -8,7 +8,8 @@ POD-scoped (the local world group's rank_in_group==0 pulls, per-pod
 barrier), upload dedup is WORLD-scoped (world rank 0 alone uploads, and
 only after the capture-end rendezvous), the group setup is collective
 (it runs on every past-the-gate process, non-pullers included), the
-reuse marker is killed up-front and rewritten only on a gate-passed HIT,
+reuse marker is cleared only by the pod's rank 0 right before its pull
+and rewritten only on a gate-passed HIT (non-pullers never touch it),
 hooks never raise, and the upload log protocol (silent on
 not-attempted) holds. static_kernel_cache / torch.distributed /
 parallel_state_ext / npugraph_ex_config are all injected as sys.modules
@@ -264,12 +265,18 @@ def test_pull_swallows_hook_exceptions(
 
 
 def test_pull_local_rank1_barriers_without_touching_the_pool(
-    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, caplog
+    sk_config, fake_dist, fake_groups, fake_static_kernel_cache, tmp_path, caplog
 ):
     # The pull decision is POD-scoped: local rank 1 must not pull even at
     # world rank 0 (a single-pod multi-server deployment).
     fake_groups.local.rank_in_group = 1
     fake_dist["rank"] = 0
+    # Regression (s10 hot boot 2026-10-20): a slowly spawned sibling's
+    # entry-time kill used to delete the marker the pod rank 0 had just
+    # written after its pull HIT, sinking the whole pod into full compile.
+    # Non-pullers must never touch the marker.
+    _marker_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    _marker_path(tmp_path).write_text("fp_test\n")
 
     with caplog.at_level(logging.INFO):
         bridge.maybe_pull_static_kernel_cache(_vllm())
@@ -278,6 +285,7 @@ def test_pull_local_rank1_barriers_without_touching_the_pool(
     assert fake_dist["barrier"] == 1
     assert fake_dist["barrier_groups"] == [fake_groups.local.device_group]
     assert "static_kernel_cache pool pull:" not in caplog.text
+    assert _marker_path(tmp_path).read_text() == "fp_test\n"
     # Group setup is collective: it ran on the non-puller too, before any
     # rank branching.
     fake_groups.pse.initialize_local_world_group.assert_called_once()
@@ -333,8 +341,8 @@ def test_multinode_second_pod_local_rank1_does_not_pull(
 def test_pull_abandoned_when_pod_group_unavailable(
     sk_config, fake_dist, fake_groups, fake_static_kernel_cache, tmp_path, caplog
 ):
-    # No silent fallback: pooling is abandoned entirely; the stale marker
-    # still dies, and no barrier is owed (every rank fails identically).
+    # No silent fallback: pooling is abandoned entirely with no side
+    # effects, and no barrier is owed (every rank fails identically).
     fake_groups.pse.initialize_local_world_group.side_effect = RuntimeError("no local size")
     fake_dist["rank"] = 0
     _marker_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
@@ -347,7 +355,11 @@ def test_pull_abandoned_when_pod_group_unavailable(
     assert "abandoned" in caplog.text
     fake_static_kernel_cache.static_kernel_cache_store.bounded_pull.assert_not_called()
     assert fake_dist["barrier"] == 0
-    assert not _marker_path(tmp_path).exists()
+    # The kill lives inside the rank-0 pull path, which was never reached:
+    # abandonment leaves the product dir untouched. A stale marker riding
+    # an abandoned boot is the playbook's per-boot cleanup to prevent, not
+    # this path's (the bridge comment covers the fresh-dir argument).
+    assert _marker_path(tmp_path).exists()
 
 
 def test_upload_abandoned_when_pod_group_unavailable(
