@@ -84,6 +84,7 @@ def test_runner_installs_cuda_aliases_and_pins_override_surface(
         "prepare_dummy_attn",        # dummy forward 清零 block table，别写脏已交接的块
         "_omni_has_separate_kv_update",
         "_sync_dummy_main_compute_logits",
+        "_init_thinking_budget_state",  # V2 thinking budget 状态挂接（vllm#46727 backport）
         "sample_tokens",             # Scope NPU device APIs over MTP proposal
         "execute_model",             # 在 dummy target forward 后补 lm_head logits
     }, f"NPUModelRunnerV2 覆写面变化，实际定义了: {own}"
@@ -167,7 +168,12 @@ def test_mhc_mm_embedding_width_alignment_guards(
             runner._align_mhc_mm_embedding_width()
 
 
-def test_load_model_aligns_mhc_buffer_after_upstream_load(monkeypatch):
+def test_load_model_runs_post_load_hooks_after_upstream_load(monkeypatch):
+    """mHC 对齐与 thinking budget 挂接都必须在上游 load_model 之后。
+
+    0.25.1 的 V2 Sampler 是在 load_model 里才创建的（它需要 model_state 的
+    ``num_new_sampled_tokens_per_step``），构造期 ``self.sampler`` 还是 None。
+    """
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
     from omni_npu.worker.npu.model_runner import NPUModelRunnerV2
@@ -184,9 +190,37 @@ def test_load_model_aligns_mhc_buffer_after_upstream_load(monkeypatch):
         "_align_mhc_mm_embedding_width",
         lambda: calls.append("align"),
     )
+    monkeypatch.setattr(
+        runner,
+        "_init_thinking_budget_state",
+        lambda: calls.append("thinking_budget"),
+    )
 
     runner.load_model(True, marker="value")
-    assert calls == [((True,), {"marker": "value"}), "align"]
+    assert calls == [((True,), {"marker": "value"}), "thinking_budget", "align"]
+
+
+def test_init_thinking_budget_state_waits_for_the_sampler(monkeypatch):
+    """Sampler 还不存在时安静返回（构造期就是这样），建好后挂上去。"""
+    from omni_npu.worker.npu import thinking_budget as tb
+    from omni_npu.worker.npu.model_runner import NPUModelRunnerV2
+
+    runner = NPUModelRunnerV2.__new__(NPUModelRunnerV2)
+    runner.vllm_config = SimpleNamespace(reasoning_config=None)
+    runner.req_states = SimpleNamespace(max_num_reqs=4)
+
+    # 构造期：sampler 属性还不存在（0.25.1 里 __init__ 置 None）。
+    runner.sampler = None
+    runner._init_thinking_budget_state()
+    assert runner.sampler is None
+
+    state = SimpleNamespace(enabled=True)
+    monkeypatch.setattr(
+        tb, "NPUThinkingBudgetState", lambda req_states, cfg: state
+    )
+    runner.sampler = SimpleNamespace()
+    runner._init_thinking_budget_state()
+    assert runner.sampler.thinking_budget_state is state
 
 
 def test_reshape_kv_cache_routes_backend_and_upstream_groups(monkeypatch):
