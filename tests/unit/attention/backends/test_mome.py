@@ -106,6 +106,7 @@ class TestNPUMomeAttentionMetadataBuilder(unittest.TestCase):
             num_reqs=2,
             query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc.cpu(),
+            num_actual_tokens=int(query_start_loc.cpu()[-1]),
             seq_lens=torch.tensor([1, 0], dtype=torch.int32),
             block_table_tensor=torch.tensor([[42], [43]], dtype=torch.int32),
             max_query_len=1,
@@ -264,6 +265,7 @@ class TestNPUMomeAttentionMetadataBuilder(unittest.TestCase):
             num_reqs=num_reqs,
             query_start_loc=qsl,
             query_start_loc_cpu=qsl,
+            num_actual_tokens=int(qsl[-1]),
             seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
             num_computed_tokens_cpu=torch.zeros(num_reqs, dtype=torch.int32),
         )
@@ -422,6 +424,7 @@ class TestNPUMomeAttentionMetadataBuilder(unittest.TestCase):
             num_reqs=num_reqs,
             query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc.cpu(),
+            num_actual_tokens=int(query_start_loc.cpu()[-1]),
             seq_lens=seq_lens,
             block_table_tensor=block_table,
             max_query_len=3,
@@ -438,6 +441,30 @@ class TestNPUMomeAttentionMetadataBuilder(unittest.TestCase):
         self.assertIsNotNone(meta.block_idx_last_computed_token)
         self.assertEqual(int(meta.block_idx_last_computed_token[0]), 1)
         self.assertEqual(int(meta.block_idx_last_computed_token[1]), 1)
+
+        # A graph-served batch: the per-request tensors move into the
+        # persistent buffers, and the pad rows get a defined request slot and
+        # a span of their own ending at the graph width.
+        builder.graph_max_reqs = 16
+        builder.cache_indices_tensor = torch.zeros(16, 4, dtype=torch.int32)
+        builder._graph_prefill_qsl = torch.zeros(4, dtype=torch.int32)
+        with patch.object(mome_mod, "graph_prefill_width", return_value=8):
+            meta = builder.build(0, common, num_accepted_tokens=num_acc,
+                                 num_prompt_tokens=num_prompt)
+        self.assertEqual(meta.cache_indices.data_ptr(), builder.cache_indices_tensor.data_ptr())
+        self.assertEqual(int(meta.block_idx_last_scheduled_token[num_reqs]), 0)
+        self.assertEqual(meta.query_start_loc.tolist(), [0, 3, 5, 8])
+        self.assertIs(meta.prefill.query_start_loc, meta.query_start_loc)
+
+    def test_build_for_cudagraph_capture_widens_a_prefill_capture(self):
+        builder = mome_mod.NPUMomeAttentionMetadataBuilder.__new__(
+            mome_mod.NPUMomeAttentionMetadataBuilder
+        )
+        builder.build = MagicMock(return_value="prefill")
+        with patch.object(mome_mod, "should_capture_as_prefill", return_value=True), \
+             patch.object(mome_mod, "widen_capture_query_len", return_value="wide"):
+            self.assertEqual(builder.build_for_cudagraph_capture("cm"), "prefill")
+        builder.build.assert_called_once_with(0, "wide")
 
     @patch("omni_npu.attention.backends.mome.split_decodes_and_prefills")
     def test_build_masked_fill_applied(self, mock_split):
@@ -482,6 +509,7 @@ class TestNPUMomeAttentionMetadataBuilder(unittest.TestCase):
             num_reqs=num_reqs,
             query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc.cpu(),
+            num_actual_tokens=int(query_start_loc.cpu()[-1]),
             seq_lens=seq_lens,
             block_table_tensor=block_table,
             max_query_len=3,
@@ -794,7 +822,7 @@ class TestBuilderInit(unittest.TestCase):
 
     It is computed unconditionally (both the prefix-caching and the plain
     branch of the buffer allocation), and the prefix-caching cache-index
-    buffer is shaped ``(decode_cudagraph_max_bs, max_num_blocks)``.
+    buffer is shaped ``(graph_max_reqs, max_num_blocks)``.
     """
 
     @staticmethod
@@ -844,15 +872,16 @@ class TestBuilderInit(unittest.TestCase):
 
         # cdiv(1024, 4) == 256
         self.assertEqual(builder.max_num_blocks, 256)
-        # decode_cudagraph_max_bs = max_num_seqs * (num_spec + 1) = 4
-        self.assertEqual(builder.cache_indices_tensor.shape, (4, 256))
+        # graph_max_reqs = max(max_num_seqs * (num_spec + 1), max_num_seqs + 1) = 5
+        self.assertEqual(builder.graph_max_reqs, 5)
+        self.assertEqual(builder.cache_indices_tensor.shape, (5, 256))
 
     def test_max_num_blocks_exists_without_prefix_caching(self):
         builder = self._init_builder(enable_prefix_caching=False)
 
         self.assertEqual(builder.max_num_blocks, 256)
         # The plain branch allocates a 1-D cache-index buffer.
-        self.assertEqual(builder.cache_indices_tensor.shape, (4,))
+        self.assertEqual(builder.cache_indices_tensor.shape, (5,))
 
 
 def _manual_builder(*, reuse_prefilled_tokens=False):

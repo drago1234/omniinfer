@@ -11,11 +11,20 @@ from vllm.config import VllmConfig, CUDAGraphMode
 from vllm.config.utils import Range
 
 from omni_npu.compilation.decorators import (
-    _bypass_prefill,
+    run_eager,
     _wrap_call,
     patch_compile_decorators,
 )
 import omni_npu.compilation.decorators as decorators_mod
+
+
+def _prefill_cudagraph(enabled):
+    """Flip the P-side prefill-in-graph switch for the duration of a test."""
+    return patch.object(
+        decorators_mod.model_extra_config.operator_opt_config,
+        "enable_prefill_cudagraph",
+        enabled,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -95,53 +104,53 @@ def _support_torch_compile(x):
     return x
 
 @pytest.mark.parametrize(
-    "attn_metadata, cudagraph_runtime_mode, expected_hit",
+    "attn_metadata, cudagraph_runtime_mode, prefill_cudagraph, expected_eager",
     [
-        (None, CUDAGraphMode.FULL, True),
-        ({"0": MagicMock(num_prefills=1)}, CUDAGraphMode.FULL, True),
-        ({"0": MagicMock(num_prefills=0)}, CUDAGraphMode.FULL, False),
-        ({"0": MagicMock(num_prefills=0)}, CUDAGraphMode.NONE, True),
+        # No metadata or a non-FULL mode always falls back, switch or not.
+        (None, CUDAGraphMode.FULL, False, True),
+        (None, CUDAGraphMode.FULL, True, True),
+        ({"0": MagicMock(num_prefills=0, num_decodes=1)}, CUDAGraphMode.NONE, True, True),
+        # Switch off: decode replays, anything with a prefill does not.
+        ({"0": MagicMock(num_prefills=0, num_decodes=1)}, CUDAGraphMode.FULL, False, False),
+        ({"0": MagicMock(num_prefills=1, num_decodes=0)}, CUDAGraphMode.FULL, False, True),
+        ({"0": MagicMock(num_prefills=1, num_decodes=1)}, CUDAGraphMode.FULL, False, True),
+        # Switch on: the captures are prefill-shaped, so only pure prefill replays.
+        ({"0": MagicMock(num_prefills=1, num_decodes=0)}, CUDAGraphMode.FULL, True, False),
+        ({"0": MagicMock(num_prefills=0, num_decodes=1)}, CUDAGraphMode.FULL, True, True),
+        ({"0": MagicMock(num_prefills=1, num_decodes=1)}, CUDAGraphMode.FULL, True, True),
     ]
 )
-def test_bypass_prefill(attn_metadata, cudagraph_runtime_mode, expected_hit):
-    """Test whether bypass compilation is required and proceed with the native forward method."""
-    test_model = TestModel(vllm_config=VllmConfig(), prefix="test")
-    test_tensor = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-
-    with patch("omni_npu.compilation.decorators.get_forward_context") as mock_get_forward_context:
+def test_run_eager(
+    attn_metadata, cudagraph_runtime_mode, prefill_cudagraph, expected_eager
+):
+    """Test which batches skip the compiled call and run the plain forward."""
+    with patch(
+        "omni_npu.compilation.decorators.get_forward_context"
+    ) as mock_get_forward_context, _prefill_cudagraph(prefill_cudagraph):
         mock_get_forward_context.return_value.attn_metadata = attn_metadata
         mock_get_forward_context.return_value.cudagraph_runtime_mode = cudagraph_runtime_mode
 
-        hit, retval = _bypass_prefill(test_model, test_tensor)
-
-        assert hit == expected_hit
-        if expected_hit:
-            assert torch.allclose(retval, test_tensor * 2)
-        else:
-            assert retval is None
+        assert run_eager() == expected_eager
 
 
 @pytest.mark.parametrize(
-    "bypass_result, model_cls, expected",
+    "eager, model_cls",
     [
-        ((True, "bypassed"), TestModel, "bypassed"),
-        ((False, None), TestModelWithTuple, torch.tensor([2.0])),
-        ((False, None), TestModelWithList, torch.tensor([2.0])),
+        (True, TestModel),
+        (False, TestModelWithTuple),
+        (False, TestModelWithList),
     ]
 )
-def test_wrap_call(bypass_result, model_cls, expected):
-    """Test wrap_call bypasses and unwraps single-element outputs correctly."""
+def test_wrap_call(eager, model_cls):
+    """Test wrap_call falls back to forward and unwraps single-element outputs."""
     model = model_cls(vllm_config=VllmConfig(), prefix="test")
     wrapped_call = _wrap_call(type(model).__call__)
     test_tensor = torch.tensor([1.0])
 
-    with patch("omni_npu.compilation.decorators._bypass_prefill", return_value=bypass_result):
+    with patch("omni_npu.compilation.decorators.run_eager", return_value=eager):
         retval = wrapped_call(model, test_tensor)
 
-    if isinstance(expected, torch.Tensor):
-        assert torch.equal(retval, expected.to(retval.device))
-    else:
-        assert retval == expected
+    assert torch.equal(retval, (test_tensor * 2).to(retval.device))
 
 
 def test_wrap_call_returns_original_output_for_non_singleton_sequence():
@@ -151,7 +160,7 @@ def test_wrap_call_returns_original_output_for_non_singleton_sequence():
     model = TestModel(vllm_config=VllmConfig(), prefix="test")
     test_tensor = torch.tensor([1.0])
 
-    with patch("omni_npu.compilation.decorators._bypass_prefill", return_value=(False, None)):
+    with patch("omni_npu.compilation.decorators.run_eager", return_value=False):
         retval = wrapped_call(model, test_tensor)
 
     assert retval == original_call.return_value
@@ -163,7 +172,7 @@ def test_wrap_call_unwraps_nested_single_tensor_list():
     wrapped_call = _wrap_call(original_call)
     model = TestModel(vllm_config=VllmConfig(), prefix="test")
 
-    with patch("omni_npu.compilation.decorators._bypass_prefill", return_value=(False, None)):
+    with patch("omni_npu.compilation.decorators.run_eager", return_value=False):
         retval = wrapped_call(model, torch.tensor([1.0]))
 
     assert torch.equal(retval, torch.tensor([3.0]).to(retval.device))

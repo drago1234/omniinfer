@@ -469,6 +469,9 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
                 self.slot_mapping = torch.tensor([], dtype=torch.long)
                 self.seq_lens = torch.tensor([2, 3], dtype=torch.long)
                 self.slot_mapping_cache = None
+                # With no decodes the prefill spans the whole batch, so the
+                # common tensor and the prefill one hold the same cumlens.
+                self.query_start_loc = torch.tensor([0, 2, 5], dtype=torch.long)
 
         fake_meta = _Meta()
 
@@ -482,6 +485,26 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
             [fake_meta.slot_mapping // 16, fake_meta.slot_mapping % 16], dim=-1
         )
         self.assertTrue(torch.equal(out.get_slot_mapping_2d(), expect_2d))
+
+        # A graph-served batch keeps the persistent cumlens: upstream rebases
+        # them into a fresh tensor, whose address the graph would freeze.
+        with self._metadata_from(b, fake_meta, fake_meta), \
+             patch.object(mla_mod, "graph_prefill_width", return_value=8):
+            out = b.build(common_prefix_len=0, common_attn_metadata=fake_meta, fast_build=False)
+        self.assertEqual(out.prefill_graph_width, 8)
+        self.assertIs(out.prefill.query_start_loc, fake_meta.query_start_loc)
+
+    def test_build_for_cudagraph_capture_follows_the_prefill_switch(self):
+        b = self._new_builder_minimal()
+        b.build = MagicMock(return_value="prefill")
+        with patch.object(mla_mod, "should_capture_as_prefill", return_value=True), \
+             patch.object(mla_mod, "widen_capture_query_len", return_value="wide"):
+            self.assertEqual(b.build_for_cudagraph_capture("cm"), "prefill")
+        b.build.assert_called_once_with(0, "wide")
+        base = mla_mod.NPUDSAMetadataBuilder.__mro__[1]
+        with patch.object(mla_mod, "should_capture_as_prefill", return_value=False), \
+             patch.object(base, "build_for_cudagraph_capture", return_value="decode", create=True):
+            self.assertEqual(b.build_for_cudagraph_capture("cm"), "decode")
 
     def test_build_decode_sets_num_actual_tokens_from_query_start_loc(self):
         b = self._new_builder_minimal()
@@ -544,6 +567,9 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
         common = SimpleNamespace(
             seq_lens=fake_meta.seq_lens,
             query_start_loc_cpu=fake_meta.query_start_loc_cpu,
+            # With no decodes the prefill spans the whole batch, so the common
+            # tensor and the prefill one hold the same cumlens.
+            query_start_loc=fake_meta.prefill.query_start_loc,
         )
         fake_sp = object()
         me = SimpleNamespace(
@@ -608,8 +634,11 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
             slot_mapping=slot_mapping,
             slot_mapping_cache=None,
         )
+        # With no decodes the prefill spans the whole batch, so the common
+        # tensors and the prefill one hold the same cumlens.
         common_metadata = SimpleNamespace(seq_lens=torch.tensor([3, 4], dtype=torch.int64),
-                                          query_start_loc_cpu=prefill.query_start_loc)
+                                          query_start_loc_cpu=prefill.query_start_loc,
+                                          query_start_loc=prefill.query_start_loc)
         cache_fn = object()
         sp_manager = MagicMock()
         sp_manager.init_cp.return_value = object()

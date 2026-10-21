@@ -608,7 +608,12 @@ def test_acl_replay_without_metadata_raises_instead_of_skipping_updates():
     context = SimpleNamespace(attn_metadata=None, batch_descriptor=descriptor,
                               cudagraph_runtime_mode=1)
     namespace.update(time=time, logger=logging.getLogger(__name__), torch=torch,
-                     get_forward_context=lambda: context, CUDAGraphMode=SimpleNamespace(NONE=0))
+                     get_forward_context=lambda: context,
+                     CUDAGraphMode=SimpleNamespace(NONE=0, FULL=1),
+                     model_extra_config=SimpleNamespace(
+                         operator_opt_config=SimpleNamespace(
+                             enable_prefill_cudagraph=False)),
+                     run_eager=lambda: False)
     replay = _function(ROOT / "omni/compilation/acl_graph.py",
                        "__call__", namespace, "ACLGraphWrapper")
     entry = SimpleNamespace(aclgraph=MagicMock(), output=object())

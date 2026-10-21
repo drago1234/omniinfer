@@ -6,6 +6,7 @@ Unit tests for omni_npu.attention.backends.utils module.
 Tests for get_attention_backend, load_plugin_backends, and get_available_backends.
 """
 
+import dataclasses
 import importlib.util
 import sys
 from pathlib import Path
@@ -14,7 +15,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 # Load utils.py directly so we do not import omni_npu.attention.backends.__init__
 # (that pulls attention.py -> torch.npu / NPU runtime, which breaks CPU-only pytest).
@@ -41,6 +42,31 @@ get_available_backends = _utils.get_available_backends
 _load_plugin_backends_map = _utils._load_plugin_backends_map
 _is_plugin_disabled = _utils._is_plugin_disabled
 apply_plugin_overrides = _utils.apply_plugin_overrides
+
+
+class TestPrefillGraphLayoutPredicates:
+    def test_graph_prefill_width_only_accepts_a_captured_width(self):
+        def config(full):
+            return SimpleNamespace(
+                cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: full),
+                cudagraph_capture_sizes=[256, 2048],
+            )
+
+        with patch.object(_utils.model_extra_config.operator_opt_config,
+                          "enable_prefill_cudagraph", True):
+            assert _utils.graph_prefill_width(config(True), 0, 2048) == 2048
+            # A width the dispatcher never padded to has no capture to replay.
+            assert _utils.graph_prefill_width(config(True), 0, 2049) is None
+            assert _utils.graph_prefill_width(config(False), 0, 2048) is None
+
+    def test_widen_capture_query_len_lifts_a_dummy_batch_to_the_width(self):
+        # The dummy batch spreads its tokens over max_num_seqs requests, while
+        # a replay can hand the kernels a span as long as the whole width.
+        batch = dataclasses.make_dataclass(
+            "Batch", ["max_query_len", "num_actual_tokens"])
+        assert _utils.widen_capture_query_len(batch(683, 2048)).max_query_len == 2048
+        wide = batch(2048, 2048)
+        assert _utils.widen_capture_query_len(wide) is wide
 
 
 class TestGetAttentionBackend:

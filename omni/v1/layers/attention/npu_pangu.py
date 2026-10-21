@@ -40,7 +40,11 @@ from omni_npu.v1.layers.linear import (
 )
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.compilation.acl_graph import sk_scope, enable_sk_scope
-from omni_npu.attention.backends.utils import SPManager, DummySPManager, conv_sp
+from omni_npu.attention.backends.utils import (
+    SPManager,
+    DummySPManager,
+    conv_sp,
+)
 from omni_npu.attention.backends.mla import NPUMLADecodeMetadata, NPUMLAPrefillMetadata
 from omni_npu.layers.mome.npu_mome import ColumnParallelMOME
 from omni_npu.layers.attention.npu_sparse_attentions import (
@@ -4846,6 +4850,15 @@ def npu_pangu_forward(
         # so that there are enough tokens to communicate
         enable_attn_sp = self.is_attn_sp_layer and not has_decode
         enable_flashcomm2 = self.is_flashcomm2_layer and not has_decode
+        # CP/SWA-SP/FlashComm2 rebuild their layout from this step's cumlens,
+        # which a graph cannot follow and the builder already omitted. Dropping
+        # them here lets the all-gather below restore the full sequence. The
+        # ena_cp / ena_sp flags themselves stay as configured.
+        prefill_graph_width = getattr(attn_metadata, "prefill_graph_width", None)
+        if prefill_graph_width is not None:
+            enable_cp = False
+            enable_attn_sp = False
+            enable_flashcomm2 = False
 
         # Only skip the global all_gather when the CP/SP/FC2 path will actually run
         # (pure prefill, no decode). Mixed batch and decode paths still need it.
@@ -4853,6 +4866,13 @@ def npu_pangu_forward(
             is_prefill_cp = enable_cp or enable_attn_sp or enable_flashcomm2
             if not is_prefill_cp or (has_decode and has_prefill):
                 hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
+
+        if prefill_graph_width is not None and torch.compiler.is_compiling():
+            # positions is not a dynamic compile dim, so the host int would
+            # freeze the first capture's width. The gathered hidden length is
+            # the dynamic token symbol, which every capture follows.
+            num_actual_tokens = hidden_states.shape[0]
+            attn_metadata.num_actual_tokens = num_actual_tokens
 
         if has_decode and has_prefill:
             prefill_hidden_states, prefill_cos, prefill_sin = self._prepare_phase_inputs(

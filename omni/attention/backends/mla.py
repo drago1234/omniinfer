@@ -44,6 +44,9 @@ from omni_npu.attention.backends.utils import (
     register_attention_backend,
     split_decodes_and_prefills,
     _maybe_padded_raw_tensor_to_strided_caches,
+    graph_prefill_width,
+    should_capture_as_prefill,
+    widen_capture_query_len,
 )
 from omni_npu.model_config.config_loader.loader import model_extra_config
 
@@ -161,6 +164,9 @@ class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
     causal: bool = True
     decode_threshold: int = 1
     slot_mapping_2d: torch.Tensor = None
+    # Capture width a FULL graph would serve this batch at; None keeps a
+    # decode-only or eager batch off the graph path. Set by the builder below.
+    prefill_graph_width = None
 
     def get_slot_mapping_2d(self):
         return None
@@ -218,6 +224,15 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
             num_actual_tokens=num_actual_tokens,
             dcp_tot_seq_lens=dcp_tot_seq_lens_device
         )
+
+    def build_for_cudagraph_capture(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> NPUMLAMetadata:
+        # The base implementation asserts decode-only.
+        if should_capture_as_prefill():
+            return self.build(0, widen_capture_query_len(common_attn_metadata))
+        return super().build_for_cudagraph_capture(common_attn_metadata)
 
     def build(
         self,
@@ -287,8 +302,17 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
             context_lens_cpu = num_computed_tokens_cpu[reqs_start:num_reqs]
             max_context_len_cpu = context_lens_cpu.max().item()
             num_prefills_with_context_cpu = (context_lens_cpu > 0).sum().item()
+            graph_width = graph_prefill_width(
+                self.vllm_config.compilation_config,
+                num_decodes,
+                common_attn_metadata.num_actual_tokens,
+            )
+            # A replay reads this tensor by address, so a batch the graph can
+            # serve keeps the persistent buffer; its rebase is a no-op anyway.
             prefill_query_start_loc = (
-                query_start_loc[reqs_start:] - query_start_loc[reqs_start]
+                query_start_loc
+                if graph_width is not None
+                else query_start_loc[reqs_start:] - query_start_loc[reqs_start]
             )
 
             chunked_context_metadata = None
@@ -505,6 +529,8 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
             decode=decode_metadata,
             causal=common_attn_metadata.causal,
         )
+        if num_prefills > 0:
+            metadata.prefill_graph_width = graph_width
 
         # === NPU-specific post-processing (was previously applied on top of
         #     super().build() in the old override) ===

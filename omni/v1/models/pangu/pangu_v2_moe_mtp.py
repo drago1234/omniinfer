@@ -16,8 +16,9 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dp_group, get_tp_group
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -26,6 +27,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
+from vllm.utils.math_utils import cdiv
 
 from omni_npu.attention.backends.utils import SPManager
 from omni_npu.v1.layers.attention.weight_utils import run_post_weight_load
@@ -128,6 +130,22 @@ class OpenPanguV2MultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
+        # The SP shard's length specializes to the first capture (width / tp),
+        # while positions carries the dynamic full length. Re-slice so the shard
+        # and the all-gathers sized from it track each capture. Only prefill
+        # widths vary, so decode-only graphs keep what they always had.
+        if (
+            self.need_tp_padding
+            and model_extra_config.operator_opt_config.enable_prefill_cudagraph
+            and torch.compiler.is_compiling()
+        ):
+            # cdiv, like SPManager.slice_tokens: floor would drop the last row
+            # of a width that does not divide, and the all-gather would then
+            # rebuild a sequence shorter than the main model's.
+            local = cdiv(positions.shape[-1], get_tp_group().world_size)
+            assert inputs_embeds.shape[0] >= local, (inputs_embeds.shape, local)
+            inputs_embeds = inputs_embeds[:local]
+            previous_hidden_states = previous_hidden_states[:local]
         inputs_embeds = self.enorm(inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
@@ -161,6 +179,44 @@ class OpenPanguV2MultiTokenPredictor(nn.Module):
             }
         )
         self.wrapped_layers = None
+        if (
+            model_extra_config.parall_config.ena_seq_parallel
+            and model_extra_config.operator_opt_config.enable_prefill_cudagraph
+            and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            # A replay reads these shards at their capture-time addresses.
+            # Sized for the widest batch the scheduler can issue, so one address
+            # serves every capture. Decode shards need no pinning: upstream
+            # already hands those to the graph at a stable address. Allocating
+            # them does not commit a forward to using them; _graph_serves_batch
+            # decides that per step, so an eager step keeps the fresh shard.
+            self.compilation_config = vllm_config.compilation_config
+            # Only a graph-served batch is pinned, so the widest capture bounds
+            # the shard. Sizing by max_num_batched_tokens instead would hold 16x
+            # the rows a replay can reach. _pin_sp_shard asserts the fit.
+            graph_tokens = (
+                self.compilation_config.max_cudagraph_capture_size
+                or vllm_config.scheduler_config.max_num_batched_tokens
+            )
+            shard_shape = (
+                cdiv(graph_tokens,
+                     vllm_config.parallel_config.tensor_parallel_size),
+                config.hidden_size,
+            )
+            dtype = vllm_config.model_config.dtype
+            self.register_buffer(
+                "inputs_embeds_shard",
+                torch.empty(shard_shape, dtype=dtype),
+                persistent=False,
+            )
+            self.register_buffer(
+                "previous_hidden_states_shard",
+                torch.empty(shard_shape, dtype=dtype),
+                persistent=False,
+            )
+        else:
+            self.inputs_embeds_shard = None
+            self.previous_hidden_states_shard = None
         self.embed_tokens = NPUVocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -178,6 +234,37 @@ class OpenPanguV2MultiTokenPredictor(nn.Module):
         enable_scatter = model_extra_config.parall_config.ena_seq_parallel
         return self.embed_tokens(input_ids, enable_scatter=enable_scatter)
 
+    def _graph_serves_batch(self) -> bool:
+        """Whether a captured graph will serve this forward.
+
+        Pinning only matters then: outside a graph the fresh shard is read at
+        the address it was just written to. Reads the width the builder stored
+        on the metadata, so the shards and the attention layout see one answer.
+        """
+        attn_metadata = get_forward_context().attn_metadata
+        if not attn_metadata:
+            return False
+        metadata = attn_metadata[next(iter(attn_metadata))]
+        return getattr(metadata, "prefill_graph_width", None) is not None
+
+    @staticmethod
+    def _pin_sp_shard(buf: torch.Tensor, shard: torch.Tensor) -> torch.Tensor:
+        """Copy an SP shard into its persistent buffer before it enters the graph.
+
+        A per-forward shard has a new address every step, and the one seen at
+        capture is unmapped by the empty_cache that follows. The copy also
+        drops the storage offset slice_tokens leaves on its view.
+        """
+        assert (
+            shard.dtype == buf.dtype
+            and shard.shape[1:] == buf.shape[1:]
+            and shard.shape[0] <= buf.shape[0]
+        ), f"SP shard {tuple(shard.shape)} {shard.dtype} does not fit " \
+           f"{tuple(buf.shape)} {buf.dtype}"
+        pinned = buf[: shard.shape[0]]
+        pinned.copy_(shard)
+        return pinned
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -194,6 +281,15 @@ class OpenPanguV2MultiTokenPredictor(nn.Module):
             if inputs_embeds.size(0) == previous_hidden_states.size(0):
                 inputs_embeds = sp_manager.slice_tokens(inputs_embeds)
             previous_hidden_states = sp_manager.slice_tokens(previous_hidden_states)
+            if self.inputs_embeds_shard is not None and self._graph_serves_batch():
+                inputs_embeds = self._pin_sp_shard(self.inputs_embeds_shard, inputs_embeds)
+                previous_hidden_states = self._pin_sp_shard(
+                    self.previous_hidden_states_shard, previous_hidden_states
+                )
+                # A ReduceScatter-ed inputs_embeds has to split the same
+                # width; a graph would hide the mismatch behind the pad rows.
+                assert inputs_embeds.size(0) == previous_hidden_states.size(0), (
+                    inputs_embeds.shape, previous_hidden_states.shape)
         current_step_idx = spec_step_idx % self.num_mtp_layers
 
         if self.wrapped_layers is not None:

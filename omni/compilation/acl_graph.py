@@ -23,7 +23,9 @@ from vllm.logger import logger
 from vllm.platforms import current_platform
 
 from omni_npu.configs import OmniAdditionalConfig
+from omni_npu.compilation.decorators import run_eager
 from omni_npu.compilation.npugraph_ex_config import enable_sk_scope
+from omni_npu.model_config.config_loader.loader import model_extra_config
 
 global_recapture = False
 
@@ -167,6 +169,29 @@ def sk_scope(name: str, active: bool = True):
         torch.npu.super_kernel_scope_end(name)
 
 
+@contextmanager
+def task_queue_level(mode: int):
+    """Temporarily switch the NPU task queue optimization level.
+
+    Level 2 hands op dispatch to a side thread and is meant for the steady-state
+    inference path only, so graph capture runs at level 1 instead. Switching
+    drains every pending NPU operation, which rules this out for hot paths.
+    torch_npu only grows these APIs in recent builds; on older ones the level
+    stays at whatever ``TASK_QUEUE_ENABLE`` set.
+    """
+    get_level = getattr(torch_npu.npu, "get_task_queue_enable", None)
+    set_level = getattr(torch_npu.npu, "set_task_queue_enable", None)
+    origin = None if get_level is None or set_level is None else get_level()
+    if origin is None or origin == mode:
+        yield
+        return
+    set_level(mode)
+    try:
+        yield
+    finally:
+        set_level(origin)
+
+
 class ACLGraphWrapper:
     """Wraps a runnable to add acl graph capturing and replaying ability. And
     provide attribute access to the underlying `runnable` via `__getattr__`.
@@ -285,6 +310,18 @@ class ACLGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
+        if (
+            aclgraph_runtime_mode == CUDAGraphMode.FULL
+            and model_extra_config.operator_opt_config.enable_prefill_cudagraph
+            and run_eager()
+        ):
+            # Captures are prefill-shaped here, and the key cannot tell a
+            # prefill batch from the rest: FULL makes separate_routine()
+            # false, so it carries only the padded token count and a decode
+            # or mixed batch lands on a prefill entry. Same gate the compiled
+            # call uses, which the replay below would otherwise bypass.
+            return self.runnable(*args, **kwargs)
+
         if batch_descriptor not in self.concrete_aclgraph_entries:
             # create a new entry for this batch descriptor
             self.concrete_aclgraph_entries[batch_descriptor] = \
@@ -313,6 +350,17 @@ class ACLGraphWrapper:
             aclgraph = torch.npu.NPUGraph()
 
             with ExitStack() as stack:
+                # Entered before torch.npu.graph so the stream drain the switch
+                # performs lands outside the capture.
+                if (
+                    model_extra_config.operator_opt_config
+                    .enable_prefill_cudagraph
+                ):
+                    # Switching the level drains every pending NPU op, so pay
+                    # that only where a capture can meet level 2: prefill
+                    # captures run on the steady-state inference path, decode
+                    # ones are taken before it is ever raised.
+                    stack.enter_context(task_queue_level(1))
                 if self.aclgraph_options.gc_disable:
                     # during every model forward for piecewise aclgraph
                     # mode, we will capture many pieces of aclgraphs
