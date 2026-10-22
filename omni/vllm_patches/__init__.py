@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # vllm_patches Reference: https://blog.vllm.ai/2025/11/20/vllm-plugin-system.html
+import importlib
 import importlib.util
 import logging
 import os
@@ -155,6 +156,16 @@ manager = PatchManager()
 def apply_patches():
     # auto import and register patches from patches/ only
     auto_import_patches()
+
+    # Load this debug-only wrapper after common/model patches have registered,
+    # so it remains the outermost load_model and _dummy_run call-through chain.
+    if os.getenv("OMNI_NPU_ACCURACY_ALIGNMENT_ENABLE", "False") == "True":
+        module_name = (
+            "omni_npu.diagnostics.accuracy_alignment."
+            "patch_accuracy_alignment"
+        )
+        importlib.import_module(module_name)
+        logger.info("loaded opt-in accuracy-alignment patch from %s", module_name)
 
     manager.apply_patches()
 
