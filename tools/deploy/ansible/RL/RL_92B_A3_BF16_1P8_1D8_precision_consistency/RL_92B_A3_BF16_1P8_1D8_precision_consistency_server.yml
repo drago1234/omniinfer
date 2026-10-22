@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 #
-# RL 场景单机 1P1D（92B BF16），强一致 + 特性全开：MTP、prefix caching、chunked prefill。
+# RL 场景两机 1P1D（每机 16 die，92B BF16），强一致 + 特性全开：MTP、prefix caching、chunked prefill。
 # vLLM 0.25.1 升级后用这套配置逐位核对过 logp：64 条 reasoning 样本 6400 token 与
 # 0.14 版本、以及关掉三个特性的基线全部 bit-exact。
 #
