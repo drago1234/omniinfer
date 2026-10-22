@@ -161,11 +161,6 @@ direct_register_custom_op(
 # of (h_post, h_res, sk_event) so it's a single-slot signal that doesn't
 # collide with None (sync) or torch.npu.Event (already launched).
 _DEFERRED_SINKHORN = object()
-try:
-    # Imported for side effect: registers the torch.ops.custom operators.
-    import omni_custom_ops
-except ImportError as e:
-    logger.warning(f"Failed to import omni_custom_ops: {e}")
 
 
 
