@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
 
 from vllm.distributed import get_tp_group
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from omni_npu.attention.backends.utils import CrossLayerSharedOp
 from omni_npu.model_config.config_loader.loader import model_extra_config
+
+if TYPE_CHECKING:
+    from omni_npu.attention.backends.utils import CrossLayerSharedOp
 
 # Metadata buffer for the FIA that takes the sink logit itself, shared across the
 # layers that drive it exactly as the FIA-sink metadata is.
@@ -93,6 +99,8 @@ class GptOssSinkMixin:
     @staticmethod
     def _reserve_gpt_oss_fia_metadata(callers: tuple) -> None:
         """Reserve a native-sink metadata buffer per caller key."""
+        from omni_npu.attention.backends.utils import CrossLayerSharedOp
+
         global npu_gpt_oss_fia_metadata
         if npu_gpt_oss_fia_metadata is None:
             npu_gpt_oss_fia_metadata = CrossLayerSharedOp(
@@ -124,6 +132,14 @@ class GptOssSinkMixin:
         num_kv_heads = kwargs.pop("num_key_value_heads")
         block_table = kwargs.get("block_table")
         paged = block_table is not None
+        value_dim = kwargs["value"].shape[-1]
+        if paged and kwargs.get("query_rope") is None:
+            # GQA ND: [blocks, block_size, kv_heads * value_dim].
+            # GQA NZ: [blocks, kv_heads, value_dim // nz_dim, block_size, nz_dim].
+            if kwargs["value"].ndim == 3:
+                value_dim //= num_kv_heads
+            elif kwargs["value"].ndim == 5:
+                value_dim *= kwargs["value"].shape[-3]
         stream_limit = torch.npu.get_stream_limit(torch.npu.current_stream())
         meta_data = npu_gpt_oss_fia_metadata(
             {
@@ -131,7 +147,7 @@ class GptOssSinkMixin:
                 "num_heads_q": num_heads,
                 "num_heads_kv": num_kv_heads,
                 "head_dim_qk": kwargs["query"].shape[-1],
-                "head_dim_v": kwargs["value"].shape[-1],
+                "head_dim_v": value_dim,
                 "actual_seq_lengths": query_cumlens,
                 "actual_seq_lengths_kv": kv_lens,
                 "batch_size": block_table.shape[0] if paged else query_cumlens.numel(),
@@ -140,7 +156,7 @@ class GptOssSinkMixin:
                 "next_tokens": kwargs["next_tokens"],
                 "input_layout": "TND",
                 "input_layout_kv": "BnBsH" if paged else "TND",
-                "rope_head_dim": kwargs["query_rope"].shape[-1],
+                "rope_head_dim": kwargs["query_rope"].shape[-1] if kwargs.get("query_rope") is not None else 0,
                 "block_size": kwargs.get("block_size", 0) if paged else 0,
                 "aic_core_num": stream_limit["cube_core_num"],
                 "aiv_core_num": stream_limit["vector_core_num"],
@@ -226,10 +242,16 @@ def npu_gpt_oss_fia_fake(
     sparse_mode: int = 0, block_size: int = 0,
     batch_invariant: bool = False,
 ) -> torch.Tensor:
+    value_dim = value.size(-1)
+    if block_table is not None and query_rope is None:
+        if value.ndim == 3:
+            value_dim //= num_key_value_heads
+        elif value.ndim == 5:
+            value_dim *= value.size(-3)
     if input_layout == "TND_NTD":
-        shape = (num_heads, query.size(0), value.size(-1))
+        shape = (num_heads, query.size(0), value_dim)
     else:
-        shape = (*query.shape[:-1], value.size(-1))
+        shape = (*query.shape[:-1], value_dim)
     return torch.empty(shape, device=query.device, dtype=query.dtype)
 
 

@@ -74,6 +74,14 @@ class PanguV2MoeSpeculativeConfigPatch(VLLMPatch):
 
         archs = getattr(hf_config, "architectures", None) or []
 
+        if hf_config.model_type == "openpangu_v3" and "PanguV3DenseForCausalLM" in archs:
+            hf_config.model_type = "openpangu_mtp"
+            hf_config.update({
+                "n_predict": hf_config.num_nextn_predict_layers,
+                "architectures": ["PanguV3DenseMTPModel"],
+            })
+            return hf_config
+
         if (hf_config.model_type in ("openpangu_v2", "openpangu_v3")
                 and any(a.startswith("PanguUltraMoE") for a in archs)) or is_openpangu_mtp_vl:
             hf_config.model_type = "openpangu_mtp"

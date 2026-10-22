@@ -35,13 +35,15 @@ def create_mock_modules(name: str, pure_mock: bool = False):
 def make_model_extra_config(
     kv_nz: bool = False,
     enable_kv_rmsnorm_rope_cache: bool = False,
-    use_aicpu_fa_tiling: bool = False
+    use_aicpu_fa_tiling: bool = False,
+    use_ai_infra_fa_for_gpt_oss_sink: bool = False,
 ):
     return types.SimpleNamespace(
         operator_opt_config=types.SimpleNamespace(
             kv_nz=kv_nz,
             enable_kv_rmsnorm_rope_cache=enable_kv_rmsnorm_rope_cache,
-            use_aicpu_fa_tiling=use_aicpu_fa_tiling
+            use_aicpu_fa_tiling=use_aicpu_fa_tiling,
+            use_ai_infra_fa_for_gpt_oss_sink=use_ai_infra_fa_for_gpt_oss_sink,
         )
     )
 
@@ -111,6 +113,46 @@ class SinkLenZeroThenNone:
     def __eq__(self, other):
         self.impl.sink_len = None
         return other == 0
+
+
+@pytest.mark.parametrize('window', [None, 512])
+def test_gqa_native_sink_shares_window_key_and_preserves_padded_output(npu_attention_classes, monkeypatch, window):
+    module = npu_attention_classes['attention_module']
+    cls = npu_attention_classes['NPUAttentionBackendImpl']
+    monkeypatch.setattr(module, 'model_extra_config', make_model_extra_config(use_ai_infra_fa_for_gpt_oss_sink=True))
+    monkeypatch.setattr(cls, 'SHARE_MASK_TRIL_SPARSE', torch.zeros(1))
+    reserve = MagicMock()
+    monkeypatch.setattr(cls, '_reserve_gpt_oss_fia_metadata', reserve)
+    monkeypatch.setattr(module, 'get_forward_context', lambda: types.SimpleNamespace(capturing=False))
+    first = cls(4, 8, 8 ** -.5, 2, sliding_window=window, should_recompute_attn_meta=True)
+    later = cls(4, 8, 8 ** -.5, 2, sliding_window=window, should_recompute_attn_meta=False)
+    assert first.metadata_caller == later.metadata_caller == ('gqa', window)
+    assert reserve.call_count == 2
+    q = torch.randn(4, 4, 8)
+    native = MagicMock(return_value=q[:2])
+    monkeypatch.setattr(later, '_apply_gpt_oss_fia_native', native)
+    layer = types.SimpleNamespace(_k_scale_float=1., _v_scale_float=1.)
+    monkeypatch.setattr(module, 'split_decodes_and_prefills', lambda *args, **kwargs: (0, 1, 0, 2))
+    builder = npu_attention_classes['NPUAttentionMetadataBuilder'](
+        types.SimpleNamespace(block_size=128, head_size=8), ['layer'],
+        types.SimpleNamespace(compilation_config=None), torch.device('cpu'))
+    common = types.SimpleNamespace(num_actual_tokens=2, query_start_loc=torch.tensor([0, 2]),
+                                   seq_lens=torch.tensor([10]), block_table_tensor=torch.tensor([[0]]),
+                                   slot_mapping=None, max_query_len=2)
+    metadata = builder.build(0, common)
+    assert metadata.query_start_loc is common.query_start_loc
+    assert metadata.seq_lens is common.seq_lens
+    output = torch.ones_like(q)
+    caches = (torch.zeros(2, 128, 16), torch.zeros(2, 128, 16))
+    later.forward(layer, q, None, None, caches, metadata, output)
+    kwargs, sink, caller, recompute = native.call_args.args
+    assert kwargs['pre_tokens'] == (511 if window else (1 << 31) - 1)
+    assert caller == first.metadata_caller and recompute is False
+    assert kwargs['block_table'] is metadata.block_tables
+    torch.testing.assert_close(output[:2], q[:2])
+    assert torch.count_nonzero(output[2:]) == 0
+    later.forward(layer, q, None, None, caches, None, output)
+    assert torch.count_nonzero(output) == 0
 
 
 @pytest.fixture

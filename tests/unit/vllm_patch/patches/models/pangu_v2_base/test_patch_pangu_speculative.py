@@ -56,6 +56,8 @@ class HFConfig:
             "mtp",
             "OpenPanguV2MTPModel",
         ),
+        ("openpangu_v3", ["PanguV3DenseForCausalLM"], "high_throughout",
+         "openpangu_mtp", "PanguV3DenseMTPModel"),
     ],
 )
 def test_pangu_speculative_model_mapping(

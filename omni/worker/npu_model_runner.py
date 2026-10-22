@@ -440,6 +440,29 @@ class NPUModelRunner(GPUModelRunner):
         """Public iterator over KV cache groups with attention backends."""
         yield from self._kv_cache_spec_attn_group_iterator()
 
+    def _allocate_kv_cache_tensors(
+        self, kv_cache_config: KVCacheConfig
+    ) -> dict[str, torch.Tensor]:
+        tensors = super()._allocate_kv_cache_tensors(kv_cache_config)
+        if (
+            self.vllm_config.kv_transfer_config is not None
+            and model_extra_config.operator_opt_config.use_ai_infra_fa_for_gpt_oss_sink
+        ):
+            # HCCL IPC export requires 2 MiB alignment for these KV buffers.
+            alignment = 2 * 1024 * 1024
+            for tensor in tensors.values():
+                if tensor.data_ptr() % alignment:
+                    backing = torch.empty(
+                        tensor.numel() + alignment - 1,
+                        dtype=tensor.dtype, device=tensor.device,
+                    )
+                    offset = -backing.data_ptr() % alignment
+                    aligned = backing[offset:offset + tensor.numel()]
+                    aligned.copy_(tensor)
+                    # Preserve aliases for layers sharing the same raw tensor.
+                    tensor.set_(aligned)
+        return tensors
+
     def _reshape_kv_cache_tensors(
         self,
         kv_cache_raw_tensors: dict[str, torch.Tensor],

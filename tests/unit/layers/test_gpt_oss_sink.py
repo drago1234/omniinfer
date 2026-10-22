@@ -145,6 +145,7 @@ def test_apply_gpt_oss_fia_native_translates_fia_sink_kwargs(paged, batch_invari
     op = MagicMock(return_value=torch.zeros(2, 3, 5))
     with patch.object(sink_mod.model_extra_config.operator_opt_config, "use_batch_invariant_op", batch_invariant), \
          patch.object(sink_mod, "npu_gpt_oss_fia_metadata", meta), \
+         patch.object(torch.npu, "current_stream", return_value=None), \
          patch.object(torch.npu, "get_stream_limit",
                       return_value={"cube_core_num": 24, "vector_core_num": 48}), \
          patch.object(torch.ops.vllm, "npu_gpt_oss_fia", op, create=True):
@@ -170,7 +171,7 @@ def test_reserve_gpt_oss_fia_metadata_creates_then_extends():
     with patch.object(torch.ops.custom, "npu_ai_infra_flash_attention_metadata",
                       MagicMock(), create=True), \
          patch.object(sink_mod, "npu_gpt_oss_fia_metadata", None), \
-         patch.object(sink_mod, "CrossLayerSharedOp") as ctor:
+         patch("omni_npu.attention.backends.utils.CrossLayerSharedOp") as ctor:
         GptOssSinkMixin._reserve_gpt_oss_fia_metadata((("decode", 511),))
         ctor.assert_called_once()
         assert ctor.call_args.kwargs["callers"] == (("decode", 511),)
@@ -207,3 +208,26 @@ def test_npu_gpt_oss_fia_forwards_to_the_sink_capable_kernel(batch_invariant):
     assert op.call_args.kwargs["sinks"].shape == (2,)
     assert op.call_args.kwargs["num_heads"] == 2 and op.call_args.kwargs["block_size"] == 8
     assert op.call_args.kwargs["batch_invariant"] is batch_invariant
+
+
+@pytest.mark.parametrize("nz", [False, True])
+def test_gqa_sink_metadata_and_fake_shape_preserve_per_head_value_dim(nz):
+    cache = torch.zeros((2, 2, 1, 128, 16) if nz else (2, 128, 32))
+    q, lengths, table = torch.zeros(3, 4, 16), torch.tensor([3]), torch.tensor([[0]])
+    args = dict(query=q, key=cache, value=cache, num_query_heads=4,
+                num_key_value_heads=2, input_layout="TND", block_table=table,
+                block_size=128, sparse_mode=4, pre_tokens=511, next_tokens=0,
+                actual_seq_qlen=lengths, actual_seq_kvlen=lengths)
+    metadata, kernel = MagicMock(return_value=torch.zeros(1024)), MagicMock(return_value=q)
+    with patch.object(sink_mod, "npu_gpt_oss_fia_metadata", metadata), \
+         patch.object(torch.npu, "current_stream", return_value=None), \
+         patch.object(torch.npu, "get_stream_limit", return_value={"cube_core_num": 24, "vector_core_num": 48}), \
+         patch.object(torch.ops.vllm, "npu_gpt_oss_fia", kernel):
+        out = GptOssSinkMixin._apply_gpt_oss_fia_native(args, torch.zeros(4), ("gqa", 512), False)
+    assert out is q
+    assert metadata.call_args.args[0]["head_dim_v"] == 16
+    assert metadata.call_args.args[0]["rope_head_dim"] == 0
+    assert metadata.call_args.args[1:] == (False, ("gqa", 512))
+    fake = npu_gpt_oss_fia_fake(q, cache, cache, torch.zeros(1), lengths, lengths,
+                               torch.zeros(4), 4, 2, block_table=table)
+    assert fake.shape == q.shape

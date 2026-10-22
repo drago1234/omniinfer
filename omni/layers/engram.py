@@ -965,8 +965,11 @@ class NgramHashState(nn.Module):
         starts = metadata.query_start_loc
         num_reqs = starts.numel() - 1
         slots = metadata.slot_mapping[:num_tokens]
-        blocks = [part.block_table for part in (metadata.decode, metadata.prefill) if part is not None]
-        block_table = blocks[0] if len(blocks) == 1 else torch.cat(blocks, dim=0)
+        if hasattr(metadata, "block_tables"):
+            block_table = metadata.block_tables
+        else:
+            blocks = [part.block_table for part in (metadata.decode, metadata.prefill) if part is not None]
+            block_table = blocks[0] if len(blocks) == 1 else torch.cat(blocks, dim=0)
         if lookback_token_ids is None:
             lookback_token_ids = input_ids.new_full((num_reqs, self.layout.max_ngram_size - 1), -1)
         lookbacks = lookback_token_ids[:num_reqs]
