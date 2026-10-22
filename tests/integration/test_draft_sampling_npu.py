@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Real-NPU checks for draft sampling, RNG, output lifetime and numerical edges."""
+import os
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+pytest.importorskip("torch_npu")
 
 from omni_npu.sample.ops import draft_sampling as ds
 from omni_npu.sample.rejection_sampler import compute_probs
@@ -12,6 +15,16 @@ from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.vllm_patches.patches.common.patch_eagle import EagleProposerPatch
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.llm_base_proposer import compute_probs_and_sample_next_token
+
+
+pytestmark = [pytest.mark.integration, pytest.mark.npu]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def npu_device():
+    if not torch.npu.is_available():
+        pytest.skip("NPU required")
+    torch.npu.set_device(int(os.environ.get("OMNI_TEST_NPU_DEVICE", "0")))
 
 
 def entrypoint():
