@@ -3232,6 +3232,177 @@ class TestDPLMHeadHelpers:
         (arg,), _ = runner.model.compute_logits.call_args
         torch.testing.assert_close(arg, hidden)
 
+    # ------------------------------------------------------------------
+    # msprobe precision debugger (_start_dump_data / _finalize_dump_data)
+    # ------------------------------------------------------------------
+    # These use bare objects (object.__new__) to avoid re-running the heavy
+    # __init__, and inject mock debuggers directly — same pattern as
+    # test_iter_aclgraph_wrappers above.
+
+    def test_start_dump_data_noop_when_disabled(self):
+        runner = object.__new__(NPUModelRunner)
+        runner.debugger = None
+        runner._debugger_started = False
+        # Must not raise even though there is no model attribute.
+        runner._start_dump_data()
+        assert runner._debugger_started is False
+
+    def test_start_dump_data_noop_when_already_started(self):
+        runner = object.__new__(NPUModelRunner)
+        debugger = MagicMock()
+        runner.debugger = debugger
+        runner._debugger_started = True
+
+        runner._start_dump_data()
+
+        debugger.start.assert_not_called()
+        assert runner._debugger_started is True
+
+    def test_start_dump_data_starts_debugger_once(self):
+        runner = object.__new__(NPUModelRunner)
+        debugger = MagicMock()
+        runner.debugger = debugger
+        runner._debugger_started = False
+        runner.model = MagicMock()
+
+        runner._start_dump_data()
+
+        debugger.start.assert_called_once_with(runner.model)
+        assert runner._debugger_started is True
+
+    def test_finalize_dump_data_noop_when_disabled(self):
+        runner = object.__new__(NPUModelRunner)
+        runner.debugger = None
+        runner._debugger_started = True  # even if "started", disabled wins
+        runner._finalize_dump_data()
+        # No exception, no attribute access beyond the guard.
+
+    def test_finalize_dump_data_noop_when_not_started(self):
+        runner = object.__new__(NPUModelRunner)
+        debugger = MagicMock()
+        runner.debugger = debugger
+        runner._debugger_started = False
+
+        runner._finalize_dump_data()
+
+        debugger.stop.assert_not_called()
+        debugger.step.assert_not_called()
+
+    def test_finalize_dump_data_stops_stop_capable_debugger(self):
+        """Eager PrecisionDebugger has stop(): finalize stops then steps."""
+        runner = object.__new__(NPUModelRunner)
+        debugger = MagicMock()
+        debugger.stop = MagicMock()
+        runner.debugger = debugger
+        runner._debugger_started = True
+
+        runner._finalize_dump_data()
+
+        debugger.stop.assert_called_once_with()
+        assert runner._debugger_started is False
+        debugger.step.assert_called_once_with()
+
+    def test_finalize_dump_data_steps_graph_debugger_without_stop(self):
+        """AclGraphDumper has no stop(): finalize keeps started, still steps."""
+        runner = object.__new__(NPUModelRunner)
+        # A debugger WITHOUT a stop attribute (graph-mode AclGraphDumper).
+        debugger = MagicMock()
+        del debugger.stop  # remove the auto-generated stop mock
+        runner.debugger = debugger
+        runner._debugger_started = True
+
+        runner._finalize_dump_data()
+
+        # No stop attribute -> _debugger_started stays True, step still called.
+        assert runner._debugger_started is True
+        debugger.step.assert_called_once_with()
+
+    def test_execute_model_calls_start_and_finalize(self, monkeypatch):
+        """execute_model wraps super() with start/finally finalize in order."""
+        runner = object.__new__(NPUModelRunner)
+        debugger = MagicMock()
+        debugger.stop = MagicMock()
+        runner.debugger = debugger
+        runner._debugger_started = False
+        runner.model = MagicMock()
+        runner.use_async_scheduling = False
+        # drafter attr is deleted in the happy path; pre-set it so the
+        # ``if self.drafter is None: del self.drafter`` branch is exercised
+        # without raising AttributeError.
+        runner.drafter = MagicMock()
+
+        expected_output = SimpleNamespace()
+        monkeypatch.setattr(
+            GPUModelRunner,
+            "execute_model",
+            lambda self, scheduler_output, intermediate_tensors=None: expected_output,
+        )
+        monkeypatch.setattr(torch.npu, "current_device", lambda: "npu:0")
+
+        out = runner.execute_model("sched_out", intermediate_tensors=None)
+
+        assert out is expected_output
+        debugger.start.assert_called_once_with(runner.model)
+        debugger.stop.assert_called_once_with()
+        debugger.step.assert_called_once_with()
+        assert runner._debugger_started is False
+
+    def test_execute_model_finalizes_on_exception(self, monkeypatch):
+        """finally still runs _finalize_dump_data when super() raises."""
+        runner = object.__new__(NPUModelRunner)
+        debugger = MagicMock()
+        debugger.stop = MagicMock()
+        runner.debugger = debugger
+        runner._debugger_started = True  # simulate an already-open window
+        runner.model = MagicMock()
+        runner.use_async_scheduling = False
+        runner.drafter = MagicMock()
+
+        def boom(self, scheduler_output, intermediate_tensors=None):
+            raise RuntimeError("forward failed")
+
+        monkeypatch.setattr(GPUModelRunner, "execute_model", boom)
+        monkeypatch.setattr(torch.npu, "current_device", lambda: "npu:0")
+
+        with pytest.raises(RuntimeError, match="forward failed"):
+            runner.execute_model("sched_out")
+
+        # The window was opened (started=True going in), so finalize must
+        # still stop + step even though super() raised.
+        debugger.stop.assert_called_once_with()
+        debugger.step.assert_called_once_with()
+        assert runner._debugger_started is False
+
+    def test_init_builds_debugger_none_when_no_dump_config(self, monkeypatch):
+        """Default config (no dump_config) -> debugger is None, zero cost.
+
+        This guards against build_debugger accidentally importing msprobe
+        on the disabled path, which would break every existing init test.
+        """
+        # Spy on build_debugger to confirm it was called with a None path.
+        import omni_npu.worker.npu_model_runner as runner_mod
+        captured = {}
+
+        real_build = runner_mod.build_debugger
+
+        def spy_build(path, *, use_graph):
+            captured["path"] = path
+            captured["use_graph"] = use_graph
+            return real_build(path, use_graph=use_graph)
+
+        monkeypatch.setattr(runner_mod, "build_debugger", spy_build)
+
+        # Build a full runner from a default config locally — this class has
+        # no class-level vllm_cfg/npu_device fixtures (its other tests use
+        # object.__new__ to skip __init__ entirely).
+        vllm_cfg = create_vllm_config()
+        npu_device = torch.device("npu:0")
+        runner = NPUModelRunner(vllm_cfg, npu_device)
+
+        assert captured["path"] is None
+        assert runner.debugger is None
+        assert runner._debugger_started is False
+
 
 class TestSlotMappingReqIndices:
 
