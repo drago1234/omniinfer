@@ -20,6 +20,7 @@
         "control_accept_rate": -1,
         "use_prefetch": true,
         "attn_prefetch": 96,
-        "enable_dsa": true
+        "enable_dsa": true,
+        "ascend_operator_fusion_pass_set": "InplaceAddRmsNormFusionPass:off"
     }
 }
