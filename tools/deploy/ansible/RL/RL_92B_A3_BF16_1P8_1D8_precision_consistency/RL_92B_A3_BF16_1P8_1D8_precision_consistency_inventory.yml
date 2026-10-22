@@ -1,16 +1,18 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 
-# 单机 1P1D（16 chip）：P 占卡 0-7（TP=8，1 个 API server），
-# D 占卡 8-15（TP=1 DP=8，8 个 API server）。
+# 两机 1P1D（每机 16 die）：P 使用一台机器的 16 die（TP=16，1 个 API server），
+# D 使用另一台机器的 16 die（TP=1 DP=16，16 个 API server）。
 # role 固定给启动器传 --use-inventory-devices 1，按这里的物理卡号逐 server 切片，
-# 所以同机 P/D 不会抢卡。
+# 所以 D 的 16 个 API server 分别使用本机的 16 个 die。
 
 all:
   vars:
     ansible_user: root
     ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
     # ansible_ssh_private_key_file: /path/to/key.pem  # Private key path on the executor
-    single_node_ip: "127.0.0.1"
+    # 部署前分别替换为 P、D 两台机器可相互访问的真实 IP；不可使用回环地址。
+    prefill_node_ip: "127.0.0.1"
+    decode_node_ip: "127.0.0.2"
     global_port_base: 8000
     base_api_port: 9000
     proxy_port: 7000
@@ -22,29 +24,29 @@ all:
     P:
       hosts:
         p0:
-          ansible_host: "{{ single_node_ip }}"
-          host_ip: "{{ single_node_ip }}"
+          ansible_host: "{{ prefill_node_ip }}"
+          host_ip: "{{ prefill_node_ip }}"
           node_rank: 0
           kv_rank: 0
           node_port: "{{ global_port_base + port_offset.P + kv_rank }}"
           api_port: "{{ base_api_port + port_offset.P + kv_rank }}"
-          ascend_rt_visible_devices: "0,1,2,3,4,5,6,7"
+          ascend_rt_visible_devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
 
     D:
       hosts:
         d0:
-          ansible_host: "{{ single_node_ip }}"
-          host_ip: "{{ single_node_ip }}"
+          ansible_host: "{{ decode_node_ip }}"
+          host_ip: "{{ decode_node_ip }}"
           node_rank: 0
           node_port: "{{ global_port_base + port_offset.D }}"
           api_port: "{{ base_api_port + port_offset.D + node_rank }}"
-          ascend_rt_visible_devices: "8,9,10,11,12,13,14,15"
+          ascend_rt_visible_devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
 
     C:
       hosts:
         c0:
-          ansible_host: "{{ single_node_ip }}"
-          host_ip: "{{ single_node_ip }}"
+          ansible_host: "{{ prefill_node_ip }}"
+          host_ip: "{{ prefill_node_ip }}"
           node_rank: 0
           node_port: "{{ proxy_port + node_rank }}"
           role: "C"
