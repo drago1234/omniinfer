@@ -487,12 +487,12 @@ requires_npu = pytest.mark.skipif(not _npu_available(), reason="NPU is unavailab
 def _npu_sampling_available() -> bool:
     if not _npu_available():
         return False
-    from omni_npu.worker.npu import sampler
+    from omni_npu.worker.npu.ops.gumbel import _gumbel_sample_kernel
 
     # Some UT shards run with vLLM's no-Triton fallback.  In that fallback
     # @triton.jit is an identity decorator, so the kernel is a plain function
     # and cannot be launched with kernel[grid](...).
-    return hasattr(sampler._gumbel_sample_kernel, "__getitem__")
+    return hasattr(_gumbel_sample_kernel, "__getitem__")
 
 
 requires_npu_sampling = pytest.mark.xfail(
@@ -675,11 +675,10 @@ def test_gumbel_sample_processed_logits():
 
 @requires_npu
 def test_apply_top_k_top_p_mask_layout():
-    """NPU apply_top_k_top_p（PyTorch sort）mask 布局与 numpy sort oracle 一致。
+    """核对 CANN top-k/top-p 在无边界并列值时的过滤 mask。
 
-    上游 Qrita Triton kernel 在 triton-ascend 3.2.2 编译失败，omni setattr 强制走
-    PyTorch sort。本测试直接调 omni 注入版，验证三种 case 的 mask 布局（哪些位置变 -inf）
-    与 numpy fp64 sort oracle 完全一致——top-k/top-p 是纯过滤，mask 布局是正确性核心。
+    与 NumPy FP64 sort oracle 比较 top-k、top-p 及逐请求组合参数。
+    并列值和 p=1 下溢尾部的 CANN 语义另由 test_mrv2_topk_topp_npu 覆盖。
     """
     import numpy as np
     import torch
