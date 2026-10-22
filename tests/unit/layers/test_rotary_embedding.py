@@ -696,3 +696,41 @@ def test_forward_oot_key_none_matches_reference(default_vllm_config, layer_facto
 
     assert out_k is None
     assert torch.allclose(out_q, exp_q, atol=1e-4, rtol=1e-4)
+
+
+def test_forward_oot_partial_rotary_production_shape_matches_reference(
+    default_vllm_config,
+):
+    """Partial-rotary fused path (rotary_dim < 64) must match the pure-PyTorch
+    reference on the production shape (rotary_dim=32, head_size=128, 16-head GQA).
+    """
+    device = _require_npu()
+    torch.manual_seed(6)
+    layer = NPURotaryEmbedding(
+        head_size=128,
+        rotary_dim=32,
+        max_position_embeddings=512,
+        base=10000,
+        is_neox_style=True,
+        dtype=torch.float32,
+    ).to(device)
+    num_tokens = 5
+    num_q_heads = 16
+    num_kv_heads = 2
+    positions = torch.tensor([0, 7, 64, 129, 300], device=device)
+    query = torch.randn((num_tokens, num_q_heads * 128), device=device)
+    key = torch.randn((num_tokens, num_kv_heads * 128), device=device)
+    query_ref = query.clone()
+    key_ref = key.clone()
+
+    out_q, out_k = layer.forward_oot(positions, query, key)
+    exp_q, exp_k = _reference_forward_partial_dim(layer, positions, query_ref, key_ref)
+
+    assert out_q.shape == query.shape
+    assert out_k.shape == key.shape
+    assert torch.allclose(out_q, exp_q, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(out_k, exp_k, atol=1e-4, rtol=1e-4)
+    # Pass-through dims must be untouched by the fused path.
+    q_view = out_q.view(num_tokens, num_q_heads, 128)
+    exp_view = exp_q.view(num_tokens, num_q_heads, 128)
+    assert torch.equal(q_view[..., 32:], exp_view[..., 32:])

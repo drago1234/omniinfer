@@ -191,6 +191,16 @@
         }
     },
     {
+        "model": "pangu-2B",
+        "hardware": "A2",
+        "precision": "bf16",
+        "configs":{
+            "hybrid": {
+                "config_file": "openpangu/openpangu_dense.json"
+            }
+        }
+    },
+    {
         "model": "pangu-7B",
         "hardware": "A2",
         "precision": "bf16",
