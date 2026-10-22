@@ -1,5 +1,5 @@
 {
-  "name": "opensource_92B_DSA_A2_INT8_1P4_1D4",
+  "name": "opensource_92B_DSA_A2_INT8_1P4_1D4-copy-4171",
   "version": "1.0.0",
   "description": "",
   "type": "REAL_TIME",
@@ -7,9 +7,11 @@
   "group_configs": [
     {
       "advanced_config": {
+        "custom_metrics_path": "",
         "deploy_timeout_minutes": 60,
         "dynamic_routing_enable": false,
         "ems_enable": false,
+        "mooncake_enable": false,
         "port": 7710,
         "protocol": "HTTP",
         "service_secret": {
@@ -36,7 +38,7 @@
         "source": "EFS",
         "mount_path": "/mnt/",
         "efs_sub_path": "/",
-        "read_only": true,
+        "read_only": false,
         "host_cache": false,
         "source_id": "126f3932-99e6-11f1-b6c6-fa165115aea8",
         "os_warm_up": false
@@ -48,7 +50,7 @@
       "system_log_dump_enable": false,
       "unit_configs": [
         {
-          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/deploy/model_arts\n\nexport PYTHONHASHSEED=1234\nexport log_level_proxy=info\nexport core_num=4\nexport start_core_index=16\nexport pd_policy=sequential\nexport max_num_batched_tokens=100000\n\nTORCH_DEVICE_BACKEND_AUTOLOAD=0 bash \"${SCRIPT_PATH}/proxy.sh\" \\\n  --omni-proxy-max-batch-num-token 100000 \\\n  --omni-proxy-prefill-max-num-seqs 32 \\\n  --omni-proxy-decode-max-num-seqs 4 &&\n\nexport TASK_QUEUE_ENABLE=2\nexport HCCL_BUFFSIZE=20\nexport gpu_util=0.85\nexport max_num_seqs=32\nexport max_num_batched_tokens=16384\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_p_open.json\"\nexport kv_transfer_config='{\"kv_buffer_device\":\"npu\",\"kv_connector\":\"LLMDataDistConnector\",\"kv_parallel_size\":1,\"kv_role\":\"kv_producer\",\"kv_rank\":0}'\n\nbash \"${SCRIPT_PATH}/prefill.sh\" \\\n  --block-size 128 \\\n  --mamba-block-size 128 \\\n  --enable-prefix-caching \\\n  --enable-chunked-prefill \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --enable-prompt-tokens-details \\\n  --scheduling-policy priority \\\n  --additional-config '{\"enable_low_latency\":true}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' \\\n  --enforce-eager && sleep infinity",
+          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/deploy/model_arts\n\nexport PYTHONHASHSEED=1234\nexport log_level_proxy=info\nexport core_num=4\nexport start_core_index=16\nexport pd_policy=sequential\n\nTORCH_DEVICE_BACKEND_AUTOLOAD=0 bash \"${SCRIPT_PATH}/proxy.sh\" \\\n  --log-level info \\\n  --core-num 4 \\\n  --start-core-index 16 \\\n  --subrequest-output-buffer-size 10M \\\n  --omni-proxy-pd-policy sequential \\\n  --omni-proxy-max-batch-num-token 100000 \\\n  --omni-proxy-prefill-max-num-seqs 4 \\\n  --omni-proxy-decode-max-num-seqs 3 &&\n\nexport OMNI_NPU_USE_DEVICE_COMM_A2A=1\nexport TASK_QUEUE_ENABLE=2\nexport HCCL_BUFFSIZE=100\nexport HCCL_OP_EXPANSION_MODE=\"AIV\"\nexport HCCL_CONNECT_TIMEOUT=1800\nexport HCCL_EXEC_TIMEOUT=1800\nexport HCCL_OP_RETRY_ENABLE=\"L0:0,L1:0,L2:0\"\nexport ASCEND_GLOBAL_LOG_LEVEL=3\nexport OMNI_PIGGYBACK_INPUT_IDS=1\nexport OMNI_SKIP_DECODE_TOKENIZE=0\nexport VLLM_MQ_MAX_CHUNK_BYTES_MB=100\nexport VLLM_PLUGINS=\"omni-npu,omni_pangu_models,omni_npu_patches,omni_custom_models\"\nexport OMNI_HYBRID_ATTN_GROUP_SIZE=17\nexport OMNI_VLLM_PATCHES_DIR=\"pangu_v2_hybrid, pangu_v2_moe\"\nexport OMNI_VLLM_PATCHES=\"ALL\"\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_p_open.json\"\nexport OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1\nexport TORCH_COMPILE_DISABLE=1\nexport PYTORCH_NPU_ALLOC_CONF=expandable_segments:True\nexport gpu_util=0.85\nexport max_num_seqs=12\nexport max_num_batched_tokens=16384\nexport kv_offload=false\nexport hugepage_enabled=true\nexport cpu_bytes_to_use=858993459200\n\nbash \"${SCRIPT_PATH}/prefill.sh\" \\\n  --block-size 128 \\\n  --mamba-block-size 128 \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --max-num-batched-tokens 16384 \\\n  --enable-expert-parallel \\\n  --max-num-seqs 12 \\\n  --enable-prefix-caching \\\n  --enable-chunked-prefill \\\n  --dtype bfloat16 \\\n  --enforce-eager \\\n  --kv-cache-dtype li_int8_ds_mla \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --enable-lopt --lopt-pool-size 16 \\\n  --lopt-chunk-size 4096 \\\n  --enable-log-requests --enable-log-outputs --enable-logging-iteration-details \\\n  --reasoning-config '{\"reasoning_start_str\":\"<think>\",\"reasoning_end_str\":\"</think>\",\"ban_sequence_end_in_thinking\":true}' \\\n  --max-model-len 524288 \\\n  --additional-config '{\"enable_low_latency\": true}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity\n",
           "codes": [],
           "count": 1,
           "custom_spec": {
@@ -62,27 +64,37 @@
           },
           "dumps": [],
           "envs": {
-            "MODEL_PATH": "/mnt/s3-asset-g-wl-infra-infer-exp/rk/ckpt/openPangu_2.0_Flash_INT8/global_step_26-iterative-int8-0626/",
-            "MODEL_NAME": "pangu_ultra_moe",
+            "MODEL_PATH": "/mnt/bucket-910c-6055/s00562949/models/openPangu_2.0_Flash_INT8/global_step_26-iterative-int8-0626/",
+            "MODEL_NAME": "pangu-v2-92b",
             "PREFILL_INSTANCE_NUM": "1",
             "DECODE_INSTANCE_NUM": "1",
-            "npu": "4",
             "PROXY_PORT": "7710",
-            "ENABLE_OMNI_CACHE": "0",
-            "dtype": "bfloat16",
-            "max_model_len": "524288",
+            "OMNI_NPU_USE_DEVICE_COMM_A2A": "1",
             "VLLM_DISABLE_PYNCCL": "1",
             "HCCL_CONNECT_TIMEOUT": "1800",
             "HCCL_EXEC_TIMEOUT": "1800",
             "HCCL_OP_RETRY_ENABLE": "L0:0,L1:0,L2:0",
-            "HCCL_OP_EXPANSION_MODE": "AIV",
             "ASCEND_GLOBAL_LOG_LEVEL": "3",
-            "VLLM_PLUGINS": "omni-npu,omni_npu_patches,omni_custom_models",
+            "OMNI_PIGGYBACK_INPUT_IDS": "1",
+            "OMNI_SKIP_DECODE_TOKENIZE": "0",
+            "VLLM_MQ_MAX_CHUNK_BYTES_MB": "100",
+            "VLLM_PLUGINS": "omni-npu,omni_pangu_models,omni_npu_patches,omni_custom_models",
             "OMNI_HYBRID_ATTN_GROUP_SIZE": "17",
-            "OMNI_VLLM_PATCHES_DIR": "pangu_v2_hybrid,pangu_v2_moe",
+            "OMNI_VLLM_PATCHES_DIR": "pangu_v2_hybrid, pangu_v2_moe",
             "OMNI_VLLM_PATCHES": "ALL",
+            "OMNI_PANGU_TOOL_CALL_ENDS_THINKING": "1",
             "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
-            "OMNI_NPU_USE_DEVICE_COMM_A2A": "1"
+            "LOG_PATH": "/home/ma-user/",
+            "LOG_PATH_PROXY": "/home/ma-user/",
+            "PROFILE_DIR": "/home/ma-user/",
+            "hugepage_enabled": "true",
+            "npu": "4",
+            "HCCL_BUFFSIZE": "100",
+            "HCCL_OP_EXPANSION_MODE": "AIV",
+            "TASK_QUEUE_ENABLE": "2",
+            "TORCH_COMPILE_DISABLE": "1",
+            "kv_offload": "false",
+            "cpu_bytes_to_use": "858993459200"
           },
           "files": [],
           "group_count": 1,
@@ -90,7 +102,7 @@
             "category": "CPU",
             "id": "8ee7aa0f-502f-11f1-aca0-0255ac10016a",
             "source": "SWR_PRO",
-            "swr_path": "swr-aifm-exp-z7c82y.swr-pro.myhuaweicloud.com/aifm.infra.pipeline/ai-infra-infer-1.0.3-a2-arm-develop-202609050943-daily:0.0.1"
+            "swr_path": "swr-aifm-exp-z7c82y.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a2-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.1-omni_master-vllm-202610150031:0.0.1"
           },
           "models": [],
           "name": "prefill",
@@ -103,7 +115,7 @@
           }
         },
         {
-          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/deploy/model_arts\n\nexport TASK_QUEUE_ENABLE=1\nexport HCCL_BUFFSIZE=1000\nexport gpu_util=0.85\nexport max_num_seqs=4\nexport ENABLE_DP_LB=false\nexport VLLM_DATA_PARALLEL_EXTERNAL_LB=false\nexport TORCH_COMPILE_DISABLE=1\nexport VLLM_CACHE_ROOT=\"./graph_cache\"\nexport VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY=False\nexport VLLM_TORCH_PROFILER_WITH_STACK=False\nexport VLLM_TORCH_PROFILER_WITH_FLOPS=False\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_d_open.json\"\nexport kv_transfer_config='{\"kv_buffer_device\":\"npu\",\"kv_connector\":\"LLMDataDistConnector\",\"kv_parallel_size\":1,\"kv_role\":\"kv_consumer\"}'\n\nbash \"${SCRIPT_PATH}/decode.sh\" \\\n  --block-size 128 \\\n  --mamba-block-size 128 \\\n  --enable-prefix-caching \\\n  --enable-chunked-prefill \\\n  --distributed-executor-backend mp \\\n  --compilation-config '{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[16],\"backend\":\"\",\"compile_sizes\":[16]}' \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --enable-prompt-tokens-details \\\n  --scheduling-policy priority \\\n  --additional-config '{\"enable_low_latency\":true,\"npugraph_ex_config\":{\"enable\":true,\"super_kernel_optimize\":false,\"static_kernel_compile\":false}}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity",
+          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/deploy/model_arts\n\nexport OMNI_NPU_USE_DEVICE_COMM_A2A=1\nexport TASK_QUEUE_ENABLE=1\nexport HCCL_BUFFSIZE=1200\nexport HCCL_OP_EXPANSION_MODE=\"AI_CPU\"\nexport HCCL_CONNECT_TIMEOUT=1800\nexport HCCL_EXEC_TIMEOUT=1800\nexport HCCL_OP_RETRY_ENABLE=\"L0:0,L1:0,L2:0\"\nexport ASCEND_GLOBAL_LOG_LEVEL=3\nexport OMNI_PIGGYBACK_INPUT_IDS=1\nexport OMNI_SKIP_DECODE_TOKENIZE=0\nexport VLLM_MQ_MAX_CHUNK_BYTES_MB=100\nexport VLLM_PLUGINS=\"omni-npu,omni_pangu_models,omni_npu_patches,omni_custom_models\"\nexport OMNI_HYBRID_ATTN_GROUP_SIZE=17\nexport OMNI_VLLM_PATCHES_DIR=\"pangu_v2_hybrid, pangu_v2_moe\"\nexport OMNI_VLLM_PATCHES=\"ALL\"\nexport ENABLE_DP_LB=false\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_92B_xp1d_d_open.json\"\nexport OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1\nexport TORCH_COMPILE_DISABLE=1\nexport VLLM_CACHE_ROOT='./graph_cache'\nexport LOCAL_WORLD_SIZE=4\nexport PYTORCH_NPU_ALLOC_CONF=expandable_segments:True\nexport gpu_util=0.85\nexport max_num_seqs=3\nexport kv_offload=false\nexport hugepage_enabled=true\nexport cpu_bytes_to_use=53687091200\n\nbash \"${SCRIPT_PATH}/decode.sh\" \\\n  --block-size 128 \\\n  --mamba-block-size 128 \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --enable-expert-parallel \\\n  --max-num-seqs 3 \\\n  --enable-prefix-caching \\\n  --enable-chunked-prefill \\\n  --distributed-executor-backend mp \\\n  --dtype bfloat16 \\\n  --kv-cache-dtype li_int8_ds_mla \\\n  --compilation-config '{\"cudagraph_mode\":\"FULL\", \"cudagraph_capture_sizes\":[4,8,12], \"backend\":\"\", \"compile_sizes\":[4,8,12]}' \\\n  --reasoning-parser pangu \\\n  --enable-auto-tool-choice \\\n  --tool-call-parser pangu \\\n  --enable-lopt --lopt-pool-size 16 \\\n  --lopt-chunk-size 4096 \\\n  --enable-log-requests --enable-logging-iteration-details \\\n  --reasoning-config '{\"reasoning_start_str\":\"<think>\",\"reasoning_end_str\":\"</think>\",\"ban_sequence_end_in_thinking\":true}' \\\n  --max-model-len 524288 \\\n  --additional-config '{\"enable_low_latency\": true, \"npugraph_ex_config\":{\"enable\": true, \"super_kernel_optimize\": false, \"static_kernel_compile\": false}}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity\n",
           "codes": [],
           "count": 1,
           "custom_spec": {
@@ -117,27 +129,40 @@
           },
           "dumps": [],
           "envs": {
-            "MODEL_PATH": "/mnt/s3-asset-g-wl-infra-infer-exp/rk/ckpt/openPangu_2.0_Flash_INT8/global_step_26-iterative-int8-0626/",
-            "MODEL_NAME": "pangu_ultra_moe",
+            "MODEL_PATH": "/mnt/bucket-910c-6055/s00562949/models/openPangu_2.0_Flash_INT8/global_step_26-iterative-int8-0626/",
+            "MODEL_NAME": "pangu-v2-92b",
             "PREFILL_INSTANCE_NUM": "1",
             "DECODE_INSTANCE_NUM": "1",
-            "npu": "4",
             "PROXY_PORT": "7710",
-            "ENABLE_OMNI_CACHE": "0",
-            "dtype": "bfloat16",
-            "max_model_len": "524288",
+            "OMNI_NPU_USE_DEVICE_COMM_A2A": "1",
             "VLLM_DISABLE_PYNCCL": "1",
             "HCCL_CONNECT_TIMEOUT": "1800",
             "HCCL_EXEC_TIMEOUT": "1800",
             "HCCL_OP_RETRY_ENABLE": "L0:0,L1:0,L2:0",
-            "HCCL_OP_EXPANSION_MODE": "AIV",
             "ASCEND_GLOBAL_LOG_LEVEL": "3",
-            "VLLM_PLUGINS": "omni-npu,omni_npu_patches,omni_custom_models",
+            "OMNI_PIGGYBACK_INPUT_IDS": "1",
+            "OMNI_SKIP_DECODE_TOKENIZE": "0",
+            "VLLM_MQ_MAX_CHUNK_BYTES_MB": "100",
+            "VLLM_PLUGINS": "omni-npu,omni_pangu_models,omni_npu_patches,omni_custom_models",
             "OMNI_HYBRID_ATTN_GROUP_SIZE": "17",
-            "OMNI_VLLM_PATCHES_DIR": "pangu_v2_hybrid,pangu_v2_moe",
+            "OMNI_VLLM_PATCHES_DIR": "pangu_v2_hybrid, pangu_v2_moe",
             "OMNI_VLLM_PATCHES": "ALL",
+            "OMNI_PANGU_TOOL_CALL_ENDS_THINKING": "1",
             "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
-            "OMNI_NPU_USE_DEVICE_COMM_A2A": "1"
+            "LOG_PATH": "/home/ma-user/",
+            "LOG_PATH_PROXY": "/home/ma-user/",
+            "PROFILE_DIR": "/home/ma-user/",
+            "hugepage_enabled": "true",
+            "npu": "4",
+            "tp": "1",
+            "HCCL_BUFFSIZE": "1200",
+            "HCCL_OP_EXPANSION_MODE": "AI_CPU",
+            "TASK_QUEUE_ENABLE": "1",
+            "TORCH_COMPILE_DISABLE": "1",
+            "VLLM_CACHE_ROOT": "./graph_cache",
+            "LOCAL_WORLD_SIZE": "4",
+            "kv_offload": "false",
+            "cpu_bytes_to_use": "53687091200"
           },
           "files": [],
           "group_count": 1,
@@ -145,7 +170,7 @@
             "category": "CPU",
             "id": "8ee7aa0f-502f-11f1-aca0-0255ac10016a",
             "source": "SWR_PRO",
-            "swr_path": "swr-aifm-exp-z7c82y.swr-pro.myhuaweicloud.com/aifm.infra.pipeline/ai-infra-infer-1.0.3-a2-arm-develop-202609050943-daily:0.0.1"
+            "swr_path": "swr-aifm-exp-z7c82y.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a2-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.1-omni_master-vllm-202610150031:0.0.1"
           },
           "models": [],
           "name": "decode",
@@ -160,14 +185,14 @@
       ],
       "weight": 0,
       "workload_type": "LWS",
-      "name": "opensource_92B_DSA_A2_INT8_1P4_1D4"
+      "name": "deploy-opensource_92B_DSA_A2_INT8_1P4_1D4-copy-4171"
     }
   ],
   "workspace_id": "1d670a16e0b34acbb27975dfec4d3790",
   "workload_type": "LWS",
   "runtime_config": {
     "service_invoke": {
-      "port": 7000,
+      "port": 7710,
       "protocol": "HTTPS",
       "auth_type": "API_KEY",
       "dynamic_routing_enable": false,
@@ -182,7 +207,7 @@
         "unit": "SECONDS"
       },
       "request_size_limit": 20,
-      "request_timeout": 30,
+      "request_timeout": 1200,
       "ip_white_list": [],
       "ip_black_list": []
     },
