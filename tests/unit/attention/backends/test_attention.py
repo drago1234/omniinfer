@@ -48,10 +48,11 @@ def make_model_extra_config(
     )
 
 
+@pytest.mark.parametrize("num_heads,num_kv_heads", [(24, 4), (6, 1)])
 @pytest.mark.parametrize("capturing", [False, True])
 @pytest.mark.parametrize("kv_nz", [False, True])
 def test_zero_sink_aicpu_uses_device_metadata_without_graph_task_updates(
-    npu_attention_classes, monkeypatch, capturing, kv_nz,
+    npu_attention_classes, monkeypatch, capturing, kv_nz, num_heads, num_kv_heads,
 ):
     module = npu_attention_classes["attention_module"]
     impl_cls = npu_attention_classes["NPUAttentionBackendImpl"]
@@ -70,17 +71,17 @@ def test_zero_sink_aicpu_uses_device_metadata_without_graph_task_updates(
     meta_tensor = torch.zeros(1024, dtype=torch.int32)
     metadata_op = MagicMock(return_value=meta_tensor)
     graph_task = MagicMock()
-    query = torch.randn(4, 24, 128)
+    query = torch.randn(4, num_heads, 128)
     sink_op = MagicMock(return_value=(query,))
     monkeypatch.setattr(module, "npu_fused_infer_attention_sink_metadata", metadata_op)
     monkeypatch.setattr(module, "capture_graph_task", graph_task)
     monkeypatch.setattr(torch.ops.custom, "npu_fused_infer_attention_sink", sink_op)
-    impl = impl_cls(24, 128, 128 ** -0.5, num_kv_heads=4, sink_len=0)
-    shape = (2, 32, 128, 16) if kv_nz else (2, 128, 512)
+    impl = impl_cls(num_heads, 128, 128 ** -0.5, num_kv_heads=num_kv_heads, sink_len=0)
+    shape = (2, num_kv_heads * 8, 128, 16) if kv_nz else (2, 128, num_kv_heads * 128)
     cache = (torch.zeros(shape), torch.zeros(shape))
     metadata = types.SimpleNamespace(
-        num_actual_tokens=4, query_start_loc=torch.tensor([0, 4]),
-        seq_lens=torch.tensor([17]), block_tables=torch.tensor([[0, 1]]),
+        num_actual_tokens=4, query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([17], dtype=torch.int32), block_tables=torch.tensor([[0, 1]]),
         slot_mapping=None, is_pure_prefill_without_prefix_and_use_kvnz=False,
     )
     layer = types.SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
@@ -89,15 +90,25 @@ def test_zero_sink_aicpu_uses_device_metadata_without_graph_task_updates(
     graph_task.assert_not_called()
     metadata_op.assert_called_once()
     metadata_args = metadata_op.call_args.args[0]
-    assert metadata_args["num_heads_q"] == 24
-    assert metadata_args["num_heads_kv"] == 4
+    assert metadata_args["num_heads_q"] == num_heads
+    assert metadata_args["num_heads_kv"] == num_kv_heads
     assert metadata_args["sink_num"] == 0
     assert metadata_args["actual_seq_lengths"].dtype == torch.int64
     kwargs = sink_op.call_args.kwargs
     assert kwargs["meta_data"] is meta_tensor
+    assert isinstance(kwargs["actual_seq_qlen"], torch.Tensor)
+    assert isinstance(kwargs["actual_seq_kvlen"], torch.Tensor)
+    assert kwargs["actual_seq_qlen"].dtype == torch.int64
+    assert kwargs["actual_seq_kvlen"].dtype == torch.int64
+    torch.testing.assert_close(
+        kwargs["actual_seq_qlen"], metadata.query_start_loc[1:].to(torch.int64),
+    )
+    torch.testing.assert_close(
+        kwargs["actual_seq_kvlen"], metadata.seq_lens.to(torch.int64),
+    )
     assert kwargs["sink_number"] == 0
     assert kwargs["sparse_mode"] == 3
-    assert kwargs["key"].shape == ((2, 4, 8, 128, 16) if kv_nz else shape)
+    assert kwargs["key"].shape == ((2, num_kv_heads, 8, 128, 16) if kv_nz else shape)
     assert kwargs["key"].data_ptr() == cache[0].data_ptr()
     assert kwargs["value"].shape == kwargs["key"].shape
     assert kwargs["value"].data_ptr() == cache[1].data_ptr()

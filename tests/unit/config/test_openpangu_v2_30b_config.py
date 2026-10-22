@@ -58,7 +58,8 @@ def test_openpangu_v2_30b_low_latency_config_is_registered():
     }
 
 
-def test_openpangu_v2_30b_bf16_a2_hybrid_config_is_registered():
+@pytest.mark.parametrize("hardware", ["A2", "A3"])
+def test_openpangu_v2_30b_bf16_hybrid_config_is_registered(hardware):
     best_practice_configs = _load(
         "high_throughout/best_practice_configs.json"
     )
@@ -66,13 +67,16 @@ def test_openpangu_v2_30b_bf16_a2_hybrid_config_is_registered():
         entry
         for entry in best_practice_configs
         if entry["model"] == MODEL_NAME
-        and entry["hardware"] == "A2"
+        and entry["hardware"] == hardware
         and entry["precision"] == "bf16"
     ]
 
     assert len(matches) == 1
     assert set(matches[0]["configs"]) == {"hybrid"}
     relative_path = matches[0]["configs"]["hybrid"]["config_file"]
+    assert relative_path == (
+        "openpangu_v2/openpangu_v2_omni_30b_bf16_a2_hybrid.json"
+    )
     config = _load("high_throughout/" + relative_path)
 
     assert config["model_parallel_config"] == {}
