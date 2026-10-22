@@ -197,6 +197,8 @@ def hifloat8_module(monkeypatch):
         operator_opt_config=SimpleNamespace(
             shared_expert_multi_stream=True,
             shared_expert_parallel_schedule="with_finalize",
+            enable_moe_init_routing_v2=False,
+            enable_moe_init_routing_v3=False,
         ),
     )
 

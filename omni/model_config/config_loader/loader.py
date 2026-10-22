@@ -144,6 +144,9 @@ class ModelOperatorOptConfig:
     enable_prefill_mla_absorb_pa: bool = False
     kv_nz: bool = False
     enable_moe_init_routing_v2: bool = False
+    enable_moe_init_routing_v3: bool = False
+    enable_dense_mlp_dequant_swiglu_quant: bool = False
+    enable_shared_expert_dequant_swiglu_quant: bool = False
     gmm_nz: bool = True
     gmm_autotiling: bool = False
     lmhead_fp32: bool = False

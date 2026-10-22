@@ -94,6 +94,7 @@ def _stub_fused_moe_deps(monkeypatch: pytest.MonkeyPatch) -> None:
         operator_opt_config=SimpleNamespace(
             shared_expert_parallel_schedule="with_finalize",
             enable_moe_init_routing_v2=False,
+            enable_moe_init_routing_v3=False,
             enable_mxfp8_comm_quant=False,
             decode_moe_dispatch_combine=False,
             enable_moe_agrs=False,

@@ -54,7 +54,11 @@ def test_openpangu_v2_30b_low_latency_config_is_registered():
     assert config["model_parallel_config"] == {}
     assert config["operator_optimization_config"] == {
         "kv_nz": True,
-        "enable_moe_init_routing_v2": True,
+        "use_aicpu_fa_tiling": True,
+        "enable_moe_init_routing_v2": False,
+        "enable_moe_init_routing_v3": True,
+        "enable_dense_mlp_dequant_swiglu_quant": True,
+        "enable_shared_expert_dequant_swiglu_quant": True,
     }
 
 
