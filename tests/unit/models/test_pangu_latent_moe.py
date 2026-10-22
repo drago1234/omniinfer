@@ -59,7 +59,11 @@ def build_moe(monkeypatch, default_vllm_config):
             value = super().forward(x)
             return (value, None) if self.return_bias else value
 
-    for name in ("ReplicatedLinear", "MergedColumnParallelLinear", "RowParallelLinear"):
+    for name in (
+        "ReplicatedLinear",
+        "MergedColumnParallelFlashCommLinear",
+        "RowParallelFlashCommLinear",
+    ):
         monkeypatch.setattr(model, name, Linear)
     monkeypatch.setattr(model, "RMSNorm", lambda size, eps: nn.RMSNorm(size, eps=eps))
 

@@ -29,11 +29,7 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
@@ -81,6 +77,10 @@ from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.attention.npu_pangu import NPUPanguSparseAttention
 from omni_npu.v1.layers.attention.weight_utils import run_post_weight_load
+from omni_npu.v1.layers.linear import (
+    MergedColumnParallelFlashCommLinear,
+    RowParallelFlashCommLinear,
+)
 from omni_npu.v1.layers.logits_processor import NPULogitsProcessor
 from omni_npu.v1.layers.vocab_parallel_embedding import NPUParallelLMHead, NPUVocabParallelEmbedding
 from omni_npu.v1.utils import on_ascend910b, on_ascend950
@@ -189,7 +189,7 @@ class OpenPanguV2MLP(nn.Module):
         self._fuse_dense_mlp = "shared_experts" not in prefix
         dense_idx = extract_layer_index(prefix) if self._fuse_dense_mlp else -1
         self._sk_dense_name = f"dense_mlp_{dense_idx}"
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelFlashCommLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=bias,
@@ -198,7 +198,7 @@ class OpenPanguV2MLP(nn.Module):
             prefix=f"{prefix}.gate_up_proj",
             return_bias=False,
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = RowParallelFlashCommLinear(
             intermediate_size,
             hidden_size,
             bias=bias,
@@ -212,7 +212,11 @@ class OpenPanguV2MLP(nn.Module):
         check_ffn_act_fn(hidden_act)
         self.act_fn = SiluAndMulWithClamp(swiglu_limit) if swiglu_limit is not None else SiluAndMul()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        down_proj_ready_event: Optional[torch.npu.Event] = None,
+    ) -> torch.Tensor:
 
         # AllGather for sequence parallelism: when TP > 1 and not using naive backend,
         # each rank has only 1/TP of the sequence, so we need to gather the full sequence
@@ -225,6 +229,9 @@ class OpenPanguV2MLP(nn.Module):
         with sk_scope(self._sk_dense_name, self._fuse_dense_mlp):
             gate_up = self.gate_up_proj(x)
             act = self.act_fn(gate_up)
+            if down_proj_ready_event is not None:
+                # Shared MLP is unfused: wait after activation, before S2.
+                down_proj_ready_event.wait(torch.npu.current_stream())
             out = self.down_proj(act)
 
         # ReduceScatter or AllReduce for sequence parallelism:
@@ -903,6 +910,7 @@ class OpenPanguV2MOE(nn.Module):
         # all only read it), so it is safe to hand it to the side stream immediately.
         shared_input = hidden_states
         use_side_stream = self.side_stream is not None
+        routed_done_event = torch.npu.Event() if use_side_stream else None
 
         # Launch shared experts on side stream before gating_topk so that
         # shared_expert overlaps with the full routed-expert pipeline:
@@ -949,6 +957,7 @@ class OpenPanguV2MOE(nn.Module):
                 quant_mode,
                 ep_comm_name,
                 x_active_mask,
+                routed_done_event=routed_done_event,
             )
         else:
             # Multi-batch processing
@@ -967,6 +976,11 @@ class OpenPanguV2MOE(nn.Module):
                     quant_mode,
                     ep_comm_name,
                     batch_x_active_mask,
+                    # One record after the final sub-batch R2 covers every
+                    # routed GMM; earlier sub-batches must not release S2.
+                    routed_done_event=(
+                        routed_done_event if end_idx == num_tokens else None
+                    ),
                 )
                 outputs.append(batch_output)
 
@@ -976,12 +990,15 @@ class OpenPanguV2MOE(nn.Module):
         # Submit side-stream work here (after the routed-expert pipeline) so this block
         # stays outside any kernel-fusion scope, matching _forward_allgather convention.
         # On the NPU the side stream waits for shared_pre_event (recorded before gating_topk)
-        # and therefore runs in parallel with the entire routed-expert pipeline above.
+        # S1/activation may overlap routing. Only S2 waits for R2;
+        # no dependency from shared S1 to routed R1 is introduced.
         if use_side_stream:
             with torch.npu.stream(self.side_stream):
                 shared_input.record_stream(self.side_stream)
                 shared_pre_event.wait(self.side_stream)
-                shared_output = self.shared_experts(shared_input)
+                shared_output = self.shared_experts(
+                    shared_input, down_proj_ready_event=routed_done_event
+                )
                 shared_done_event.record()
         else:
             shared_output = self.shared_experts(shared_input)
@@ -1003,6 +1020,7 @@ class OpenPanguV2MOE(nn.Module):
         quant_mode: int,
         ep_comm_name: str,
         x_active_mask: Optional[torch.Tensor] = None,
+        routed_done_event: Optional[torch.npu.Event] = None,
     ) -> torch.Tensor:
         """Single batch dispatch + combine processing."""
         use_swiglu_group_fusion = self._use_swiglu_group_fusion
@@ -1121,6 +1139,11 @@ class OpenPanguV2MOE(nn.Module):
                 group_type=0,
                 group_list_type=1,
             )[0]
+
+        # All three routed paths (W4A8, W8A8, BF16) have submitted R2 here.
+        # Record before Combine so shared S2 can overlap communication.
+        if routed_done_event is not None:
+            routed_done_event.record(torch.npu.current_stream())
 
         # Step 6: npu_moe_distribute_combine_v2 - fused combine + unpermutation
         expert_scales = (

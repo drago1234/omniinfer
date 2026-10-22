@@ -356,8 +356,8 @@ def test_sandwich_mega_passes_none_mid_norm(monkeypatch):
 
 def test_dense_mlp_sk_scope(monkeypatch):
     monkeypatch.setattr(model_mod, "get_tp_group", lambda: SimpleNamespace(world_size=1))
-    monkeypatch.setattr(model_mod, "MergedColumnParallelLinear", lambda *a, **k: _identity)
-    monkeypatch.setattr(model_mod, "RowParallelLinear", lambda *a, **k: _identity)
+    monkeypatch.setattr(model_mod, "MergedColumnParallelFlashCommLinear", lambda *a, **k: _identity)
+    monkeypatch.setattr(model_mod, "RowParallelFlashCommLinear", lambda *a, **k: _identity)
     monkeypatch.setattr(model_mod, "SiluAndMul", lambda: _identity)
     mlp = model_mod.OpenPanguV2MLP(4, 8, "silu", prefix="model.layers.0.mlp")
     x = torch.ones(2, 4)
