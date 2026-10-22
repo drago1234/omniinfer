@@ -486,10 +486,26 @@ def npu_pangu_kv_cache_update(
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer, attn_metadata = _lookup_layer_and_attn_metadata(layer_name)
-    kv_cache, _ = layer._npu_kvrmsnorm_rope_cache(
+    result = layer._npu_kvrmsnorm_rope_cache(
         kv, (kv_cache_0, kv_cache_1), cos, sin, attn_metadata, None,
     )
-    return kv_cache
+    # Only DSA/absorb returns ((cache_0, cache_1), topk_indices).
+    # Non-absorb's three tensors belong on the direct-call path.
+    if not (
+        isinstance(result, tuple)
+        and len(result) == 2
+        and isinstance(result[0], tuple)
+        and len(result[0]) == 2
+        and all(isinstance(cache, torch.Tensor) for cache in result[0])
+        and (result[1] is None or isinstance(result[1], torch.Tensor))
+    ):
+        raise RuntimeError(
+            "npu_pangu_kv_cache_update expects ((cache_0, cache_1), topk_indices) "
+            "from a DSA/absorb path; non-absorb prefill must call "
+            "_npu_kvrmsnorm_rope_cache directly."
+        )
+    kv_cache_tuple, _ = result
+    return kv_cache_tuple
 
 
 def npu_pangu_kv_cache_update_fake(

@@ -135,7 +135,7 @@ class LLMDataDistConnector(KVConnectorBase_V1, SupportsHMA):
     # ================= Worker overrides =================
 
     def register_kv_caches(self, kv_caches):
-        self.worker.manager.weakup()
+        self.worker.manager.wakeup()
         self.worker.manager.register(kv_caches)
 
     def unregister_kv_caches(self):

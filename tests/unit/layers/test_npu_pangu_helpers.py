@@ -270,6 +270,51 @@ class TestPanguCustomOps(unittest.TestCase):
         self.assertEqual(fake_output[3].shape, kv_cache_1.shape)
 
 
+class TestPanguKVCacheUpdate(unittest.TestCase):
+    def test_cache_pair_matches_fake_contract(self):
+        cache = (torch.randn(2, 4), torch.randn(2, 2))
+        kv, cos, sin = torch.randn(3, 6), torch.randn(3, 2), torch.randn(3, 2)
+        metadata = object()
+        for topk_indices in (None, torch.tensor([[0, 1]])):
+            with self.subTest(topk_indices=topk_indices):
+                update = Mock(return_value=(cache, topk_indices))
+                layer = SimpleNamespace(_npu_kvrmsnorm_rope_cache=update)
+                with patch.object(custom_ops_mod, "_lookup_layer_and_attn_metadata",
+                                  return_value=(layer, metadata)):
+                    output = custom_ops_mod.npu_pangu_kv_cache_update(
+                        kv, *cache, cos, sin, "layer",
+                    )
+                    fake = custom_ops_mod.npu_pangu_kv_cache_update_fake(
+                        kv, *cache, cos, sin, "layer",
+                    )
+                self.assertIs(output, cache)
+                self.assertIs(update.call_args.args[4], metadata)
+                self.assertIsNone(update.call_args.args[5])
+                self.assertEqual(len(output), len(fake))
+                for actual, expected in zip(output, fake):
+                    self.assertEqual(actual.shape, expected.shape)
+                    self.assertEqual(actual.dtype, expected.dtype)
+                    self.assertEqual(actual.device, expected.device)
+
+    def test_invalid_return_structure_is_rejected(self):
+        cache = (torch.randn(2, 4), torch.randn(2, 2))
+        invalid_results = {
+            "non_absorb_triple": (*cache, torch.randn(2, 3)),
+            "flat_tensor_pair": cache,
+            "invalid_cache_item": ((cache[0], None), None),
+            "invalid_topk": (cache, "invalid"),
+        }
+        for name, result in invalid_results.items():
+            with self.subTest(name=name):
+                layer = SimpleNamespace(_npu_kvrmsnorm_rope_cache=Mock(return_value=result))
+                with patch.object(custom_ops_mod, "_lookup_layer_and_attn_metadata",
+                                  return_value=(layer, object())):
+                    with self.assertRaisesRegex(RuntimeError, "non-absorb prefill must call"):
+                        custom_ops_mod.npu_pangu_kv_cache_update(
+                            cache[0], *cache, cache[0], cache[0], "layer",
+                        )
+
+
 class TestDSALazySlotMapping2d(unittest.TestCase):
     """Direct coverage for NPUDSAMetadataBuilder._lazy_slot_mapping_2d."""
 

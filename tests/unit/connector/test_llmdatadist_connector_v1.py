@@ -163,9 +163,9 @@ def _mock_cache_manager():
             self.inited = False
             self.log.runtime("sleep")
 
-        def weakup(self):
+        def wakeup(self):
             self.inited = True
-            self.log.runtime("weakup")
+            self.log.runtime("wakeup")
 
         def register(self, vllm_caches: dict | list | None) -> list[int]:
             self.log.runtime("register")
@@ -211,7 +211,7 @@ class TestLLMDataDistConnector:
             log.clear()
 
             worker.register_kv_caches({})
-            log.manual("weakup")
+            log.manual("wakeup")
             log.manual("register")
             log.compare_and_clear()
 
@@ -220,7 +220,7 @@ class TestLLMDataDistConnector:
             log.compare_and_clear()
 
             worker.register_kv_caches({})
-            log.manual("weakup")
+            log.manual("wakeup")
             log.manual("register")
             log.compare_and_clear()
 

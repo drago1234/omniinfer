@@ -220,6 +220,63 @@ class TestNPUDSABackendReshapeNoncontiguous(unittest.TestCase):
 
 
 class TestNPUDSAMetadataBuilder(unittest.TestCase):
+    def test_build_normalizes_indexer_lengths_to_int32(self):
+        for dtype in (torch.int32, torch.int64):
+            for kv_role in (None, "kv_consumer"):
+                with self.subTest(dtype=dtype, kv_role=kv_role):
+                    b = self._new_builder_minimal()
+                    b.metadata_cls = mla_mod.NPUDSAMetadata
+                    b.prefill_metadata_cls = mla_mod.NPUDSAPrefillMetadata
+                    b._prefill_backend = MagicMock()
+                    b.q_data_type = torch.bfloat16
+                    b.model_config.dtype = torch.bfloat16
+                    b.model_config.get_head_size.return_value = 576
+                    b.vllm_config.kv_transfer_config = (
+                        SimpleNamespace(kv_role=kv_role) if kv_role else None
+                    )
+                    # One decode request and two prefill requests without cached context.
+                    starts = torch.tensor([0, 1, 4, 6], dtype=dtype)
+                    lengths = torch.tensor([10, 3, 2], dtype=dtype)
+                    common = SimpleNamespace(
+                        num_reqs=3, num_actual_tokens=6,
+                        max_query_len=3, max_seq_len=10,
+                        query_start_loc=starts,
+                        query_start_loc_cpu=starts,
+                        seq_lens=lengths,
+                        seq_lens_cpu_upper_bound=lengths,
+                        dcp_local_seq_lens=None,
+                        block_table_tensor=torch.zeros(3, 2, dtype=torch.int32),
+                        slot_mapping=torch.arange(6),
+                    )
+                    with patch.object(
+                        mla_mod, "split_decodes_and_prefills", return_value=(1, 2, 1, 5)
+                    ):
+                        result = b.build(0, common)
+
+                    for section, queries, keys in (
+                        (result.decode, [1], [10]),
+                        (result.prefill, [3, 5], [3, 2]),
+                    ):
+                        for actual, expected in (
+                            (section.query_cumlens, queries),
+                            (section.seq_lens, keys),
+                        ):
+                            torch.testing.assert_close(
+                                actual, torch.tensor(expected, dtype=torch.int32)
+                            )
+                        if dtype == torch.int32:
+                            # Same-dtype conversion must keep the existing storage.
+                            offset = 0 if section is result.decode else 1
+                            self.assertEqual(
+                                section.seq_lens.data_ptr(), lengths[offset:].data_ptr()
+                            )
+                            source = starts if section is result.decode else section.query_start_loc
+                            self.assertEqual(section.query_cumlens.data_ptr(), source[1:].data_ptr())
+                    self.assertIs(common.seq_lens, lengths)
+                    self.assertIs(common.query_start_loc, starts)
+                    torch.testing.assert_close(lengths, torch.tensor([10, 3, 2], dtype=dtype))
+                    torch.testing.assert_close(starts, torch.tensor([0, 1, 4, 6], dtype=dtype))
+
     def test_lazy_slot_mapping_2d_reuses_first_layer_result(self):
         builder = mla_mod.NPUDSAMetadataBuilder.__new__(
             mla_mod.NPUDSAMetadataBuilder

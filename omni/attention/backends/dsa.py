@@ -276,10 +276,11 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
         dcp_tot_seq_lens_device: torch.Tensor | None,
     ) -> NPUDSADecodeMetadata:
         num_actual_tokens = query_start_loc_cpu[-1]
+        # Indexer length inputs must be int32; normalize once during metadata build.
         return NPUDSADecodeMetadata(
             block_table=block_table_tensor,
-            seq_lens=seq_lens_device,
-            query_cumlens=query_start_loc_device[1:],
+            seq_lens=seq_lens_device.to(torch.int32),
+            query_cumlens=query_start_loc_device[1:].to(torch.int32),
             num_actual_tokens=num_actual_tokens,
             dcp_tot_seq_lens=dcp_tot_seq_lens_device
         )
@@ -552,7 +553,7 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
             # for pd-mixed, TP is used, no need to use mc2_mask
             if self.vllm_config.kv_transfer_config.kv_role == "kv_consumer":
                 metadata.decode.mc2_mask = self._generate_activate_mask(metadata.decode.num_actual_tokens)
-            metadata.decode.seq_lens = common_attn_metadata.seq_lens[:metadata.num_decodes]
+            metadata.decode.seq_lens = common_attn_metadata.seq_lens[:metadata.num_decodes].to(torch.int32)
 
             # DSA-KVSP is designed for prefill only on pd-disagg
             # TODO: decode-kvsp is temporarily added before kv-trans finished kvsp
@@ -576,10 +577,10 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
                 # Upstream rebases into a fresh tensor, whose address a graph
                 # would freeze. Pure prefill, so the rebase is a no-op.
                 metadata.prefill.query_start_loc = common_attn_metadata.query_start_loc
-            metadata.prefill.query_cumlens = metadata.prefill.query_start_loc[1:]
+            metadata.prefill.query_cumlens = metadata.prefill.query_start_loc[1:].to(torch.int32)
             metadata.prefill.seq_lens = common_attn_metadata.seq_lens[
                 metadata.num_decodes:metadata.num_decodes + metadata.num_prefills
-            ]
+            ].to(torch.int32)
 
             # CP's layout is rebuilt on the host every step, which a captured
             # graph cannot follow. npu_dsa_forward reads the absent sp_manager
