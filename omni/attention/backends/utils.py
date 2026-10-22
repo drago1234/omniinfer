@@ -475,6 +475,56 @@ class CrossLayerSharedOp:
         return buffer
 
 
+_CROSS_LAYER_SHARED_OPS: dict[str, CrossLayerSharedOp] = {}
+
+
+def get_cross_layer_shared_op(
+    name: str,
+    op: Callable[..., torch.Tensor],
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    callers: tuple[Hashable, ...],
+) -> CrossLayerSharedOp:
+    shared_op = _CROSS_LAYER_SHARED_OPS.get(name)
+    if shared_op is None:
+        shared_op = CrossLayerSharedOp(op, shape, dtype, callers)
+        _CROSS_LAYER_SHARED_OPS[name] = shared_op
+    else:
+        buf = shared_op._default_buffer
+        if tuple(buf.shape) != shape or buf.dtype != dtype:
+            raise ValueError(
+                "Cross-layer shared op was registered with incompatible "
+                f"buffer spec: {(tuple(buf.shape), buf.dtype)} != {(shape, dtype)}"
+            )
+        shared_op.reserve(callers)
+    return shared_op
+
+
+def enable_fia_metadata_sharing(
+    attn_module,
+    config,
+    operator_opt_config,
+) -> set | None:
+    """Enable cross-layer FIA metadata sharing when supported.
+
+    Sets ``attn_module._share_fia_metadata``. Returns ``dsa_layers`` when sharing
+    is enabled, otherwise ``None``.
+
+    MTP executes one selected layer per forward and must recompute.
+    """
+    share = (
+        getattr(config, "model_type", None) == "openpangu_v2"
+        and attn_module.layer_idx < config.num_hidden_layers
+        and attn_module.param_sink_number > 0
+        and operator_opt_config.use_noncontiguous_kv
+        and operator_opt_config.enable_precision_strong_consistency
+    )
+    attn_module._share_fia_metadata = share
+    if not share:
+        return None
+    return set(getattr(config, "dsa_layers", ()) or ())
+
+
 def _h2d_nonblocking(arr: np.ndarray, device: torch.device) -> torch.Tensor:
     """Copy host metadata to ``device`` via pinned memory, without a stream sync."""
     host = torch.from_numpy(np.ascontiguousarray(arr))

@@ -3440,3 +3440,205 @@ def test_paged_fast_path_defers_to_capture_when_capturing():
     assert capture.call_args.kwargs["num_tokens"] == 3
     assert [tuple(t.shape) for t in capture.call_args.kwargs["out_tensors"]] == [(2, 3, 6), (3,)]
     assert out.shape == (2, 3, 6)
+
+
+def _cpu_shared_op_registry():
+    from omni_npu.attention.backends import utils as utils_mod
+
+    saved = dict(utils_mod._CROSS_LAYER_SHARED_OPS)
+    utils_mod._CROSS_LAYER_SHARED_OPS.clear()
+    original_defaults = utils_mod.CrossLayerSharedOp.__init__.__defaults__
+    utils_mod.CrossLayerSharedOp.__init__.__defaults__ = ("cpu",)
+    try:
+        yield utils_mod
+    finally:
+        utils_mod.CrossLayerSharedOp.__init__.__defaults__ = original_defaults
+        utils_mod._CROSS_LAYER_SHARED_OPS.clear()
+        utils_mod._CROSS_LAYER_SHARED_OPS.update(saved)
+
+
+@pytest.fixture
+def fia_metadata_registry():
+    yield from _cpu_shared_op_registry()
+
+
+@pytest.mark.unit
+def test_get_cross_layer_shared_op_reuses_instance_and_reserves(fia_metadata_registry):
+    from omni_npu.attention.backends.utils import get_cross_layer_shared_op
+
+    op = MagicMock(return_value=torch.ones(4))
+    first = get_cross_layer_shared_op(
+        name="pangu_v2_fia_sink_metadata",
+        op=op,
+        shape=(1024,),
+        dtype=torch.int32,
+        callers=(("decode", "sink", 64),),
+    )
+    second = get_cross_layer_shared_op(
+        name="pangu_v2_fia_sink_metadata",
+        op=op,
+        shape=(1024,),
+        dtype=torch.int32,
+        callers=(("prefill", "sink", 64),),
+    )
+    assert first is second
+    assert ("prefill", "sink", 64) in second._buffers
+
+
+@pytest.mark.unit
+def test_get_cross_layer_shared_op_rejects_incompatible_spec(fia_metadata_registry):
+    from omni_npu.attention.backends.utils import get_cross_layer_shared_op
+
+    op = MagicMock(return_value=torch.ones(4))
+    get_cross_layer_shared_op(
+        name="pangu_v2_fia_sink_metadata",
+        op=op,
+        shape=(1024,),
+        dtype=torch.int32,
+        callers=(("decode",),),
+    )
+    with pytest.raises(ValueError):
+        get_cross_layer_shared_op(
+            name="pangu_v2_fia_sink_metadata",
+            op=op,
+            shape=(512,),
+            dtype=torch.int32,
+            callers=(("decode",),),
+        )
+
+
+def _mla_consistency_fake(**kwargs):
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    defaults = dict(
+        layer_idx=0,
+        sliding_window=None,
+        num_hidden_layers=8,
+        dsa_layers=(),
+        swa_layers=None,
+        sliding_window_list=None,
+        block_size=128,
+        tp_size=1,
+    )
+    defaults.update(kwargs)
+    config = SimpleNamespace(
+        model_type="openpangu_v2",
+        num_hidden_layers=defaults["num_hidden_layers"],
+        num_attention_heads=64,
+        dsa_layers=defaults["dsa_layers"],
+        swa_layers=defaults["swa_layers"],
+        sliding_window_list=defaults["sliding_window_list"],
+    )
+    fake = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
+    fake.layer_idx = defaults["layer_idx"]
+    fake.sliding_window = defaults["sliding_window"]
+    fake.param_sink_number = 4
+    fake.num_local_heads = 64
+    fake.kv_lora_rank = 512
+    fake.qk_rope_head_dim = 64
+    fake.tp_size = defaults["tp_size"]
+    cache_config = SimpleNamespace(block_size=defaults["block_size"])
+    return fake, config, cache_config
+
+
+def _mla_consistency_config(
+    *,
+    use_noncontiguous_kv=True,
+    enable_precision_strong_consistency=True,
+    ena_context_parallel=False,
+):
+    return patch(
+        MLA_MODULE + ".model_extra_config",
+        SimpleNamespace(
+            parall_config=SimpleNamespace(ena_context_parallel=ena_context_parallel),
+            operator_opt_config=SimpleNamespace(
+                use_noncontiguous_kv=use_noncontiguous_kv,
+                enable_precision_strong_consistency=enable_precision_strong_consistency,
+            ),
+        ),
+    )
+
+
+@pytest.mark.unit
+def test_mla_strong_consistency_metadata_disabled_without_gate(fia_metadata_registry):
+    fake, config, cache_config = _mla_consistency_fake()
+    with _mla_consistency_config(enable_precision_strong_consistency=False):
+        fake._init_strong_consistency_fia_metadata(config, cache_config)
+    assert getattr(fake, "_share_fia_metadata", False) is False
+    assert not hasattr(fake, "_fia_metadata_shared_op")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("layer_idx", "sliding_window", "normal_producer"),
+    [(1, 512, True), (2, 512, False), (3, 1024, True), (4, 1024, False)],
+)
+def test_mla_strong_consistency_metadata_selects_producers(
+    fia_metadata_registry, layer_idx, sliding_window, normal_producer
+):
+    fake, config, cache_config = _mla_consistency_fake(
+        layer_idx=layer_idx,
+        sliding_window=sliding_window,
+        swa_layers=[1, 2, 3, 4],
+        sliding_window_list=[512, 512, 1024, 1024],
+    )
+    with _mla_consistency_config():
+        fake._init_strong_consistency_fia_metadata(config, cache_config)
+    assert fake._share_fia_metadata is True
+    assert fake._produce_normal_fia_metadata is normal_producer
+    # No DSA layers, so the earliest MLA window owner (layer 0) produces sink metadata.
+    assert fake._produce_sink_fia_metadata["decode"] is False
+    assert fake._produce_sink_fia_metadata["prefill"] is False
+
+
+@pytest.mark.unit
+def test_mla_strong_consistency_metadata_skips_mtp(fia_metadata_registry):
+    fake, config, cache_config = _mla_consistency_fake(
+        layer_idx=8, sliding_window=512, num_hidden_layers=8
+    )
+    with _mla_consistency_config():
+        fake._init_strong_consistency_fia_metadata(config, cache_config)
+    assert getattr(fake, "_share_fia_metadata", False) is False
+
+
+@pytest.mark.unit
+def test_mla_get_fia_metadata_falls_back_when_sharing_off(fia_metadata_registry):
+    fake, config, cache_config = _mla_consistency_fake()
+    direct = MagicMock(return_value=torch.ones(1024, dtype=torch.int32))
+    with patch.object(
+        torch.ops.custom, "_npu_fused_infer_attention_sink_metadata", direct, create=True
+    ), _mla_consistency_config(enable_precision_strong_consistency=False):
+        fake._init_strong_consistency_fia_metadata(config, cache_config)
+        meta = fake._get_fia_metadata({"num_heads_q": 64}, "decode", is_sink=False)
+    direct.assert_called_once_with(num_heads_q=64)
+    assert torch.equal(meta, torch.ones(1024, dtype=torch.int32))
+
+
+@pytest.mark.unit
+def test_mla_sink_metadata_reuses_one_buffer(fia_metadata_registry):
+    producer, config, cache_config = _mla_consistency_fake(
+        layer_idx=0,
+        sliding_window=512,
+        num_hidden_layers=2,
+        swa_layers=[0, 1],
+        sliding_window_list=[512, 512],
+    )
+    consumer, _, _ = _mla_consistency_fake(
+        layer_idx=1,
+        sliding_window=512,
+        num_hidden_layers=2,
+        swa_layers=[0, 1],
+        sliding_window_list=[512, 512],
+    )
+    expected = torch.arange(1024, dtype=torch.int32)
+    direct = MagicMock(return_value=expected.clone())
+    with patch.object(
+        torch.ops.custom, "_npu_fused_infer_attention_sink_metadata", direct, create=True
+    ), _mla_consistency_config():
+        producer._init_strong_consistency_fia_metadata(config, cache_config)
+        consumer._init_strong_consistency_fia_metadata(config, cache_config)
+        produced = producer._get_fia_metadata({"num_heads_q": 64}, "decode", is_sink=True)
+        reused = consumer._get_fia_metadata({"num_heads_q": 64}, "decode", is_sink=True)
+    assert produced.data_ptr() == reused.data_ptr()
+    assert torch.equal(reused, expected)
+    direct.assert_called_once()

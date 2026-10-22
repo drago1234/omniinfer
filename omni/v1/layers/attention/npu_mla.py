@@ -56,7 +56,9 @@ from omni_npu.attention.backends.utils import (
     SPManager,
     cache_fit_shape,
     conv_sp,
+    enable_fia_metadata_sharing,
     get_batch_desc,
+    get_cross_layer_shared_op,
     lazy_zero_like,
     sp_disabled,
 )
@@ -775,6 +777,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
                 self.sliding_window = config.sliding_window_list[-1]
 
         self._init_metadata_sharing(config)
+        self._init_strong_consistency_fia_metadata(config, cache_config)
 
         if self.use_mome:
             if self.noncontiguous_kv:
@@ -899,6 +902,107 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             or first_layer is None
             # 每种窗口的首层负责生成，后续同窗口层直接复用。
             or self.layer_idx == first_layer
+        )
+
+    def _init_strong_consistency_fia_metadata(
+        self,
+        config: PretrainedConfig,
+        cache_config: CacheConfig | None,
+    ) -> None:
+        """Share strong-consistency FIA metadata across DSA and MLA layers."""
+        dsa_layers = enable_fia_metadata_sharing(
+            self, config, model_extra_config.operator_opt_config
+        )
+        if dsa_layers is None:
+            return
+        window_by_layer = dict.fromkeys(range(config.num_hidden_layers))
+        swa_layers = tuple(getattr(config, "swa_layers", ()) or ())
+        sliding_window_list = getattr(config, "sliding_window_list", None)
+        if sliding_window_list:
+            window_by_layer.update(zip(swa_layers, sliding_window_list))
+        elif hasattr(config, "sliding_window"):
+            target_layers = swa_layers or range(config.num_hidden_layers)
+            window_by_layer.update(
+                (layer_idx, config.sliding_window) for layer_idx in target_layers
+            )
+
+        first_mla_by_window: dict[int, int] = {}
+        for layer_idx, window in window_by_layer.items():
+            if layer_idx not in dsa_layers:
+                pre_tokens = self._to_metadata_pre_tokens(window)
+                first_mla_by_window.setdefault(pre_tokens, layer_idx)
+
+        pre_tokens = self._to_metadata_pre_tokens(self.sliding_window)
+        first_mla_layer = first_mla_by_window[pre_tokens]
+        self._produce_normal_fia_metadata = self.layer_idx == first_mla_layer
+
+        first_mla_sink_layer = min(first_mla_by_window.values())
+        first_decode_sink_layer = first_mla_sink_layer
+        dsa_num_heads = (
+            config.num_attention_heads
+            if model_extra_config.parall_config.ena_context_parallel
+            else config.num_attention_heads // self.tp_size
+        )
+        if dsa_layers and dsa_num_heads == self.num_local_heads:
+            first_decode_sink_layer = min(first_decode_sink_layer, min(dsa_layers))
+        self._produce_sink_fia_metadata = {
+            "decode": self.layer_idx == first_decode_sink_layer,
+            "prefill_absorb": self.layer_idx == first_mla_sink_layer,
+            "prefill": self.layer_idx == first_mla_sink_layer,
+        }
+
+        block_size = cache_config.block_size if cache_config is not None else 0
+        self._normal_fia_metadata_key_suffix = (
+            "normal",
+            self.num_local_heads,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            pre_tokens,
+            block_size,
+        )
+        self._sink_fia_metadata_key_suffix = (
+            "sink",
+            self.num_local_heads,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            self.param_sink_number,
+        )
+        callers = []
+        for caller in ("decode", "prefill_absorb", "prefill"):
+            for key_suffix in (
+                self._normal_fia_metadata_key_suffix,
+                self._sink_fia_metadata_key_suffix,
+            ):
+                callers.append((caller, *key_suffix))
+        self._fia_metadata_shared_op = get_cross_layer_shared_op(
+            name="pangu_v2_fia_sink_metadata",
+            op=torch.ops.custom._npu_fused_infer_attention_sink_metadata,
+            shape=(1024,),
+            dtype=torch.int32,
+            callers=tuple(callers),
+        )
+
+    def _get_fia_metadata(
+        self,
+        op_args: dict,
+        metadata_caller: str,
+        is_sink: bool,
+    ) -> torch.Tensor:
+        if not getattr(self, "_share_fia_metadata", False):
+            return torch.ops.custom._npu_fused_infer_attention_sink_metadata(
+                **op_args
+            )
+
+        if is_sink:
+            key_suffix = self._sink_fia_metadata_key_suffix
+            recompute = self._produce_sink_fia_metadata.get(metadata_caller, True)
+        else:
+            key_suffix = self._normal_fia_metadata_key_suffix
+            recompute = self._produce_normal_fia_metadata
+        return self._fia_metadata_shared_op(
+            op_args,
+            recompute,
+            (metadata_caller, *key_suffix),
         )
 
     def _init_cross_layer_shared_ops(self):
@@ -1173,6 +1277,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         num_actual_tokens: int,
         *,
         on_a5: bool = False,
+        metadata_caller: str = "decode",
     ) -> torch.Tensor:
         """Precision-strong-consistency sink attention core.
 
@@ -1188,6 +1293,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             num_actual_tokens: Number of valid query tokens; slice bound for query
                 slicing and the merged output write-back.
             on_a5: Select the Ascend950 pioneer attention kernels.
+            metadata_caller: Shared FIA metadata buffer used by the legacy kernels.
 
         Returns:
             Merged attention output in TND layout, [T, N, kv_lora_rank].
@@ -1195,14 +1301,17 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         common_metadata, window_size = _prepare_sink_consistency_metadata(
             self, query, kv_cache, q_cumlens, kv_lens
         )
-        run_attention = (
-            self._run_a5_sink_consistency_attention
-            if on_a5 else self._run_legacy_sink_consistency_attention
-        )
-        normal, sink = run_attention(
-            query[:num_actual_tokens], query_rope[:num_actual_tokens],
-            kv_cache, block_table, common_metadata, window_size,
-        )
+        if on_a5:
+            normal, sink = self._run_a5_sink_consistency_attention(
+                query[:num_actual_tokens], query_rope[:num_actual_tokens],
+                kv_cache, block_table, common_metadata, window_size,
+            )
+        else:
+            normal, sink = self._run_legacy_sink_consistency_attention(
+                query[:num_actual_tokens], query_rope[:num_actual_tokens],
+                kv_cache, block_table, common_metadata, window_size,
+                metadata_caller,
+            )
 
         # merge normal and sink
         attn_output = torch.zeros(
@@ -1216,7 +1325,8 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         return attn_output
 
     def _run_legacy_sink_consistency_attention(
-        self, query, query_rope, kv_cache, block_table, common_metadata, window_size
+        self, query, query_rope, kv_cache, block_table, common_metadata, window_size,
+        metadata_caller: str = "decode",
     ):
         """Run the legacy kernels and return output/max/sum for normal and sink attention."""
         q_cumlens = common_metadata["actual_seq_lengths"]
@@ -1234,7 +1344,11 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             "block_size": kv_cache[0].shape[1],
             "batch_invariant": True,
         }
-        meta_data = torch.ops.custom._npu_fused_infer_attention_sink_metadata(**meta_data_args)
+        meta_data = self._get_fia_metadata(
+            meta_data_args,
+            metadata_caller,
+            is_sink=False,
+        )
 
         # normal output and lse
         kwargs = self._build_decode_sink_fia_kwargs(
@@ -1268,7 +1382,11 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             "rope_head_dim": query_rope.shape[-1],
             "batch_invariant": True,
         }
-        meta_data_sink = torch.ops.custom._npu_fused_infer_attention_sink_metadata(**meta_data_args_sink)
+        meta_data_sink = self._get_fia_metadata(
+            meta_data_args_sink,
+            metadata_caller,
+            is_sink=True,
+        )
 
         # sink output and lse
         sink_compressed_kv = self.attn.sink_compressed_kv.repeat(q_cumlens.numel(), 1).unsqueeze(1)
@@ -1596,6 +1714,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
                 kv_lens=kv_lens,
                 block_table=block_table,
                 num_actual_tokens=num_actual_tokens,
+                metadata_caller=metadata_caller,
             )
             out = out.transpose(0, 1)  # TND -> NTD
 
