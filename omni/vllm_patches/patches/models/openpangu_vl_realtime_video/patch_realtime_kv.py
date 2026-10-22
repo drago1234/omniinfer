@@ -10,8 +10,6 @@ from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.outputs import ModelRunnerOutput
-from PIL import Image
-from vllm.multimodal.parse import ImageProcessorItems, MultiModalDataParser
 from omni_npu.connector.llmdatadist_connector_v1 import LLMDataDistConnector
 from omni_models.models.openpangu_vl.realtime_video.kv_session import (
     close_session,
@@ -22,7 +20,6 @@ from omni_models.models.openpangu_vl.realtime_video.kv_session import (
 from omni_models.models.openpangu_vl.realtime_video.metadata import (
     MROPE_DELTA_KEY,
     POSITION_OFFSET_KEY,
-    NORMALIZED_IMAGE_ATTR,
     is_realtime_kv_request,
     kv_reuse_plan,
     realtime_kv_metadata,
@@ -148,7 +145,7 @@ class RealtimeKVHybridCoordinatorPatch(VLLMPatch):
 
 @register_patch("RealtimeKVFinishRequestPatch", Scheduler)
 class RealtimeKVFinishRequestPatch(VLLMPatch):
-    _attr_names_to_apply = ["add_request", "update_from_output", "_free_request"]
+    _attr_names_to_apply = ["add_request", "update_from_output", "_connector_finished"]
 
     def add_request(self, request):
         result = RealtimeKVFinishRequestPatch._upstream_add_request(self, request)
@@ -164,12 +161,14 @@ class RealtimeKVFinishRequestPatch(VLLMPatch):
             coordinator._realtime_kv_cache_manager = self.kv_cache_manager
         return result
 
-    def _free_request(self, request, delay_free_blocks=False):
-        # Snapshot the prompt KV while the request still owns its block table.
+    def _connector_finished(self, request):
+        # Both the native scheduler and EC transfer call this before releasing
+        # KV blocks, even when EC transfer bypasses _free_request wrappers.
+        # Snapshot before the connector can remove out-of-window blocks.
         try:
             finish_request(self, request)
-            return RealtimeKVFinishRequestPatch._upstream_free_request(
-                self, request, delay_free_blocks
+            return RealtimeKVFinishRequestPatch._upstream_connector_finished(
+                self, request
             )
         finally:
             coordinator = self.kv_cache_manager.coordinator
@@ -191,7 +190,7 @@ class RealtimeKVFinishRequestPatch(VLLMPatch):
     @classmethod
     def apply(cls):
         cls.apply_bypass_conflict(
-            "add_request", "update_from_output", "_free_request"
+            "add_request", "update_from_output", "_connector_finished"
         )
 
 
@@ -240,20 +239,3 @@ class RealtimeKVTransferPatch(VLLMPatch):
     @classmethod
     def apply(cls):
         cls.apply_bypass_conflict("request_finished")
-
-
-@register_patch("RealtimeImageParsePatch", MultiModalDataParser)
-class RealtimeImageParsePatch(VLLMPatch):
-    _attr_names_to_apply = ["_parse_image_data"]
-
-    def _parse_image_data(self, data):
-        images = [data] if isinstance(data, Image.Image) else data
-        if isinstance(images, (list, tuple)) and images and all(
-            getattr(image, NORMALIZED_IMAGE_ATTR, False) for image in images
-        ):
-            return ImageProcessorItems(images)
-        return RealtimeImageParsePatch._upstream_parse_image_data(self, data)
-
-    @classmethod
-    def apply(cls):
-        cls.apply_bypass_conflict("_parse_image_data")

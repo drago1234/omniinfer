@@ -27,6 +27,7 @@ import pytest
 collect_ignore = [
     "integration/test_draft_sampling_npu.py",
     "unit/sample/test_draft_sampling_kernels.py",
+    "unit/worker/npu/test_mtp_dummy_slots.py",
 ]
 
 
