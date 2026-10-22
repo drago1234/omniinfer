@@ -445,6 +445,70 @@ class TestEngramDevice:
             torch.testing.assert_close(actual_output, expected_output, rtol=2e-2, atol=1e-5)
 
     @staticmethod
+    @pytest.mark.parametrize("graph_mode", [False, True], ids=["eager", "captured_graph"])
+    @torch.inference_mode()
+    def test_online_post_refreshes_projections_without_refilling_table(fusion, graph_mode, monkeypatch):
+        """An existing graph must consume B projections at the original addresses."""
+        from omni_npu.v1.layers.attention.weight_utils import run_post_weight_load
+
+        fusion.use_engram_proj_gate_fusion_op = True
+        fusion.process_weights_after_loading()
+        table = fusion.embed_tokens.weight
+        table_before = table.clone()
+        table_pointer = table.data_ptr()
+        mapped_pointer = fusion.embed_tokens._mapped_weight.data_ptr()
+        key, value = fusion.proj_weights_key, fusion.proj_weights_value
+        pointers = (key.data_ptr(), value.data_ptr())
+        model = torch.nn.Module()
+        model.add_module("engram", fusion)
+        # A repeated table initialization must fail even when dummy fill is disabled.
+        monkeypatch.setattr(fusion.embed_tokens, "process_weights_after_loading",
+                            lambda: pytest.fail("online post must not initialize the table"))
+        ids = fusion.layout.offsets[0].int().to("npu:0").expand(7, -1).contiguous()
+        fusion.staged_rows = torch.empty((7, fusion.layout.n_hash_cols, fusion.layout.head_dim),
+                                         device="npu:0", dtype=torch.bfloat16)
+        fusion.prepare_embeddings(ids)
+        hidden = torch.randn(7, fusion.num_streams, fusion.hidden_size, device="npu:0")
+        for _ in range(3):
+            fusion(hidden, ids)
+        torch.npu.synchronize()
+        graph = None
+        if graph_mode:
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph):
+                output = fusion(hidden, ids)
+            graph.replay()
+        else:
+            output = fusion(hidden, ids)
+        original_output = output.cpu()
+
+        for _ in range(3):
+            fusion.wkv.weight.mul_(0.5)
+            fusion.k_weight.mul_(1.125)
+            fusion.q_weight.add_(0.125)
+            run_post_weight_load(model)
+            assert fusion.proj_weights_key is key and fusion.proj_weights_value is value
+            assert (key.data_ptr(), value.data_ptr()) == pointers
+            packed = fusion.wkv.weight.reshape(fusion.num_streams + 1, fusion.hidden_size, fusion.memory_dim)
+            torch.testing.assert_close(key, packed[:-1].transpose(1, 2), rtol=0, atol=0)
+            torch.testing.assert_close(value, packed[-1].t(), rtol=0, atol=0)
+            if graph is not None:
+                graph.replay()
+            else:
+                output = fusion(hidden, ids)
+            actual = output.cpu()
+            # Compare with independent WKV/RMSNorm/gating execution, including
+            # directly updated k/q parameters, rather than another cached path.
+            with monkeypatch.context() as unfused:
+                unfused.setattr(fusion, "use_engram_proj_gate_fusion_op", False)
+                expected = fusion(hidden, ids).cpu()
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=1e-5)
+            assert not torch.equal(actual, original_output)
+            assert table.data_ptr() == table_pointer
+            assert fusion.embed_tokens._mapped_weight.data_ptr() == mapped_pointer
+            torch.testing.assert_close(table, table_before, rtol=0, atol=0)
+
+    @staticmethod
     @pytest.mark.parametrize("tokens", [1, 7, 129])
     @torch.inference_mode()
     def test_projection_gate_inference_replay_overwrites_poisoned_output(tokens):

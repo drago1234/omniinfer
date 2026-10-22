@@ -1230,6 +1230,7 @@ class PanGuEngramFusion(nn.Module):
         )
         self.register_buffer("proj_weights_key", None, persistent=False)
         self.register_buffer("proj_weights_value", None, persistent=False)
+        self._engram_weights_initialized = False
         # NPU hashing uses graph-local rows allocated by engram_lookup_rows.
         self.staged_rows = None
         self._lookup_key = id(self)
@@ -1339,11 +1340,40 @@ class PanGuEngramFusion(nn.Module):
     def process_weights_after_loading(self) -> None:
         """Finish table initialization before the loader returns the model."""
         self.embed_tokens.process_weights_after_loading()
-        if self.use_engram_proj_gate_fusion_op:
-            # Convert the checkpoint's [output, input] WKV once after loading,
-            # avoiding a full weight transpose on every inference step.
-            keys, value = self.wkv.weight.unflatten(0, (self.num_streams + 1, self.hidden_size)).split(
-                [self.num_streams, 1], dim=0
-            )
-            self.proj_weights_key = keys.transpose(1, 2).contiguous()
-            self.proj_weights_value = value.squeeze(0).t().contiguous()
+        self._refresh_projection_cache(initialize=True)
+        self._engram_weights_initialized = True
+
+    def post_weight_load(self) -> None:
+        """Refresh online projections without repeating shared-table initialization."""
+        # Model load_weights() dispatches post hooks before the first per-layer
+        # process_weights_after_loading(); WKV may not be ready at that point.
+        if not getattr(self, "_engram_weights_initialized", False):
+            return
+        self._refresh_projection_cache()
+
+    @torch.no_grad()
+    def _refresh_projection_cache(self, *, initialize: bool = False) -> None:
+        if not self.use_engram_proj_gate_fusion_op:
+            return
+        keys, value = self.wkv.weight.unflatten(0, (self.num_streams + 1, self.hidden_size)).split(
+            [self.num_streams, 1], dim=0
+        )
+        projections = (
+            ("proj_weights_key", keys.transpose(1, 2).contiguous()),
+            ("proj_weights_value", value.squeeze(0).t().contiguous()),
+        )
+        if initialize:
+            for name, projection in projections:
+                setattr(self, name, projection)
+            return
+
+        # Validate both destinations before writing either one. Online refresh
+        # must preserve buffers referenced by already captured graphs.
+        for name, projection in projections:
+            cached = getattr(self, name)
+            if cached is None or (cached.shape, cached.dtype, cached.device) != (
+                projection.shape, projection.dtype, projection.device
+            ):
+                raise RuntimeError(f"Engram projection cache {name} is incompatible with loaded WKV")
+        for name, projection in projections:
+            getattr(self, name).copy_(projection)
