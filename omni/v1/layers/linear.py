@@ -6,6 +6,7 @@
 # https://github.com/vllm-project/vllm/blob/releases/v0.14.0/vllm/model_executor/layers/linear.py
 
 from abc import abstractmethod
+from contextlib import contextmanager
 from typing import Any, Literal, Optional, Union
 
 import torch
@@ -255,6 +256,50 @@ class FlashCommLinearBase(torch.nn.Module):
                 param.tp_rank = self.tp_rank
                 param.tp_size = self.tp_size
 
+    @staticmethod
+    def _to_plain_layout(param: Parameter) -> None:
+        """Undo the compute-layout transforms so param.data is ND / non-transposed.
+
+        ``process_weights_after_loading`` cast the live weight to FRACTAL_NZ +
+        transpose; before ``copy_`` of raw checkpoint bytes we must revert both.
+        Order: NZ -> ND first, then drop the transpose.
+        """
+        if getattr(param, "is_weight_nz", False):
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.ND)
+        if getattr(param, "is_weight_transposed", False):
+            param.data = param.data.t_()
+
+    @staticmethod
+    def _to_compute_layout(param: Parameter) -> None:
+        """Re-apply the compute-layout transforms after ``copy_``.
+
+        Must run in the exact reverse order of ``_to_plain_layout``: restore
+        the transpose first, then ND -> FRACTAL_NZ. Request an ACLGraph
+        recapture once the NZ cast is back; the global flag coalesces repeats,
+        so one reload maps to a single recapture regardless of param count.
+        """
+        if getattr(param, "is_weight_transposed", False):
+            param.data = param.data.t_()
+        if getattr(param, "is_weight_nz", False):
+            param.data = torch_npu.npu_format_cast(
+                param.data, torch_npu.Format.FRACTAL_NZ)
+            set_aclgraph_recapture(True)
+
+    @contextmanager
+    def _restored_plain_layout(self, param: Parameter):
+        """Yield param.data in plain (ND / non-transposed) form for ``copy_``.
+
+        On veRL reload ``process_weights_after_loading`` is not re-run (guarded
+        by ``process_weights_after_loading_already_called``), so each
+        ``weight_loader`` must undo the compute layout before copying and redo
+        it afterwards. Centralized here so subclasses only carry shard slicing.
+        """
+        self._to_plain_layout(param)
+        try:
+            yield param.data
+        finally:
+            self._to_compute_layout(param)
+
 
 class ReplicatedFlashCommLinear(FlashCommLinearBase):
 
@@ -312,27 +357,12 @@ class ReplicatedFlashCommLinear(FlashCommLinearBase):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        # veRL special case: transpose the weight back to original shape
-        is_weight_nz = getattr(param, "is_weight_nz", False)
-        is_weight_transposed = getattr(param, "is_weight_transposed", False)
-        if is_weight_nz:
-            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.ND)
-        if is_weight_transposed:
-            param.data = param.data.t_()
-
-        param_data = param.data
-        is_2_dims = getattr(param, "is_2_dims", False)
-        if not is_2_dims:
-            loaded_weight = torch.squeeze(loaded_weight)
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
-
-        # veRL special case: transpose the weight to use torch npu operator
-        if is_weight_transposed:
-            param.data = param.data.t_()
-        if is_weight_nz:
-            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.FRACTAL_NZ)
-            set_aclgraph_recapture(True)
+        with self._restored_plain_layout(param) as param_data:
+            is_2_dims = getattr(param, "is_2_dims", False)
+            if not is_2_dims:
+                loaded_weight = torch.squeeze(loaded_weight)
+            assert param_data.shape == loaded_weight.shape
+            param_data.copy_(loaded_weight)
 
     def forward(
         self,
@@ -421,32 +451,18 @@ class ColumnParallelFlashCommLinear(FlashCommLinearBase):
         self.update_param_tp_status()
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        # veRL special case: transpose the weight back to original shape
-        is_weight_nz = getattr(param, "is_weight_nz", False)
-        is_weight_transposed = getattr(param, "is_weight_transposed", False)
-        if is_weight_nz:
-            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.ND)
-        if is_weight_transposed:
-            param.data = param.data.t_()
-        output_dim = getattr(param, "output_dim", None)
+        with self._restored_plain_layout(param) as param_data:
+            output_dim = getattr(param, "output_dim", None)
+            if output_dim is not None:
+                shard_size = param_data.shape[output_dim]
+                start_idx = self.tp_rank * shard_size
+                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
-        param_data = param.data
-        if output_dim is not None:
-            shard_size = param_data.shape[output_dim]
-            start_idx = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-
-        is_2_dims = getattr(param, "is_2_dims", False)
-        if not is_2_dims:
-            loaded_weight = torch.squeeze(loaded_weight)
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
-        # veRL special case: transpose the weight to use torch npu operator
-        if is_weight_transposed:
-            param.data = param.data.t_()
-        if is_weight_nz:
-            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.FRACTAL_NZ)
-            set_aclgraph_recapture(True)
+            is_2_dims = getattr(param, "is_2_dims", False)
+            if not is_2_dims:
+                loaded_weight = torch.squeeze(loaded_weight)
+            assert param_data.shape == loaded_weight.shape
+            param_data.copy_(loaded_weight)
 
     def forward(
         self,
@@ -541,33 +557,31 @@ class QKVParallelFlashCommLinear(ColumnParallelFlashCommLinear):
             assert self.tp_size == 1
             self.load_qkv_weights_interleaved(param, loaded_weight)
             return
-        # veRL special case: transpose the weight back to original shape
-        is_weight_nz = getattr(param, "is_weight_nz", False)
-        is_weight_transposed = getattr(param, "is_weight_transposed", False)
-        if is_weight_nz:
-            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.ND)
-        if is_weight_transposed:
-            param.data = param.data.t_()
-        param_data = param.data
-        output_dim = getattr(param, "output_dim", None)
+        with self._restored_plain_layout(param) as param_data:
+            output_dim = getattr(param, "output_dim", None)
+            if loaded_shard_id is None:
+                shard_offsets = [
+                    ("q", 0, self.total_num_heads * self.head_size),
+                    ("k", self.total_num_heads * self.head_size,
+                     self.total_num_kv_heads * self.head_size),
+                    ("v", (self.total_num_heads + self.total_num_kv_heads) *
+                     self.head_size, self.total_num_kv_heads * self.head_size),
+                ]
+                for shard_id, shard_offset, shard_size in shard_offsets:
+                    loaded_weight_shard = loaded_weight.narrow(
+                        output_dim, shard_offset, shard_size)
+                    self._copy_qkv_shard(
+                        param, param_data, loaded_weight_shard, shard_id)
+                return
+            self._copy_qkv_shard(param, param_data, loaded_weight, loaded_shard_id)
 
-        if loaded_shard_id is None:
-            shard_offsets = [
-                ("q", 0, self.total_num_heads * self.head_size),
-                ("k", self.total_num_heads * self.head_size,
-                 self.total_num_kv_heads * self.head_size),
-                ("v", (self.total_num_heads + self.total_num_kv_heads) *
-                 self.head_size, self.total_num_kv_heads * self.head_size),
-            ]
-            for shard_id, shard_offset, shard_size in shard_offsets:
-                loaded_weight_shard = loaded_weight.narrow(
-                    output_dim, shard_offset, shard_size)
-                self.weight_loader(param, loaded_weight_shard, shard_id)
-            return
-
+    def _copy_qkv_shard(self,
+                        param: Parameter,
+                        param_data: torch.Tensor,
+                        loaded_weight: torch.Tensor,
+                        loaded_shard_id: str):
         assert loaded_shard_id in ["q", "k", "v"]
-
-        # If output dim is defined, use the default loading process.
+        output_dim = getattr(param, "output_dim", None)
         assert output_dim is not None
         if loaded_shard_id == "q":
             shard_offset = 0
@@ -580,28 +594,20 @@ class QKVParallelFlashCommLinear(ColumnParallelFlashCommLinear):
                             self.num_kv_heads) * self.head_size
             shard_size = self.num_kv_heads * self.head_size
 
-        param_data = param_data.narrow(output_dim, shard_offset,
-                                        shard_size)
+        param_data = param_data.narrow(output_dim, shard_offset, shard_size)
         if loaded_shard_id == "q":
             shard_id = self.tp_rank
         else:
             shard_id = self.tp_rank // self.num_kv_head_replicas
         start_idx = shard_id * shard_size
 
-        loaded_weight = loaded_weight.narrow(output_dim, start_idx,
-                                                shard_size)
+        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
         is_2_dims = getattr(param, "is_2_dims", False)
         if not is_2_dims:
             loaded_weight = torch.squeeze(loaded_weight)
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
-        # veRL special case: transpose the weight to use torch npu operator
-        if is_weight_transposed:
-            param.data = param.data.t_()
-        if is_weight_nz:
-            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.FRACTAL_NZ)
-            set_aclgraph_recapture(True)
 
     # When y_transform = ALL2ALL for the weight_loader, weights must be rearranged.
     # 下表中 q1..q8 / k1..k4 / v1..v4 分别代表 q_head1..8 / k_head1..4 / v_head1..4
@@ -614,95 +620,83 @@ class QKVParallelFlashCommLinear(ColumnParallelFlashCommLinear):
     def load_qkv_weights_interleaved(self,
                                      param: Parameter,
                                      loaded_weight: torch.Tensor):
-        is_weight_nz = getattr(param, "is_weight_nz", False)
-        is_weight_transposed = getattr(param, "is_weight_transposed", False)
-        if is_weight_nz:
-            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.ND)
-        if is_weight_transposed:
-            param.data = param.data.t_()
-        param_data = param.data
-        output_dim = getattr(param, "output_dim", None)
-        assert output_dim is not None, "output_dim must be defined for QKV weight loading"
+        with self._restored_plain_layout(param) as param_data:
+            output_dim = getattr(param, "output_dim", None)
+            assert output_dim is not None, "output_dim must be defined for QKV weight loading"
 
-        q_total_size = self.total_num_heads * self.head_size
-        k_total_size = self.total_num_kv_heads * self.head_size
-        v_total_size = self.total_num_kv_heads * self.head_size
+            q_total_size = self.total_num_heads * self.head_size
+            k_total_size = self.total_num_kv_heads * self.head_size
+            v_total_size = self.total_num_kv_heads * self.head_size
 
-        q_weight_global = loaded_weight.narrow(output_dim, 0, q_total_size)
-        k_weight_global = loaded_weight.narrow(output_dim, q_total_size, k_total_size)
-        v_weight_global = loaded_weight.narrow(output_dim, q_total_size + k_total_size, v_total_size)
+            q_weight_global = loaded_weight.narrow(output_dim, 0, q_total_size)
+            k_weight_global = loaded_weight.narrow(output_dim, q_total_size, k_total_size)
+            v_weight_global = loaded_weight.narrow(output_dim, q_total_size + k_total_size, v_total_size)
 
-        y_num_heads = divide(self.total_num_heads, self.y_world_size)
-        if self.y_world_size >= self.total_num_kv_heads:
-            y_num_kv_heads = 1
-            y_num_kv_head_replicas = divide(self.y_world_size, self.total_num_kv_heads)
-        else:
-            y_num_kv_heads = divide(self.total_num_kv_heads, self.y_world_size)
-            y_num_kv_head_replicas = 1
+            y_num_heads = divide(self.total_num_heads, self.y_world_size)
+            if self.y_world_size >= self.total_num_kv_heads:
+                y_num_kv_heads = 1
+                y_num_kv_head_replicas = divide(self.y_world_size, self.total_num_kv_heads)
+            else:
+                y_num_kv_heads = divide(self.total_num_kv_heads, self.y_world_size)
+                y_num_kv_head_replicas = 1
 
-        current_offset = 0
-        q_shard_size = y_num_heads * self.head_size
-        kv_shard_size = y_num_kv_heads * self.head_size
-        is_2_dims = getattr(param, "is_2_dims", False)
+            current_offset = 0
+            q_shard_size = y_num_heads * self.head_size
+            kv_shard_size = y_num_kv_heads * self.head_size
+            is_2_dims = getattr(param, "is_2_dims", False)
 
-        for rank in range(self.y_world_size):
-            q_shard_id = rank
-            q_start_idx = q_shard_id * q_shard_size
+            for rank in range(self.y_world_size):
+                q_shard_id = rank
+                q_start_idx = q_shard_id * q_shard_size
 
-            kv_shard_id = rank // y_num_kv_head_replicas
-            kv_start_idx = kv_shard_id * kv_shard_size
+                kv_shard_id = rank // y_num_kv_head_replicas
+                kv_start_idx = kv_shard_id * kv_shard_size
 
-            q_shard = q_weight_global.narrow(output_dim, q_start_idx, q_shard_size)
-            param_target_q = param_data.narrow(output_dim, current_offset, q_shard_size)
-            if not is_2_dims:
-                q_shard = torch.squeeze(q_shard)
+                q_shard = q_weight_global.narrow(output_dim, q_start_idx, q_shard_size)
+                param_target_q = param_data.narrow(output_dim, current_offset, q_shard_size)
+                if not is_2_dims:
+                    q_shard = torch.squeeze(q_shard)
+                assert (
+                    q_shard.shape == param_target_q.shape
+                ), f"Q shard shape {q_shard.shape} != target {param_target_q.shape} (rank {rank})"
+                param_target_q.copy_(q_shard)
+                current_offset += q_shard_size
+
+                k_shard = k_weight_global.narrow(output_dim, kv_start_idx, kv_shard_size)
+                param_target_k = param_data.narrow(
+                    output_dim, current_offset, kv_shard_size
+                )
+                if not is_2_dims:
+                    k_shard = torch.squeeze(k_shard)
+                assert (
+                    k_shard.shape == param_target_k.shape
+                ), f"K shard shape {k_shard.shape} != target {param_target_k.shape} (rank {rank})"
+                param_target_k.copy_(k_shard)
+                current_offset += kv_shard_size
+
+                v_shard = v_weight_global.narrow(output_dim, kv_start_idx, kv_shard_size)
+                param_target_v = param_data.narrow(
+                    output_dim, current_offset, kv_shard_size
+                )
+                if not is_2_dims:
+                    v_shard = torch.squeeze(v_shard)
+                assert (
+                    v_shard.shape == param_target_v.shape
+                ), f"V shard shape {v_shard.shape} != target {param_target_v.shape} (rank {rank})"
+                param_target_v.copy_(v_shard)
+                current_offset += kv_shard_size
+
+            total_expected_size = self.y_world_size * (q_shard_size + 2 * kv_shard_size)
             assert (
-                q_shard.shape == param_target_q.shape
-            ), f"Q shard shape {q_shard.shape} != target {param_target_q.shape} (rank {rank})"
-            param_target_q.copy_(q_shard)
-            current_offset += q_shard_size
-
-            k_shard = k_weight_global.narrow(output_dim, kv_start_idx, kv_shard_size)
-            param_target_k = param_data.narrow(
-                output_dim, current_offset, kv_shard_size
-            )
-            if not is_2_dims:
-                k_shard = torch.squeeze(k_shard)
+                current_offset == total_expected_size
+            ), f"Total copied size {current_offset} != expected {total_expected_size}"
             assert (
-                k_shard.shape == param_target_k.shape
-            ), f"K shard shape {k_shard.shape} != target {param_target_k.shape} (rank {rank})"
-            param_target_k.copy_(k_shard)
-            current_offset += kv_shard_size
-
-            v_shard = v_weight_global.narrow(output_dim, kv_start_idx, kv_shard_size)
-            param_target_v = param_data.narrow(
-                output_dim, current_offset, kv_shard_size
-            )
-            if not is_2_dims:
-                v_shard = torch.squeeze(v_shard)
+                param_data.shape[output_dim] == total_expected_size
+            ), f"Param dimension {param_data.shape[output_dim]} != expected {total_expected_size}"
             assert (
-                v_shard.shape == param_target_v.shape
-            ), f"V shard shape {v_shard.shape} != target {param_target_v.shape} (rank {rank})"
-            param_target_v.copy_(v_shard)
-            current_offset += kv_shard_size
-
-        total_expected_size = self.y_world_size * (q_shard_size + 2 * kv_shard_size)
-        assert (
-            current_offset == total_expected_size
-        ), f"Total copied size {current_offset} != expected {total_expected_size}"
-        assert (
-            param_data.shape[output_dim] == total_expected_size
-        ), f"Param dimension {param_data.shape[output_dim]} != expected {total_expected_size}"
-        assert (
-            loaded_weight.shape[output_dim]
-            == q_total_size + k_total_size + v_total_size
-        ), f"Loaded weight dimension {loaded_weight.shape[output_dim]} != Q+K+V size"
-
-        if is_weight_transposed:
-            param.data = param.data.t_()
-        if is_weight_nz:
-            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.FRACTAL_NZ)
-            set_aclgraph_recapture(True)
+                loaded_weight.shape[output_dim]
+                == q_total_size + k_total_size + v_total_size
+            ), f"Loaded weight dimension {loaded_weight.shape[output_dim]} != Q+K+V size"
 
 
 class MergedColumnParallelFlashCommLinear(ColumnParallelFlashCommLinear):
@@ -743,37 +737,24 @@ class MergedColumnParallelFlashCommLinear(ColumnParallelFlashCommLinear):
                       param: Parameter,
                       loaded_weight: torch.Tensor,
                       loaded_shard_id: Optional[int] = None):
-        # veRL special case: transpose the weight back to original shape
-        is_weight_nz = getattr(param, "is_weight_nz", False)
-        is_weight_transposed = getattr(param, "is_weight_transposed", False)
-        if is_weight_nz:
-            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.ND)
-        if is_weight_transposed:
-            param.data = param.data.t_()
-        param_data = param.data
-        output_dim = getattr(param, "output_dim", None)
+        with self._restored_plain_layout(param) as param_data:
+            output_dim = getattr(param, "output_dim", None)
 
-        assert loaded_shard_id is not None
-        assert loaded_shard_id < len(self.output_sizes)
-        assert output_dim is not None
-        shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
-        shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
+            assert loaded_shard_id is not None
+            assert loaded_shard_id < len(self.output_sizes)
+            assert output_dim is not None
+            shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
+            shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
 
-        param_data = param_data.narrow(output_dim, shard_offset, shard_size)
-        start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            param_data = param_data.narrow(output_dim, shard_offset, shard_size)
+            start_idx = self.tp_rank * shard_size
+            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
-        is_2_dims = getattr(param, "is_2_dims", False)
-        if not is_2_dims:
-            loaded_weight = torch.squeeze(loaded_weight)
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
-        # veRL special case: transpose the weight to use torch npu operator
-        if is_weight_transposed:
-            param.data = param.data.t_()
-        if is_weight_nz:
-            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.FRACTAL_NZ)
-            set_aclgraph_recapture(True)
+            is_2_dims = getattr(param, "is_2_dims", False)
+            if not is_2_dims:
+                loaded_weight = torch.squeeze(loaded_weight)
+            assert param_data.shape == loaded_weight.shape
+            param_data.copy_(loaded_weight)
 
 
 class RowParallelFlashCommLinear(FlashCommLinearBase):
@@ -840,32 +821,19 @@ class RowParallelFlashCommLinear(FlashCommLinearBase):
         self.update_param_tp_status()
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        # veRL special case: transpose the weight back to original shape
-        is_weight_nz = getattr(param, "is_weight_nz", False)
-        is_weight_transposed = getattr(param, "is_weight_transposed", False)
-        if is_weight_nz:
-            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.ND)
-        if is_weight_transposed:
-            param.data = param.data.t_()
-        input_dim = getattr(param, "input_dim", None)
-        param_data = param.data
+        with self._restored_plain_layout(param) as param_data:
+            input_dim = getattr(param, "input_dim", None)
 
-        if input_dim is not None:
-            shard_size = param_data.shape[input_dim]
-            start_idx = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
+            if input_dim is not None:
+                shard_size = param_data.shape[input_dim]
+                start_idx = self.tp_rank * shard_size
+                loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
 
-        is_2_dims = getattr(param, "is_2_dims", False)
-        if not is_2_dims:
-            loaded_weight = torch.squeeze(loaded_weight)
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
-        # veRL special case: transpose the weight to use torch npu operator
-        if is_weight_transposed:
-            param.data = param.data.t_()
-        if is_weight_nz:
-            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.FRACTAL_NZ)
-            set_aclgraph_recapture(True)
+            is_2_dims = getattr(param, "is_2_dims", False)
+            if not is_2_dims:
+                loaded_weight = torch.squeeze(loaded_weight)
+            assert param_data.shape == loaded_weight.shape
+            param_data.copy_(loaded_weight)
 
     def forward(
         self,
