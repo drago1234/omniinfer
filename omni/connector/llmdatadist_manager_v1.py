@@ -101,7 +101,7 @@ class DatadistEngine:
                 self.engine.finalize()
             self.inited = False
 
-    def weakup(self):
+    def wakeup(self):
         if not self.inited:
             with self.data_lock:
                 self.engine.init(self.cfg)
@@ -300,8 +300,8 @@ class DatadistEngine:
         If not set, defaults to /etc/hixlep.
 
         Controlled by HIXL_LOCAL_COMM_RES_ENABLE environment variable:
-        - "1", "true", "yes" (default): enable loading
-        - "0", "false", "no": disable loading, return empty string
+        - Unset (default), "0", "false", "no": disable loading, return empty string
+        - "1", "true", "yes": enable loading
 
         Returns:
             str: JSON string for hixl backend, or empty string if not found/disabled.
@@ -500,8 +500,8 @@ class CacheManager:  # safe in multi-thread
     def sleep(self):
         self.engine.sleep()  # auto unregister
 
-    def weakup(self):
-        self.engine.weakup()
+    def wakeup(self):
+        self.engine.wakeup()
 
     # ================= memory =================
 
