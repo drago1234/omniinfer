@@ -491,6 +491,108 @@ def test_projection_gate_switch_and_loaded_weight_layout(monkeypatch, fusion, tp
         assert layer.proj_weights_key is layer.proj_weights_value is None
 
 
+@pytest.fixture
+def online_projection_layer(monkeypatch):
+    from unittest.mock import Mock
+    from omni_npu.layers import engram
+    from omni_npu.model_config.config_loader.loader import ModelOperatorOptConfig, model_extra_config
+
+    monkeypatch.setattr(
+        model_extra_config, "operator_opt_config", ModelOperatorOptConfig(use_engram_proj_gate_fusion_op=True)
+    )
+    table = torch.zeros(7, 4)
+    embedding = SimpleNamespace(weight=table, process_weights_after_loading=Mock(side_effect=lambda: table.fill_(1)))
+    monkeypatch.setattr(engram, "ParallelEngramEmbedding", lambda *args: embedding)
+
+    def linear(size, output, **kwargs):
+        module = torch.nn.Linear(size, output, bias=False, dtype=torch.bfloat16)
+        module.tp_size = 1
+        return module
+
+    monkeypatch.setattr(engram, "ColumnParallelLinear", linear)
+    return engram.PanGuEngramFusion(EngramLayout(_config()), 2, None, False)
+
+
+def _run_online_post(layer):
+    from omni_npu.v1.layers.attention.weight_utils import run_post_weight_load
+
+    model = torch.nn.Module()
+    model.add_module("engram", layer)
+    run_post_weight_load(model)
+
+
+def test_online_post_skips_uninitialized_wkv(online_projection_layer):
+    layer = online_projection_layer
+    # The model's first load dispatches post hooks before per-layer initialization.
+    layer.wkv.weight = torch.nn.Parameter(torch.empty(0))
+    _run_online_post(layer)
+    assert layer.proj_weights_key is layer.proj_weights_value is None
+    layer.embed_tokens.process_weights_after_loading.assert_not_called()
+
+
+def test_online_post_refreshes_both_projections_in_place_without_refilling_table(online_projection_layer):
+    layer = online_projection_layer
+    layer.process_weights_after_loading()
+    key, value = layer.proj_weights_key, layer.proj_weights_value
+    pointers = (key.data_ptr(), value.data_ptr())
+    # A second dummy initialization would destroy this sentinel table content.
+    layer.embed_tokens.weight.fill_(7)
+    with torch.no_grad():
+        for step in range(3):
+            layer.wkv.weight.copy_(torch.arange(layer.wkv.weight.numel()).reshape_as(layer.wkv.weight) / 128 + step)
+            _run_online_post(layer)
+            packed = layer.wkv.weight.reshape(3, 6, 8)
+            torch.testing.assert_close(key, packed[:2].transpose(1, 2), rtol=0, atol=0)
+            torch.testing.assert_close(value, packed[2].t(), rtol=0, atol=0)
+            assert layer.proj_weights_key is key and layer.proj_weights_value is value
+            assert (key.data_ptr(), value.data_ptr()) == pointers
+            assert not key.requires_grad and not value.requires_grad
+            assert torch.all(layer.embed_tokens.weight == 7)
+    layer.embed_tokens.process_weights_after_loading.assert_called_once()
+
+
+def test_online_post_does_not_initialize_unfused_caches(online_projection_layer):
+    layer = online_projection_layer
+    layer.use_engram_proj_gate_fusion_op = False
+    layer.process_weights_after_loading()
+    _run_online_post(layer)
+    assert layer.proj_weights_key is layer.proj_weights_value is None
+    layer.embed_tokens.process_weights_after_loading.assert_called_once()
+
+
+def test_online_post_skips_failed_initialization(online_projection_layer):
+    layer = online_projection_layer
+    layer.embed_tokens.process_weights_after_loading.side_effect = RuntimeError("table initialization failed")
+    with pytest.raises(RuntimeError, match="table initialization failed"):
+        layer.process_weights_after_loading()
+    layer.wkv.weight = torch.nn.Parameter(torch.empty(0))
+    _run_online_post(layer)
+    assert layer.proj_weights_key is layer.proj_weights_value is None
+    layer.embed_tokens.process_weights_after_loading.assert_called_once()
+
+
+@pytest.mark.parametrize("cache_name", ["proj_weights_key", "proj_weights_value"])
+@pytest.mark.parametrize("mismatch", ["shape", "dtype", "device", "missing"])
+def test_online_post_rejects_incompatible_cache_without_replacing_storage(
+    online_projection_layer, cache_name, mismatch
+):
+    layer = online_projection_layer
+    layer.process_weights_after_loading()
+    cache = getattr(layer, cache_name)
+    incompatible = {"shape": lambda: cache.flatten(), "dtype": lambda: cache.float(),
+                    "device": lambda: cache.to("meta"), "missing": lambda: None}[mismatch]()
+    setattr(layer, cache_name, incompatible)
+    unchanged = {name: tensor.clone() for name in ("proj_weights_key", "proj_weights_value")
+                 if (tensor := getattr(layer, name)) is not None and tensor.device.type != "meta"}
+    with torch.no_grad():
+        layer.wkv.weight.add_(1)
+    with pytest.raises(RuntimeError, match="Engram projection cache"):
+        _run_online_post(layer)
+    assert getattr(layer, cache_name) is incompatible
+    for name, expected in unchanged.items():
+        torch.testing.assert_close(getattr(layer, name), expected, rtol=0, atol=0)
+
+
 def test_projection_gate_custom_op_passes_model_eps_without_backward_caches(monkeypatch):
     import sys
     from unittest.mock import Mock
