@@ -463,6 +463,25 @@ class StaticSinkAttentionClassPatch(VLLMPatch):
         self_k_cache: torch.Tensor,
         self_v_cache: torch.Tensor
     ) -> None:
+        if model_extra_config.operator_opt_config.kv_nz:
+            # NZ layout: reuse npu_scatter_pa_kv_cache (scene 1) for the
+            # sink write, same writer as the forward KV path.
+            sink_kv_slot_mapping = torch.arange(
+                self.block_size,
+                self.sink_len + self.block_size,
+                device=current_platform.current_device(),
+                dtype=torch.long,
+            )
+            torch_npu.npu_scatter_pa_kv_cache(
+                self.sink_key,
+                self.sink_value,
+                self_k_cache,
+                self_v_cache,
+                sink_kv_slot_mapping,
+            )
+            self.sink_populated = True
+            return
+
         sink_kv_slot_mapping = torch.arange(
             self.block_size,
             self.sink_len + self.block_size,

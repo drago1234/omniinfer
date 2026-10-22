@@ -1,6 +1,7 @@
 {
     "model_parallel_config": {},
     "operator_optimization_config": {
-        "use_aicpu_fa_tiling": true
+        "use_aicpu_fa_tiling": true,
+        "kv_nz": true
     }
 }
