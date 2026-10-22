@@ -2187,3 +2187,159 @@ class TestMxfp8MoEMethodApply:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("tp_rank", [0, 3, 7])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("already_sharded", [False, True])
+def test_expert_w2_scale_loader_tp_shards(mxfp8_module, tp_rank, packed,
+                                        already_sharded):
+    full = torch.arange(4 * 16, dtype=torch.uint8).reshape(4, 16)
+    expected = full[:, tp_rank * 2:(tp_rank + 1) * 2]
+    param = torch.nn.Parameter(torch.zeros(2, 4, 2, dtype=torch.uint8),
+                               requires_grad=False)
+    if packed:
+        param.data = mxfp8_module._pack_mxfp8_expert_scale(param.data)
+        param.is_mxfp8_scale_packed = True
+    ptr = param.data_ptr()
+
+    def loader(param, loaded_weight, weight_name, shard_id, expert_id,
+               return_success=False):
+        assert shard_id == "w2"
+        param.data[expert_id].copy_(loaded_weight)
+        return return_success
+
+    result = mxfp8_module._mxfp8_scale_weight_loader(
+        loader, True, param, expected if already_sharded else full,
+        "w2_weight_scale", "w2", 1, return_success=True,
+        expert_tp_rank=tp_rank, expert_tp_size=8,
+    )
+    actual = (mxfp8_module._unpack_mxfp8_expert_scale(param.data)
+              if packed else param.data)
+    assert result is True
+    assert torch.equal(actual[1], expected)
+    assert torch.count_nonzero(actual[0]) == 0
+    assert param.data_ptr() == ptr
+
+
+def test_expert_w2_scale_loader_tp8_505_shape(mxfp8_module):
+    full = torch.arange(56, dtype=torch.uint8).expand(5120, -1)
+    param = torch.nn.Parameter(torch.empty(1, 5120, 7, dtype=torch.uint8),
+                               requires_grad=False)
+    def loader(param, loaded_weight, **kwargs):
+        param.data[kwargs["expert_id"]].copy_(loaded_weight)
+    mxfp8_module._mxfp8_scale_weight_loader(
+        loader, True, param, full, weight_name="w2_weight_scale", shard_id="w2",
+        expert_id=0, expert_tp_rank=7, expert_tp_size=8,
+    )
+    assert torch.equal(param[0], full[:, 49:56])
+
+
+def test_expert_w2_scale_loader_rejects_wrong_tp_shape(mxfp8_module):
+    param = torch.nn.Parameter(torch.zeros(1, 4, 2, dtype=torch.uint8),
+                               requires_grad=False)
+    loader = MagicMock()
+    with pytest.raises(ValueError, match="scale TP shape mismatch"):
+        mxfp8_module._mxfp8_scale_weight_loader(
+            loader, True, param, torch.zeros(4, 15, dtype=torch.uint8),
+            "w2_weight_scale", "w2", 0, expert_tp_rank=1, expert_tp_size=8,
+        )
+    loader.assert_not_called()
+
+
+def test_expert_padding_preserves_gate_up_and_moe_output(mxfp8_module):
+    torch.manual_seed(7)
+    x = torch.randn(3, 8)
+    gate_up = torch.randn(2, 448, 8)
+    down = torch.randn(2, 8, 224)
+    padded_gu = mxfp8_module._pad_mxfp8_expert_tensor(gate_up, 224, 256, "w13", False)
+    padded_down = mxfp8_module._pad_mxfp8_expert_tensor(down, 224, 256, "w2", False)
+    assert torch.count_nonzero(padded_gu[:, 224:256]) == 0
+    assert torch.count_nonzero(padded_gu[:, 480:512]) == 0
+    assert torch.count_nonzero(padded_down[..., 224:]) == 0
+    for expert in range(2):
+        gate, up = (x @ gate_up[expert].T).chunk(2, -1)
+        pg, pu = (x @ padded_gu[expert].T).chunk(2, -1)
+        expected = (torch.nn.functional.silu(gate) * up) @ down[expert].T
+        actual = (torch.nn.functional.silu(pg) * pu) @ padded_down[expert].T
+        torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("tp_rank", [0, 7])
+def test_padded_expert_tp_reload_matches_fresh(mxfp8_module, moe_method, tp_rank):
+    def loader(param, loaded_weight, weight_name, shard_id, expert_id,
+               return_success=False):
+        target = param.data[expert_id]
+        if shard_id in ("w1", "w3"):
+            width = target.shape[0] // 2
+            offset = 0 if shard_id == "w1" else width
+            target = target.narrow(0, offset, width)
+            loaded_weight = loaded_weight.narrow(0, tp_rank * width, width)
+        elif target.shape[-1] != loaded_weight.shape[-1]:
+            loaded_weight = loaded_weight.narrow(-1, tp_rank * target.shape[-1], target.shape[-1])
+        target.copy_(loaded_weight)
+        return return_success
+
+    def create():
+        layer = torch.nn.Module()
+        layer.moe_config = SimpleNamespace(tp_rank=tp_rank, tp_size=8)
+        moe_method.create_weights(layer, num_experts=2, hidden_size=128,
+                                 intermediate_size_per_partition=224,
+                                 params_dtype=torch.bfloat16, weight_loader=loader)
+        layer._ensure_moe_quant_config_init = MagicMock()
+        return layer
+
+    def load(layer, offset):
+        for eid in range(2):
+            for shard, prefix, shape in [("w1", "w13", (1792, 128)),
+                                          ("w3", "w13", (1792, 128)),
+                                          ("w2", "w2", (128, 1792))]:
+                for scale in [False, True]:
+                    name = prefix + ("_weight_scale" if scale else "_weight")
+                    size = (shape[0], shape[1] // 32) if scale else shape
+                    value = _pattern(size, torch.uint8 if scale else torch.float8_e4m3fn,
+                                     offset + eid + (9 if shard == "w3" else 0))
+                    param = getattr(layer, name)
+                    assert param.weight_loader(param, value, name, shard, eid, return_success=True)
+
+    reloaded = create()
+    load(reloaded, 3)
+    moe_method.process_weights_after_loading(reloaded)
+    assert reloaded.w13_weight.shape == (2, 128, 512)
+    assert reloaded.w2_weight.shape == (2, 256, 128)
+    scales = mxfp8_module._unpack_mxfp8_expert_scale(reloaded.w2_weight_scale)
+    assert torch.all(scales[..., 7:] == 127)
+    names = ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale")
+    pointers = {name: getattr(reloaded, name).data_ptr() for name in names}
+    load(reloaded, 47)
+    moe_method.process_weights_after_loading(reloaded)
+    fresh = create()
+    load(fresh, 47)
+    moe_method.process_weights_after_loading(fresh)
+    for name in names:
+        assert torch.equal(getattr(reloaded, name), getattr(fresh, name))
+        assert getattr(reloaded, name).data_ptr() == pointers[name]
+
+
+def test_pure_tp_keeps_tokens_and_reduces_before_shared(
+        mxfp8_module, moe_method, monkeypatch):
+    _patch_npu_streams(monkeypatch)
+    _set_schedule(mxfp8_module, monkeypatch, multi_stream=False,
+                  schedule="with_finalize")
+    method = _build_apply_method(mxfp8_module, moe_method, monkeypatch)
+    method.tp_size, method.tp_rank, method.on_ascend950 = 8, 7, True
+    method.select_communication_strategy.return_value = ("dispatch_combine", None)
+    hidden = torch.ones(2, 128, dtype=torch.bfloat16)
+    fused = MagicMock(return_value=hidden * 2)
+    reduce = MagicMock(side_effect=lambda x: x * 8)
+    shared = MagicMock(return_value=hidden * 3)
+    monkeypatch.setattr(mxfp8_module, "fused_experts_tp", fused)
+    monkeypatch.setattr(mxfp8_module, "tensor_model_parallel_all_reduce", reduce)
+    layer = as_moe_runner(SimpleNamespace(gate=None, shared_experts=shared),
+                          use_ep=False)
+    shared_out, total = method.apply(layer, hidden, torch.ones(2, 4), 1, False)
+    assert fused.call_args.kwargs['x'] is hidden
+    reduce.assert_called_once()
+    assert torch.equal(shared_out, hidden * 3)
+    assert torch.equal(total, hidden * 19)
+    method.apply_prepare_permute.assert_not_called()

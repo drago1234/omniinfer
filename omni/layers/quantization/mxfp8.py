@@ -267,6 +267,76 @@ def _pack_mxfp8_expert_weight(weight: torch.Tensor,
     return weight, scale
 
 
+
+def _pad_mxfp8_expert_tensor(data: torch.Tensor, logical_size: int,
+                              padded_size: int, shard: str,
+                              is_scale: bool) -> torch.Tensor:
+    """Pad each gate/up half separately, or the down projection's input."""
+    fill = 127 if is_scale else 0
+    if shard == "w13":
+        shape = list(data.shape)
+        shape[1] = 2 * padded_size
+        result = data.new_empty(shape)
+        if data.dtype == torch.float8_e4m3fn:
+            # CANN Fill does not accept FP8; zero has the same byte encoding.
+            result.view(torch.uint8).zero_()
+        else:
+            result.fill_(fill)
+        result[:, :logical_size].copy_(data[:, :logical_size])
+        result[:, padded_size:padded_size + logical_size].copy_(
+            data[:, logical_size:2 * logical_size])
+    else:
+        size = padded_size // MX_BLOCK_SIZE if is_scale else padded_size
+        shape = list(data.shape)
+        shape[-1] = size
+        result = data.new_empty(shape)
+        if data.dtype == torch.float8_e4m3fn:
+            # CANN Fill does not accept FP8; zero has the same byte encoding.
+            result.view(torch.uint8).zero_()
+        else:
+            result.fill_(fill)
+        result[..., :data.shape[-1]].copy_(data)
+    return result
+
+
+def _mxfp8_padded_expert_loader(original_loader, param, loaded_weight,
+                                  *args, **kwargs):
+    """Reload through the original TP shape, then restore padded storage."""
+    logical_size = getattr(param, "_mxfp8_logical_intermediate", None)
+    if logical_size is None:
+        return original_loader(param, loaded_weight, *args, **kwargs)
+    storage = param.data
+    is_scale = getattr(param, "is_mxfp8_scale_packed", False)
+    shard = param._mxfp8_expert_shard
+    plain = (_unpack_mxfp8_expert_scale(storage) if is_scale
+             else storage.transpose(1, 2))
+    padded_size = param._mxfp8_padded_intermediate
+    if shard == "w13":
+        logical = torch.cat((plain[:, :logical_size],
+                             plain[:, padded_size:padded_size + logical_size]), dim=1)
+    else:
+        width = logical_size // MX_BLOCK_SIZE if is_scale else logical_size
+        logical = plain[..., :width].contiguous()
+    transposed = getattr(param, "is_weight_transposed", False)
+    param.data = logical
+    param.is_weight_transposed = False
+    if is_scale:
+        param.is_mxfp8_scale_packed = False
+    try:
+        result = original_loader(param, loaded_weight, *args, **kwargs)
+        padded = _pad_mxfp8_expert_tensor(
+            param.data, logical_size, padded_size, shard, is_scale)
+        packed = (_pack_mxfp8_expert_scale(padded) if is_scale
+                  else padded.transpose(1, 2).contiguous())
+        storage.copy_(packed)
+        return result
+    finally:
+        param.data = storage
+        param.is_weight_transposed = transposed
+        if is_scale:
+            param.is_mxfp8_scale_packed = True
+
+
 def _unpack_mxfp8_scale(scale: torch.Tensor) -> torch.Tensor:
     """Restore a linear scale from kernel layout to checkpoint layout."""
     num_block_pairs, out_size, _ = scale.shape
@@ -324,8 +394,28 @@ def _mxfp8_linear_weight_loader(original_weight_loader,
 
 def _mxfp8_scale_weight_loader(original_weight_loader, expert: bool,
                                 param: torch.nn.Parameter,
-                                loaded_weight: torch.Tensor, *args, **kwargs):
-    """Reload a packed scale through its original checkpoint-layout loader."""
+                                loaded_weight: torch.Tensor, *args,
+                                expert_tp_rank: int = 0,
+                                expert_tp_size: int = 1, **kwargs):
+    """Load MXFP block scales, including the input-sharded expert w2 scale."""
+    shard_id = kwargs.get("shard_id", args[1] if len(args) > 1 else None)
+    if expert and shard_id == "w2":
+        logical_scale = (
+            _unpack_mxfp8_expert_scale(param.data)
+            if getattr(param, "is_mxfp8_scale_packed", False)
+            else param.data
+        )
+        local_blocks = logical_scale.shape[-1]
+        if loaded_weight.shape[-1] != local_blocks:
+            if loaded_weight.shape[-1] != local_blocks * expert_tp_size:
+                raise ValueError(
+                    "MXFP8 w2 scale TP shape mismatch: "
+                    f"loaded={tuple(loaded_weight.shape)}, "
+                    f"local_blocks={local_blocks}, tp_size={expert_tp_size}"
+                )
+            loaded_weight = loaded_weight.narrow(
+                -1, expert_tp_rank * local_blocks, local_blocks
+            )
     if not getattr(param, "is_mxfp8_scale_packed", False):
         return original_weight_loader(param, loaded_weight, *args, **kwargs)
 
@@ -743,10 +833,18 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         if scale_weight_loader is not None:
             scale_weight_attrs["weight_loader"] = partial(
                 _mxfp8_scale_weight_loader, scale_weight_loader, True,
+                expert_tp_rank=getattr(layer.moe_config, "tp_rank", 0),
+                expert_tp_size=getattr(layer.moe_config, "tp_size", 1),
             )
         scale_weight_attrs["quant_method"] = FusedMoeWeightScaleSupported.CHANNEL.value
         set_weight_attrs(w13_weight_scale, scale_weight_attrs)
         set_weight_attrs(w2_weight_scale, scale_weight_attrs)
+
+        for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+            param = getattr(layer, name)
+            loader = getattr(param, "weight_loader", None)
+            if loader is not None:
+                param.weight_loader = partial(_mxfp8_padded_expert_loader, loader)
 
         # Activations are dynamically quantized each forward.
         layer.w13_input_scale = None
@@ -777,6 +875,20 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer.w13_weight, "is_mxfp8_packed", False):
             return
+        logical_size = layer.w2_weight.shape[-1]
+        alignment = MX_BLOCK_SIZE * _MX_SCALE_PAIR
+        padded_size = (logical_size + alignment - 1) // alignment * alignment
+        if padded_size != logical_size:
+            if getattr(self.moe, "has_bias", False):
+                raise NotImplementedError("MXFP8 intermediate padding with expert bias")
+            for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+                param = getattr(layer, name)
+                shard = "w13" if name.startswith("w13") else "w2"
+                param.data = _pad_mxfp8_expert_tensor(
+                    param.data, logical_size, padded_size, shard, "scale" in name)
+                param._mxfp8_logical_intermediate = logical_size
+                param._mxfp8_padded_intermediate = padded_size
+                param._mxfp8_expert_shard = shard
         w13_weight, w13_scale = _pack_mxfp8_expert_weight(
             layer.w13_weight.data, layer.w13_weight_scale.data,
         )
@@ -825,7 +937,11 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         orig_num_tokens = hidden_states.shape[0]
         strategy, strategy_impl = self.select_communication_strategy(orig_num_tokens)
 
-        is_need_slice = self.tp_size > 1 and (strategy == "all2all" or strategy == "dispatch_combine")
+        moe_parallel_config = layer.moe_config.moe_parallel_config
+        use_ep = getattr(moe_parallel_config, "use_ep", True)
+        is_need_slice = use_ep and self.tp_size > 1 and (
+            strategy == "all2all" or strategy == "dispatch_combine"
+        )
         x_slice = hidden_states
         if is_need_slice:
             padded_num_tokens = -(orig_num_tokens // -self.tp_size) * self.tp_size
@@ -891,6 +1007,8 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
                     topk_ids=topk_ids,
                     topk_weights=topk_weights,
                 )
+                if self.tp_size > 1:
+                    routed_output = tensor_model_parallel_all_reduce(routed_output)
                 if shared_experts is not None:
                     shared_output = shared_experts(x_slice)
                     return shared_output, routed_output + shared_output

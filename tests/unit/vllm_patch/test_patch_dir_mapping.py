@@ -62,6 +62,20 @@ def test_find_patch_dir_exact_low_latency_includes_pangu_v2_base():
     ]
 
 
+def test_find_patch_dir_exact_explicit_benchmark_loads_after_high_throughout():
+    models_root = Path(vllm_patches.__file__).parent / "patches" / "models"
+
+    patch_dirs = vllm_patches._find_patch_dir_exact(
+        "high_throughout,pangu_v2_benchmark", models_root
+    )
+
+    assert [path.name for path in patch_dirs] == [
+        "pangu_v2_base",
+        "high_throughout",
+        "pangu_v2_benchmark",
+    ]
+
+
 def test_find_patch_dir_exact_legacy_pangu_v2_hybrid():
     models_root = Path(vllm_patches.__file__).parent / "patches" / "models"
 
