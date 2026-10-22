@@ -48,7 +48,9 @@ from omni_npu.attention.backends.utils import (
     SPManager,
     cache_fit_shape,
     conv_sp,
+    enable_fia_metadata_sharing,
     get_batch_desc,
+    get_cross_layer_shared_op,
     lazy_zero_like,
     sp_disabled,
 )
@@ -909,6 +911,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+        self._init_fia_metadata_sharing(config)
         self.side_stream = (
             named_stream(SIDE_STREAM_NAME)
             if self.enable_decode_multi_stream
@@ -1291,6 +1294,62 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             topk_idx = torch.concat([sink_indices, with_offset], dim=2)
         return topk_idx
 
+    def _init_fia_metadata_sharing(
+        self,
+        config: DeepseekV2Config | DeepseekV3Config,
+    ) -> None:
+        dsa_layers = enable_fia_metadata_sharing(
+            self, config, model_extra_config.operator_opt_config
+        )
+        if dsa_layers is None:
+            return
+        first_dsa_sink_layer = min(dsa_layers)
+        first_decode_sink_layer = first_dsa_sink_layer
+        mla_num_heads = config.num_attention_heads // self.tp_size
+        if mla_num_heads == self.num_local_heads:
+            mla_layers = set(range(config.num_hidden_layers)) - dsa_layers
+            if mla_layers:
+                first_decode_sink_layer = min(first_decode_sink_layer, min(mla_layers))
+        self._produce_sink_fia_metadata = {
+            "decode": self.layer_idx == first_decode_sink_layer,
+            "prefill_absorb": self.layer_idx == first_dsa_sink_layer,
+            "prefill": self.layer_idx == first_dsa_sink_layer,
+        }
+
+        self._sink_fia_metadata_key_suffix = (
+            "sink",
+            self.num_local_heads,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            self.param_sink_number,
+        )
+        callers = tuple(
+            (caller, *self._sink_fia_metadata_key_suffix)
+            for caller in ("decode", "prefill_absorb", "prefill")
+        )
+        self._fia_metadata_shared_op = get_cross_layer_shared_op(
+            name="pangu_v2_fia_sink_metadata",
+            op=torch.ops.custom._npu_fused_infer_attention_sink_metadata,
+            shape=(1024,),
+            dtype=torch.int32,
+            callers=callers,
+        )
+
+    def _get_sink_fia_metadata(
+        self,
+        op_args: dict,
+        metadata_caller: str,
+    ) -> torch.Tensor:
+        if not getattr(self, "_share_fia_metadata", False):
+            return torch.ops.custom._npu_fused_infer_attention_sink_metadata(
+                **op_args
+            )
+        return self._fia_metadata_shared_op(
+            op_args,
+            self._produce_sink_fia_metadata.get(metadata_caller, True),
+            (metadata_caller, *self._sink_fia_metadata_key_suffix),
+        )
+
     def _apply_attention_rescale_pioneer(
         self,
         q_nope: torch.Tensor,
@@ -1300,6 +1359,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         topk_idx: torch.Tensor,
         block_table: torch.Tensor,
         kv_cache: tuple[torch.Tensor, ...],
+        metadata_caller: str = "decode",
     ) -> torch.Tensor:
 
         output_normal, smax_normal, ssum_normal = (
@@ -1377,19 +1437,22 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                             dtype=q_cumlens.dtype,
                             device=q_cumlens.device,
                         ).to(torch.int64)
-            meta_data = torch.ops.custom._npu_fused_infer_attention_sink_metadata(
-                            num_heads_q=self.num_local_heads,
-                            num_heads_kv=1,
-                            head_dim_qk=q_nope.shape[-1],
-                            head_dim_v=sink_k_nope.shape[-1],
-                            actual_seq_lengths=act_seq_qlen,
-                            actual_seq_lengths_kv=actual_seq_sink_len,
-                            sparse_mode=0,
-                            batch_invariant=True,
-                            input_layout="TND",
-                            input_layout_kv="TND",
-                            rope_head_dim=q_pe.shape[-1],
-                        )
+            meta_data = self._get_sink_fia_metadata(
+                {
+                    "num_heads_q": self.num_local_heads,
+                    "num_heads_kv": 1,
+                    "head_dim_qk": q_nope.shape[-1],
+                    "head_dim_v": sink_k_nope.shape[-1],
+                    "actual_seq_lengths": act_seq_qlen,
+                    "actual_seq_lengths_kv": actual_seq_sink_len,
+                    "sparse_mode": 0,
+                    "batch_invariant": True,
+                    "input_layout": "TND",
+                    "input_layout_kv": "TND",
+                    "rope_head_dim": q_pe.shape[-1],
+                },
+                metadata_caller,
+            )
             output_sink, _, smax_sink, ssum_sink = (
                 torch.ops.custom.npu_fused_infer_attention_sink_v2(
                     q_nope,
@@ -1431,6 +1494,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         block_table: torch.Tensor = None,  # int32 [B, *]
         kv_cache: torch.Tensor = None,
         attn_metadata: NPUDSAMetadata = None,  # required by omni-cache
+        metadata_caller: str = "decode",
     ) -> torch.Tensor:  # [T, N, L]
         if None in [q_cumlens, kv_lens, block_table, topk_idx]:
             return torch.zeros_like(q_nope)  # dummy
@@ -1514,7 +1578,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             if model_extra_config.operator_opt_config.enable_precision_strong_consistency:
                 return self._apply_attention_rescale_pioneer(
                     q_nope, q_pe, q_cumlens, kv_lens,
-                    topk_idx, block_table, kv_cache,
+                    topk_idx, block_table, kv_cache, metadata_caller,
                 )
             kwargs = dict(
                 query=q_nope,
@@ -1672,6 +1736,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             block_table,  # int32 [B, *]
             kv_cache,
             attn_metadata=attn_metadata,
+            metadata_caller="prefill",
         )  # -> TND
 
         out = self._post_attn_absorb(out)  # T,ND
@@ -1808,6 +1873,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             blk_table,  # int32 [2B, *]
             kv_cache,
             attn_metadata=attn_metadata,
+            metadata_caller="prefill",
         )
         cp_out = self._post_attn_absorb(cp_out)
 
