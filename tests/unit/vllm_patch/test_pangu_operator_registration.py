@@ -9,16 +9,18 @@ Operator imports are mocked; runtime dependencies need integration validation.
 import importlib.abc
 import importlib.util
 import os
-from pathlib import Path
 import sys
-from types import ModuleType
 import unittest
+from pathlib import Path
+from types import ModuleType
 from unittest.mock import patch
-
 
 ROOT = Path(__file__).resolve().parents[3]
 MHC_MODULE = "omni_npu.layers.mhc.mhc"
 TRACE_MODULE = "omni_npu.vllm_patches.patches.common.patch_trace"
+ACCURACY_MODULE = (
+    "omni_npu.diagnostics.accuracy_alignment.patch_accuracy_alignment"
+)
 
 
 class OperatorImports(importlib.abc.MetaPathFinder, importlib.abc.Loader):
@@ -96,41 +98,115 @@ class PanguOperatorRegistrationTests(unittest.TestCase):
         sys.modules[name] = self.module
         spec.loader.exec_module(self.module)
         self.module.auto_import_patches = lambda: self.events.append("import_patches")
+        real_import_module = self.module.importlib.import_module
+
+        def tracked_import(module_name, package=None):
+            if module_name == ACCURACY_MODULE:
+                self.events.append("accuracy_alignment")
+                return ModuleType(module_name)
+            return real_import_module(module_name, package)
+
+        import_patch = patch.object(
+            self.module.importlib, "import_module", new=tracked_import
+        )
+        import_patch.start()
+        self.addCleanup(import_patch.stop)
+        os.environ["OMNI_NPU_ACCURACY_ALIGNMENT_ENABLE"] = "True"
 
     def run_with_dirs(self, value):
         os.environ["OMNI_VLLM_PATCHES_DIR"] = value
         self.module.apply_patches()
 
+    def test_accuracy_patch_import_is_gated_by_master_switch(self):
+        os.environ.pop("OMNI_NPU_ACCURACY_ALIGNMENT_ENABLE", None)
+        self.module.apply_patches()
+        self.assertNotIn("accuracy_alignment", self.events)
+
+        for unsupported_value in ("true", "1", "yes", "on", "False"):
+            with self.subTest(value=unsupported_value):
+                self.events.clear()
+                os.environ["OMNI_NPU_ACCURACY_ALIGNMENT_ENABLE"] = unsupported_value
+                self.module.apply_patches()
+                self.assertNotIn("accuracy_alignment", self.events)
+
+        self.events.clear()
+        os.environ["OMNI_NPU_ACCURACY_ALIGNMENT_ENABLE"] = "True"
+        self.module.apply_patches()
+        self.assertIn("accuracy_alignment", self.events)
+
     def test_vl_registers_mhc_after_patches_before_trace(self):
-        for value in ("openpangu_v1_vl", "openpangu_v1_vl,pangu_v2_base",
-                      "openpangu_v1_vl,high_throughout", "openpangu_v1_vl,low_latency"):
+        for value in (
+            "openpangu_v1_vl",
+            "openpangu_v1_vl,pangu_v2_base",
+            "openpangu_v1_vl,high_throughout",
+            "openpangu_v1_vl,low_latency",
+        ):
             with self.subTest(value=value):
                 self.events.clear()
                 sys.modules.pop(MHC_MODULE, None)
                 self.run_with_dirs(value)
-                self.assertEqual(self.events, ["import_patches", "apply_patches", "mhc", "trace"])
+                self.assertEqual(
+                    self.events,
+                    [
+                        "import_patches",
+                        "accuracy_alignment",
+                        "apply_patches",
+                        "mhc",
+                        "trace",
+                    ],
+                )
 
     def test_no_registration_without_vl(self):
-        for value in ("", "pangu_v2_base", "high_throughout", "low_latency",
-                      "pangu_sink_swa_mla", "openpangu_v1_vl_extra,high_throughout"):
+        for value in (
+            "",
+            "pangu_v2_base",
+            "high_throughout",
+            "low_latency",
+            "pangu_sink_swa_mla",
+            "openpangu_v1_vl_extra,high_throughout",
+        ):
             with self.subTest(value=value):
                 self.events.clear()
                 self.run_with_dirs(value)
-                self.assertEqual(self.events, ["import_patches", "apply_patches", "trace"])
+                self.assertEqual(
+                    self.events,
+                    ["import_patches", "accuracy_alignment", "apply_patches", "trace"],
+                )
 
     def test_existing_high_alias_case_whitespace_and_duplicates(self):
         self.run_with_dirs(" OpenPangu_V1_VL , PANGU_V2_HYBRID, openpangu_v1_vl ")
-        self.assertEqual(self.events, ["import_patches", "apply_patches", "mhc", "trace"])
+        self.assertEqual(
+            self.events,
+            [
+                "import_patches",
+                "accuracy_alignment",
+                "apply_patches",
+                "mhc",
+                "trace",
+            ],
+        )
 
     def test_legacy_environment_is_used_when_current_is_unset(self):
         os.environ["OMNI_NPU_PATCHES_DIR"] = "openpangu_v1_vl"
         self.module.apply_patches()
-        self.assertEqual(self.events, ["import_patches", "apply_patches", "mhc", "trace"])
+        self.assertEqual(
+            self.events,
+            [
+                "import_patches",
+                "accuracy_alignment",
+                "apply_patches",
+                "mhc",
+                "trace",
+            ],
+        )
 
     def test_current_environment_has_precedence(self):
         os.environ["OMNI_NPU_PATCHES_DIR"] = "openpangu_v1_vl"
         self.run_with_dirs("pangu_v2_base")
-        self.assertEqual(self.events, ["import_patches", "apply_patches", "trace"])
+        self.assertEqual(
+            self.events,
+            ["import_patches", "accuracy_alignment", "apply_patches", "trace"],
+        )
 
     def test_repeated_apply_keeps_one_operator_class_and_module_execution(self):
         self.run_with_dirs("openpangu_v1_vl")
@@ -145,7 +221,10 @@ class PanguOperatorRegistrationTests(unittest.TestCase):
         self.finder.failures["mhc"] = ImportError("missing NPU extension")
         with self.assertRaisesRegex(ImportError, "missing NPU extension"):
             self.run_with_dirs("openpangu_v1_vl")
-        self.assertEqual(self.events, ["import_patches", "apply_patches", "mhc"])
+        self.assertEqual(
+            self.events,
+            ["import_patches", "accuracy_alignment", "apply_patches", "mhc"],
+        )
 
     def test_registration_conflicts_are_not_suppressed(self):
         self.finder.failures["mhc"] = AssertionError("Duplicate op name")

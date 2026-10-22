@@ -3,8 +3,6 @@
 
 from pathlib import Path
 
-import pytest
-
 from omni import vllm_patches
 
 
