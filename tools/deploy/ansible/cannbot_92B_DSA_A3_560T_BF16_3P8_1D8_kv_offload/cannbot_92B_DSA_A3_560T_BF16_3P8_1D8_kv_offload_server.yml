@@ -68,8 +68,8 @@
         export HCCL_OP_EXPANSION_MODE="AIV"
         export ASCEND_GLOBAL_LOG_LEVEL=3
         export TASK_QUEUE_ENABLE=2
-        export OMNI_REUSE_PREFILLED_TOKENS=1
-        export OMNI_SKIP_DECODE_TOKENIZE=1
+        export OMNI_PIGGYBACK_INPUT_IDS=1
+        export OMNI_SKIP_DECODE_TOKENIZE=0
         export VLLM_MQ_MAX_CHUNK_BYTES_MB=100
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         # 92B 用 17；505B 才是 18
@@ -133,8 +133,8 @@
         export ASCEND_GLOBAL_LOG_LEVEL=3
         export ASCEND_SLOG_PRINT_TO_STDOUT=0
         export ASCEND_GLOBAL_EVENT_ENABLE=0
-        export OMNI_REUSE_PREFILLED_TOKENS=1
-        export OMNI_SKIP_DECODE_TOKENIZE=1
+        export OMNI_PIGGYBACK_INPUT_IDS=1
+        export OMNI_SKIP_DECODE_TOKENIZE=0
         export VLLM_MQ_MAX_CHUNK_BYTES_MB=100
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_HYBRID_ATTN_GROUP_SIZE=17

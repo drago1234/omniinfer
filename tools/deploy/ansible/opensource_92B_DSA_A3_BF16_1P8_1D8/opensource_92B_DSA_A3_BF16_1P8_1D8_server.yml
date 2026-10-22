@@ -69,8 +69,8 @@
         export HCCL_OP_EXPANSION_MODE="AIV"
         export ASCEND_GLOBAL_LOG_LEVEL=3
         export TASK_QUEUE_ENABLE=2
-        export OMNI_REUSE_PREFILLED_TOKENS=1
-        export OMNI_SKIP_DECODE_TOKENIZE=1
+        export OMNI_PIGGYBACK_INPUT_IDS=1
+        export OMNI_SKIP_DECODE_TOKENIZE=0
         export VLLM_MQ_MAX_CHUNK_BYTES_MB=100
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_HYBRID_ATTN_GROUP_SIZE=17
@@ -121,8 +121,8 @@
         export HCCL_EXEC_TIMEOUT=1800
         export ASCEND_GLOBAL_LOG_LEVEL=3
         export HCCL_OP_EXPANSION_MODE="AI_CPU"
-        export OMNI_REUSE_PREFILLED_TOKENS=1
-        export OMNI_SKIP_DECODE_TOKENIZE=1
+        export OMNI_PIGGYBACK_INPUT_IDS=1
+        export OMNI_SKIP_DECODE_TOKENIZE=0
         export VLLM_MQ_MAX_CHUNK_BYTES_MB=100
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_HYBRID_ATTN_GROUP_SIZE=17
