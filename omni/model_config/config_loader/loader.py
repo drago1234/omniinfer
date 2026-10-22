@@ -218,6 +218,7 @@ class ModelOperatorOptConfig:
     use_mega_mhc_fusion_op: bool = False # 是否使用 npu_ai_infra_mega_mhc（3BF16 phi），仅 P 侧开启，默认不开启
     use_mome_inplace_update: bool = False
     use_gpt_oss_sink_rescale: bool = False
+    use_ai_infra_fa_for_gpt_oss_sink: bool = False # 是否使用 npu_ai_infra_flash_attention 计算 GQA GPT-OSS sink
     moe_comm_strategy: MoECommStrategyType = "dispatch_combine" # MoE通信策略，默认为dispatch_combine
     moe_tbo_threshold: int = -1 # MoE: two batch overlap batch threshold, -1 for disable
     moe_dispatch_combine_max_batch_size: int = 128

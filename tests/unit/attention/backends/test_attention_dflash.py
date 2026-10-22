@@ -20,6 +20,7 @@ def _impl():
     impl.scale = 0.5
     impl.sliding_window = None
     impl.sink_len = None
+    impl.use_ai_infra_fa_for_gpt_oss_sink = False
     impl.is_cross_attention = False
     impl.kv_sharing_target_layer_name = None
     impl.attn_sinks = None
@@ -39,6 +40,7 @@ def test_metadata_builder_preserves_causal_flag(monkeypatch, causal):
         backend.NPUAttentionMetadataBuilder
     )
     builder.reorder_batch_threshold = 1
+    builder.use_ai_infra_fa_for_gpt_oss_sink = False
     monkeypatch.setattr(backend, "model_extra_config", _config())
     monkeypatch.setattr(backend, "split_decodes_and_prefills", lambda *args, **kwargs: (0, 1, 0, 2))
     common = SimpleNamespace(

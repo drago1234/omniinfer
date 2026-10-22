@@ -1,0 +1,20 @@
+{
+    "model_parallel_config": {
+        "layer_parallel_config": {},
+        "enable_aicpu_dp_sync": true
+    },
+    "operator_optimization_config": {
+        "kv_nz": false,
+        "use_aicpu_fa_tiling": true,
+        "use_ai_infra_fa_for_gpt_oss_sink": true,
+        "use_noncontiguous_kv": false,
+        "use_mhc_fusion_op": false,
+        "enable_multi_stream": false,
+        "enable_mhc_multistream": true,
+        "engram_prefetch": false,
+        "engram_head_sharding": "none",
+        "use_engram_proj_gate_fusion_op": true,
+        "use_batch_invariant_op": true,
+        "enable_precision_strong_consistency": true
+    }
+}

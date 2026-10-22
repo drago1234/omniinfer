@@ -12,6 +12,24 @@ from omni_npu.worker.npu_model_runner import NPUModelRunner, GPUModelRunner
 pytestmark = pytest.mark.unit
 
 
+def test_gqa_pd_kv_allocation_alignment_preserves_data_and_aliases(monkeypatch):
+    import omni_npu.worker.npu_model_runner as module
+
+    backing = torch.arange(129, dtype=torch.int8)
+    raw = backing[1:]
+    expected = raw.clone()
+    assert raw.data_ptr() % (2 * 1024 * 1024)
+    tensors = {'layer0': raw, 'layer1': raw}
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.vllm_config = SimpleNamespace(kv_transfer_config=object())
+    monkeypatch.setattr(module.model_extra_config.operator_opt_config, 'use_ai_infra_fa_for_gpt_oss_sink', True)
+    monkeypatch.setattr(GPUModelRunner, '_allocate_kv_cache_tensors', lambda *args: tensors)
+    result = runner._allocate_kv_cache_tensors(object())
+    assert result is tensors and result['layer0'] is result['layer1']
+    torch.testing.assert_close(result['layer0'], expected)
+    assert result['layer0'].data_ptr() % (2 * 1024 * 1024) == 0
+
+
 class CpuBuffer:
     def __init__(self, *shape):
         self.cpu = torch.empty(shape, dtype=torch.int64)

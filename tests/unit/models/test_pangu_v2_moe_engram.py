@@ -258,8 +258,12 @@ def test_serial_lookup_prepares_all_layers_before_consumption(monkeypatch, model
     assert events == expected
 
 
-@pytest.mark.parametrize("model_cls", MODEL_VARIANTS)
-def test_engram_hash_prepares_history_once(monkeypatch, model_cls):
+@pytest.mark.parametrize("model_cls,gqa", [
+    pytest.param(pangu_moe.OpenPanguV2Model, False, id="low_latency"),
+    pytest.param(ultra_moe.OpenPanguModel, False, id="high_throughout"),
+    pytest.param(ultra_moe.OpenPanguModel, True, id="high_throughout_gqa"),
+])
+def test_engram_hash_prepares_history_once(monkeypatch, model_cls, gqa):
     from omni_npu.layers import engram
 
     attention = nn.Module()
@@ -285,6 +289,10 @@ def test_engram_hash_prepares_history_once(monkeypatch, model_cls):
         decode=None,
         prefill=SimpleNamespace(block_table=torch.tensor([[0]], dtype=torch.int32)),
     )
+    if gqa:
+        metadata.block_tables = metadata.prefill.block_table
+        del metadata.decode
+        del metadata.prefill
     monkeypatch.setattr(
         engram_layer, "get_forward_context",
         lambda: SimpleNamespace(attn_metadata={attention.layer_name: metadata}),
@@ -298,6 +306,7 @@ def test_engram_hash_prepares_history_once(monkeypatch, model_cls):
         assert state._cache.numel() == 16
         assert state.block_size == 4
         assert args[3].tolist() == expected_dead
+        assert kwargs["block_table"].tolist() == [[0]]
         return expected
 
     monkeypatch.setattr(state, "forward", hash_forward)

@@ -21,3 +21,9 @@ def register_models():
     ModelRegistry.register_model(
         "OpenPanguV3ForCausalLM",
         "omni_npu.v1.models.pangu.pangu_v3_moe:OpenPanguV3ForCausalLM")
+    ModelRegistry.register_model(
+        "PanguV3DenseForCausalLM",
+        "omni_npu.v1.models.pangu.pangu_v3_dense:PanguV3DenseForCausalLM")
+    ModelRegistry.register_model(
+        "PanguV3DenseMTPModel",
+        "omni_npu.v1.models.pangu.pangu_v3_dense_mtp:PanguV3DenseMTP")
