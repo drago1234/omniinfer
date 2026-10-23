@@ -1404,6 +1404,75 @@ class TestOpenPanguModelBaseLoadWeights(unittest.TestCase):
         mark_split.assert_called_once_with(model, loaded_params)
 
 
+class TestOpenPanguModelEmbeds(unittest.TestCase):
+    """Embedding entry points and the SP slice of externally supplied embeds."""
+
+    def test_embed_input_ids_delegates_to_embed_tokens(self):
+        model = ultra_mod.OpenPanguModel.__new__(ultra_mod.OpenPanguModel)
+        nn.Module.__init__(model)
+        model.embed_tokens = MagicMock(return_value=object())
+        ids = torch.arange(4)
+        self.assertIs(model.embed_input_ids(ids), model.embed_tokens.return_value)
+        model.embed_tokens.assert_called_once_with(ids)
+
+    def test_base_embed_input_ids_reaches_inner_embed_tokens(self):
+        base = _new_open_pangu_model_base()
+        inner = ultra_mod.OpenPanguModel.__new__(ultra_mod.OpenPanguModel)
+        nn.Module.__init__(inner)
+        inner.embed_tokens = MagicMock(return_value=object())
+        base.model = inner
+        ids = torch.arange(4)
+        self.assertIs(base.embed_input_ids(ids), inner.embed_tokens.return_value)
+        inner.embed_tokens.assert_called_once_with(ids)
+
+    def test_model_forward_slices_inputs_embeds_under_seq_parallel(self):
+        """With SP on, pre-supplied embeds are token-sliced before layer 0."""
+        model = ultra_mod.OpenPanguModel.__new__(ultra_mod.OpenPanguModel)
+        nn.Module.__init__(model)
+        layer = _layer_with_rotary()
+        captured = {}
+
+        def _layer_forward(hidden, cos, sin, residual, topk, engram_hash_ids=None):
+            captured["hidden"] = hidden
+            return hidden, residual, topk
+
+        layer.forward = _layer_forward
+        _bind_single_decoder_layer(
+            model,
+            layer,
+            use_mhc=False,
+            use_mhc_fusion_op=False,
+            config=SimpleNamespace(index_topk=0),
+        )
+        model.norm = MagicMock(side_effect=_passthrough_norm)
+        inputs_embeds = torch.zeros(6, 8)
+        sliced = torch.zeros(2, 8)
+        sp_manager = MagicMock(slice_tokens=MagicMock(return_value=sliced))
+        gathered = object()
+        pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+
+        with patch.object(
+            ultra_mod, "get_pp_group", return_value=pp_group
+        ), patch.object(
+            ultra_mod.model_extra_config.parall_config, "ena_seq_parallel", True
+        ), patch.object(ultra_mod, "SPManager") as sp_cls, patch.object(
+            ultra_mod, "tensor_model_parallel_all_gather", return_value=gathered
+        ) as ag:
+            sp_cls.init_sp.return_value = sp_manager
+            result = model.forward(
+                input_ids=object(),
+                positions=object(),
+                intermediate_tensors=None,
+                inputs_embeds=inputs_embeds,
+            )
+
+        sp_cls.init_sp.assert_called_once_with(inputs_embeds.size(0))
+        sp_manager.slice_tokens.assert_called_once_with(inputs_embeds)
+        self.assertIs(captured["hidden"], sliced)
+        ag.assert_called_once_with(sliced, dim=0)
+        self.assertIs(result, gathered)
+
+
 class TestPanguUltraMoeV3Wiring(unittest.TestCase):
     """The pieces OpenPangu V3 needs from the shared ultra implementation."""
 
