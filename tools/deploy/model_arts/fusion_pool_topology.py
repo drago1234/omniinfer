@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Resolve the fixed ModelArts 4P1D topology from its rank table."""
+"""Resolve FusionPool topology: single-node P instances and one D group."""
 import argparse
 import ipaddress
 import json
@@ -30,10 +30,12 @@ def ordered_groups(data, env):
 
 
 def topology(groups, env, role):
-    if [len(group) for group in groups] != [1, 1, 1, 1, 2]:
-        raise ValueError("expected 4 single-node P groups and 1 two-node D group")
-    if int(env.get("PREFILL_INSTANCE_NUM", "4")) != 4 or int(env.get("DECODE_INSTANCE_NUM", "1")) != 1:
-        raise ValueError("PREFILL_INSTANCE_NUM/DECODE_INSTANCE_NUM must be 4/1")
+    p_count = int(env.get("PREFILL_INSTANCE_NUM", "4"))
+    if p_count <= 0 or int(env.get("DECODE_INSTANCE_NUM", "1")) != 1:
+        raise ValueError("FusionPool requires positive P instances and exactly one D group")
+    if (len(groups) != p_count + 1 or any(len(g) != 1 for g in groups[:-1])
+            or not groups[-1]):
+        raise ValueError("expected single-node P groups followed by one nonempty D group")
     npu = int(env.get("npu", "16"))
     if npu != 16:
         raise ValueError("this inventory requires 16 logical NPU devices per machine")
@@ -51,10 +53,11 @@ def topology(groups, env, role):
         "P_NODE_LIST": ";".join(p_ips),
         "LOCAL_DECODE_SERVER_IP_LIST": ",".join(d_ips),
         "GLOBAL_DECODE_SERVER_IP_LIST": ",".join(d_ips),
-        "PREFILL_POD_NUM": "4", "DECODE_POD_NUM": "1",
-        "OMNI_PD_PREFILL_POD_NUM": "4", "OMNI_PD_DECODE_POD_NUM": "1",
+        "PREFILL_POD_NUM": str(p_count), "DECODE_POD_NUM": "1",
+        "OMNI_PD_PREFILL_POD_NUM": str(p_count), "OMNI_PD_DECODE_POD_NUM": "1",
         "MOONCAKE_MASTER_IP": p_ips[0] if env.get("MOONCAKE_MASTER_IP", "auto") == "auto" else env["MOONCAKE_MASTER_IP"],
         "cur_pod_ip": ip,
+        "FUSION_POOL_PARALLEL_SIZE": str(p_count + 1),
     }
     if role == "proxy":
         if ip != p_ips[0]:
@@ -70,9 +73,9 @@ def topology(groups, env, role):
         "MASTER_PORT": str(master_base + rank if role == "prefill" else master_base + 100),
         "API_PORT": str(base + rank if role == "prefill" else base + 100 + rank),
         "NODE_RANK": str(0 if role == "prefill" else rank),
-        "prefill_instance_rank": str(rank if role == "prefill" else 4),
+        "prefill_instance_rank": str(rank if role == "prefill" else p_count),
         "SERVER_OFFSET": str(0 if role == "prefill" else rank * npu),
-        "VLLM_DP_SIZE": str(1 if role == "prefill" else npu * 2),
+        "VLLM_DP_SIZE": str(1 if role == "prefill" else npu * len(d_ips)),
         "num_servers": str(1 if role == "prefill" else npu),
         "tp": str(npu if role == "prefill" else 1),
     })

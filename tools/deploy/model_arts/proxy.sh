@@ -1,4 +1,12 @@
 #!/bin/bash
+# FusionPool is opt-in; otherwise retain the existing deployment path.
+if [[ "${ENABLE_FUSION_POOL:-0}" == 1 ]]; then
+    set -eo pipefail
+    source "$(dirname "${BASH_SOURCE[0]}")/fusion_pool_runtime.sh"
+    fusion_pool_main proxy "$@"
+    exit $?
+fi
+
 if [[ -f ~/.bashrc ]]; then
     source ~/.bashrc
 fi

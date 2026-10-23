@@ -1,3 +1,11 @@
+# FusionPool is opt-in; otherwise retain the existing deployment path.
+if [[ "${ENABLE_FUSION_POOL:-0}" == 1 ]]; then
+    set -eo pipefail
+    source "$(dirname "${BASH_SOURCE[0]}")/fusion_pool_runtime.sh"
+    fusion_pool_main decode "$@"
+    exit $?
+fi
+
 source ~/.bashrc
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
