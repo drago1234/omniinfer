@@ -265,3 +265,51 @@ def test_v3_mla_detection(kv_lora_rank, expected):
     )
     config = SimpleNamespace(hf_text_config=SimpleNamespace(model_type="openpangu_v3", kv_lora_rank=kv_lora_rank))
     assert PanguV2MoeModelArchConfigConvertorPatch.is_deepseek_mla(config) is expected
+
+
+def test_composed_pangu_dflash_architecture_is_preserved():
+    config = HFConfig(
+        "pangu_diffusion_mtp", architectures=["DFlashPanguDraftModel"]
+    )
+    assert (
+        patch_mod.PanguV2MoeSpeculativeConfigPatch.hf_config_override(config)
+        is config
+    )
+    assert config.model_type == "pangu_diffusion_mtp"
+    assert config.architectures == ["DFlashPanguDraftModel"]
+
+
+
+@pytest.mark.parametrize("method,pangu", [
+    ("dspark", True), ("dspark", False), ("dflash", True), ("mtp", False),
+])
+def test_post_init_restores_only_pangu_dspark(monkeypatch, method, pangu):
+    hf_config = SimpleNamespace(
+        model_type="pangu_diffusion_mtp" if pangu else "qwen3",
+        architectures=["DFlashPanguDraftModel"] if pangu else ["Qwen3DSparkModel"],
+        auto_map={"AutoConfig": "configuration_pangu_diffusion_mtp.PanguDiffusionMTPConfig"} if pangu else {},
+    )
+    calls = []
+    def upstream(config):
+        calls.append("upstream")
+        if method == "dspark" and pangu:
+            hf_config.model_type = "deepseek_v4"
+            hf_config.architectures = ["DSparkDraftModel"]
+    monkeypatch.setattr(patch_mod, "_origin_post_init", upstream)
+    config = SimpleNamespace(
+        method=method,
+        draft_model_config=SimpleNamespace(hf_config=hf_config),
+        update_arch_=lambda: calls.append("update_arch"),
+    )
+    patch_mod.PanguV2MoeSpeculativeConfigPatch.__post_init__(config)
+    assert calls == (["upstream", "update_arch"] if method == "dspark" and pangu else ["upstream"])
+    assert hf_config.architectures == (["DFlashPanguDraftModel"] if pangu else ["Qwen3DSparkModel"])
+    assert hf_config.model_type == ("pangu_diffusion_mtp" if pangu else "qwen3")
+
+
+def test_post_init_without_draft_config_delegates_upstream(monkeypatch):
+    calls = []
+    monkeypatch.setattr(patch_mod, "_origin_post_init", lambda config: calls.append(config))
+    config = SimpleNamespace(method="dspark", draft_model_config=None)
+    patch_mod.PanguV2MoeSpeculativeConfigPatch.__post_init__(config)
+    assert calls == [config]

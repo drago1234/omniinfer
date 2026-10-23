@@ -1,0 +1,8 @@
+{
+    "model_parallel_config": {},
+    "operator_optimization_config": {
+        "kv_nz": true,
+        "enable_moe_init_routing_v2": true,
+        "use_aicpu_fa_tiling": false
+    }
+}
