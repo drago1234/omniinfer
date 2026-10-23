@@ -147,6 +147,7 @@
         # KV budget ~9.4 GiB still covers rate-1 load (4 seqs x ~0.85 GiB).
         GPU_UTIL=0.88
         {% if enable_fusion_pool | bool %}
+        export ASCEND_USE_ASYNC_TRANSFER=1
         if [ -f "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh" ]; then
           . "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh"
         fi
