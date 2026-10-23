@@ -484,7 +484,7 @@ class TestDatadistEngine:
             assert engine.cfg["transfer_backend"] is None
             assert engine.cfg["local_comm_res"] == ""
 
-    def test_register_unregister_sleep_weakup(self, cnt = 16, port=10000):
+    def test_register_unregister_sleep_wakeup(self, cnt = 16, port=10000):
         from omni_npu.connector.utils import get_local_ip
         ip = get_local_ip()
         bufs = [torch.zeros(10, 100, dtype=torch.uint8)] * cnt
@@ -518,7 +518,7 @@ class TestDatadistEngine:
             core._manual_finalize()
             log.compare_and_clear()
 
-            engine.weakup()
+            engine.wakeup()
             core._manual_init(f"{ip}:0")
             log.compare_and_clear()
 
@@ -654,9 +654,9 @@ def _mock_datadist_engine():
             self.inited = False
             self.log.runtime("sleep")
 
-        def weakup(self):
+        def wakeup(self):
             self.inited = True
-            self.log.runtime("weakup")
+            self.log.runtime("wakeup")
 
         def register(self, bufs: list[torch.Tensor]) -> int:
             assert self.inited
@@ -754,12 +754,12 @@ class TestCacheManager:
             server_log.clear()
             client_log.clear()
 
-            server.weakup()
-            server_log.manual("weakup")
+            server.wakeup()
+            server_log.manual("wakeup")
             server_log.compare_and_clear()
 
-            client.weakup()
-            client_log.manual("weakup")
+            client.wakeup()
+            client_log.manual("wakeup")
             client_log.compare_and_clear()
 
             server.unregister()

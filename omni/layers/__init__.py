@@ -11,7 +11,7 @@ from omni_npu.layers.quantization.w4a8_mxfp import W4A8MXFPConfig
 from omni_npu.layers.fused_moe.layer import NPUUnquantizedFusedMoEMethod, NPUFusedMoE
 from omni_npu.layers.attention.npu_mla_wrapper import NPUMultiHeadLatentAttentionWrapper
 from omni_npu.layers.npu_rms_norm import NPURMSNorm, NPUMiniMaxText01RMSNormTP
-from omni_npu.layers.activation import NPUSiluAndMul
+from omni_npu.layers.activation import NPUSiluAndMul, NPUSiluAndMulWithClamp
 from omni_npu.layers.rotary_embedding.rotary_embedding_torch_npu import NPURotaryEmbedding
 try: # Avoiding UT case ImportError, for which its running process won't include all the patches
     from omni_npu.layers.rotary_embedding.mrope_interleaved_torch_npu import NPUMRotaryEmbeddingInterleaved

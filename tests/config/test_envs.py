@@ -411,3 +411,14 @@ def test_precision_strong_consistency_check_level_invalid_preserves_default(
         "OMNI_PRECISION_STRONG_CONSISTENCY_CHECK_LEVEL" in record.message
         for record in caplog.records
     )
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "20"])
+def test_is_set_distinguishes_explicit_pd_threshold_from_default(monkeypatch, value):
+    import omni_npu.envs as envs
+
+    name = "OMNI_PD_BENCH_ALIGNED_DECODE_THRESHOLD"
+    assert envs.OMNI_PD_BENCH_ALIGNED_DECODE_THRESHOLD == 20
+    if value is not None:
+        monkeypatch.setenv(name, value)
+    assert envs.is_set(name) is (value is not None)

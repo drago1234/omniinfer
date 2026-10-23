@@ -46,6 +46,7 @@ from omni_npu.attention.backends.utils import (
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.plugin_decorators import attn_decorator
 from omni_npu.attention.backends.utils import CrossLayerSharedOp
+from omni_npu.v1.layers.attention.gpt_oss_sink import GptOssSinkMixin
 
 npu_fused_infer_attention_sink_metadata: CrossLayerSharedOp | None = None
 
@@ -100,6 +101,7 @@ class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
             self.supports_uniform_spec_as_decode,
         )
         self.compilation_config = vllm_config.compilation_config
+        self.use_ai_infra_fa_for_gpt_oss_sink = model_extra_config.operator_opt_config.use_ai_infra_fa_for_gpt_oss_sink
         # npu_fused_infer_attention_score_v2 does not support TND with dim 256
         # so UNIFORM_BATCH for BSND
         if self.kv_cache_spec.head_size == 256:
@@ -139,7 +141,7 @@ class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
         if hasattr(self, "sink_len") and self.sink_len > 0:
             seq_lens.masked_fill_(seq_lens == 0, self.sink_len)
 
-        if not model_extra_config.operator_opt_config.use_aicpu_fa_tiling:
+        if not (model_extra_config.operator_opt_config.use_aicpu_fa_tiling or self.use_ai_infra_fa_for_gpt_oss_sink):
             query_start_loc = query_start_loc.tolist()
             seq_lens = seq_lens.tolist()
 
@@ -234,7 +236,7 @@ class NPUAttentionBackend(AttentionBackend):
         return tuple(t.view(tensor_shape) for t, tensor_shape in zip(tensors, kv_shapes))
 
 
-class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
+class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata], GptOssSinkMixin):
     SHARE_MASK_TRIL_SPARSE = None
 
     def __init__(
@@ -252,8 +254,8 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         sinks: torch.Tensor | None = None,
         head_size_v: int | None = None,
         sink_len: int | None = None,
-        # First SWA/FULL layer of each component (main model, MTP) recomputes the
-        # FA sink metadata; later SWA layers reuse the shared buffer.
+        # The first layer of each window recomputes FA sink metadata;
+        # subsequent layers reuse it. MTP refreshes metadata on each forward.
         should_recompute_attn_meta: bool = True,
     ) -> None:
         try:
@@ -303,10 +305,15 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         self.sparse_mode = 4 if sliding_window else 3
         self.sink_len = sink_len
         self.should_recompute_attn_meta = should_recompute_attn_meta
+        self.use_ai_infra_fa_for_gpt_oss_sink = model_extra_config.operator_opt_config.use_ai_infra_fa_for_gpt_oss_sink
+        self.metadata_caller = ("gqa", sliding_window or None)
 
         self._init_cross_layer_shared_ops()
 
     def _init_cross_layer_shared_ops(self):
+        if self.use_ai_infra_fa_for_gpt_oss_sink:
+            self._reserve_gpt_oss_fia_metadata((self.metadata_caller,))
+            return
         global npu_fused_infer_attention_sink_metadata
         if npu_fused_infer_attention_sink_metadata is None:
             npu_fused_infer_attention_sink_metadata = CrossLayerSharedOp(
@@ -361,7 +368,7 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
 
         num_tokens = query.shape[0]
         if attn_metadata is None:
-            return output
+            return output.zero_() if self.use_ai_infra_fa_for_gpt_oss_sink else output
 
         causal = getattr(attn_metadata, "causal", True)
         if isinstance(causal, torch.Tensor):
@@ -443,9 +450,11 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         forward_context = get_forward_context()
         num_actual_tokens = attn_metadata.num_actual_tokens
         use_aicpu_fa_tiling = model_extra_config.operator_opt_config.use_aicpu_fa_tiling
-        if self.sink_len is not None:
+        if self.sink_len is not None or self.use_ai_infra_fa_for_gpt_oss_sink:
             input_layout = "TND"
             pre_tokens = self.sliding_window if self.sliding_window is not None else 0
+            if self.use_ai_infra_fa_for_gpt_oss_sink:
+                pre_tokens = self.sliding_window - 1 if self.sliding_window is not None else (1 << 31) - 1
             next_tokens = 0
             block_size = kv_cache[0].shape[-2] if use_kv_nz else kv_cache[0].shape[1]
             key_cache, value_cache = kv_cache
@@ -474,11 +483,20 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
                 "sparse_mode": self.sparse_mode,
                 "pre_tokens": pre_tokens,
                 "next_tokens": next_tokens,
-                "sink_number": self.sink_len,
                 "atten_mask": None if self.is_cross_attention else NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
                 "actual_seq_qlen": actual_seq_qlen,
                 "actual_seq_kvlen": actual_seq_kvlen,
             }
+            if self.use_ai_infra_fa_for_gpt_oss_sink:
+                attn_output = self._apply_gpt_oss_fia_native(
+                    kwargs, self.attn_sinks, self.metadata_caller,
+                    self.should_recompute_attn_meta,
+                )
+                output.zero_()
+                output[:num_actual_tokens].copy_(attn_output.view_as(output[:num_actual_tokens]))
+                return output
+
+            kwargs["sink_number"] = self.sink_len
             if forward_context.capturing and not use_aicpu_fa_tiling:
                 attn_output_shape = (num_tokens, self.num_heads, self.head_size)
                 attn_output = torch.empty(

@@ -334,15 +334,82 @@ def test_fc2_epilog_preserves_mome_and_token_padding(case, monkeypatch, mome, sp
         all_to_all.assert_not_called()
 
 
-def test_unquant_kv_uses_pa_cache_without_expanding_values(case, monkeypatch):
+@pytest.mark.parametrize("on_ascend950", [False, True])
+@pytest.mark.parametrize("decode", [False, True])
+def test_unquant_kv_uses_pa_cache_without_expanding_values(case, monkeypatch, on_ascend950, decode):
     a, metadata = case.attention, case.metadata
+    a.on_ascend950 = on_ascend950
+    if decode:
+        a.first_chunk_pa = False
+        metadata.decode = SimpleNamespace()
     metadata.slot_mapping = torch.arange(3)
     monkeypatch.setattr(a, "_kv_rmsnorm_rope_cache_v2_kwargs", lambda *args: {})
     op = Mock(return_value=(case.pe, case.q))
     monkeypatch.setattr(torch.ops.custom, "npu_ai_infra_kv_rmsnorm_rope_cache_v2", op)
-    result, indices = a._npu_kvrmsnorm_rope_cache_unquant(case.q, case.cache, case.pe, case.pe, metadata)
+    naive = Mock(return_value=(case.pe, case.q))
+    monkeypatch.setattr(a, "_naive_kvrmsnorm_rope_cache", naive)
+    a.kv_b_proj = Mock(side_effect=AssertionError("absorb must not expand values"))
+    kv = torch.ones(3, a.kv_lora_rank + a.qk_rope_head_dim)
+    result, indices = a._npu_kvrmsnorm_rope_cache_unquant(kv, case.cache, case.pe, case.pe, metadata)
     assert result is case.cache and indices is None
-    torch.testing.assert_close(op.call_args.kwargs["k_cache"], case.cache[1].unsqueeze(2))
+    a.kv_b_proj.assert_not_called()
+    if on_ascend950:
+        naive.assert_called_once()
+        assert naive.call_args.kwargs["update_k_cache"] is True
+        op.assert_not_called()
+    else:
+        op.assert_called_once()
+        torch.testing.assert_close(op.call_args.kwargs["k_cache"], case.cache[1].unsqueeze(2))
+        naive.assert_not_called()
+
+
+@pytest.mark.parametrize("on_ascend950", [False, True])
+def test_non_absorb_prefill_preserves_three_tensors_without_custom_op(case, monkeypatch, on_ascend950):
+    a, metadata = case.attention, case.metadata
+    a.on_ascend950 = on_ascend950
+    a.first_chunk_pa = a.is_cla_reuse_layer = False
+    a.side_stream = None
+    a.cache_config = SimpleNamespace(cache_dtype="auto")
+    metadata.num_decodes, metadata.num_prefills = 0, 1
+    metadata.slot_mapping = torch.arange(3)
+    hidden = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+    cos = torch.ones(3, 1)
+    a.q_a_proj = Mock(side_effect=lambda value: value)
+    a.q_a_layernorm = Mock(side_effect=lambda value: value)
+    a.q_b_proj = Mock(side_effect=lambda value: value)
+    a._q_rope = Mock(side_effect=lambda value, *args: value)
+    a._run_indexer = Mock(return_value=None)
+    a._kv_down_mome = Mock(return_value=hidden[:, :4])
+    monkeypatch.setattr(a, "_kv_rmsnorm_rope_cache_v2_kwargs", lambda *args: {})
+    kernel = Mock(return_value=(cos, hidden[:, :3]))
+    monkeypatch.setattr(torch.ops.custom, "npu_ai_infra_kv_rmsnorm_rope_cache_v2", kernel)
+    naive = Mock(return_value=(cos, hidden[:, :3]))
+    monkeypatch.setattr(a, "_naive_kvrmsnorm_rope_cache", naive)
+    kv_up = torch.arange(30, dtype=torch.float32).reshape(3, 2, 5)
+    a.kv_b_proj = Mock(return_value=kv_up.reshape(3, 10))
+    wrapper = Mock(side_effect=AssertionError("non-absorb must bypass the custom op"))
+    monkeypatch.setattr(torch.ops.vllm, "npu_pangu_kv_cache_update", wrapper)
+    attention = Mock(return_value=hidden)
+    monkeypatch.setattr(a, "_apply_SWA_attention_prefill", attention)
+    monkeypatch.setattr(a, "_mla_epilog", lambda value, *args: value)
+
+    output = a._forward_prefill(hidden, cos, cos, metadata)
+
+    wrapper.assert_not_called()
+    if on_ascend950:
+        naive.assert_called_once()
+        assert naive.call_args.kwargs["update_k_cache"] is True
+        kernel.assert_not_called()
+    else:
+        kernel.assert_called_once()
+        naive.assert_not_called()
+    attention.assert_called_once()
+    _, _, k_up_nope, k_pe, v_up = attention.call_args.args
+    torch.testing.assert_close(k_up_nope, kv_up[..., :3])
+    torch.testing.assert_close(k_pe, cos.view(3, 1, 1).repeat(1, 2, 1))
+    torch.testing.assert_close(v_up, kv_up[..., 3:])
+    assert all(value.is_contiguous() for value in (k_up_nope, k_pe, v_up))
+    assert output is hidden
 
 
 def test_mixed_forward_restores_shared_metadata(case, monkeypatch):
@@ -353,6 +420,7 @@ def test_mixed_forward_restores_shared_metadata(case, monkeypatch):
     # "global" through attn.layer_name.
     a.attn.layer_name = "global.attn"
     a.is_cp_layer = a.is_attn_sp_layer = a.enable_flashcomm2 = False
+    a.vllm_config = SimpleNamespace(compilation_config=None)
     a.is_flashcomm2_layer = False
     a.tp_size = 1
     a.moe_comm_strategy = "allreduce"

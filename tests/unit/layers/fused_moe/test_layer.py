@@ -146,6 +146,7 @@ class _DummyStrategy:
             hidden_states_sorted_by_experts=x,
             expert_tokens=torch.tensor([x.shape[0]], dtype=torch.int64),
             dynamic_scale=None,
+            expanded_topk_weights=None,
         )
 
     def prepare_finalize_metadata(self, layer, topk_weights, result):
@@ -230,7 +231,21 @@ def _make_unquantized_apply_method(
 
 
 def _bare_runner(module):
-    return module.NPUFusedMoERunner.__new__(module.NPUFusedMoERunner)
+    runner = module.NPUFusedMoERunner.__new__(module.NPUFusedMoERunner)
+    runner.routed_input_transform = None
+    return runner
+
+
+def test_runner_swiglu_group_fusion_tracks_activation_state(layer_module):
+    module, _, _ = layer_module
+    runner = _bare_runner(module)
+    runner.routed_experts = SimpleNamespace()
+    assert runner.use_swiglu_group_fusion is False
+    activation = SimpleNamespace(use_swiglu_group_fusion=False)
+    runner.routed_experts.act_fn = activation
+    assert runner.use_swiglu_group_fusion is False
+    activation.use_swiglu_group_fusion = True
+    assert runner.use_swiglu_group_fusion is True
 
 
 def _bare_experts(module):
@@ -389,6 +404,17 @@ def test_select_experts_custom_routing_function(layer_module):
     custom_fn.assert_called_once()
     assert torch.equal(topk_weights, torch.full((2, 1), 0.5, dtype=torch.float32))
     assert torch.equal(topk_ids, torch.ones(2, 1, dtype=torch.int32))
+
+
+def test_apply_preweighted_swiglu_does_not_weight_finalize_again(layer_module, monkeypatch):
+    module, _, context_holder = layer_module
+    context_holder.attn_metadata = {}
+    method = _make_unquantized_apply_method(module, monkeypatch, strategy="dispatch")
+    weights = torch.tensor([[0.2], [0.8]])
+    _stub_select_experts(module, monkeypatch, weights=weights)
+    method.apply_prepare_permute.return_value.expanded_topk_weights = weights.flatten()
+    _apply(method, _ep_layer(), torch.ones(2, 4), torch.zeros(2, 2))
+    torch.testing.assert_close(method.apply_unpermute_finalize.call_args.args[4], torch.ones_like(weights))
 
 
 @pytest.mark.unit
@@ -559,6 +585,62 @@ def test_apply_shared_experts_reduce_branch(layer_module, monkeypatch):
     all_reduce_mock.assert_called_once()
     assert shared.call_count == 1
     assert torch.equal(shared.call_args.args[0], hidden_states)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("multi_stream", [False, True])
+def test_latent_shared_input_survives_custom_op_and_stream_dispatch(layer_module, monkeypatch, multi_stream):
+    module, _, context = layer_module
+    method = _make_unquantized_apply_method(module, monkeypatch, hidden=2)
+    monkeypatch.setattr(module.model_extra_config.operator_opt_config, "shared_expert_multi_stream", multi_stream)
+    monkeypatch.setenv("VLLM_PLUGINS", "omni_custom_models")
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    latent = hidden[:, :2].contiguous()
+    stream_entries = []
+
+    @contextmanager
+    def stream_scope(stream):
+        stream_entries.append(stream)
+        yield
+        stream_entries.pop()
+
+    def shared_forward(x):
+        assert x is hidden
+        assert (method.sub_stream in stream_entries) == multi_stream
+        return x + 1
+
+    monkeypatch.setattr(module.torch.npu, "stream", stream_scope)
+    shared = MagicMock(side_effect=shared_forward)
+    shared.gate_up_proj = SimpleNamespace(tp_size=1)
+    runner = _bare_runner(module)
+    runner._shared_experts = SimpleNamespace(_layer=shared)
+    runner.shared_experts = shared
+    runner.gate = None
+    runner.layer_name = "latent.moe"
+    runner.routed_input_transform = object()
+    runner.apply_routed_input_transform = MagicMock(return_value=(latent, hidden))
+    runner.moe_config = _ep_layer().moe_config
+    runner.routed_experts = SimpleNamespace(
+        quant_method=method, top_k=1, renormalize=False, use_grouped_topk=False,
+        global_num_experts=2, expert_map=None, topk_group=None, num_expert_group=None,
+        custom_routing_function=None, scoring_func="softmax", routed_scaling_factor=1.,
+        e_score_correction_bias=None, activation=SimpleNamespace(value="silu"),
+        apply_router_weight_on_input=False,
+    )
+    context.no_compile_layers = {runner.layer_name: runner}
+    monkeypatch.setattr(module.torch.ops.vllm, "npu_moe_forward_shared", module.npu_moe_forward_shared)
+    shared_out, routed_out = runner.forward(hidden, torch.zeros(2, 2))
+    runner.apply_routed_input_transform.assert_called_once_with(hidden)
+    shared.assert_called_once_with(hidden)
+    torch.testing.assert_close(shared_out, hidden + 1)
+    assert routed_out.shape == (2, 2)
+    assert method.sub_stream.waits if multi_stream else not method.sub_stream.waits
+    for shared_input in (None, hidden):
+        fake_shared, fake_routed = module.npu_moe_forward_shared_fake(
+            latent, torch.zeros(2, 2), "latent.moe", shared_input
+        )
+        assert fake_shared.shape == (latent.shape if shared_input is None else hidden.shape)
+        assert fake_routed.shape == latent.shape
 
 
 @pytest.mark.unit

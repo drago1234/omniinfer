@@ -103,7 +103,7 @@ class TestHighThroughoutModelForward:
                     )
                 )
 
-            def mhc_head(self, hidden_states):
+            def mhc_head(self, hidden_states, engram_hash_ids=None):
                 return hidden_states, None, None, None, None
 
             def __call__(
@@ -115,6 +115,7 @@ class TestHighThroughoutModelForward:
                 cos,
                 sin,
                 sk_event,
+                next_engram_hash_ids=None,
             ):
                 self.seen_cos = cos
                 return (
@@ -128,6 +129,7 @@ class TestHighThroughoutModelForward:
         model = model_mod.OpenPanguV2Model.__new__(model_mod.OpenPanguV2Model)
         torch.nn.Module.__init__(model)
         layer = FakeLayer()
+        model.engram_hash = None
         model.layers = [layer]
         model.start_layer = 0
         model.end_layer = 1

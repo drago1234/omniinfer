@@ -14,6 +14,8 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     _compute_cumulative_log_p_kernel,
+    _compute_local_residual_mass_kernel,
+    _insert_resampled_kernel,
     _compute_global_logprobs_and_logsumexp,
     _compute_global_logsumexp,
     _compute_global_residual_mass,
@@ -21,10 +23,24 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     _compute_local_logits_stats_kernel,
 )
 
-from omni_npu.worker.npu.ops.gumbel import _npu_gumbel_block_argmax
+from omni_npu.worker.npu.ops.gumbel import (
+    _npu_gumbel_block_argmax,
+    spec_step_seed,
+)
 
 
-def _next_power_of_2(x: int) -> int:  # pragma: no cover
+@triton.jit
+def tl_rand32(seed, offset, includes_zero: tl.constexpr):
+    # Triton-Ascend requires a 32-bit offset to keep scalar Philox output.
+    # Positions use their low 32 bits; all 64 seed bits remain significant.
+    u = tl.rand(seed, offset.to(tl.int32))
+    if not includes_zero:
+        u = tl.maximum(u, 4.6566127342e-10)
+    return u
+
+
+
+def _next_power_of_2(x: int) -> int:
     next_power_of_2 = getattr(triton, "next_power_of_2", None)
     if next_power_of_2 is not None:
         return next_power_of_2(x)
@@ -32,84 +48,7 @@ def _next_power_of_2(x: int) -> int:  # pragma: no cover
 
 
 @triton.jit
-def _npu_rand_uniform(seed, pos):  # pragma: no cover
-    # NPU: cast pos to int32 so Philox avoids the uint64 umulhi path, which
-    # triton-ascend cannot lower on Ascend vector cores. The 1-element block
-    # form also avoids scalar-rand lowering issues.
-    pos = pos.to(tl.int32)
-    rand_seed = tl.randint(seed, pos)
-    u = tl.max(tl.rand(rand_seed, tl.arange(0, 1)).to(tl.float32), axis=0)
-    return tl.maximum(u, 4.6566127342e-10)
-
-
-@triton.jit
-def _compute_local_residual_mass_kernel(  # pragma: no cover
-    local_residual_mass_ptr,
-    local_residual_mass_stride,
-    cumulative_log_p_ptr,
-    target_logits_ptr,
-    target_logits_stride,
-    target_local_max_ptr,
-    target_local_max_stride,
-    target_local_sumexp_ptr,
-    target_local_sumexp_stride,
-    draft_logits_ptr,
-    draft_logits_stride_0,
-    draft_logits_stride_1,
-    draft_local_max_ptr,
-    draft_local_max_stride,
-    draft_local_sumexp_ptr,
-    draft_local_sumexp_stride,
-    expanded_idx_mapping_ptr,
-    expanded_local_pos_ptr,
-    temp_ptr,
-    vocab_size,
-    num_speculative_steps,
-    vocab_num_blocks,
-    BLOCK_SIZE: tl.constexpr,
-    PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
-):
-    logit_idx = tl.program_id(0).to(tl.int64)
-    draft_step_idx = tl.load(expanded_local_pos_ptr + logit_idx)
-    should_skip = (draft_step_idx == 0) | (draft_step_idx >= num_speculative_steps)
-    if should_skip:
-        # The acceptance threshold, h, looks one position ahead and sums
-        # over: max(p_i * M_b(x|x_{<i}) - M_s(x|x_{<i}), 0). Tokens at the
-        # first and last (bonus) positions aren't needed for this computation.
-        return
-
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + logit_idx).to(tl.int64)
-    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
-    if temp == 0.0:
-        return
-
-    block_idx = tl.program_id(1)
-    block_offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = block_offsets < vocab_size
-    target_log_probs, draft_log_probs, _, _ = _compute_global_logprobs_and_logsumexp(
-        block_offsets, mask, logit_idx, req_state_idx, draft_step_idx,
-        target_logits_ptr, target_logits_stride,
-        target_local_max_ptr, target_local_max_stride,
-        target_local_sumexp_ptr, target_local_sumexp_stride,
-        draft_logits_ptr, draft_logits_stride_0, draft_logits_stride_1,
-        draft_local_max_ptr, draft_local_max_stride,
-        draft_local_sumexp_ptr, draft_local_sumexp_stride,
-        vocab_num_blocks, PADDED_VOCAB_NUM_BLOCKS, True,  # HAS_DRAFT_LOGITS
-    )
-
-    # Compute the residual mass: max(p_i * M_b(x|x_{<i}) - M_s(x|x_{<i}), 0)
-    p = tl.exp(tl.load(cumulative_log_p_ptr + logit_idx - 1).to(tl.float32))
-    m_b = tl.exp(target_log_probs)
-    m_s = tl.exp(draft_log_probs)
-    partial = tl.sum(tl.maximum(p * m_b - m_s, 0.0), axis=0)
-    tl.store(
-        local_residual_mass_ptr + logit_idx * local_residual_mass_stride + block_idx,
-        partial,
-    )
-
-
-@triton.jit
-def _rejection_kernel(  # pragma: no cover
+def _rejection_kernel(
     sampled_ptr,
     sampled_stride,
     rejected_steps_ptr,
@@ -134,13 +73,13 @@ def _rejection_kernel(  # pragma: no cover
     cu_num_logits_ptr,
     idx_mapping_ptr,
     temp_ptr,
-    seed_ptr,
-    pos_ptr,
     synthetic_conditional_rates_ptr,
     cumulative_log_p_ptr,
     local_residual_mass_ptr,
     local_residual_mass_stride,
     vocab_num_blocks,
+    seed_ptr,
+    pos_ptr,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
     SYNTHETIC_MODE: tl.constexpr,
@@ -151,10 +90,10 @@ def _rejection_kernel(  # pragma: no cover
     start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     num_draft_tokens = end_idx - start_idx - 1
-    seed = tl.load(seed_ptr + req_state_idx)
-    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+    temp = tl.load(temp_ptr + req_state_idx)
     is_greedy = temp == 0.0
 
+    seed = tl.load(seed_ptr + req_state_idx)
     accepted_length = tl.zeros((), tl.int64)
     target_lse = 0.0
     draft_lse = 0.0
@@ -163,14 +102,15 @@ def _rejection_kernel(  # pragma: no cover
         logit_idx = start_idx + i
         draft_sampled = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
         pos = tl.load(pos_ptr + logit_idx)
-        u = _npu_rand_uniform(seed, pos)
+        step_seed = spec_step_seed(seed, i) if USE_BLOCK_VERIFICATION else seed
+        u = tl_rand32(step_seed, pos, includes_zero=False)
         use_block_path = False
         if USE_BLOCK_VERIFICATION:
             use_block_path = not is_greedy
         if use_block_path:
             # Block verification (Sun et al., 2024): https://arxiv.org/abs/2403.10444
             prefix_joint_ratio = tl.exp(
-                tl.load(cumulative_log_p_ptr + logit_idx).to(tl.float32)
+                tl.load(cumulative_log_p_ptr + logit_idx)
             )
             if i < num_draft_tokens - 1:
                 residual_mass = _compute_global_residual_mass(
@@ -278,7 +218,7 @@ def _rejection_kernel(  # pragma: no cover
 
 
 @triton.jit
-def _resample_kernel(  # pragma: no cover
+def _resample_kernel(
     resampled_local_argmax_ptr,
     resampled_local_argmax_stride,
     resampled_local_max_ptr,
@@ -295,9 +235,9 @@ def _resample_kernel(  # pragma: no cover
     expanded_idx_mapping_ptr,
     draft_sampled_ptr,
     temp_ptr,
-    seed_ptr,
-    pos_ptr,
     cumulative_log_p_ptr,
+    seeds_ptr,
+    pos_ptr,
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
@@ -311,7 +251,7 @@ def _resample_kernel(  # pragma: no cover
     resample_token_idx = start_idx + resample_idx
     req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx).to(tl.int64)
 
-    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+    temp = tl.load(temp_ptr + req_state_idx)
     is_bonus = resample_token_idx == end_idx - 1
     if temp == 0.0:
         if not is_bonus:
@@ -351,9 +291,7 @@ def _resample_kernel(  # pragma: no cover
             # shifting when nothing was accepted (tau == 0).
             log_p_tau = 0.0
             if resample_idx > 0:
-                log_p_tau = tl.load(cumulative_log_p_ptr + resample_token_idx - 1).to(
-                    tl.float32
-                )
+                log_p_tau = tl.load(cumulative_log_p_ptr + resample_token_idx - 1)
             target_log_probs += log_p_tau
         draft_log_probs = draft_logits - draft_lse
         # Compute the residual:
@@ -367,7 +305,7 @@ def _resample_kernel(  # pragma: no cover
             ratio < 1.0,
             target_log_probs + tl.log(1 - ratio),
             float("-inf"),
-        ).to(tl.float32)
+        )
     else:
         # One-hot draft. The residual is just the target distribution with
         # the rejected draft token probability zeroed out.
@@ -381,7 +319,7 @@ def _resample_kernel(  # pragma: no cover
             block != rejected_draft_token,
             target_logits,
             float("-inf"),
-        ).to(tl.float32)
+        )
 
     # Resample the rejected/bonus token.
     value, idx = _npu_gumbel_block_argmax(
@@ -391,12 +329,13 @@ def _resample_kernel(  # pragma: no cover
         resample_token_idx,
         expanded_idx_mapping_ptr,
         temp_ptr,
-        seed_ptr,
-        pos_ptr,
         None,  # processed_logits_ptr
         0,  # processed_logits_stride
         None,  # processed_logits_col_ptr
         vocab_size,
+        seeds_ptr,
+        pos_ptr,
+        IS_DRAFTING=False,
         APPLY_TEMPERATURE=False,
         USE_FP64=USE_FP64,
     )
@@ -413,60 +352,7 @@ def _resample_kernel(  # pragma: no cover
     )
 
 
-@triton.jit
-def _insert_resampled_kernel(  # pragma: no cover
-    sampled_ptr,
-    sampled_stride,
-    num_sampled_ptr,
-    resampled_local_argmax_ptr,
-    resampled_local_argmax_stride,
-    resampled_local_max_ptr,
-    resampled_local_max_stride,
-    resample_num_blocks,
-    cu_num_logits_ptr,
-    expanded_idx_mapping_ptr,
-    temp_ptr,
-    PADDED_RESAMPLE_NUM_BLOCKS: tl.constexpr,
-):
-    req_idx = tl.program_id(0)
-    num_sampled = tl.load(num_sampled_ptr + req_idx)
-    start_idx = tl.load(cu_num_logits_ptr + req_idx)
-    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
-    resample_token_idx = start_idx + num_sampled
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx)
-
-    # Increment the number of sampled tokens.
-    tl.store(num_sampled_ptr + req_idx, num_sampled + 1)
-
-    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
-    is_bonus = resample_token_idx == end_idx - 1
-    if temp == 0.0:
-        if not is_bonus:
-            # Greedy + non-bonus token. The target argmax is already
-            # in the sampled tensor.
-            return
-
-    # Insert the resampled token.
-    block = tl.arange(0, PADDED_RESAMPLE_NUM_BLOCKS)
-    mask = block < resample_num_blocks
-    resampled_local_max = tl.load(
-        resampled_local_max_ptr + req_idx * resampled_local_max_stride + block,
-        mask=mask,
-        other=float("-inf"),
-    )
-    resampled_max_block_idx = tl.argmax(resampled_local_max, axis=0)
-    resampled = tl.load(
-        resampled_local_argmax_ptr
-        + req_idx * resampled_local_argmax_stride
-        + resampled_max_block_idx,
-    )
-    tl.store(
-        sampled_ptr + req_idx * sampled_stride + num_sampled,
-        resampled,
-    )
-
-
-def rejection_sample(  # pragma: no cover
+def rejection_sample(
     target_logits: torch.Tensor,
     draft_logits: torch.Tensor | None,
     draft_sampled: torch.Tensor,
@@ -623,9 +509,10 @@ def rejection_sample(  # pragma: no cover
         draft_sampled, draft_logits, draft_logits_stride_0, draft_logits_stride_1,
         draft_local_max, draft_local_max.stride(0),
         draft_local_sumexp, draft_local_sumexp.stride(0),
-        cu_num_logits, idx_mapping, temperature, seed, pos,
+        cu_num_logits, idx_mapping, temperature,
         synthetic_conditional_rates, cumulative_log_p,
         local_residual_mass, local_residual_mass.stride(0), vocab_num_blocks,
+        seed, pos,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,
         SYNTHETIC_MODE=synthetic_mode,
@@ -663,9 +550,9 @@ def rejection_sample(  # pragma: no cover
         expanded_idx_mapping,
         draft_sampled,
         temperature,
+        cumulative_log_p,
         seed,
         pos,
-        cumulative_log_p,
         vocab_size,
         BLOCK_SIZE=RESAMPLE_BLOCK_SIZE,
         HAS_DRAFT_LOGITS=has_draft_logits,

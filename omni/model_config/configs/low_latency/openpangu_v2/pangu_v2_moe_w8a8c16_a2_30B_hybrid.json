@@ -2,6 +2,10 @@
     "model_parallel_config": {},
     "operator_optimization_config": {
         "kv_nz": true,
-        "enable_moe_init_routing_v2": true
+        "use_aicpu_fa_tiling": true,
+        "enable_moe_init_routing_v2": false,
+        "enable_moe_init_routing_v3": true,
+        "enable_dense_mlp_dequant_swiglu_quant": true,
+        "enable_shared_expert_dequant_swiglu_quant": true
     }
 }

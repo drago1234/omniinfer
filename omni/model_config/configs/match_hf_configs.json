@@ -75,6 +75,13 @@
         "n_shared_experts": 1,
         "moe_intermediate_size": 2048
     },
+    "pangu-2B":{
+        "model_type": "PanguEmbedded",
+        "hidden_size": 2048,
+        "num_attention_heads": 16,
+        "vocab_size": 151552,
+        "intermediate_size": 6144
+    },
     "pangu-7B":{
         "model_type": "PanguEmbedded",
         "hidden_size": 4096,

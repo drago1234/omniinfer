@@ -11,6 +11,7 @@ import torch
 
 
 def _moe_layer(**kwargs):
+    kwargs.setdefault("use_swiglu_group_fusion", False)
     layer = SimpleNamespace(**kwargs)
     if getattr(layer, "routed_experts", None) is None:
         layer.routed_experts = layer
@@ -155,6 +156,30 @@ def test_grouped_topk_invalid_scoring_func_raises(fused_module):
         )
 
 
+@pytest.mark.parametrize("routing_v2", [False, True])
+def test_fused_experts_tp_weights_activation_once(fused_module, monkeypatch, routing_v2):
+    module, stubs = fused_module
+    monkeypatch.setattr(module.model_extra_config.operator_opt_config,
+                        "enable_moe_init_routing_v2", routing_v2)
+    layer = _moe_layer(
+        global_num_experts=2, quant_config=None, quant_method=MagicMock(), use_swiglu_group_fusion=True
+    )
+    rows = torch.tensor([2, 0, 3, 1], dtype=torch.int32)
+    sorted_tokens = torch.ones(4, 2)
+    layer.quant_method.apply_experts.return_value = sorted_tokens
+    stubs.torch_npu.npu_moe_init_routing.return_value = (sorted_tokens, rows, torch.zeros(4, dtype=torch.int32))
+    stubs.torch_npu.npu_moe_init_routing_v2.return_value = (sorted_tokens, rows, torch.tensor([2, 4]), None)
+    stubs.torch_npu.npu_moe_compute_expert_tokens.return_value = torch.tensor([2, 4])
+    weights = torch.tensor([[0.1, 0.2], [0.3, 0.4]])
+    module.fused_experts_tp(layer, torch.ones(2, 2), torch.zeros(2, 2, dtype=torch.int32), weights)
+    expected = torch.tensor([0.2, 0.4, 0.1, 0.3] if routing_v2 else [0.3, 0.4, 0.1, 0.2])
+    prepare_result = layer.quant_method.apply_experts.call_args.kwargs["prepare_permute_result"]
+    torch.testing.assert_close(prepare_result.expanded_topk_weights, expected)
+    finalize_call = stubs.torch_npu.npu_moe_finalize_routing.call_args
+    scales = finalize_call.kwargs["scales"] if routing_v2 else finalize_call.args[4]
+    torch.testing.assert_close(scales, torch.ones_like(weights))
+
+
 @pytest.mark.unit
 def test_fused_experts_tp_no_quant(fused_module):
     module, stubs = fused_module
@@ -199,6 +224,12 @@ def test_fused_experts_tp_uses_routing_v2(fused_module, monkeypatch):
         module.model_extra_config.operator_opt_config,
         "enable_moe_init_routing_v2",
         True,
+    )
+    monkeypatch.setattr(
+        module.model_extra_config.operator_opt_config,
+        "enable_moe_init_routing_v3",
+        False,
+        raising=False,
     )
     layer = _moe_layer(
         global_num_experts=4,
@@ -292,6 +323,76 @@ def test_fused_experts_tp_uses_routing_v2(fused_module, monkeypatch):
 
 
 @pytest.mark.unit
+def test_fused_experts_tp_routing_v3_quantizes_before_routing_once(
+    fused_module, monkeypatch
+):
+    module, stubs = fused_module
+    config = module.model_extra_config.operator_opt_config
+    monkeypatch.setattr(config, "enable_moe_init_routing_v2", False)
+    monkeypatch.setattr(
+        config, "enable_moe_init_routing_v3", True, raising=False
+    )
+
+    quant_method = MagicMock()
+    quant_method.moe_quant_config = SimpleNamespace(
+        use_hifloat8_w8a8=False,
+        use_mxfp8_w8a8=False,
+        use_mxfp4_w4a8=False,
+    )
+    experts = _moe_layer(
+        global_num_experts=4,
+        quant_config=object(),
+        quant_method=quant_method,
+    )
+    layer = SimpleNamespace(
+        routed_experts=experts,
+        use_swiglu_group_fusion=False,
+    )
+    x = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    quantized_x = torch.arange(6, dtype=torch.int8).reshape(3, 2)
+    input_scale = torch.tensor([0.1, 0.2, 0.3])
+    routed_scale = torch.tensor([0.3, 0.1, 0.2])
+    sorted_tokens = quantized_x.flip(0)
+    expanded_src_to_dst_row = torch.tensor([[2], [0], [1]], dtype=torch.int32)
+    expert_tokens = torch.tensor([1, 2, 3, 3], dtype=torch.int64)
+    stubs.torch_npu.npu_dynamic_quant.return_value = (quantized_x, input_scale)
+    stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
+        sorted_tokens,
+        expanded_src_to_dst_row,
+        expert_tokens,
+        routed_scale,
+    )
+    expert_output = torch.full((3, 2), 5.0)
+    quant_method.apply_experts.return_value = expert_output
+    stubs.torch_npu.npu_moe_finalize_routing.side_effect = None
+    stubs.torch_npu.npu_moe_finalize_routing.return_value = torch.full(
+        (3, 2), 6.0
+    )
+
+    module.fused_experts_tp(
+        layer=layer,
+        x=x,
+        topk_ids=torch.zeros(3, 1, dtype=torch.int64),
+        topk_weights=torch.ones(3, 1),
+    )
+
+    stubs.torch_npu.npu_dynamic_quant.assert_called_once_with(x)
+    init_call = stubs.torch_npu.npu_moe_init_routing_v2.call_args
+    assert torch.equal(init_call.args[0], quantized_x)
+    assert torch.equal(init_call.kwargs["scale"], input_scale)
+    assert init_call.kwargs["expert_idx"].dtype == torch.int32
+    prepare_result = quant_method.apply_experts.call_args.kwargs[
+        "prepare_permute_result"
+    ]
+    assert torch.equal(
+        prepare_result.hidden_states_sorted_by_experts, sorted_tokens
+    )
+    assert torch.equal(prepare_result.dynamic_scale, routed_scale)
+    stubs.torch_npu.npu_dynamic_mx_quant.assert_not_called()
+    stubs.torch_npu.npu_dtype_cast.assert_not_called()
+
+
+@pytest.mark.unit
 def test_fused_experts_tp_with_quant(fused_module):
     module, stubs = fused_module
     layer = _moe_layer(
@@ -338,7 +439,7 @@ def test_fused_experts_tp_with_mxfp_quant(fused_module):
         quant_config=object(),
         quant_method=MagicMock(),
     )
-    layer = SimpleNamespace(routed_experts=experts)
+    layer = _moe_layer(routed_experts=experts)
     experts.quant_method.moe_quant_config.use_mxfp8_w8a8 = True
     experts.quant_method.moe_quant_config.use_hifloat8_w8a8 = False
     sorted_tokens = torch.ones(3, 2)
@@ -382,7 +483,7 @@ def test_fused_experts_tp_with_hifloat8_casts_without_scale(fused_module):
         quant_config=object(),
         quant_method=MagicMock(),
     )
-    layer = SimpleNamespace(routed_experts=experts)
+    layer = _moe_layer(routed_experts=experts)
     experts.quant_method.moe_quant_config.use_hifloat8_w8a8 = True
     experts.quant_method.moe_quant_config.use_mxfp8_w8a8 = False
     experts.quant_method.moe_quant_config.use_mxfp4_w4a8 = False

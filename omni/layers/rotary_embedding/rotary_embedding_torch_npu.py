@@ -127,6 +127,46 @@ class NPURotaryEmbedding(CachedCosSinMixin, RotaryEmbedding):
         k_embed_flat = k_embed.flatten(1, 2)
         return q_embed_flat, k_embed_flat
 
+    def _forward_rotary_mul(
+        self,
+        position_ids: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Partial rotary (rotary_dim < 64) via npu_rotary_mul.
+
+        npu_apply_rotary_pos_emb requires rotary_dim >= 64; same
+        slice-apply-cat pattern as the MLA path in npu_pangu.py.
+        """
+        cos = torch.index_select(
+            self.cos_cached, dim=0, index=position_ids.view(-1)
+        )
+        sin = torch.index_select(
+            self.sin_cached, dim=0, index=position_ids.view(-1)
+        )
+        num_tokens = position_ids.numel()
+        query = query.view(num_tokens, -1, self.head_size)
+        key = key.view(num_tokens, -1, self.head_size)
+
+        query_rot = query[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim:]
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim:]
+
+        cos4 = cos.view(num_tokens, 1, 1, self.rotary_dim)
+        sin4 = sin.view(num_tokens, 1, 1, self.rotary_dim)
+
+        q_embed = torch_npu.npu_rotary_mul(
+            query_rot.unsqueeze(1), cos4, sin4, rotary_mode="half"
+        ).squeeze(1)
+        k_embed = torch_npu.npu_rotary_mul(
+            key_rot.unsqueeze(1), cos4, sin4, rotary_mode="half"
+        ).squeeze(1)
+
+        q_embed = torch.cat((q_embed, query_pass), dim=-1)
+        k_embed = torch.cat((k_embed, key_pass), dim=-1)
+        return q_embed.flatten(1, 2), k_embed.flatten(1, 2)
+
     def forward_oot(
         self,
         positions: torch.Tensor,
@@ -151,6 +191,9 @@ class NPURotaryEmbedding(CachedCosSinMixin, RotaryEmbedding):
                 q_embed, k_embed = self._forward_fused_ops(
                     positions, query, key, cos=cos, sin=sin
                 )
+            elif self.is_neox_style:
+                # npu_apply_rotary_pos_emb requires rotary_dim >= 64.
+                q_embed, k_embed = self._forward_rotary_mul(positions, query, key)
             else:
                 q_embed, k_embed = super().forward_native(positions, query, key)
         elif self.rotary_dim != 128:

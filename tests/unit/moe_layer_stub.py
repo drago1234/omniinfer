@@ -16,6 +16,8 @@ def as_moe_runner(layer, *, use_ep=None):
     # object.__setattr__ keeps torch.nn.Module from registering a self-cycle.
     if getattr(layer, "routed_experts", None) is None:
         object.__setattr__(layer, "routed_experts", layer)
+    if not hasattr(layer, "use_swiglu_group_fusion"):
+        object.__setattr__(layer, "use_swiglu_group_fusion", False)
     if getattr(layer, "_shared_experts", None) is None:
         shared = getattr(layer, "shared_experts", None)
         object.__setattr__(

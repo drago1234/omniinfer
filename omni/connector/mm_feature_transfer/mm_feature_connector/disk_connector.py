@@ -205,7 +205,7 @@ class SQLiteMetadataStore(MMFeatureMetadataStore):
             return
         self._run_with_retry(lambda: self.conn.execute("PRAGMA journal_mode=WAL"))
 
-    def _run_with_retry(self, func: Callable[[], T]) -> T:  # pylint: disable=inconsistent-return-statements
+    def _run_with_retry(self, func: Callable[[], T]) -> T:
         start = time.monotonic()
         for attempt in range(self._max_retry_attempts):
             try:

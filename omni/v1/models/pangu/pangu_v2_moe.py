@@ -21,18 +21,15 @@ from vllm.distributed import (
     get_tp_group,
     tensor_model_parallel_all_gather,
 )
+from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
@@ -61,6 +58,13 @@ from vllm.forward_context import get_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op, get_kv_cache_torch_dtype
 
 from omni_npu import envs
+from omni_npu.layers.engram import (
+    EngramLayout,
+    PanGuEngramConfig,
+    PanGuEngramFusion,
+    PanGuEngramPostNorm,
+    PanGuEngramModelMixin,
+)
 from omni_npu.layers.mhc.cube_side_task_ops import (
     maybe_register_mhc_task,
     resolve_mhc_h_res,
@@ -68,11 +72,15 @@ from omni_npu.layers.mhc.cube_side_task_ops import (
 from omni_npu.layers.mhc.npu_mhc import NPUmHC
 from omni_npu.compilation.acl_graph import sk_scope
 from omni_npu.model_config.config_loader.loader import model_extra_config
-from omni_npu.v1.distributed.parallel_state_ext import get_local_world_group
+from omni_npu.v1.distributed.parallel_state_ext import get_engram_shared_group, get_local_world_group
 from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.attention.npu_pangu import NPUPanguSparseAttention
 from omni_npu.v1.layers.attention.weight_utils import run_post_weight_load
+from omni_npu.v1.layers.linear import (
+    MergedColumnParallelFlashCommLinear,
+    RowParallelFlashCommLinear,
+)
 from omni_npu.v1.layers.logits_processor import NPULogitsProcessor
 from omni_npu.v1.layers.vocab_parallel_embedding import NPUParallelLMHead, NPUVocabParallelEmbedding
 from omni_npu.v1.utils import on_ascend910b, on_ascend950
@@ -90,7 +98,6 @@ from .utils import (
     finalize_routing,
     w4a8_expert_ffn,
 )
-
 
 logger = init_logger(__name__)
 
@@ -154,11 +161,7 @@ direct_register_custom_op(
 # of (h_post, h_res, sk_event) so it's a single-slot signal that doesn't
 # collide with None (sync) or torch.npu.Event (already launched).
 _DEFERRED_SINKHORN = object()
-try:
-    # Imported for side effect: registers the torch.ops.custom operators.
-    import omni_custom_ops
-except ImportError as e:
-    logger.warning(f"Failed to import omni_custom_ops: {e}")
+
 
 
 class OpenPanguV2MLP(nn.Module):
@@ -175,7 +178,9 @@ class OpenPanguV2MLP(nn.Module):
         reduce_results: bool = True,
         disable_tp: bool = False,
         prefix: str = "",
+        swiglu_limit: float | None = None,
     ) -> None:
+        swiglu_limit = swiglu_limit if swiglu_limit is not None and swiglu_limit > 0 else None
         super().__init__()
         self.disable_tp = disable_tp
         self.tp_size = get_tp_group().world_size
@@ -184,7 +189,7 @@ class OpenPanguV2MLP(nn.Module):
         self._fuse_dense_mlp = "shared_experts" not in prefix
         dense_idx = extract_layer_index(prefix) if self._fuse_dense_mlp else -1
         self._sk_dense_name = f"dense_mlp_{dense_idx}"
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelFlashCommLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=bias,
@@ -193,7 +198,7 @@ class OpenPanguV2MLP(nn.Module):
             prefix=f"{prefix}.gate_up_proj",
             return_bias=False,
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = RowParallelFlashCommLinear(
             intermediate_size,
             hidden_size,
             bias=bias,
@@ -205,9 +210,13 @@ class OpenPanguV2MLP(nn.Module):
         )
 
         check_ffn_act_fn(hidden_act)
-        self.act_fn = SiluAndMul()
+        self.act_fn = SiluAndMulWithClamp(swiglu_limit) if swiglu_limit is not None else SiluAndMul()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        down_proj_ready_event: Optional[torch.npu.Event] = None,
+    ) -> torch.Tensor:
 
         # AllGather for sequence parallelism: when TP > 1 and not using naive backend,
         # each rank has only 1/TP of the sequence, so we need to gather the full sequence
@@ -220,6 +229,9 @@ class OpenPanguV2MLP(nn.Module):
         with sk_scope(self._sk_dense_name, self._fuse_dense_mlp):
             gate_up = self.gate_up_proj(x)
             act = self.act_fn(gate_up)
+            if down_proj_ready_event is not None:
+                # Shared MLP is unfused: wait after activation, before S2.
+                down_proj_ready_event.wait(torch.npu.current_stream())
             out = self.down_proj(act)
 
         # ReduceScatter or AllReduce for sequence parallelism:
@@ -271,6 +283,37 @@ class OpenPanguV2MOE(nn.Module):
         self.moe_tbo_threshold = getattr(model_extra_config.operator_opt_config, "moe_tbo_threshold", -1)
         check_ffn_act_fn(config.hidden_act)
 
+        latent_size = getattr(config, "routed_expert_hidden_size", None)
+        swiglu_limit = getattr(config, "swiglu_limit", None)
+        swiglu_limit = swiglu_limit if swiglu_limit is not None and swiglu_limit > 0 else None
+        has_latent_or_clamp = latent_size is not None or swiglu_limit is not None
+        if has_latent_or_clamp and (quant_config is not None or self.on_ascend950):
+            raise NotImplementedError("Latent MoE and SwiGLU clamp currently require the unquantized A2/A3 MoE path")
+        self.routed_expert_down_proj = None
+        self.routed_expert_up_proj = None
+        self.routed_expert_norm = None
+        if latent_size is not None:
+            if latent_size <= 0:
+                raise ValueError("routed_expert_hidden_size must be positive")
+            # Router/shared experts retain the model width; only routed experts use the latent width.
+            self.routed_expert_down_proj = ReplicatedLinear(
+                config.hidden_size,
+                latent_size,
+                bias=False,
+                prefix=f"{prefix}.routed_expert_down_proj",
+                return_bias=False,
+            )
+            self.routed_expert_up_proj = ReplicatedLinear(
+                latent_size,
+                config.hidden_size,
+                bias=False,
+                prefix=f"{prefix}.routed_expert_up_proj",
+                return_bias=False,
+            )
+            if getattr(config, "latent_moe_use_norm", False):
+                self.routed_expert_norm = RMSNorm(latent_size, eps=config.rms_norm_eps)
+        self.act_fn = SiluAndMulWithClamp(swiglu_limit) if swiglu_limit is not None else torch_npu.npu_swiglu
+
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.n_routed_experts,
@@ -298,6 +341,7 @@ class OpenPanguV2MOE(nn.Module):
             disable_tp=True,
             reduce_results=False,
             prefix=f"{prefix}.shared_experts",
+            swiglu_limit=swiglu_limit,
         )
 
         self.use_moe_force_load_balance = (
@@ -316,7 +360,7 @@ class OpenPanguV2MOE(nn.Module):
             shared_experts=self.shared_experts,
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
+            hidden_size=latent_size if latent_size is not None else config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
             renormalize=config.norm_topk_prob,
@@ -359,8 +403,29 @@ class OpenPanguV2MOE(nn.Module):
         self.fetch_stream = None
 
     @property
+    def _use_swiglu_group_fusion(self) -> bool:
+        return (
+            not self._is_quant
+            and isinstance(self.act_fn, SiluAndMulWithClamp)
+            and self.act_fn.use_swiglu_group_fusion
+        )
+
+    @property
     def _is_graph_mode(self) -> bool:
         return get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.NONE
+
+    def _project_routed_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.routed_expert_down_proj is not None:
+            return self.routed_expert_down_proj(hidden_states)
+        return hidden_states
+
+    def _project_routed_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Normalize after communication has combined all selected expert outputs.
+        if self.routed_expert_norm is not None:
+            hidden_states = self.routed_expert_norm(hidden_states)
+        if self.routed_expert_up_proj is not None:
+            hidden_states = self.routed_expert_up_proj(hidden_states)
+        return hidden_states
 
     def forward(
         self,
@@ -414,7 +479,7 @@ class OpenPanguV2MOE(nn.Module):
             return self._forward_fused_moe(
                 hidden_states
             )
-        elif self.tp_size > 1 and self.moe_comm_strategy == "allreduce":
+        elif self.moe_comm_strategy == "allreduce":
             return self._forward_allgather(
                 hidden_states,
                 use_allreduce=True,
@@ -540,6 +605,7 @@ class OpenPanguV2MOE(nn.Module):
             topk_ids = self._apply_mapping(topk_ids)
 
 
+            hidden_states = self._project_routed_input(hidden_states)
             if self._is_quant:
                 hidden_states_int8, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
                 if not use_allreduce:
@@ -722,7 +788,21 @@ class OpenPanguV2MOE(nn.Module):
                     group_type=0,
                     group_list_type=1,
                 )[0]
-                gate_up_proj_output = torch_npu.npu_swiglu(gate_up_proj_output)
+                expanded_topk_weights = None
+                combine_weights = topk_weights.to(torch.float32)
+                if self._use_swiglu_group_fusion:
+                    # row_idx_type=0 maps original token/expert pairs to local sorted rows;
+                    # -1 entries belong to experts on other ranks.
+                    expanded_topk_weights = torch.zeros_like(combine_weights).flatten().scatter_add(
+                        0,
+                        expanded_x_idx.clamp_min(0).long(),
+                        combine_weights.flatten() * (expanded_x_idx >= 0),
+                    )
+                    combine_weights = torch.ones_like(combine_weights)
+                gate_up_proj_output = (
+                    self.act_fn(gate_up_proj_output, weight=expanded_topk_weights)
+                    if expanded_topk_weights is not None else self.act_fn(gate_up_proj_output)
+                )
                 down_proj_output = torch_npu.npu_grouped_matmul(
                     [gate_up_proj_output],
                     [self.experts.w2_weight],
@@ -738,7 +818,7 @@ class OpenPanguV2MOE(nn.Module):
                 moe_output = torch_npu.npu_moe_finalize_routing(
                     down_proj_output.unsqueeze(1),
                     None, None, None,
-                    topk_weights.to(torch.float32),
+                    combine_weights,
                     expanded_x_idx,
                     topk_ids,
                     drop_pad_mode=3,
@@ -778,7 +858,7 @@ class OpenPanguV2MOE(nn.Module):
         # Combine MoE and shared expert outputs
         if use_side_stream:
             shared_done_event.wait(main_stream)
-        result = routed_output + shared_output
+        result = self._project_routed_output(routed_output) + shared_output
         if use_side_stream:
             shared_output.record_stream(main_stream)
         return result
@@ -830,6 +910,7 @@ class OpenPanguV2MOE(nn.Module):
         # all only read it), so it is safe to hand it to the side stream immediately.
         shared_input = hidden_states
         use_side_stream = self.side_stream is not None
+        routed_done_event = torch.npu.Event() if use_side_stream else None
 
         # Launch shared experts on side stream before gating_topk so that
         # shared_expert overlaps with the full routed-expert pipeline:
@@ -861,6 +942,7 @@ class OpenPanguV2MOE(nn.Module):
         # Determine quantization mode
         # 0 - no quantization
         # 2 - w8a8 quantization
+        hidden_states = self._project_routed_input(hidden_states)
         quant_mode = 2 if self._is_quant else 0
 
         num_tokens = hidden_states.shape[0]
@@ -875,6 +957,7 @@ class OpenPanguV2MOE(nn.Module):
                 quant_mode,
                 ep_comm_name,
                 x_active_mask,
+                routed_done_event=routed_done_event,
             )
         else:
             # Multi-batch processing
@@ -893,6 +976,11 @@ class OpenPanguV2MOE(nn.Module):
                     quant_mode,
                     ep_comm_name,
                     batch_x_active_mask,
+                    # One record after the final sub-batch R2 covers every
+                    # routed GMM; earlier sub-batches must not release S2.
+                    routed_done_event=(
+                        routed_done_event if end_idx == num_tokens else None
+                    ),
                 )
                 outputs.append(batch_output)
 
@@ -902,12 +990,15 @@ class OpenPanguV2MOE(nn.Module):
         # Submit side-stream work here (after the routed-expert pipeline) so this block
         # stays outside any kernel-fusion scope, matching _forward_allgather convention.
         # On the NPU the side stream waits for shared_pre_event (recorded before gating_topk)
-        # and therefore runs in parallel with the entire routed-expert pipeline above.
+        # S1/activation may overlap routing. Only S2 waits for R2;
+        # no dependency from shared S1 to routed R1 is introduced.
         if use_side_stream:
             with torch.npu.stream(self.side_stream):
                 shared_input.record_stream(self.side_stream)
                 shared_pre_event.wait(self.side_stream)
-                shared_output = self.shared_experts(shared_input)
+                shared_output = self.shared_experts(
+                    shared_input, down_proj_ready_event=routed_done_event
+                )
                 shared_done_event.record()
         else:
             shared_output = self.shared_experts(shared_input)
@@ -915,7 +1006,7 @@ class OpenPanguV2MOE(nn.Module):
         # Combine MoE and shared expert outputs
         if use_side_stream:
             shared_done_event.wait(main_stream)
-        final_output = moe_output + shared_output
+        final_output = self._project_routed_output(moe_output) + shared_output
         if use_side_stream:
             shared_output.record_stream(main_stream)
 
@@ -929,8 +1020,10 @@ class OpenPanguV2MOE(nn.Module):
         quant_mode: int,
         ep_comm_name: str,
         x_active_mask: Optional[torch.Tensor] = None,
+        routed_done_event: Optional[torch.npu.Event] = None,
     ) -> torch.Tensor:
         """Single batch dispatch + combine processing."""
+        use_swiglu_group_fusion = self._use_swiglu_group_fusion
         # Step 2: npu_moe_distribute_dispatch_v2 - fused dispatch + routing
         dispatch_output = torch_npu.npu_moe_distribute_dispatch_v2(
             x=hidden_states,
@@ -945,11 +1038,14 @@ class OpenPanguV2MOE(nn.Module):
             ep_world_size=self.ep_size,
             ep_rank_id=self.ep_rank,
             x_active_mask=x_active_mask, # (MC2 mask, set None for now)
-            comm_alg="fullmesh_v2",
+            # fullmesh_v2 supports top_k <= 12; fullmesh_v1 supports K <= 16.
+            comm_alg="fullmesh_v2" if self.experts.top_k <= 12 else "fullmesh_v1",
+            expert_scales=topk_weights.float() if use_swiglu_group_fusion else None,
         )
  
         # Unpack dispatch output
         expand_x, dynamic_scale, expand_idx, expert_token_nums, ep_recv_counts, tp_recv_counts = dispatch_output[0:6]
+        expanded_topk_weights = dispatch_output[6] if use_swiglu_group_fusion else None
  
         # Convert expert_token_nums to int64 for grouped_matmul
         expert_tokens = expert_token_nums.to(torch.int64)
@@ -1027,8 +1123,9 @@ class OpenPanguV2MOE(nn.Module):
             )[0]
 
             # Step 4: swiglu - Apply activation
-            gate_up_proj_output = torch_npu.npu_swiglu(
-                gate_up_proj_output,
+            gate_up_proj_output = (
+                self.act_fn(gate_up_proj_output, weight=expanded_topk_weights)
+                if expanded_topk_weights is not None else self.act_fn(gate_up_proj_output)
             )
 
             # Step 5: grouped_matmul - Second matmul (down projection)
@@ -1043,12 +1140,21 @@ class OpenPanguV2MOE(nn.Module):
                 group_list_type=1,
             )[0]
 
+        # All three routed paths (W4A8, W8A8, BF16) have submitted R2 here.
+        # Record before Combine so shared S2 can overlap communication.
+        if routed_done_event is not None:
+            routed_done_event.record(torch.npu.current_stream())
+
         # Step 6: npu_moe_distribute_combine_v2 - fused combine + unpermutation
+        expert_scales = (
+            torch.ones_like(topk_weights, dtype=torch.float32)
+            if use_swiglu_group_fusion else topk_weights.float()
+        )
         moe_output = torch_npu.npu_moe_distribute_combine_v2(
             expand_x=down_proj_output,
             expert_ids=topk_ids,
             assist_info_for_combine=expand_idx,  # Assist info for combining outputs
-            expert_scales=topk_weights.to(torch.float32),
+            expert_scales=expert_scales,
             expert_shard_type=0,
             shared_expert_rank_num=0,
             moe_expert_num=self.n_physical_experts,
@@ -1122,6 +1228,8 @@ class OpenPanguV2MOE(nn.Module):
 
         # Step 2: npu_moe_init_routing_v2 - Local routing initialization
         # This sorts tokens locally without communication
+        shared_input = hidden_states
+        hidden_states = self._project_routed_input(hidden_states)
         topk_ids_int = topk_ids.int()
 
         # Expert range for all physical experts across all ranks
@@ -1197,6 +1305,19 @@ class OpenPanguV2MOE(nn.Module):
             group=self.ep_group,
         )
 
+        expanded_topk_weights = None
+        if self._use_swiglu_group_fusion:
+            # Exchange probabilities in the same expert order and splits as token data.
+            send_topk_weights = torch.zeros_like(topk_weights, dtype=torch.float32).flatten().scatter_add(
+                0,
+                expanded_row_idx.clamp_min(0).long(),
+                topk_weights.float().flatten() * (expanded_row_idx >= 0),
+            )
+            expanded_topk_weights = send_topk_weights.new_empty(gathered_tokens.shape[0])
+            dist.all_to_all_single(
+                expanded_topk_weights, send_topk_weights, output_splits, input_splits, group=self.ep_group
+            )
+
         # Handle pertoken_scale if needed (not used in current implementation)
         gathered_pertoken_scale = None
         if pertoken_scale is not None:
@@ -1217,6 +1338,9 @@ class OpenPanguV2MOE(nn.Module):
                 tokens_per_expert_group.view(self.ep_size, -1),
                 per_token_scales=gathered_pertoken_scale,
             )
+
+        if expanded_topk_weights is not None:
+            expanded_topk_weights = expanded_topk_weights.index_select(0, gathered_idxs_unsort.long())
 
         self._record_eplb_load(tokens_per_local_expert)
 
@@ -1290,8 +1414,9 @@ class OpenPanguV2MOE(nn.Module):
             )[0]
 
             # swiglu activation
-            gate_up_proj_output = torch_npu.npu_swiglu(
-                gate_up_proj_output,
+            gate_up_proj_output = (
+                self.act_fn(gate_up_proj_output, weight=expanded_topk_weights)
+                if expanded_topk_weights is not None else self.act_fn(gate_up_proj_output)
             )
 
             # BF16 down projection
@@ -1331,7 +1456,7 @@ class OpenPanguV2MOE(nn.Module):
             skip1=None,
             skip2=None,
             bias=None,
-            scales=topk_weights,
+            scales=torch.ones_like(topk_weights) if self._use_swiglu_group_fusion else topk_weights,
             expanded_src_to_dst_row=expanded_row_idx,
             export_for_source_row=None,
             drop_pad_mode=2,
@@ -1339,10 +1464,10 @@ class OpenPanguV2MOE(nn.Module):
 
         # Step 12: Compute shared expert output
         # Shared experts work on the original input (data parallel mode)
-        shared_output = self.shared_experts(hidden_states)
+        shared_output = self.shared_experts(shared_input)
 
         # Combine MoE and shared expert outputs
-        final_output = moe_output + shared_output
+        final_output = self._project_routed_output(moe_output) + shared_output
 
         return final_output
 
@@ -1533,6 +1658,8 @@ class OpenPanguV2DecoderLayer(nn.Module):
         config: PretrainedConfig | None,
         prefix: str,
         vllm_config: VllmConfig,
+        engram_layout: EngramLayout | None = None,
+        engram_dp_group: GroupCoordinator | None = None,
     ) -> None:
         super().__init__()
 
@@ -1553,6 +1680,22 @@ class OpenPanguV2DecoderLayer(nn.Module):
         self.enable_mhc_multistream = (
             self.use_mhc
             and model_extra_config.operator_opt_config.enable_mhc_multistream
+        )
+
+        self.engram = (
+            PanGuEngramFusion(
+                engram_layout, self.layer_idx, engram_dp_group, model_extra_config.parall_config.ena_seq_parallel
+            )
+            if engram_layout is not None and self.layer_idx in engram_layout.layer_ids
+            else None
+        )
+        self.post_self_attn_engram_layernorm = (
+            PanGuEngramPostNorm(
+                config.hidden_size,
+                eps=engram_layout.config.rms_norm_eps,
+            )
+            if self.engram is not None and engram_layout.config.post_norm
+            else None
         )
 
         self.use_mla = _has_mla_config(config)
@@ -1736,6 +1879,7 @@ class OpenPanguV2DecoderLayer(nn.Module):
     def mhc_head(
         self,
         hidden_states: torch.Tensor,
+        engram_hash_ids: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1743,6 +1887,7 @@ class OpenPanguV2DecoderLayer(nn.Module):
         torch.Tensor | None,
         torch.npu.Event | None,
     ]:
+        hidden_states = self._apply_engram(hidden_states, engram_hash_ids)
         use_side_stream = self.side_stream is not None
         residual = hidden_states
         sk_event: torch.npu.Event | None = None
@@ -1768,6 +1913,22 @@ class OpenPanguV2DecoderLayer(nn.Module):
             h_res = None
         hidden_states = self.input_layernorm(hidden_states)
         return hidden_states, residual, h_post, h_res, sk_event
+
+    def _apply_engram(
+        self,
+        hidden_states: torch.Tensor,
+        hash_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.engram is None or hash_ids is None:
+            return hidden_states
+        output = self.engram(hidden_states, hash_ids[:, self.engram.layer_hash_index])
+        if self.post_self_attn_engram_layernorm is not None:
+            # mHC post can return flattened streams. The training Engram
+            # post-norm normalizes each hidden-size stream independently.
+            output = self.post_self_attn_engram_layernorm(output.reshape(-1, self.hidden_size)).reshape(
+                -1, *output.shape[1:]
+            )
+        return hidden_states + output
 
     def _launch_split_post_res_sinkhorn(
         self,
@@ -1822,6 +1983,9 @@ class OpenPanguV2DecoderLayer(nn.Module):
         return_h_in_f32: Optional[bool] = False,
         sk_event: Optional[torch.npu.Event] = None,
         defer_side_launch: bool = False,
+        pre_engram_module=None,
+        pre_engram_norm=None,
+        pre_engram_hash_ids: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -1832,8 +1996,9 @@ class OpenPanguV2DecoderLayer(nn.Module):
         use_side_stream = self.side_stream is not None
         main_stream = torch.npu.current_stream() if use_side_stream else None
         new_sk_event: torch.npu.Event | None = None
+        allow_mhc_fusion = self.use_mhc and pre_engram_module is None
 
-        if self.use_mhc and self.use_mega_mhc_fusion_op and not is_model_tail:
+        if allow_mhc_fusion and self.use_mega_mhc_fusion_op and not is_model_tail:
             hidden_states, h_post, h_res, residual = torch.ops.custom.npu_ai_infra_mega_mhc(
                 hidden_states,
                 residual.view(-1, self.mhc_num_stream, self.hidden_size),
@@ -1857,7 +2022,7 @@ class OpenPanguV2DecoderLayer(nn.Module):
                     "hidden_states_fp32": hidden_states.float(),
                 }
 
-        elif self.use_mhc and self.use_mhc_fusion_op and hidden_states.shape[0] <= 256:
+        elif allow_mhc_fusion and self.use_mhc_fusion_op and hidden_states.shape[0] <= 256:
             # Wait for previous side-stream sinkhorn before fusion op consumes h_res.
             if use_side_stream and sk_event is not None:
                 sk_event.wait(main_stream)
@@ -1934,6 +2099,16 @@ class OpenPanguV2DecoderLayer(nn.Module):
                         )
                         hidden_states = hidden_states.view(-1, self.mhc_num_stream, self.hidden_size)
 
+                    if pre_engram_module is not None and pre_engram_hash_ids is not None:
+                        engram_output = pre_engram_module(
+                            hidden_states, pre_engram_hash_ids[:, pre_engram_module.layer_hash_index]
+                        )
+                        if pre_engram_norm is not None:
+                            engram_output = pre_engram_norm(engram_output.reshape(-1, self.hidden_size)).reshape(
+                                -1, *engram_output.shape[1:]
+                            )
+                        hidden_states = hidden_states + engram_output
+
                     residual = None if is_model_tail else hidden_states
                     hidden_states, h_post, h_res = pre_mhc_module.mhc_pre(
                         hidden_states,
@@ -1983,6 +2158,7 @@ class OpenPanguV2DecoderLayer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         sk_event: Optional[torch.npu.Event] = None,
+        next_engram_hash_ids: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -2098,7 +2274,9 @@ class OpenPanguV2DecoderLayer(nn.Module):
             hidden_states,
         )
 
-        nxt_mhc_pre, nxt_layernorm, is_model_tail = self._tail_refs
+        nxt_mhc_pre, nxt_layernorm, is_model_tail = self._tail_refs[:3]
+        # MTP does not use Engram and keeps the original three tail references.
+        nxt_engram, nxt_engram_norm = self._tail_refs[3:] if len(self._tail_refs) > 3 else (None, None)
 
         hidden_states, residual, h_post, h_res, sk_event = self.mhc_sandwich_norm_post_pre(
             hidden_states,
@@ -2114,6 +2292,9 @@ class OpenPanguV2DecoderLayer(nn.Module):
             return_h_in_f32=False,
             sk_event=sk_event,
             defer_side_launch=self.attn_supports_pre_epilog and not is_model_tail,
+            pre_engram_module=nxt_engram,
+            pre_engram_norm=nxt_engram_norm,
+            pre_engram_hash_ids=next_engram_hash_ids,
         )
 
         return hidden_states, residual, h_post, h_res, sk_event
@@ -2123,9 +2304,11 @@ class OpenPanguV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        engram_hash_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Original (pre-refactor) forward kept as a reference / fallback.
         """
+        hidden_states = self._apply_engram(hidden_states, engram_hash_ids)
         ###### Attention Block with MHC & SandwichNorm ######
         residual = hidden_states
         if self.use_mhc:
@@ -2303,7 +2486,7 @@ def _maybe_gather_and_unpadding(
         "inputs_embeds": 0,
     }
 )
-class OpenPanguV2Model(nn.Module):
+class OpenPanguV2Model(PanGuEngramModelMixin, nn.Module):
     fall_back_to_pt_during_load = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -2318,6 +2501,9 @@ class OpenPanguV2Model(nn.Module):
         self.vocab_size = config.vocab_size
 
         self.hidden_size = config.hidden_size
+        engram_config = PanGuEngramConfig.from_vllm_config(vllm_config)
+        self.engram_layout = EngramLayout(engram_config) if engram_config is not None else None
+        engram_dp_group = get_engram_shared_group() if self.engram_layout is not None else None
         # Optional MHC configuration
         self.mhc_num_stream = getattr(config, "mhc_num_stream", 1)
         self.use_mhc = hasattr(config, "mhc_num_stream") and self.mhc_num_stream > 1
@@ -2336,9 +2522,11 @@ class OpenPanguV2Model(nn.Module):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: OpenPanguV2DecoderLayer(config, prefix, vllm_config),
+            lambda prefix: OpenPanguV2DecoderLayer(config, prefix, vllm_config, self.engram_layout, engram_dp_group),
             prefix=f"{prefix}.layers",
         )
+
+        self._init_engram_hash()
 
         # Merge MHC module (optional)
         if self.use_mhc:
@@ -2386,6 +2574,8 @@ class OpenPanguV2Model(nn.Module):
                     self.merge_mhc_module,
                     self.norm,
                     True,  # is_model_tail
+                    None,
+                    None,
                 )
             else:
                 nxt = self.layers[i + 1]
@@ -2393,6 +2583,8 @@ class OpenPanguV2Model(nn.Module):
                     nxt.attn_mhc_module,
                     nxt.input_layernorm,
                     False,  # is_model_tail
+                    nxt.engram,
+                    nxt.post_self_attn_engram_layernorm,
                 )
 
         use_multi_stream = model_extra_config.operator_opt_config.enable_multi_stream
@@ -2412,7 +2604,11 @@ class OpenPanguV2Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        prepare_engram = self.engram_hash is not None
+        if prepare_engram and input_ids is None:
+            raise ValueError("PanGu Engram requires raw token IDs")
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -2453,7 +2649,19 @@ class OpenPanguV2Model(nn.Module):
             cos = self.cos_cached.index_select(dim=0, index=positions)
             sin = self.sin_cached.index_select(dim=0, index=positions)
 
-        hidden_states, residual, h_post, h_res, sk_event = self.layers[0].mhc_head(hidden_states)
+        engram_hash_ids = None
+        if prepare_engram:
+            engram_hash_ids = self.prepare_model_embeddings(
+                input_ids,
+                positions,
+                lookback_token_ids,
+            )
+        hidden_states, residual, h_post, h_res, sk_event = self.layers[self.start_layer].mhc_head(
+            hidden_states,
+            engram_hash_ids,
+        )
+        # engram_hash_ids has shape [tokens, Engram layers, hash heads].
+        # Pass the full tensor; each Engram layer selects its layer_hash_index slice.
         for i in range(self.start_layer, self.end_layer):
             hidden_states, residual, h_post, h_res, sk_event = self.layers[i](
                 hidden_states,
@@ -2462,6 +2670,7 @@ class OpenPanguV2Model(nn.Module):
                 h_res,
                 cos, sin,
                 sk_event,
+                engram_hash_ids,
             )
 
         if not get_pp_group().is_last_rank:
@@ -2602,6 +2811,11 @@ class OpenPanguV2ForCausalLM(
         self.num_routed_experts = example_moe.n_routed_experts
         self.num_shared_experts = example_moe.n_shared_experts
 
+    @property
+    def token_lookback_depth(self) -> int:
+        engram_hash = self.model.engram_hash
+        return engram_hash.layout.max_ngram_size - 1 if engram_hash is not None else 0
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
@@ -2611,9 +2825,10 @@ class OpenPanguV2ForCausalLM(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids, positions, intermediate_tensors, inputs_embeds, lookback_token_ids
         )
         return hidden_states
 
@@ -2749,6 +2964,9 @@ class OpenPanguV2ForCausalLM(
         for name, loaded_weight in weights:
             if _skip_weight(name):
                 continue
+
+            # DeepSeek checkpoint naming; the table parameter owns its shard loader.
+            name = name.replace(".engram.embed.weight", ".engram.embed_tokens.weight")
 
             loaded_name = _try_load_stacked(name, loaded_weight)
             if loaded_name is not None:

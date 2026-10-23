@@ -107,7 +107,7 @@ def _function(path, name, namespace, class_name=None):
     return namespace[name]
 
 
-def _passthrough_mhc_head(value):
+def _passthrough_mhc_head(value, engram_hash_ids=None):
     return value, None, None, None, None
 
 
@@ -128,7 +128,7 @@ def test_backbone_mhc_preserves_token_axis(expanded, first_rank):
     layer.self_attn = SimpleNamespace(rotary_emb=rotary)
     layer.mhc_head.side_effect = _passthrough_mhc_head
     layer.side_effect = _passthrough_layer
-    model = SimpleNamespace(use_mhc=True, need_tp_padding=False, hidden_size=hidden,
+    model = SimpleNamespace(engram_hash=None, use_mhc=True, need_tp_padding=False, hidden_size=hidden,
                             mhc_num_stream=streams, start_layer=0, end_layer=1,
                             layers=[layer], cos_cached=None, sin_cached=None)
     namespace = dict(torch=torch, high_throughout=lambda: False,
@@ -232,7 +232,7 @@ def test_backbone_rotary_lookup_preserves_legacy_and_high_throughput_paths(
     layer.self_attn = SimpleNamespace(rotary_emb=rotary)
     layer.mhc_head.side_effect = _passthrough_mhc_head
     layer.side_effect = _passthrough_layer
-    model = SimpleNamespace(use_mhc=False, need_tp_padding=False,
+    model = SimpleNamespace(engram_hash=None, use_mhc=False, need_tp_padding=False,
                             start_layer=0, end_layer=1, layers=[layer])
     _initialize_backbone_rotary_caches(model)
     forward = _function(
@@ -608,7 +608,12 @@ def test_acl_replay_without_metadata_raises_instead_of_skipping_updates():
     context = SimpleNamespace(attn_metadata=None, batch_descriptor=descriptor,
                               cudagraph_runtime_mode=1)
     namespace.update(time=time, logger=logging.getLogger(__name__), torch=torch,
-                     get_forward_context=lambda: context, CUDAGraphMode=SimpleNamespace(NONE=0))
+                     get_forward_context=lambda: context,
+                     CUDAGraphMode=SimpleNamespace(NONE=0, FULL=1),
+                     model_extra_config=SimpleNamespace(
+                         operator_opt_config=SimpleNamespace(
+                             enable_prefill_cudagraph=False)),
+                     run_eager=lambda: False)
     replay = _function(ROOT / "omni/compilation/acl_graph.py",
                        "__call__", namespace, "ACLGraphWrapper")
     entry = SimpleNamespace(aclgraph=MagicMock(), output=object())

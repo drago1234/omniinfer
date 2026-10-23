@@ -10,6 +10,16 @@
         }
     },
     {
+        "model": "openpangu_v2_omni_30B",
+        "hardware": "A3",
+        "precision": "bf16",
+        "configs": {
+            "hybrid": {
+                "config_file": "openpangu_v2/openpangu_v2_omni_30b_bf16_a2_hybrid.json"
+            }
+        }
+    },
+    {
         "model": "deepseek_v3",
         "hardware": "A3",
         "precision": "w8a8c16",
@@ -187,6 +197,16 @@
         "configs":{
             "hybrid": {
                 "config_file": "gpt_oss/gpt_oss_w8a8c16_a2_hybrid.json"
+            }
+        }
+    },
+    {
+        "model": "pangu-2B",
+        "hardware": "A2",
+        "precision": "bf16",
+        "configs":{
+            "hybrid": {
+                "config_file": "openpangu/openpangu_dense.json"
             }
         }
     },

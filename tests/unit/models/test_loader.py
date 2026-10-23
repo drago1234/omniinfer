@@ -211,6 +211,8 @@ class TestConfigLoaderUnit(unittest.TestCase):
 
         self.assertFalse(ModelOperatorOptConfig().use_gpt_oss_sink_rescale)
         self.assertTrue(ModelOperatorOptConfig(use_gpt_oss_sink_rescale=True).use_gpt_oss_sink_rescale)
+        self.assertFalse(ModelOperatorOptConfig().use_ai_infra_fa_for_gpt_oss_sink)
+        self.assertTrue(ModelOperatorOptConfig(use_ai_infra_fa_for_gpt_oss_sink=True).use_ai_infra_fa_for_gpt_oss_sink)
 
     def test_v3_config_files_load_without_mome(self):
         from omni_npu.model_config.config_loader import loader

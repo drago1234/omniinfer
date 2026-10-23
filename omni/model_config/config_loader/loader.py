@@ -18,6 +18,7 @@ from omni_npu.configs import OmniAdditionalConfig
 from .features import (
     apply_eager_mode_config,
     apply_omni_cache,
+    apply_prefill_cudagraph,
     apply_seq_parallel,
 )
 
@@ -133,10 +134,19 @@ class ModelParallelConfig:
 @dataclass
 class ModelOperatorOptConfig:
     enable_mxfp8_comm_quant: bool = False
+    # Shared host table, serial NPU execution and optional TP head sharding.
+    engram_table_location: str = "cpu_shared"  # support cpu_shared only
+    engram_prefetch: bool = False  # support False only (serial lookup on the model stream)
+    engram_head_sharding: str = "tp"  # none / tp
+    use_engram_proj_gate_fusion_op: bool = False  # Fuse BF16 projection and gating when WKV is not TP-sharded.
+    use_swiglu_group_fusion_op: bool = False  # Fuse clamp, SwiGLU and routing weights for limited, unquantized experts.
     enable_kv_rmsnorm_rope_cache: bool = False
     enable_prefill_mla_absorb_pa: bool = False
     kv_nz: bool = False
     enable_moe_init_routing_v2: bool = False
+    enable_moe_init_routing_v3: bool = False
+    enable_dense_mlp_dequant_swiglu_quant: bool = False
+    enable_shared_expert_dequant_swiglu_quant: bool = False
     gmm_nz: bool = True
     gmm_autotiling: bool = False
     lmhead_fp32: bool = False
@@ -211,6 +221,7 @@ class ModelOperatorOptConfig:
     use_mega_mhc_fusion_op: bool = False # 是否使用 npu_ai_infra_mega_mhc（3BF16 phi），仅 P 侧开启，默认不开启
     use_mome_inplace_update: bool = False
     use_gpt_oss_sink_rescale: bool = False
+    use_ai_infra_fa_for_gpt_oss_sink: bool = False # 是否使用 npu_ai_infra_flash_attention 计算 GQA GPT-OSS sink
     moe_comm_strategy: MoECommStrategyType = "dispatch_combine" # MoE通信策略，默认为dispatch_combine
     moe_tbo_threshold: int = -1 # MoE: two batch overlap batch threshold, -1 for disable
     moe_dispatch_combine_max_batch_size: int = 128
@@ -225,8 +236,21 @@ class ModelOperatorOptConfig:
     swa_prefill_absorb_max_tokens: int = 8192  # Ascend 950 SWA global prefill tokens; 0 keeps standard path
     optimize_first_chunk: bool = False # Whether turn off PA (non-absorb mode) and use MoME SP for the first chunk
     use_w4a8_enk_gmm: bool = False # W4A8 MoE EnK 优化，仅对称量化，默认关闭
+    # Let prefill batches run inside the ACL graph (P side). Off keeps the
+    # upstream split, prefill always eager. On, a pure-prefill batch within the
+    # largest captured size keeps its per-request metadata in the persistent
+    # buffers and drops the host-rebuilt SP/CP layout; wider batches stay
+    # eager with SP/CP intact.
+    enable_prefill_cudagraph: bool = False
 
     def __post_init__(self):
+        if self.engram_table_location != "cpu_shared":
+            raise ValueError("Currently, engram_table_location must be 'cpu_shared'")
+        if self.engram_prefetch is not False:
+            raise ValueError("Currently, engram_prefetch must be False")
+        if self.engram_head_sharding not in ("none", "tp"):
+            raise ValueError("Currently, engram_head_sharding must be 'none' or 'tp'")
+
         if type(self.mome_sp_token_threshold) is not int or self.mome_sp_token_threshold < 0:
             raise ValueError("mome_sp_token_threshold must be a non-negative integer")
 
@@ -545,6 +569,7 @@ def _validate_config(vllm_config):
     global model_extra_config
     apply_eager_mode_config(model_extra_config)
     apply_omni_cache(vllm_config.additional_config)
+    apply_prefill_cudagraph(model_extra_config)
     apply_seq_parallel(model_extra_config)
     _validate_precision_strong_consistency(vllm_config)
 

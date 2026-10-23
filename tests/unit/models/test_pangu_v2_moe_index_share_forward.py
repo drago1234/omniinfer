@@ -24,6 +24,7 @@ TOKENS = 2
 def _make_decoder_layer(*, use_mhc: bool = False):
     layer = pangu_moe.OpenPanguV2DecoderLayer.__new__(pangu_moe.OpenPanguV2DecoderLayer)
     layer.use_mhc = use_mhc
+    layer.engram = None
     layer.side_stream = None
     layer.attn_supports_pre_epilog = False
     layer.layer_idx = 0
@@ -56,6 +57,7 @@ def _make_decoder_layer(*, use_mhc: bool = False):
 def _make_model(monkeypatch, layer, *, enable_mhc_multistream):
     model = pangu_moe.OpenPanguV2Model.__new__(pangu_moe.OpenPanguV2Model)
     model.use_mhc = True
+    model.engram_hash = None
     model.hidden_size = HIDDEN
     model.mhc_num_stream = 1
     model.need_tp_padding = False
@@ -143,7 +145,8 @@ def test_model_forward_threaded_path_without_topk_buffer(monkeypatch):
 
     layer.assert_called_once()
     args, kwargs = layer.call_args
-    # hidden, residual, h_post, h_res, cos, sin, sk_event — no topk buffer
-    assert len(args) == 7
+    # hidden, residual, h_post, h_res, cos, sin, sk_event, next_engram_hash_ids
+    assert len(args) == 8
+    assert args[-1] is None
     assert "topk_indices_buffer" not in kwargs
     assert out.shape == (TOKENS, 1, HIDDEN)

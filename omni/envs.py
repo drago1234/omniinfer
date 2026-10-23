@@ -128,6 +128,11 @@ def _as_check_level(raw: str, name: str) -> str:
     return value
 
 
+def is_set(name: str) -> bool:
+    """Whether a variable was explicitly set, independently of its default."""
+    return name in os.environ
+
+
 def get_env_with_fallback(
     new_name: str,
     old_names: Optional[List[str]],
@@ -637,10 +642,12 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # releases everywhere on the same engine step so the first decode batch
     # is full and aligned across ranks. One-shot: once released it stays open
     # for the engine's lifetime. Accepts "1"/"true"/"all".
-    # Requires OMNI_VLLM_PATCHES_DIR to include pangu_v2_benchmark. Mutually
-    # exclusive with decode_profile_sync and pd_bench_aligned_decode (they
-    # patch the same attrs). Inflates TTFT — benchmarking only.
-    # Consumers: pangu_v2_benchmark/patch_hybrid_aligned_decode.py:109-219.
+    # Requires OMNI_VLLM_PATCHES_DIR to include pangu_v2_benchmark. Applied
+    # only when enabled at startup; mutually exclusive with an explicitly set
+    # OMNI_PD_BENCH_ALIGNED_DECODE_THRESHOLD (including its legacy alias).
+    # Also mutually exclusive with decode_profile_sync and other decode
+    # gates patching the same attrs. Inflates TTFT — benchmarking only.
+    # Consumer: pangu_v2_benchmark/patch_hybrid_aligned_decode.py.
     "OMNI_HYBRID_ALIGNED_DECODE":
     lambda: get_env_with_fallback(
         "OMNI_HYBRID_ALIGNED_DECODE", None, False, _as_bool_or_all),
@@ -649,7 +656,7 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # decode gate releases. Invalid (non-integer) values log a warning and
     # fall back to 16 instead of raising — a benchmark typo should not abort
     # startup.
-    # Consumers: pangu_v2_benchmark/patch_hybrid_aligned_decode.py:115-116,208-211.
+    # Consumer: pangu_v2_benchmark/patch_hybrid_aligned_decode.py.
     "OMNI_HYBRID_ALIGNED_DECODE_THRESHOLD":
     lambda: get_env_with_fallback(
         "OMNI_HYBRID_ALIGNED_DECODE_THRESHOLD",
@@ -677,11 +684,12 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Per-rank finished-KV-reception count required before the PD-benchmark
     # aligned decode gate releases. Unlike the hybrid gate (which keys on
     # local prefill completion), this one keys on remote KV arrival and is
-    # only meaningful on PD-disaggregated decode nodes. Requires
-    # OMNI_VLLM_PATCHES_DIR to include pd_bench_aligned_decode (a separate
-    # directory from pangu_v2_benchmark, so the two gates are independently
-    # toggleable). Invalid values fall back to 20 with a warning.
-    # Consumers: pd_bench_aligned_decode/patch_bench_aligned_decode.py:47-107.
+    # only meaningful on PD-disaggregated decode nodes. In pangu_v2_benchmark,
+    # explicitly setting this variable or its legacy alias applies the PD
+    # gate at startup. The default 20 alone does not enable it. Mutually
+    # exclusive with OMNI_HYBRID_ALIGNED_DECODE. Invalid values fall back
+    # to 20 with a warning.
+    # Consumer: pangu_v2_benchmark/patch_bench_aligned_decode.py.
     "OMNI_PD_BENCH_ALIGNED_DECODE_THRESHOLD":
     lambda: get_env_with_fallback(
         "OMNI_PD_BENCH_ALIGNED_DECODE_THRESHOLD",

@@ -45,6 +45,7 @@ def test_model_forward_uses_rotary_get_cos_sin(monkeypatch):
 
     model = SimpleNamespace()
     model.use_mhc = False
+    model.engram_hash = None
     model.need_tp_padding = False
     model.cos_cached = None
     model.sin_cached = None

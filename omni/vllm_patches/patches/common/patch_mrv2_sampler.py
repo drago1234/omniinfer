@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""NPU sampling ops for the V2 runner. Implementation: omni/worker/npu/sampler.py.
+"""NPU sampling bindings for the V2 runner: ops.gumbel and sampler.
 
 gumbel_sample: upstream reaches tldevice.log1p, a returning-None stub on
 triton-ascend 3.2.2. apply_top_k_top_p: the upstream Qrita Triton kernel fails
-to compile there, so the PyTorch sort path is taken unconditionally.
+to compile there, so the CANN fused filter is used while preserving logits dtype.
 
 Only V2 consumers are replaced. The defining module
 vllm/v1/sample/ops/topk_topp_sampler.py is left alone because MRv1's
@@ -16,7 +16,8 @@ covers nothing. Add a class when upstream adds a consumer.
 from vllm.logger import init_logger
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-from omni_npu.worker.npu.sampler import apply_top_k_top_p, gumbel_sample
+from omni_npu.worker.npu.ops.gumbel import gumbel_sample
+from omni_npu.worker.npu.sampler import apply_top_k_top_p
 
 logger = init_logger(__name__)
 

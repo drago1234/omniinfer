@@ -952,14 +952,22 @@ class EagleProposerPatch(VLLMPatch):
 
         # Multi-layer MTP always embeds; upstream first-pass may leave input_ids.
         if use_multi_mtp and model_kwargs["inputs_embeds"] is None:
-            embeds = self.model.embed_input_ids(
-                input_ids=self.input_ids[:num_tokens],
+            # Embed the padded width, so a ReduceScatter over it splits the
+            # same rows as MTP's SP slice of hidden_states[:num_input_tokens].
+            # Only prefill-in-graph pads a width SP has to split.
+            embed_width = (
+                num_input_tokens
+                if model_extra_config.operator_opt_config.enable_prefill_cudagraph
+                else num_tokens
             )
-            if embeds.size(0) < num_tokens:
+            embeds = self.model.embed_input_ids(
+                input_ids=self.input_ids[:embed_width],
+            )
+            if embeds.size(0) < embed_width:
                 # ReduceScatter: pass scattered directly, MTP handles it
                 model_kwargs["inputs_embeds"] = embeds
             else:
-                self.inputs_embeds[:num_tokens] = embeds
+                self.inputs_embeds[:embed_width] = embeds
                 model_kwargs["inputs_embeds"] = self.inputs_embeds[:num_input_tokens]
             model_kwargs["input_ids"] = None
 
@@ -1094,14 +1102,20 @@ class EagleProposerPatch(VLLMPatch):
                     mm_embed_inputs=mm_embed_inputs,
                 )
                 if model_kwargs["inputs_embeds"] is None:
-                    embeds = self.model.embed_input_ids(
-                        input_ids=self.input_ids[:num_tokens]
+                    # Padded width, as in the first pass.
+                    embed_width = (
+                        input_batch_size
+                        if model_extra_config.operator_opt_config.enable_prefill_cudagraph
+                        else num_tokens
                     )
-                    if embeds.size(0) < num_tokens:
+                    embeds = self.model.embed_input_ids(
+                        input_ids=self.input_ids[:embed_width]
+                    )
+                    if embeds.size(0) < embed_width:
                         # ReduceScatter: pass scattered directly, MTP handles it
                         model_kwargs["inputs_embeds"] = embeds
                     else:
-                        self.inputs_embeds[:num_tokens] = embeds
+                        self.inputs_embeds[:embed_width] = embeds
                         model_kwargs["inputs_embeds"] = (
                             self.inputs_embeds[:input_batch_size]
                         )

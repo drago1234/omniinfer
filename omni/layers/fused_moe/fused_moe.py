@@ -10,10 +10,14 @@ from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import (
     _uses_hifloat_activation,
     _uses_mxfp_activation,
+    _sorted_topk_weights,
 )
 
 
-def _apply_experts(layer: torch.nn.Module, h: torch.Tensor, expert_tokens: torch.Tensor, pertoken_scale=None):
+def _apply_experts(
+    layer: torch.nn.Module, h: torch.Tensor, expert_tokens: torch.Tensor,
+    pertoken_scale: torch.Tensor | None = None, expanded_topk_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import PreparePermuteResult
 
     experts = layer.routed_experts
@@ -23,6 +27,7 @@ def _apply_experts(layer: torch.nn.Module, h: torch.Tensor, expert_tokens: torch
             hidden_states_sorted_by_experts=h,
             expert_tokens=expert_tokens,
             dynamic_scale=pertoken_scale,
+            expanded_topk_weights=expanded_topk_weights,
         ),
         activation=experts.activation.value,
     )
@@ -94,16 +99,21 @@ def fused_experts_tp(
     experts = layer.routed_experts
     n_routed_experts = experts.global_num_experts
     use_routing_v2 = (model_extra_config.operator_opt_config.enable_moe_init_routing_v2)
+    use_routing_v3 = (model_extra_config.operator_opt_config.enable_moe_init_routing_v3)
 
-    if use_routing_v2:
+    if use_routing_v2 or use_routing_v3:
         topk_ids = topk_ids.int()
+        routing_input = x
+        input_scale = None
+        if use_routing_v3:
+            routing_input, input_scale = torch_npu.npu_dynamic_quant(x)
         (
             sorted_tokens,
             expanded_src_to_dst_row,
             expert_tokens,
-            _,
+            pertoken_scale,
         ) = torch_npu.npu_moe_init_routing_v2(
-            x,
+            routing_input,
             expert_idx=topk_ids,
             expert_num=n_routed_experts,
             active_expert_range=[0, n_routed_experts],
@@ -113,6 +123,7 @@ def fused_experts_tp(
             drop_pad_mode=0,
             row_idx_type=0,
             quant_mode=-1,
+            scale=input_scale,
         )
         expert_tokens = expert_tokens.to(torch.int64)
     else:
@@ -143,7 +154,7 @@ def fused_experts_tp(
 
     if experts.quant_config is None:
         pertoken_scale = None
-    else:
+    elif not use_routing_v3:
         moe_quant_config = getattr(experts.quant_method, "moe_quant_config", None)
         if _uses_hifloat_activation(moe_quant_config):
             sorted_tokens = torch_npu.npu_dtype_cast(sorted_tokens, torch_npu.hifloat8)
@@ -158,9 +169,15 @@ def fused_experts_tp(
         else:
             sorted_tokens, pertoken_scale = torch_npu.npu_dynamic_quant(sorted_tokens)
 
-    out = _apply_experts(layer, sorted_tokens, expert_tokens, pertoken_scale)
+    expanded_topk_weights = None
+    if layer.use_swiglu_group_fusion:
+        # V1 numbers source rows in top-k-major order; V2 uses token-major order.
+        source_topk_weights = topk_weights if use_routing_v2 else topk_weights.T.contiguous()
+        expanded_topk_weights = _sorted_topk_weights(source_topk_weights, expanded_src_to_dst_row)
+        topk_weights = torch.ones_like(topk_weights)
+    out = _apply_experts(layer, sorted_tokens, expert_tokens, pertoken_scale, expanded_topk_weights)
 
-    if use_routing_v2:
+    if use_routing_v2 or use_routing_v3:
         return torch_npu.npu_moe_finalize_routing(
             out.unsqueeze(0),
             skip1=None,

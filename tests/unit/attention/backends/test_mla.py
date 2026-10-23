@@ -290,6 +290,20 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
         ):
             yield
 
+    def test_build_for_cudagraph_capture_follows_the_prefill_switch(self):
+        import omni_npu.attention.backends.mla as mla_mod
+
+        b = self.mla_setup["builder"].__new__(self.mla_setup["builder"])
+        b.build = MagicMock(return_value="prefill")
+        with patch.object(mla_mod, "should_capture_as_prefill", return_value=True), \
+             patch.object(mla_mod, "widen_capture_query_len", return_value="wide"):
+            self.assertEqual(b.build_for_cudagraph_capture("cm"), "prefill")
+        b.build.assert_called_once_with(0, "wide")
+        base = type(b).__mro__[1]
+        with patch.object(mla_mod, "should_capture_as_prefill", return_value=False), \
+             patch.object(base, "build_for_cudagraph_capture", return_value="decode", create=True):
+            self.assertEqual(b.build_for_cudagraph_capture("cm"), "decode")
+
     def _new_builder_for_current_build(
         self,
         *,

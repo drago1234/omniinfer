@@ -1,0 +1,143 @@
+{
+  "name": "deploy-hybrid-2b-49ch",
+  "version": "1.0.0",
+  "description": "",
+  "type": "REAL_TIME",
+  "deploy_type": "SINGLE",
+  "group_configs": [
+    {
+      "advanced_config": {
+        "custom_metrics_path": "",
+        "deploy_timeout_minutes": 60,
+        "dynamic_routing_enable": false,
+        "ems_enable": false,
+        "mooncake_enable": false,
+        "port": 7000,
+        "protocol": "HTTP",
+        "service_secret": {
+          "group_enable": false,
+          "secret_enable": false,
+          "secret_volumes": []
+        },
+        "upgrade_config": {
+          "rolling_update": {
+            "max_surge": "25%",
+            "max_unavailable": "25%"
+          },
+          "type": "ROLLING"
+        }
+      },
+      "count": 1,
+      "deploy_type": "SINGLE",
+      "description": "",
+      "framework": "COMMON",
+      "high_avail_switch": true,
+      "mirror_traffic_enable": false,
+      "mirror_traffic_weight": 0,
+      "model": {
+        "source": "EFS",
+        "mount_path": "/home/ma-user/work/",
+        "efs_sub_path": "/",
+        "read_only": false,
+        "host_cache": true,
+        "source_id": "126f3932-99e6-11f1-b6c6-fa165115aea8",
+        "os_warm_up": false
+      },
+      "pool_id": "pool-0f355a2a-4594-4ff7-9d79-a118021caff5",
+      "priority": 1,
+      "schedule_strategy": "HIGH_AVAILABILITY",
+      "secret_type": "dew",
+      "system_log_dump_enable": false,
+      "unit_configs": [
+        {
+          "cmd": "source ~/.bashrc && bash /home/ma-user/work/s3-asset-g-wl-infra-infer-exp/hwq/ma_2b/1019/hybrid_server.sh && sleep infinity",
+          "codes": [],
+          "count": 1,
+          "custom_spec": {
+            "arch": "arm64",
+            "ascend": 4,
+            "card": 4,
+            "cpu": 180,
+            "memory": 1300000,
+            "ratio": 1,
+            "type_alias": "Snt9b2"
+          },
+          "dumps": [],
+          "envs": {
+            "MODEL_NAME":"pangu_2b",
+            "MODEL_PATH": "/home/ma-user/work/s3-asset-g-wl-infra-infer-exp/hwq/model/2B/iter_0006200_hf_omni/",
+            "PORT": "7000",
+            "ASCEND_RT_VISIBLE_DEVICES": "0,1",
+            "TP_SIZE": "2",
+            "DP_SIZE": "1",
+            "ADD_DATA_PARALLEL_ARG": "0",
+            "MAX_MODEL_LEN": "32768",
+            "MAX_NUM_BATCHED_TOKENS": "32768",
+            "MAX_NUM_SEQS": "256",
+            "GPU_MEMORY_UTILIZATION": "0.9",
+            "VLLM_PLUGINS": "omni-npu,omni_pangu_models,omni_npu_patches",
+            "OMNI_NPU_VLLM_PATCHES": "ALL",
+            "OMNI_NPU_PATCHES_DIR": "high_throughout",
+            "CUSTOM_MODEL_CONFIG_PATH": "high_throughout/openpangu/openpangu_dense.json",
+            "VLLM_USE_V2_MODEL_RUNNER": "0",
+            "HCCL_IF_BASE_PORT": "59200",
+            "PREFIX_CACHING": "disable",
+            "CHUNKED_PREFILL": "auto",
+            "ASYNC_SCHEDULING": "1",
+            "EXECUTION_MODE": "graph",
+            "COMPILATION_CONFIG": "{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"max_cudagraph_capture_size\":256}"
+          },
+          "files": [],
+          "group_count": 1,
+          "image": {
+            "category": "CPU",
+            "id": "8ee7aa0f-502f-11f1-aca0-0255ac10016a",
+            "source": "SWR_PRO",
+            "swr_path": "swr-aifm-exp-z7c82y.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a2-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_develop-vllm-202609220204:0.0.1"
+          },
+          "models": [],
+          "name": "role-0",
+          "npu_reset_enable": false,
+          "recovery": "Instance",
+          "role": "COMMON",
+          "security_config": {},
+          "termination_grace": {
+            "termination_grace_period_seconds": 30
+          }
+        }
+      ],
+      "weight": 100,
+      "workload_type": "LWS",
+      "name": "deploy-deploy-hybrid-2b-49ch"
+    }
+  ],
+  "workspace_id": "0491adff50a74bccbc1abc637c27da1f",
+  "workload_type": "LWS",
+  "runtime_config": {
+    "service_invoke": {
+      "port": 7000,
+      "protocol": "HTTPS",
+      "auth_type": "API_KEY",
+      "dynamic_routing_enable": false,
+      "ems_enable": false,
+      "internet_access_enable": true,
+      "intranet_approval_enable": true,
+      "request_retry_enable": false
+    },
+    "service_limit": {
+      "rate_limit": {
+        "num": 200,
+        "unit": "SECONDS"
+      },
+      "request_size_limit": 20,
+      "request_timeout": 30,
+      "ip_white_list": [],
+      "ip_black_list": []
+    },
+    "service_secret": {
+      "group_enable": false,
+      "secret_enable": false,
+      "secret_volumes": []
+    }
+  }
+}

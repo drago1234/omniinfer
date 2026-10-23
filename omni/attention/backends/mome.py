@@ -20,9 +20,12 @@ from omni_npu import envs
 from omni_npu.attention.backends.attention import NPUAttentionBackendImpl
 from omni_npu.attention.backends.utils import (
     _maybe_padded_raw_tensor_to_strided_caches,
+    graph_prefill_width,
     register_attention_backend,
     scheme_conv_sp,
+    should_capture_as_prefill,
     split_decodes_and_prefills,
+    widen_capture_query_len,
 )
 from omni_npu.model_config.config_loader.loader import model_extra_config
 
@@ -117,11 +120,19 @@ class NPUMomeAttentionMetadata:
     # Per-step decision owned by the builder, shared by all model paths.
     use_mome_sp: bool = False
     conv_sp_meta: tuple | None = None
+    # Capture width a FULL graph would serve this batch at, or None if the batch
+    # stays eager. The builder's single answer; model paths read it rather than
+    # re-deriving graph_prefill_width from metadata they may have since mutated.
+    prefill_graph_width: int | None = None
 
 
 class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.ALWAYS
     reorder_batch_threshold: int = 1
+    # Must stay False while enable_prefill_cudagraph can be on: the decode-only
+    # update_block_table would re-slice the per-request tensors and drop the pad
+    # request a graph-served prefill batch needs. MoME layers span several
+    # same-spec KV-cache groups, so every group after the first would use it.
     supports_update_block_table: bool = False
 
     # Bound each step by NPUModelRunner; None during dummy runs and capture.
@@ -172,31 +183,39 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 self.compilation_config.max_cudagraph_capture_size,
             )
         self.max_num_blocks = cdiv(self.vllm_config.model_config.max_model_len, self.mome_block_size)
+
+        # Requests the graph path may address: one past the scheduler's batch,
+        # for the pad rows' own request. Spec decode already leaves that room.
+        self.graph_max_reqs = max(
+            self.decode_cudagraph_max_bs,
+            self.vllm_config.scheduler_config.max_num_seqs + 1,
+        )
+
         # Allocate buffers for prefix caching support
         if self.vllm_config.cache_config.enable_prefix_caching:
             self.cache_indices_tensor = torch.empty(
-                (self.decode_cudagraph_max_bs, self.max_num_blocks),
+                (self.graph_max_reqs, self.max_num_blocks),
                 dtype=torch.int32,
                 device=device,
             )
             self.block_idx_last_computed_token = torch.empty(
-                (self.decode_cudagraph_max_bs,),
+                (self.graph_max_reqs,),
                 dtype=torch.int32,
                 device=device,
             )
             self.block_idx_first_scheduled_token = torch.empty(
-                (self.decode_cudagraph_max_bs,),
+                (self.graph_max_reqs,),
                 dtype=torch.int32,
                 device=device,
             )
             self.block_idx_last_scheduled_token = torch.empty(
-                (self.decode_cudagraph_max_bs,),
+                (self.graph_max_reqs,),
                 dtype=torch.int32,
                 device=device,
             )
         else:
             self.cache_indices_tensor = torch.empty(
-                (self.decode_cudagraph_max_bs,),
+                (self.graph_max_reqs,),
                 dtype=torch.int32,
                 device=device,
             )
@@ -205,15 +224,83 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
         # Buffers for cudagraph
         self.num_computed_tokens = torch.empty(
-            (self.decode_cudagraph_max_bs,),
+            (self.graph_max_reqs,),
             dtype=torch.int32,
             device=device,
         )
         self.num_accepted_tokens = torch.empty(
-            (self.decode_cudagraph_max_bs,),
+            (self.graph_max_reqs,),
             dtype=torch.int32,
             device=device,
         )
+        # Prefill query_start_loc; see _graph_prefill_query_start_loc. Two past
+        # max_num_seqs, so a full batch still fits its pad span.
+        self._graph_prefill_qsl = torch.zeros(
+            (self.vllm_config.scheduler_config.max_num_seqs + 2,),
+            dtype=torch.int32,
+            device=device,
+        )
+
+    def _may_replay_full_graph(
+        self,
+        num_reqs: int,
+        num_prefills: int,
+        graph_width: int | None,
+    ) -> bool:
+        """Whether a FULL graph may serve this batch.
+
+        Its kernels read the per-request tensors at their capture-time
+        addresses, so a batch that qualifies must have them in the persistent
+        buffers. Prefill needs no request bound of its own: the scheduler
+        issues at most max_num_seqs, which graph_max_reqs covers.
+        """
+        if num_prefills == 0:
+            return (
+                num_reqs <= self.decode_cudagraph_max_bs
+                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            )
+        return graph_width is not None
+
+    def _graph_prefill_query_start_loc(
+        self,
+        query_start_loc: torch.Tensor,  # int32 [B + 1], device
+        num_reqs: int,
+        graph_width: int,
+    ) -> torch.Tensor:  # int32 [B + 2]
+        """Prefill query_start_loc whose total is the graph width, not the batch.
+
+        The conv tiles on the captured total, so a replay reporting fewer
+        tokens hangs. The pad rows get a span of their own, request
+        ``num_reqs``, whose PAD_SLOT_ID cache_indices make the kernel skip it
+        instead of ending the last real request's conv state on pad. Built on
+        the device: a pinned host buffer is still read by the DMA after
+        build() returns, so the next step could overwrite it first.
+        """
+        qsl = self._graph_prefill_qsl
+        # Against the buffer, not graph_max_reqs: a slice past the end is
+        # silently short and the kernel would then skip spans.
+        assert num_reqs + 2 <= qsl.size(0), (num_reqs, qsl.size(0))
+        qsl[: num_reqs + 1].copy_(query_start_loc[: num_reqs + 1], non_blocking=True)
+        qsl[num_reqs + 1:].fill_(graph_width)  # the pad span, then empty ones
+        return qsl[: num_reqs + 2]
+
+    def _pin_pad_request_slot(self, num_reqs: int, apc_enabled: bool) -> None:
+        """Make the slot that owns the graph's pad rows a defined pad request.
+
+        The kernel reads a span's per-request metadata before it can tell the
+        span is pad, and only ``cache_indices`` is reset past the batch. Under
+        prefix caching the PAD_SLOT_ID marker is reachable only through
+        ``block_idx_*``, and a stale out-of-range index hides it, so the span
+        runs as a request and the step hangs. Row 0 of a pad row is PAD_SLOT_ID
+        throughout, so index 0 resolves to pad, not to a real block.
+        """
+        assert num_reqs < self.graph_max_reqs, (num_reqs, self.graph_max_reqs)
+        self.num_computed_tokens[num_reqs] = 0
+        self.num_accepted_tokens[num_reqs] = self.fake_num_spec + 1
+        if apc_enabled:
+            self.block_idx_last_computed_token[num_reqs] = 0
+            self.block_idx_first_scheduled_token[num_reqs] = 0
+            self.block_idx_last_scheduled_token[num_reqs] = 0
 
     def _compute_prefix_caching_block_indices(
         self,
@@ -507,50 +594,49 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 cache_indices,
             )
 
-        # For cudagraph: copy to persistent buffer if applicable
-        if (
-            num_prefills == 0
-            and num_decodes <= self.decode_cudagraph_max_bs
-            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
-        ):
-            self.cache_indices_tensor[:num_decodes].copy_(cache_indices, non_blocking=True)
-            cache_indices = self.cache_indices_tensor[
-                :num_decodes
-            ]  # NOTE: slice to num_decodes instead of num_decode_tokens
-            self.cache_indices_tensor[num_decodes:].fill_(PAD_SLOT_ID)
-
-            self.num_computed_tokens[:num_decodes].copy_(num_computed_tokens, non_blocking=True)
-            num_computed_tokens = self.num_computed_tokens[
-                :num_decodes  # NOTE: slice to num_decodes instead of num_decode_tokens
-            ]
-
-            if num_accepted_tokens is not None:
-                self.num_accepted_tokens[:num_decodes].copy_(num_accepted_tokens, non_blocking=True)
-                num_accepted_tokens = self.num_accepted_tokens[:num_decodes]
-
-            if self.vllm_config.cache_config.enable_prefix_caching:
-                self.block_idx_last_computed_token[:num_decodes].copy_(block_idx_last_computed_token, non_blocking=True)
-                block_idx_last_computed_token = self.block_idx_last_computed_token[
-                    :num_decodes  # NOTE: slice to num_decodes instead of num_decode_tokens
-                ]
-
-                self.block_idx_first_scheduled_token[:num_decodes].copy_(
-                    block_idx_first_scheduled_token, non_blocking=True
-                )
-                block_idx_first_scheduled_token = self.block_idx_first_scheduled_token[
-                    :num_decodes  # NOTE: slice to num_decodes instead of num_decode_tokens
-                ]
-
-                self.block_idx_last_scheduled_token[:num_decodes].copy_(
-                    block_idx_last_scheduled_token, non_blocking=True
-                )
-                block_idx_last_scheduled_token = self.block_idx_last_scheduled_token[
-                    :num_decodes  # NOTE: slice to num_decodes instead of num_decode_tokens
-                ]
-
         max_query_len = common_attn_metadata.max_query_len
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         num_actual_tokens = int(query_start_loc_cpu[-1].item())
+        # Asked once: every layout decision below must agree on the answer,
+        # and on the padded count the other backends ask with, which is what
+        # the dispatcher keyed the capture by.
+        graph_width = graph_prefill_width(
+            self.compilation_config,
+            num_decodes,
+            common_attn_metadata.num_actual_tokens,
+        )
+
+        # For cudagraph: copy to persistent buffer if applicable
+        if self._may_replay_full_graph(num_reqs, num_prefills, graph_width):
+            self.cache_indices_tensor[:num_reqs].copy_(cache_indices, non_blocking=True)
+            self.cache_indices_tensor[num_reqs:].fill_(PAD_SLOT_ID)
+            self.num_computed_tokens[:num_reqs].copy_(num_computed_tokens, non_blocking=True)
+            if num_accepted_tokens is not None:
+                self.num_accepted_tokens[:num_reqs].copy_(num_accepted_tokens, non_blocking=True)
+            if apc_enabled:
+                self.block_idx_last_computed_token[:num_reqs].copy_(block_idx_last_computed_token, non_blocking=True)
+                self.block_idx_first_scheduled_token[:num_reqs].copy_(
+                    block_idx_first_scheduled_token, non_blocking=True
+                )
+                self.block_idx_last_scheduled_token[:num_reqs].copy_(
+                    block_idx_last_scheduled_token, non_blocking=True
+                )
+
+            # NOTE: slice to num_reqs, the batch the graph captured. A prefill
+            # batch takes one slot more, for the pad rows' own span.
+            graph_reqs = num_reqs
+            if num_prefills:
+                self._pin_pad_request_slot(num_reqs, apc_enabled)
+                graph_reqs += 1
+
+            cache_indices = self.cache_indices_tensor[:graph_reqs]
+            num_computed_tokens = self.num_computed_tokens[:graph_reqs]
+            if num_accepted_tokens is not None:
+                num_accepted_tokens = self.num_accepted_tokens[:graph_reqs]
+            if apc_enabled:
+                block_idx_last_computed_token = self.block_idx_last_computed_token[:graph_reqs]
+                block_idx_first_scheduled_token = self.block_idx_first_scheduled_token[:graph_reqs]
+                block_idx_last_scheduled_token = self.block_idx_last_scheduled_token[:graph_reqs]
 
         attn_metadata = NPUMomeAttentionMetadata(
             num_prefills=num_prefills,
@@ -570,6 +656,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
             num_reqs=num_reqs,
         )
+        attn_metadata.prefill_graph_width = graph_width
 
         if num_prefills == 0:
             attn_metadata.prefill = None
@@ -577,6 +664,13 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             prefill_query_start_loc = (
                 common_attn_metadata.query_start_loc[num_decodes:] - common_attn_metadata.query_start_loc[num_decodes]
             )
+            if graph_width is not None:
+                # Pure prefill, so the rebase above was a no-op.
+                prefill_query_start_loc = self._graph_prefill_query_start_loc(
+                    common_attn_metadata.query_start_loc, num_reqs, graph_width
+                )
+                # Pure prefill conv reads the top-level metadata, not .prefill.
+                attn_metadata.query_start_loc = prefill_query_start_loc
             prefill_num_actual_tokens = int(
                 (
                     query_start_loc_cpu[-1]
@@ -603,7 +697,9 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
         if num_decodes == 0:
             attn_metadata.decode = None
-            if self.enable_flashcomm2:
+            # FlashComm2's token map is rebuilt on the host every step, which
+            # a captured graph cannot follow.
+            if self.enable_flashcomm2 and graph_width is None:
                 attn_metadata.fc2_metadata = self._build_for_flashcomm2(
                     common_attn_metadata,
                     cache_indices,
@@ -631,7 +727,8 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 block_idx_last_scheduled_token=block_idx_last_scheduled_token[:num_decodes] if apc_enabled else None,
             )
 
-        attn_metadata.use_mome_sp = self._should_build_mome_sp(
+        # MoME-SP's split is recomputed from this step's cumlens.
+        attn_metadata.use_mome_sp = graph_width is None and self._should_build_mome_sp(
             num_prefills, num_decodes, num_actual_tokens
         )
         if attn_metadata.use_mome_sp:
@@ -702,6 +799,8 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         Currently, only decode is supported for full cudagraphs with Mamba.
         """
         m = common_attn_metadata
+        if should_capture_as_prefill():
+            return self.build(0, widen_capture_query_len(m))
 
         assert m.num_reqs <= self.decode_cudagraph_max_bs and m.num_actual_tokens <= self.decode_cudagraph_max_bs, (
             f"GDN only supports decode-only full CUDAGraph capture. "

@@ -43,9 +43,12 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from omni_npu.attention.backends.utils import (
     _maybe_padded_raw_tensor_to_strided_caches,
+    graph_prefill_width,
     paged_cache,
     register_attention_backend,
     split_decodes_and_prefills,
+    should_capture_as_prefill,
+    widen_capture_query_len,
     SPManager,
     KVSPMaganer,
 )
@@ -199,6 +202,9 @@ class NPUDSADecodeMetadata(MLACommonDecodeMetadata):
 class NPUDSAMetadata(MLACommonMetadata[NPUDSADecodeMetadata]):
     slot_mapping_cache = None
     first_layer_idx = -1
+    # Capture width a FULL graph would serve this batch at; None keeps a
+    # decode-only or eager batch off the graph path. Set by the builder below.
+    prefill_graph_width = None
 
     def get_slot_mapping_2d(self):
         return None
@@ -270,13 +276,23 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
         dcp_tot_seq_lens_device: torch.Tensor | None,
     ) -> NPUDSADecodeMetadata:
         num_actual_tokens = query_start_loc_cpu[-1]
+        # Indexer length inputs must be int32; normalize once during metadata build.
         return NPUDSADecodeMetadata(
             block_table=block_table_tensor,
-            seq_lens=seq_lens_device,
-            query_cumlens=query_start_loc_device[1:],
+            seq_lens=seq_lens_device.to(torch.int32),
+            query_cumlens=query_start_loc_device[1:].to(torch.int32),
             num_actual_tokens=num_actual_tokens,
             dcp_tot_seq_lens=dcp_tot_seq_lens_device
         )
+
+    def build_for_cudagraph_capture(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> NPUDSAMetadata:
+        # The base implementation asserts decode-only.
+        if should_capture_as_prefill():
+            return self.build(0, widen_capture_query_len(common_attn_metadata))
+        return super().build_for_cudagraph_capture(common_attn_metadata)
 
     def build(
         self,
@@ -537,7 +553,7 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
             # for pd-mixed, TP is used, no need to use mc2_mask
             if self.vllm_config.kv_transfer_config.kv_role == "kv_consumer":
                 metadata.decode.mc2_mask = self._generate_activate_mask(metadata.decode.num_actual_tokens)
-            metadata.decode.seq_lens = common_attn_metadata.seq_lens[:metadata.num_decodes]
+            metadata.decode.seq_lens = common_attn_metadata.seq_lens[:metadata.num_decodes].to(torch.int32)
 
             # DSA-KVSP is designed for prefill only on pd-disagg
             # TODO: decode-kvsp is temporarily added before kv-trans finished kvsp
@@ -550,14 +566,29 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
                 )
 
         if metadata.prefill is not None:
-            metadata.prefill.query_cumlens = metadata.prefill.query_start_loc[1:]
+            # Asked once: both branches below must agree on the answer.
+            graph_width = graph_prefill_width(
+                self.compilation_config,
+                metadata.num_decodes,
+                common_attn_metadata.num_actual_tokens,
+            )
+            metadata.prefill_graph_width = graph_width
+            if graph_width is not None:
+                # Upstream rebases into a fresh tensor, whose address a graph
+                # would freeze. Pure prefill, so the rebase is a no-op.
+                metadata.prefill.query_start_loc = common_attn_metadata.query_start_loc
+            metadata.prefill.query_cumlens = metadata.prefill.query_start_loc[1:].to(torch.int32)
             metadata.prefill.seq_lens = common_attn_metadata.seq_lens[
                 metadata.num_decodes:metadata.num_decodes + metadata.num_prefills
-            ]
+            ].to(torch.int32)
 
+            # CP's layout is rebuilt on the host every step, which a captured
+            # graph cannot follow. npu_dsa_forward reads the absent sp_manager
+            # as "run this prefill with SP disabled".
             should_build_cp_metadata = (
                 model_extra_config.parall_config.ena_context_parallel
                 and metadata.num_decodes == 0
+                and graph_width is None
             )
             if should_build_cp_metadata:
                 prefill = metadata.prefill

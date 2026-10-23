@@ -90,6 +90,10 @@ class TestMomeSPThreshold(unittest.TestCase):
                 is_cp_layer=route == "cp", is_attn_sp_layer=route == "sp",
                 is_flashcomm2_layer=route == "fc2", tp_size=1,
                 moe_comm_strategy="allgather_reducescatter",
+                vllm_config=SimpleNamespace(compilation_config=SimpleNamespace(
+                    cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False),
+                    cudagraph_capture_sizes=(),
+                )),
             )
             seen = []
             consume = Mock(side_effect=lambda hidden, cos, sin, attn, mome: seen.append(mome) or hidden)

@@ -3159,3 +3159,162 @@ def test_dsa_rejects_unsupported_quantized_cache_before_allocating_weights(
             v_head_dim=128, q_lora_rank=512, kv_lora_rank=latent_dim,
             cache_config=SimpleNamespace(cache_dtype=cache_dtype), prefix="model.layers.0.self_attn",
         )
+
+
+def _cpu_shared_op_registry():
+    from omni_npu.attention.backends import utils as utils_mod
+
+    saved = dict(utils_mod._CROSS_LAYER_SHARED_OPS)
+    utils_mod._CROSS_LAYER_SHARED_OPS.clear()
+    original_defaults = utils_mod.CrossLayerSharedOp.__init__.__defaults__
+    utils_mod.CrossLayerSharedOp.__init__.__defaults__ = ("cpu",)
+    try:
+        yield utils_mod
+    finally:
+        utils_mod.CrossLayerSharedOp.__init__.__defaults__ = original_defaults
+        utils_mod._CROSS_LAYER_SHARED_OPS.clear()
+        utils_mod._CROSS_LAYER_SHARED_OPS.update(saved)
+
+
+@pytest.fixture
+def fia_metadata_registry():
+    yield from _cpu_shared_op_registry()
+
+
+def _dsa_sharing_fake(**kwargs):
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    defaults = dict(
+        layer_idx=0,
+        num_hidden_layers=8,
+        dsa_layers=(0, 3, 6),
+        num_local_heads=64,
+        num_attention_heads=64,
+        param_sink_number=128,
+        tp_size=1,
+    )
+    defaults.update(kwargs)
+    config = SimpleNamespace(
+        model_type="openpangu_v2",
+        num_hidden_layers=defaults["num_hidden_layers"],
+        num_attention_heads=defaults["num_attention_heads"],
+        dsa_layers=defaults["dsa_layers"],
+    )
+    fake = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    fake.layer_idx = defaults["layer_idx"]
+    fake.param_sink_number = defaults["param_sink_number"]
+    fake.num_local_heads = defaults["num_local_heads"]
+    fake.kv_lora_rank = 512
+    fake.qk_rope_head_dim = 64
+    fake.tp_size = defaults["tp_size"]
+    return fake, config
+
+
+def _dsa_consistency_config(
+    *,
+    use_noncontiguous_kv=True,
+    enable_precision_strong_consistency=True,
+):
+    return patch(
+        DSA_MODULE + ".model_extra_config",
+        SimpleNamespace(
+            operator_opt_config=SimpleNamespace(
+                use_noncontiguous_kv=use_noncontiguous_kv,
+                enable_precision_strong_consistency=enable_precision_strong_consistency,
+            ),
+        ),
+    )
+
+
+@pytest.mark.unit
+def test_dsa_metadata_sharing_disabled_without_gate(fia_metadata_registry):
+    fake, config = _dsa_sharing_fake()
+    with _dsa_consistency_config(enable_precision_strong_consistency=False):
+        fake._init_fia_metadata_sharing(config)
+    assert getattr(fake, "_share_fia_metadata", False) is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("layer_idx", "decode_producer", "prefill_producer"),
+    [(0, True, True), (1, False, False), (3, False, False)],
+)
+def test_dsa_metadata_sharing_selects_producers(
+    fia_metadata_registry, layer_idx, decode_producer, prefill_producer
+):
+    fake, config = _dsa_sharing_fake(layer_idx=layer_idx)
+    with _dsa_consistency_config():
+        fake._init_fia_metadata_sharing(config)
+    assert fake._share_fia_metadata is True
+    assert fake._produce_sink_fia_metadata["decode"] is decode_producer
+    assert fake._produce_sink_fia_metadata["prefill"] is prefill_producer
+
+
+@pytest.mark.unit
+def test_dsa_sink_metadata_reuses_one_buffer(fia_metadata_registry):
+    producer, config = _dsa_sharing_fake(layer_idx=0)
+    consumer, _ = _dsa_sharing_fake(layer_idx=3)
+    expected = torch.arange(1024, dtype=torch.int32)
+    direct = MagicMock(return_value=expected.clone())
+    with patch.object(
+        torch.ops.custom, "_npu_fused_infer_attention_sink_metadata", direct, create=True
+    ), _dsa_consistency_config():
+        producer._init_fia_metadata_sharing(config)
+        consumer._init_fia_metadata_sharing(config)
+        produced = producer._get_sink_fia_metadata({"num_heads_q": 64}, "decode")
+        reused = consumer._get_sink_fia_metadata({"num_heads_q": 64}, "decode")
+    assert produced.data_ptr() == reused.data_ptr()
+    assert torch.equal(reused, expected)
+    direct.assert_called_once()
+
+
+@pytest.mark.unit
+def test_dsa_rescale_pioneer_reads_shared_metadata(fia_metadata_registry):
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+
+    T, N, L, R, S, B = 2, 2, 4, 2, 3, 1
+    producer, config = _dsa_sharing_fake(
+        layer_idx=0, num_local_heads=N, param_sink_number=S
+    )
+    consumer, _ = _dsa_sharing_fake(
+        layer_idx=3, num_local_heads=N, param_sink_number=S
+    )
+    for fake in (producer, consumer):
+        fake.on_ascend950 = False
+        fake.scaling = 0.5
+        fake.kv_lora_rank = L
+        fake.dummy_value_cache = torch.zeros(1)
+        fake.attn = SimpleNamespace(
+            impl=SimpleNamespace(
+                sink_k_nope=torch.zeros(S, 1, L),
+                sink_kv=torch.zeros(S, 1, L + R),
+            )
+        )
+    expected = torch.full((T, N, L), 7.0)
+    pioneer = MagicMock(return_value=(torch.zeros(T, N, L), torch.zeros(1, T, N), torch.ones(1, T, N)))
+    direct_meta = MagicMock(return_value=torch.arange(1024, dtype=torch.int32))
+    sink_v2 = MagicMock(return_value=(torch.ones(T, N, L), None, torch.zeros(T, N, 1), torch.ones(T, N, 1)))
+    rescale = MagicMock(return_value=(expected, None, None))
+    with patch.object(dsa_mod.ops, "apply_FA_rescale_forward", rescale), \
+         patch.object(torch.ops.custom, "npu_ai_infra_sparse_flash_attention_pioneer", pioneer, create=True), \
+         patch.object(torch.ops.custom, "_npu_fused_infer_attention_sink_metadata", direct_meta, create=True), \
+         patch.object(torch.ops.custom, "npu_fused_infer_attention_sink_v2", sink_v2, create=True), \
+         _dsa_consistency_config():
+        producer._init_fia_metadata_sharing(config)
+        consumer._init_fia_metadata_sharing(config)
+        produced = producer._get_sink_fia_metadata({"num_heads_q": N}, "decode")
+        out = NPUDeepseekSparseAttention._apply_attention_rescale_pioneer(
+            consumer,
+            q_nope=torch.zeros(T, N, L),
+            q_pe=torch.zeros(T, N, R),
+            q_cumlens=torch.tensor([T], dtype=torch.int32),
+            kv_lens=torch.tensor([T], dtype=torch.int32),
+            topk_idx=torch.zeros(T, 1, 2, dtype=torch.int32),
+            block_table=torch.zeros(B, 4, dtype=torch.int32),
+            kv_cache=(torch.zeros(4, 8, L),),
+            metadata_caller="decode",
+        )
+    assert out is expected
+    direct_meta.assert_called_once()
+    assert sink_v2.call_args.kwargs["meta_data"].data_ptr() == produced.data_ptr()

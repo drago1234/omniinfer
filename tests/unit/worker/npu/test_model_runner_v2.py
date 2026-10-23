@@ -84,6 +84,7 @@ def test_runner_installs_cuda_aliases_and_pins_override_surface(
         "prepare_dummy_attn",        # dummy forward 清零 block table，别写脏已交接的块
         "_omni_has_separate_kv_update",
         "_sync_dummy_main_compute_logits",
+        "_init_thinking_budget_state",  # V2 thinking budget 状态挂接（vllm#46727 backport）
         "sample_tokens",             # Scope NPU device APIs over MTP proposal
         "execute_model",             # 在 dummy target forward 后补 lm_head logits
     }, f"NPUModelRunnerV2 覆写面变化，实际定义了: {own}"
@@ -167,7 +168,12 @@ def test_mhc_mm_embedding_width_alignment_guards(
             runner._align_mhc_mm_embedding_width()
 
 
-def test_load_model_aligns_mhc_buffer_after_upstream_load(monkeypatch):
+def test_load_model_runs_post_load_hooks_after_upstream_load(monkeypatch):
+    """mHC 对齐与 thinking budget 挂接都必须在上游 load_model 之后。
+
+    0.25.1 的 V2 Sampler 是在 load_model 里才创建的（它需要 model_state 的
+    ``num_new_sampled_tokens_per_step``），构造期 ``self.sampler`` 还是 None。
+    """
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
     from omni_npu.worker.npu.model_runner import NPUModelRunnerV2
@@ -184,9 +190,37 @@ def test_load_model_aligns_mhc_buffer_after_upstream_load(monkeypatch):
         "_align_mhc_mm_embedding_width",
         lambda: calls.append("align"),
     )
+    monkeypatch.setattr(
+        runner,
+        "_init_thinking_budget_state",
+        lambda: calls.append("thinking_budget"),
+    )
 
     runner.load_model(True, marker="value")
-    assert calls == [((True,), {"marker": "value"}), "align"]
+    assert calls == [((True,), {"marker": "value"}), "thinking_budget", "align"]
+
+
+def test_init_thinking_budget_state_waits_for_the_sampler(monkeypatch):
+    """Sampler 还不存在时安静返回（构造期就是这样），建好后挂上去。"""
+    from omni_npu.worker.npu import thinking_budget as tb
+    from omni_npu.worker.npu.model_runner import NPUModelRunnerV2
+
+    runner = NPUModelRunnerV2.__new__(NPUModelRunnerV2)
+    runner.vllm_config = SimpleNamespace(reasoning_config=None)
+    runner.req_states = SimpleNamespace(max_num_reqs=4)
+
+    # 构造期：sampler 属性还不存在（0.25.1 里 __init__ 置 None）。
+    runner.sampler = None
+    runner._init_thinking_budget_state()
+    assert runner.sampler is None
+
+    state = SimpleNamespace(enabled=True)
+    monkeypatch.setattr(
+        tb, "NPUThinkingBudgetState", lambda req_states, cfg: state
+    )
+    runner.sampler = SimpleNamespace()
+    runner._init_thinking_budget_state()
+    assert runner.sampler.thinking_budget_state is state
 
 
 def test_reshape_kv_cache_routes_backend_and_upstream_groups(monkeypatch):
@@ -453,12 +487,12 @@ requires_npu = pytest.mark.skipif(not _npu_available(), reason="NPU is unavailab
 def _npu_sampling_available() -> bool:
     if not _npu_available():
         return False
-    from omni_npu.worker.npu import sampler
+    from omni_npu.worker.npu.ops.gumbel import _gumbel_sample_kernel
 
     # Some UT shards run with vLLM's no-Triton fallback.  In that fallback
     # @triton.jit is an identity decorator, so the kernel is a plain function
     # and cannot be launched with kernel[grid](...).
-    return hasattr(sampler._gumbel_sample_kernel, "__getitem__")
+    return hasattr(_gumbel_sample_kernel, "__getitem__")
 
 
 requires_npu_sampling = pytest.mark.xfail(
@@ -641,11 +675,10 @@ def test_gumbel_sample_processed_logits():
 
 @requires_npu
 def test_apply_top_k_top_p_mask_layout():
-    """NPU apply_top_k_top_p（PyTorch sort）mask 布局与 numpy sort oracle 一致。
+    """核对 CANN top-k/top-p 在无边界并列值时的过滤 mask。
 
-    上游 Qrita Triton kernel 在 triton-ascend 3.2.2 编译失败，omni setattr 强制走
-    PyTorch sort。本测试直接调 omni 注入版，验证三种 case 的 mask 布局（哪些位置变 -inf）
-    与 numpy fp64 sort oracle 完全一致——top-k/top-p 是纯过滤，mask 布局是正确性核心。
+    与 NumPy FP64 sort oracle 比较 top-k、top-p 及逐请求组合参数。
+    并列值和 p=1 下溢尾部的 CANN 语义另由 test_mrv2_topk_topp_npu 覆盖。
     """
     import numpy as np
     import torch

@@ -35,21 +35,24 @@ def create_mock_modules(name: str, pure_mock: bool = False):
 def make_model_extra_config(
     kv_nz: bool = False,
     enable_kv_rmsnorm_rope_cache: bool = False,
-    use_aicpu_fa_tiling: bool = False
+    use_aicpu_fa_tiling: bool = False,
+    use_ai_infra_fa_for_gpt_oss_sink: bool = False,
 ):
     return types.SimpleNamespace(
         operator_opt_config=types.SimpleNamespace(
             kv_nz=kv_nz,
             enable_kv_rmsnorm_rope_cache=enable_kv_rmsnorm_rope_cache,
-            use_aicpu_fa_tiling=use_aicpu_fa_tiling
+            use_aicpu_fa_tiling=use_aicpu_fa_tiling,
+            use_ai_infra_fa_for_gpt_oss_sink=use_ai_infra_fa_for_gpt_oss_sink,
         )
     )
 
 
+@pytest.mark.parametrize("num_heads,num_kv_heads", [(24, 4), (6, 1)])
 @pytest.mark.parametrize("capturing", [False, True])
 @pytest.mark.parametrize("kv_nz", [False, True])
 def test_zero_sink_aicpu_uses_device_metadata_without_graph_task_updates(
-    npu_attention_classes, monkeypatch, capturing, kv_nz,
+    npu_attention_classes, monkeypatch, capturing, kv_nz, num_heads, num_kv_heads,
 ):
     module = npu_attention_classes["attention_module"]
     impl_cls = npu_attention_classes["NPUAttentionBackendImpl"]
@@ -68,17 +71,17 @@ def test_zero_sink_aicpu_uses_device_metadata_without_graph_task_updates(
     meta_tensor = torch.zeros(1024, dtype=torch.int32)
     metadata_op = MagicMock(return_value=meta_tensor)
     graph_task = MagicMock()
-    query = torch.randn(4, 24, 128)
+    query = torch.randn(4, num_heads, 128)
     sink_op = MagicMock(return_value=(query,))
     monkeypatch.setattr(module, "npu_fused_infer_attention_sink_metadata", metadata_op)
     monkeypatch.setattr(module, "capture_graph_task", graph_task)
     monkeypatch.setattr(torch.ops.custom, "npu_fused_infer_attention_sink", sink_op)
-    impl = impl_cls(24, 128, 128 ** -0.5, num_kv_heads=4, sink_len=0)
-    shape = (2, 32, 128, 16) if kv_nz else (2, 128, 512)
+    impl = impl_cls(num_heads, 128, 128 ** -0.5, num_kv_heads=num_kv_heads, sink_len=0)
+    shape = (2, num_kv_heads * 8, 128, 16) if kv_nz else (2, 128, num_kv_heads * 128)
     cache = (torch.zeros(shape), torch.zeros(shape))
     metadata = types.SimpleNamespace(
-        num_actual_tokens=4, query_start_loc=torch.tensor([0, 4]),
-        seq_lens=torch.tensor([17]), block_tables=torch.tensor([[0, 1]]),
+        num_actual_tokens=4, query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([17], dtype=torch.int32), block_tables=torch.tensor([[0, 1]]),
         slot_mapping=None, is_pure_prefill_without_prefix_and_use_kvnz=False,
     )
     layer = types.SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
@@ -87,15 +90,25 @@ def test_zero_sink_aicpu_uses_device_metadata_without_graph_task_updates(
     graph_task.assert_not_called()
     metadata_op.assert_called_once()
     metadata_args = metadata_op.call_args.args[0]
-    assert metadata_args["num_heads_q"] == 24
-    assert metadata_args["num_heads_kv"] == 4
+    assert metadata_args["num_heads_q"] == num_heads
+    assert metadata_args["num_heads_kv"] == num_kv_heads
     assert metadata_args["sink_num"] == 0
     assert metadata_args["actual_seq_lengths"].dtype == torch.int64
     kwargs = sink_op.call_args.kwargs
     assert kwargs["meta_data"] is meta_tensor
+    assert isinstance(kwargs["actual_seq_qlen"], torch.Tensor)
+    assert isinstance(kwargs["actual_seq_kvlen"], torch.Tensor)
+    assert kwargs["actual_seq_qlen"].dtype == torch.int64
+    assert kwargs["actual_seq_kvlen"].dtype == torch.int64
+    torch.testing.assert_close(
+        kwargs["actual_seq_qlen"], metadata.query_start_loc[1:].to(torch.int64),
+    )
+    torch.testing.assert_close(
+        kwargs["actual_seq_kvlen"], metadata.seq_lens.to(torch.int64),
+    )
     assert kwargs["sink_number"] == 0
     assert kwargs["sparse_mode"] == 3
-    assert kwargs["key"].shape == ((2, 4, 8, 128, 16) if kv_nz else shape)
+    assert kwargs["key"].shape == ((2, num_kv_heads, 8, 128, 16) if kv_nz else shape)
     assert kwargs["key"].data_ptr() == cache[0].data_ptr()
     assert kwargs["value"].shape == kwargs["key"].shape
     assert kwargs["value"].data_ptr() == cache[1].data_ptr()
@@ -111,6 +124,46 @@ class SinkLenZeroThenNone:
     def __eq__(self, other):
         self.impl.sink_len = None
         return other == 0
+
+
+@pytest.mark.parametrize('window', [None, 512])
+def test_gqa_native_sink_shares_window_key_and_preserves_padded_output(npu_attention_classes, monkeypatch, window):
+    module = npu_attention_classes['attention_module']
+    cls = npu_attention_classes['NPUAttentionBackendImpl']
+    monkeypatch.setattr(module, 'model_extra_config', make_model_extra_config(use_ai_infra_fa_for_gpt_oss_sink=True))
+    monkeypatch.setattr(cls, 'SHARE_MASK_TRIL_SPARSE', torch.zeros(1))
+    reserve = MagicMock()
+    monkeypatch.setattr(cls, '_reserve_gpt_oss_fia_metadata', reserve)
+    monkeypatch.setattr(module, 'get_forward_context', lambda: types.SimpleNamespace(capturing=False))
+    first = cls(4, 8, 8 ** -.5, 2, sliding_window=window, should_recompute_attn_meta=True)
+    later = cls(4, 8, 8 ** -.5, 2, sliding_window=window, should_recompute_attn_meta=False)
+    assert first.metadata_caller == later.metadata_caller == ('gqa', window)
+    assert reserve.call_count == 2
+    q = torch.randn(4, 4, 8)
+    native = MagicMock(return_value=q[:2])
+    monkeypatch.setattr(later, '_apply_gpt_oss_fia_native', native)
+    layer = types.SimpleNamespace(_k_scale_float=1., _v_scale_float=1.)
+    monkeypatch.setattr(module, 'split_decodes_and_prefills', lambda *args, **kwargs: (0, 1, 0, 2))
+    builder = npu_attention_classes['NPUAttentionMetadataBuilder'](
+        types.SimpleNamespace(block_size=128, head_size=8), ['layer'],
+        types.SimpleNamespace(compilation_config=None), torch.device('cpu'))
+    common = types.SimpleNamespace(num_actual_tokens=2, query_start_loc=torch.tensor([0, 2]),
+                                   seq_lens=torch.tensor([10]), block_table_tensor=torch.tensor([[0]]),
+                                   slot_mapping=None, max_query_len=2)
+    metadata = builder.build(0, common)
+    assert metadata.query_start_loc is common.query_start_loc
+    assert metadata.seq_lens is common.seq_lens
+    output = torch.ones_like(q)
+    caches = (torch.zeros(2, 128, 16), torch.zeros(2, 128, 16))
+    later.forward(layer, q, None, None, caches, metadata, output)
+    kwargs, sink, caller, recompute = native.call_args.args
+    assert kwargs['pre_tokens'] == (511 if window else (1 << 31) - 1)
+    assert caller == first.metadata_caller and recompute is False
+    assert kwargs['block_table'] is metadata.block_tables
+    torch.testing.assert_close(output[:2], q[:2])
+    assert torch.count_nonzero(output[2:]) == 0
+    later.forward(layer, q, None, None, caches, None, output)
+    assert torch.count_nonzero(output) == 0
 
 
 @pytest.fixture
