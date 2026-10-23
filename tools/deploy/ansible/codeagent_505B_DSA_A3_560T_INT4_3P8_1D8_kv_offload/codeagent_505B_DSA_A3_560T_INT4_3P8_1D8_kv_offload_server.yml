@@ -74,6 +74,7 @@
         export VLLM_DISABLE_PYNCCL=1
         export HCCL_BUFFSIZE=100
         export HCCL_CONNECT_TIMEOUT=1800
+        export VLLM_SERVER_DEV_MODE=1
         export HCCL_EXEC_TIMEOUT=1800
         export HCCL_OP_RETRY_ENABLE="L0:0,L1:0,L2:0"
         export HCCL_OP_EXPANSION_MODE="AIV"
@@ -87,8 +88,7 @@
         export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_HYBRID_ATTN_GROUP_SIZE=18
-        export OMNI_VLLM_PATCHES_DIR="pangu_v2_hybrid, pangu_v2_moe"
-        export OMNI_VLLM_PATCHES="ALL"
+        export OMNI_VLLM_PATCHES_DIR="low_latency"
         # export VLLM_TORCH_PROFILER_DIR=${LOG_PATH}/{{ inventory_hostname }}/profiling
         # mkdir -p "${VLLM_TORCH_PROFILER_DIR}"
         # export OMNI_PROFILE_TOKEN_THRESHOLD=100
@@ -149,10 +149,8 @@
         export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_HYBRID_ATTN_GROUP_SIZE=18
-        export OMNI_VLLM_PATCHES_DIR="pangu_v2_hybrid, pangu_v2_moe"
-        export OMNI_VLLM_PATCHES="ALL"
+        export OMNI_VLLM_PATCHES_DIR="low_latency"
         export ENABLE_DP_LB=false
-        export VLLM_CACHE_ROOT='./graph_cache'
         export TASK_QUEUE_ENABLE=1
         export LOCAL_WORLD_SIZE=16
         # export VLLM_TORCH_PROFILER_DIR=${LOG_PATH}/{{ inventory_hostname }}/profiling
