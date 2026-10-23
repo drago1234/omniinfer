@@ -146,6 +146,7 @@
         # max-model-len 524288 (mirrors the espace reference playbook).
         GPU_UTIL=0.9
         {% if enable_fusion_pool | bool %}
+        export ASCEND_USE_ASYNC_TRANSFER=1
         if [ -f "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh" ]; then
           . "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh"
         fi
