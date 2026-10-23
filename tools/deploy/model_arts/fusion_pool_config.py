@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Create the pool config used by the 1019 _fusion_pool_runtime.sh.j2."""
+"""Build Mooncake and MultiConnector configuration for public ModelArts entries."""
 import json
 import os
 import socket
@@ -27,7 +27,7 @@ def main():
     role = sys.argv[1]
     env = os.environ
     if "--dry-run" in sys.argv:
-        print(json.dumps(build_transfer(role, int(env["prefill_instance_rank"]), 5,
+        print(json.dumps(build_transfer(role, int(env["prefill_instance_rank"]), int(env["FUSION_POOL_PARALLEL_SIZE"]),
                          int(env.get("OMNI_LLMDATADIST_ZMQ_PORT", "5568")),
                          env.get("FUSION_POOL_ENABLE_STORE_EVENTS", "false") == "true",
                          env.get("FUSION_POOL_ENABLE_LOAD_EVENTS", "false") == "true"), separators=(",", ":")))
@@ -55,7 +55,7 @@ def main():
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"Mooncake master not ready: {master}:{metadata}/{rpc}")
             time.sleep(2)
-    transfer = build_transfer(role, int(env["prefill_instance_rank"]), 5,
+    transfer = build_transfer(role, int(env["prefill_instance_rank"]), int(env["FUSION_POOL_PARALLEL_SIZE"]),
                               int(env.get("OMNI_LLMDATADIST_ZMQ_PORT", "5568")),
                               env.get("FUSION_POOL_ENABLE_STORE_EVENTS", "false") == "true",
                               env.get("FUSION_POOL_ENABLE_LOAD_EVENTS", "false") == "true")

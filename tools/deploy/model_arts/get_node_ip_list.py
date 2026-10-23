@@ -46,4 +46,7 @@ def main():
 
 
 if __name__ == '__main__':
+    if '--role' in sys.argv[1:]:
+        from fusion_pool_topology import main as fusion_pool_main
+        sys.exit(fusion_pool_main())
     sys.exit(main())
