@@ -1653,7 +1653,10 @@ class NPUModelRunner(GPUModelRunner):
         kv_caches = super().initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
         engram_hash_state = None
         if self.engram_config is not None:
-            engram_hash_state = self.get_model().model.engram_hash
+            model = self.get_model()
+            if hasattr(model, "language_model"):
+                model = model.language_model
+            engram_hash_state = model.model.engram_hash
         if engram_hash_state is not None:
             # group_id indexes the KV group and its matching block table.
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups):

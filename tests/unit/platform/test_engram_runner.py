@@ -191,3 +191,39 @@ def test_missing_history_kv_group_is_rejected(monkeypatch):
     monkeypatch.setattr(GPUModelRunner, "initialize_kv_cache_tensors", lambda *args: {})
     with pytest.raises(ValueError, match="requires its attention KV cache"):
         runner.initialize_kv_cache_tensors(SimpleNamespace(kv_cache_groups=[]), [])
+
+
+def test_multimodal_wrapper_history_is_reached_through_language_model(monkeypatch):
+    """A multimodal wrapper exposes the text model as ``language_model``."""
+    import omni_npu.worker.npu_model_runner as runner_module
+
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.engram_config = SimpleNamespace()
+    history = Mock(cache_prefix="layer")
+    runner.get_model = lambda: SimpleNamespace(
+        language_model=SimpleNamespace(model=SimpleNamespace(engram_hash=history))
+    )
+    runner.input_batch = SimpleNamespace(block_table=[SimpleNamespace(block_size=16)])
+    cache_config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=["layer"])])
+    monkeypatch.setattr(GPUModelRunner, "initialize_kv_cache_tensors", lambda *args: {})
+    monkeypatch.setattr(runner_module, "has_kv_transfer_group", lambda: False)
+    runner.initialize_kv_cache_tensors(cache_config, [16])
+    assert history.block_size == 16
+    history.ensure_cache.assert_called_once_with()
+
+
+def test_multimodal_wrapper_without_matching_history_group_is_rejected(monkeypatch):
+    """The wrapper's text model must still find its attention KV group."""
+    import omni_npu.worker.npu_model_runner as runner_module
+
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.engram_config = SimpleNamespace()
+    runner.get_model = lambda: SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(engram_hash=SimpleNamespace(cache_prefix="missing"))
+        )
+    )
+    monkeypatch.setattr(GPUModelRunner, "initialize_kv_cache_tensors", lambda *args: {})
+    monkeypatch.setattr(runner_module, "has_kv_transfer_group", lambda: False)
+    with pytest.raises(ValueError, match="requires its attention KV cache"):
+        runner.initialize_kv_cache_tensors(SimpleNamespace(kv_cache_groups=[]), [])
