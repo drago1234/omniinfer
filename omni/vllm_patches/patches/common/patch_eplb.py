@@ -43,6 +43,8 @@ import vllm.distributed.eplb.async_worker as _async_worker
 import vllm.model_executor.layers.fused_moe.layer as _fused_moe_layer
 from vllm.config.parallel import EPLBConfig
 from vllm.distributed.parallel_state import get_ep_group
+from vllm.triton_utils import tl, triton
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 from omni_npu.distributed.eplb_communicate import HixlEplbCommunicator, _PinnedH2D
@@ -54,6 +56,12 @@ _upstream_move_from_buffer = _rebalance_execute.move_from_buffer
 _upstream_transfer_layer = _rebalance_execute.transfer_layer
 _UpstreamEplbState = _eplb_state.EplbState
 _UpstreamEplbLayerState = _eplb_state.EplbLayerState
+
+
+# Keep the routing table small and shape-stable for ACL graph capture.  The
+# table is periodic, so requests with more rows are processed in 1024-row
+# blocks without allocating a table proportional to max_model_len.
+EPLB_ROUTING_TABLE_ROWS = 1024
 
 
 # =====================================================================================
@@ -77,28 +85,272 @@ class NPUEplbState(_UpstreamEplbState):
             raise ValueError(f"EPLB requires cuda_device_index, got None for device {device.type}.")
 
 
+def build_expert_replica_routing_table(
+    logical_to_physical_map: torch.Tensor,
+    logical_replica_count: torch.Tensor,
+    ep_rank: int,
+) -> torch.Tensor:
+    """Build the graph-stable, rank-aware replica table used by Ascend EPLB."""
+    if logical_to_physical_map.ndim != 2:
+        raise ValueError("logical_to_physical_map must be a 2D tensor")
+    if logical_replica_count.ndim != 1:
+        raise ValueError("logical_replica_count must be a 1D tensor")
+    if logical_to_physical_map.shape[0] != logical_replica_count.shape[0]:
+        raise ValueError("logical expert dimensions must match")
+    if torch.any(logical_replica_count <= 0):
+        raise ValueError("every logical expert must have at least one replica")
+
+    device = logical_to_physical_map.device
+    num_logical_experts = logical_replica_count.shape[0]
+    table_rows = torch.arange(
+        EPLB_ROUTING_TABLE_ROWS,
+        dtype=torch.int64,
+        device=device,
+    )[:, None]
+    logical_ids = torch.arange(
+        num_logical_experts,
+        dtype=torch.int64,
+        device=device,
+    )[None, :]
+    replica_count = logical_replica_count.to(torch.int64).clamp_min(1)[None, :]
+    replica_indices = (table_rows + ep_rank + logical_ids) % replica_count
+    return logical_to_physical_map.gather(1, replica_indices.T).T.to(
+        dtype=torch.int32
+    ).contiguous()
+
+
+def map_to_physical(
+    topk_ids: torch.Tensor,
+    expert_replica_routing_table: torch.Tensor,
+) -> torch.Tensor:
+    """Map logical expert IDs to global physical IDs without host sync."""
+    if topk_ids.numel() == 0:
+        return topk_ids
+    if topk_ids.ndim != 2:
+        raise ValueError("topk_ids must be a 2D tensor")
+
+    logical_ids = topk_ids.to(torch.int64)
+    num_rows, topk = topk_ids.shape
+    num_full_blocks, tail_rows = divmod(num_rows, EPLB_ROUTING_TABLE_ROWS)
+    mapped_blocks = []
+    if num_full_blocks:
+        full_rows = num_full_blocks * EPLB_ROUTING_TABLE_ROWS
+        tables = expert_replica_routing_table.view(
+            1,
+            EPLB_ROUTING_TABLE_ROWS,
+            expert_replica_routing_table.shape[1],
+        ).expand(num_full_blocks, -1, -1)
+        ids = logical_ids[:full_rows].view(
+            num_full_blocks, EPLB_ROUTING_TABLE_ROWS, topk
+        )
+        mapped_blocks.append(
+            torch.gather(tables, 2, ids).reshape(full_rows, topk)
+        )
+    if tail_rows:
+        mapped_blocks.append(
+            torch.gather(
+                expert_replica_routing_table[:tail_rows],
+                1,
+                logical_ids[num_full_blocks * EPLB_ROUTING_TABLE_ROWS:],
+            )
+        )
+    physical_ids = (
+        mapped_blocks[0] if len(mapped_blocks) == 1 else torch.cat(mapped_blocks)
+    )
+    return physical_ids.to(dtype=topk_ids.dtype)
+
+
+@triton.jit
+def _map_to_physical_and_record_kernel(
+    topk_ids_ptr,
+    routing_table_ptr,
+    physical_ids_ptr,
+    expert_load_ptr,
+    record_enabled_ptr,
+    num_unpadded_tokens_ptr,
+    num_logical_experts,
+    num_physical_experts,
+    numel,
+    topk,
+    routing_table_rows,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """vLLM-Ascend EPLB mapping and load collection in one NPU kernel."""
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+    logical_id = tl.load(topk_ids_ptr + offsets, mask=mask, other=-1).to(
+        tl.int64
+    )
+    valid_logical_id = (logical_id >= 0) & (
+        logical_id < num_logical_experts
+    )
+    safe_logical_id = tl.where(valid_logical_id, logical_id, 0)
+
+    token_idx = offsets // topk
+    routing_row = token_idx % routing_table_rows
+    routing_index = routing_row * num_logical_experts + safe_logical_id
+    physical_id = tl.load(
+        routing_table_ptr + routing_index,
+        mask=mask & valid_logical_id,
+        other=-1,
+    )
+    tl.store(physical_ids_ptr + offsets, physical_id, mask=mask)
+
+    record_enabled = tl.load(record_enabled_ptr) != 0
+    num_unpadded_tokens = tl.load(num_unpadded_tokens_ptr)
+    valid_physical_id = (physical_id >= 0) & (
+        physical_id < num_physical_experts
+    )
+    should_record = (
+        mask
+        & valid_logical_id
+        & valid_physical_id
+        & record_enabled
+        & (token_idx < num_unpadded_tokens)
+    )
+    safe_physical_id = tl.where(valid_physical_id, physical_id, 0)
+    tl.atomic_add(
+        expert_load_ptr + safe_physical_id,
+        1,
+        mask=should_record,
+    )
+
+
+def map_to_physical_and_record(
+    topk_ids: torch.Tensor,
+    expert_replica_routing_table: torch.Tensor,
+    expert_load_view: torch.Tensor,
+    record_enabled: torch.Tensor,
+    num_unpadded_tokens: torch.Tensor,
+) -> torch.Tensor:
+    """Map logical IDs and collect physical load without host synchronization."""
+    if topk_ids.numel() == 0:
+        return topk_ids
+    if topk_ids.device.type != "cpu":
+        physical_ids = torch.empty_like(topk_ids)
+        numel = topk_ids.numel()
+
+        def grid(meta):
+            return (triton.cdiv(numel, meta["BLOCK_SIZE"]),)
+
+        _map_to_physical_and_record_kernel[grid](
+            topk_ids,
+            expert_replica_routing_table,
+            physical_ids,
+            expert_load_view,
+            record_enabled,
+            num_unpadded_tokens,
+            expert_replica_routing_table.shape[1],
+            expert_load_view.numel(),
+            numel,
+            topk_ids.shape[1],
+            expert_replica_routing_table.shape[0],
+            BLOCK_SIZE=256,
+        )
+        return physical_ids
+
+    # CPU fallback is used by unit tests and keeps identical semantics.
+    physical_ids = map_to_physical(topk_ids, expert_replica_routing_table)
+    if bool(record_enabled):
+        real_ids = physical_ids[: int(num_unpadded_tokens)].reshape(-1)
+        valid_ids = real_ids[
+            (real_ids >= 0) & (real_ids < expert_load_view.numel())
+        ]
+        if valid_ids.numel() > 0:
+            expert_load_view.add_(
+                torch.bincount(
+                    valid_ids.to(torch.int64),
+                    minlength=expert_load_view.numel(),
+                ).to(expert_load_view.dtype)
+            )
+    return physical_ids
+
+
 class NPUEplbLayerState(_UpstreamEplbLayerState):  # @dataclass
-    replica_table: torch.Tensor = None  # [num_logical_experts] int32：逻辑专家 -> 物理专家（无冗余版，1D）
+    # Legacy (non-redundant) EPLB state.
+    replica_table: torch.Tensor = None
+    local_load: torch.Tensor = None
+
+    # Redundant-expert EPLB state.
+    expert_replica_routing_table: torch.Tensor = None
 
     def set_layer_state(self, *args, **kw):
         super().set_layer_state(*args, **kw)
-        ep = get_ep_group()
-        num_local = self.expert_load_view.numel() // ep.world_size
-        start = ep.rank_in_group * num_local
-        self.local_load = self.expert_load_view[start: start + num_local]  # 本 rank 物理专家切片，等价 physical_expert_start
+
+        num_logical_experts = self.logical_replica_count.numel()
+        num_physical_experts = self.expert_load_view.numel()
+        self.has_redundant_experts = (
+            num_physical_experts > num_logical_experts
+        )
+
+        if not self.has_redundant_experts:
+            ep = get_ep_group()
+            num_local_experts = num_physical_experts // ep.world_size
+            start = ep.rank_in_group * num_local_experts
+            self.local_load = self.expert_load_view[
+                start: start + num_local_experts
+            ]
+
+        self.refresh_replica_table()
 
     def refresh_replica_table(self):
-        new_table = self.logical_to_physical_map[:, 0].int()
-        if self.replica_table is not None and self.replica_table.shape == new_table.shape:
-            self.replica_table.copy_(new_table)  # 原地改，保持张量 identity（ACL graph 稳定）
+        if not self.has_redundant_experts:
+            # Keep the original no-redundancy implementation isolated from
+            # the 2D replica routing table and its Triton mapping kernel.
+            new_table = self.logical_to_physical_map[:, 0].int()
+            if (
+                self.replica_table is not None
+                and self.replica_table.shape == new_table.shape
+            ):
+                self.replica_table.copy_(new_table)
+            else:
+                self.replica_table = new_table
+            return
+
+        new_table = build_expert_replica_routing_table(
+            self.logical_to_physical_map,
+            self.logical_replica_count,
+            get_ep_group().rank_in_group,
+        )
+        if (
+            self.expert_replica_routing_table is not None
+            and self.expert_replica_routing_table.shape == new_table.shape
+        ):
+            # Keep tensor identity stable so an already captured ACL graph sees
+            # the new placement after an EPLB rearrangement.
+            self.expert_replica_routing_table.copy_(new_table, non_blocking=True)
         else:
-            self.replica_table = new_table
+            self.expert_replica_routing_table = new_table
 
     def apply_mapping(self, topk_ids: torch.Tensor):
-        return self.replica_table[topk_ids.flatten()].view(*topk_ids.shape)  # 一次 1D gather，替代官方 Triton 映射算子
+        if not self.has_redundant_experts:
+            if self.replica_table is None:
+                raise RuntimeError("EPLB replica table is not initialized")
+            return self.replica_table[topk_ids.flatten()].view_as(topk_ids)
 
-    def record_load(self, expert_tokens: torch.Tensor):
-        self.local_load.add_(expert_tokens.int())  # 累加本 rank 物理专家的 token 数
+        if self.expert_replica_routing_table is None:
+            raise RuntimeError("EPLB replica routing table is not initialized")
+        if (
+            self.should_record_tensor is not None
+            and self.num_unpadded_tokens_tensors is not None
+        ):
+            num_unpadded = self.num_unpadded_tokens_tensors[
+                dbo_current_ubatch_id()
+            ]
+            return map_to_physical_and_record(
+                topk_ids,
+                self.expert_replica_routing_table,
+                self.expert_load_view,
+                self.should_record_tensor,
+                num_unpadded,
+            )
+        return map_to_physical(topk_ids, self.expert_replica_routing_table)
+
+    def record_load(self, expert_tokens: torch.Tensor) -> None:
+        # apply_mapping() already records load for redundant experts.  Keep
+        # this compatibility hook for Pangu without counting that load twice.
+        if not self.has_redundant_experts:
+            self.local_load.add_(expert_tokens.int())
 
 
 # ---- compute_logical_maps：向量化替代逐槽位 Python 循环 ----
