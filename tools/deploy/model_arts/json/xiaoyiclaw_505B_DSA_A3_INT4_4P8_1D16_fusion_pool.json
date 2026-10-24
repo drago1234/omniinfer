@@ -123,7 +123,11 @@
             "OMNI_USE_DSV3": "1",
             "AUTO_USE_UC_MEMORY": "1",
             "OMNI_NPU_VLLM_PATCHES": "ALL",
-            "OMNI_WORKER_CPUSET_MAP": "auto"
+            "OMNI_WORKER_CPUSET_MAP": "auto",
+            "OMNI_PROXY_PREFILL_MAX_NUM_SEQS": "4",
+            "OMNI_PROXY_DECODE_MAX_NUM_SEQS": "3",
+            "OMNI_PROXY_MAX_BATCH_NUM_TOKEN": "49152",
+            "OMNI_PROXY_WORK_AWARE_SHORT_THRESHOLD": "98304"
           },
           "files": [],
           "group_count": 1,

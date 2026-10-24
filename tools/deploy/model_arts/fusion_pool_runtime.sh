@@ -182,11 +182,12 @@ cmd=(bash omni_proxy.sh \
     --access-log-file "$log_dir/nginx_access.log" \
     --omni-proxy-model-path "$MODEL_PATH" \
     --core-num 16 --start-core-index 16 --subrequest-output-buffer-size 10M \
-    --omni-proxy-pd-policy sequential --omni-proxy-max-batch-num-token 49152 \
-    --omni-proxy-prefill-max-num-seqs 4 --omni-proxy-decode-max-num-seqs 3 \
+    --omni-proxy-pd-policy sequential --omni-proxy-max-batch-num-token "${OMNI_PROXY_MAX_BATCH_NUM_TOKEN:-49152}" \
+    --omni-proxy-prefill-max-num-seqs "${OMNI_PROXY_PREFILL_MAX_NUM_SEQS:-4}" \
+    --omni-proxy-decode-max-num-seqs "${OMNI_PROXY_DECODE_MAX_NUM_SEQS:-3}" \
     --omni-proxy-tokenizer-wide-affinity on \
     --omni-proxy-schedule-algo work_aware \
-    --omni-proxy-work-aware-short-threshold 98304 \
+    --omni-proxy-work-aware-short-threshold "${OMNI_PROXY_WORK_AWARE_SHORT_THRESHOLD:-98304}" \
     --omni-proxy-work-aware-service-floor-tokens 4096 \
     --omni-proxy-pool-aware-scheduling on \
     --omni-proxy-pool-master-events "$MOONCAKE_MASTER_IP:$MOONCAKE_KV_EVENTS_PORT" \
