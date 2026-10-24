@@ -70,6 +70,7 @@
         # 特性默认关，这里只是把开关摆出来；要开改成 true。
         sharded_load: false
       prepare_commands: |-
+        export VLLM_USE_V2_MODEL_RUNNER=1
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_ALL | replace(' ', '') | trim | quote }}
         export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=36000
         export VLLM_DISABLE_PYNCCL=1
@@ -133,6 +134,7 @@
 
     run_server_decode_profile:
       prepare_commands: |-
+        export VLLM_USE_V2_MODEL_RUNNER=1
         export DECODE_DATA_PARALLEL_SIZE={{ DECODE_SERVER_BY_GROUP | quote }}
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_BY_GROUP | replace(' ', '') | trim | quote }}
         export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=36000
@@ -151,6 +153,7 @@
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_HYBRID_ATTN_GROUP_SIZE=18
         export OMNI_VLLM_PATCHES_DIR="low_latency"
+        export OMNI_DRAFT_TOP_K=100
         export ENABLE_DP_LB=false
         export TASK_QUEUE_ENABLE=1
         export LOCAL_WORLD_SIZE=16
@@ -163,10 +166,10 @@
         # EXTRA_ARGS="--profiler-config.profiler=torch --profiler-config.torch_profiler_dir ${VLLM_TORCH_PROFILER_DIR}"
         # EXTRA_ARGS="${EXTRA_ARGS} --profiler-config.torch_profiler_with_stack false"
         EXTRA_ARGS="${EXTRA_ARGS} --no-disable-hybrid-kv-cache-manager --enable-expert-parallel"
-        EXTRA_ARGS="${EXTRA_ARGS} --max-num-seqs 16"
+        EXTRA_ARGS="${EXTRA_ARGS} --max-num-seqs 8"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prompt-tokens-details --enable-chunked-prefill"
         EXTRA_ARGS="${EXTRA_ARGS} --distributed-executor-backend mp --dtype bfloat16"
-        COMPILATION_CONFIG='{"mode": 3, "cudagraph_mode":"FULL", "cudagraph_capture_sizes":[128], "backend":"", "compile_sizes":[128]}'
+        COMPILATION_CONFIG='{"mode": 3, "cudagraph_mode":"FULL", "cudagraph_capture_sizes":[16,32,64], "backend":"", "compile_sizes":[16,32,64]}'
         EXTRA_ARGS="${EXTRA_ARGS} --compilation-config ${COMPILATION_CONFIG}"
         EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
@@ -201,7 +204,7 @@
         - --hccl-buffsize "${HCCL_BUFFSIZE}"
         - --hccl-op-expansion-mode "${HCCL_OP_EXPANSION_MODE}"
         - --num-speculative-tokens 7
-        - --rejection-sample-method standard
+        - --rejection-sample-method block
         - --draft-sample-method probabilistic
 
     run_server_common_profile:
@@ -221,7 +224,7 @@
         - --omni-proxy-pd-policy sequential
         - --omni-proxy-max-batch-num-token 65536
         - --omni-proxy-prefill-max-num-seqs 8
-        - --omni-proxy-decode-max-num-seqs 16
+        - --omni-proxy-decode-max-num-seqs 8
 
   tasks:
     - ansible.builtin.import_role:
