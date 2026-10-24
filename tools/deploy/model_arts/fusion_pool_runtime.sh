@@ -18,7 +18,9 @@ init_runtime() {
     unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY proxy
     topology_exports=$(python3 "$SCRIPT_DIR/get_node_ip_list.py" --role "$role") || return 1
     eval "$topology_exports"
-    export LOG_PATH="${LOG_PATH:-/home/ma-user/log}/${role}/${POD_IP}"
+    # Keep layout aligned with legacy MA scripts: ${LOG_PATH}/${POD_IP}
+    # (do not insert ${role}, which would yield .../p0/prefill/<ip>).
+    export LOG_PATH="${LOG_PATH:-/home/ma-user/log}/${POD_IP}"
     mkdir -p "$LOG_PATH"
     export ASCEND_PROCESS_LOG_PATH="$LOG_PATH/ascend"
     mkdir -p "$ASCEND_PROCESS_LOG_PATH"
@@ -169,7 +171,8 @@ while True:
         time.sleep(2)
 PY
 fi
-log_dir="${LOG_PATH_PROXY:-/home/ma-user/log}/proxy/${POD_IP}"
+# Keep layout aligned with legacy: ${LOG_PATH_PROXY}/${POD_IP} (no extra /proxy/).
+log_dir="${LOG_PATH_PROXY:-/home/ma-user/log}/${POD_IP}"
 mkdir -p "$log_dir"
 if [[ "${MA_DRY_RUN:-0}" != 1 ]]; then
     cd "$CODE_PATH/components/omni-proxy/omni_proxy"
