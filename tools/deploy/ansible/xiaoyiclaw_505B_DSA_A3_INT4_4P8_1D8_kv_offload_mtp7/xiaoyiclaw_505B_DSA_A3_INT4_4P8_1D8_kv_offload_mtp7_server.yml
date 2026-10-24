@@ -68,6 +68,7 @@
       fusion_pool:
         global_segment_size_gb: 64
       prepare_commands: |-
+        export VLLM_USE_V2_MODEL_RUNNER=1
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_ALL | replace(' ', '') | trim | quote }}
         export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=36000
         export VLLM_DISABLE_PYNCCL=1
@@ -129,6 +130,7 @@
         cpu_bytes_to_use: 53687091200  # 50 GiB
         eviction_policy: arc  # arc or lru
       prepare_commands: |-
+        export VLLM_USE_V2_MODEL_RUNNER=1
         export DECODE_DATA_PARALLEL_SIZE={{ DECODE_SERVER_BY_GROUP | quote }}
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_BY_GROUP | replace(' ', '') | trim | quote }}
         export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=36000
@@ -186,7 +188,7 @@
         - --hccl-buffsize "${HCCL_BUFFSIZE}"
         - --hccl-op-expansion-mode "${HCCL_OP_EXPANSION_MODE}"
         - --num-speculative-tokens 7
-        - --rejection-sample-method standard
+        - --rejection-sample-method block
         - --draft-sample-method probabilistic
 
     run_server_common_profile:
