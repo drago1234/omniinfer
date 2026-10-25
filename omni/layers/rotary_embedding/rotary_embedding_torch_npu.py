@@ -131,8 +131,8 @@ class NPURotaryEmbedding(CachedCosSinMixin, RotaryEmbedding):
         self,
         position_ids: torch.Tensor,
         query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Partial rotary (rotary_dim < 64) via npu_rotary_mul.
 
         npu_apply_rotary_pos_emb requires rotary_dim >= 64; same
@@ -146,12 +146,9 @@ class NPURotaryEmbedding(CachedCosSinMixin, RotaryEmbedding):
         )
         num_tokens = position_ids.numel()
         query = query.view(num_tokens, -1, self.head_size)
-        key = key.view(num_tokens, -1, self.head_size)
 
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim:]
-        key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim:]
 
         cos4 = cos.view(num_tokens, 1, 1, self.rotary_dim)
         sin4 = sin.view(num_tokens, 1, 1, self.rotary_dim)
@@ -159,13 +156,20 @@ class NPURotaryEmbedding(CachedCosSinMixin, RotaryEmbedding):
         q_embed = torch_npu.npu_rotary_mul(
             query_rot.unsqueeze(1), cos4, sin4, rotary_mode="half"
         ).squeeze(1)
-        k_embed = torch_npu.npu_rotary_mul(
-            key_rot.unsqueeze(1), cos4, sin4, rotary_mode="half"
-        ).squeeze(1)
+        q_embed = torch.cat((q_embed, query_pass), dim=-1).flatten(1, 2)
 
-        q_embed = torch.cat((q_embed, query_pass), dim=-1)
-        k_embed = torch.cat((k_embed, key_pass), dim=-1)
-        return q_embed.flatten(1, 2), k_embed.flatten(1, 2)
+        # DFlash precomputes context K independently of the current Q block.
+        # Such calls pass that tensor as query and leave key unset.
+        k_embed = None
+        if key is not None:
+            key = key.view(num_tokens, -1, self.head_size)
+            key_rot = key[..., : self.rotary_dim]
+            key_pass = key[..., self.rotary_dim:]
+            k_embed = torch_npu.npu_rotary_mul(
+                key_rot.unsqueeze(1), cos4, sin4, rotary_mode="half"
+            ).squeeze(1)
+            k_embed = torch.cat((k_embed, key_pass), dim=-1).flatten(1, 2)
+        return q_embed, k_embed
 
     def forward_oot(
         self,
