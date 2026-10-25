@@ -698,8 +698,10 @@ def test_forward_oot_key_none_matches_reference(default_vllm_config, layer_facto
     assert torch.allclose(out_q, exp_q, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("has_key", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_forward_oot_partial_rotary_production_shape_matches_reference(
-    default_vllm_config,
+    default_vllm_config, has_key, dtype,
 ):
     """Partial-rotary fused path (rotary_dim < 64) must match the pure-PyTorch
     reference on the production shape (rotary_dim=32, head_size=128, 16-head GQA).
@@ -712,24 +714,28 @@ def test_forward_oot_partial_rotary_production_shape_matches_reference(
         max_position_embeddings=512,
         base=10000,
         is_neox_style=True,
-        dtype=torch.float32,
+        dtype=dtype,
     ).to(device)
     num_tokens = 5
     num_q_heads = 16
     num_kv_heads = 2
     positions = torch.tensor([0, 7, 64, 129, 300], device=device)
-    query = torch.randn((num_tokens, num_q_heads * 128), device=device)
-    key = torch.randn((num_tokens, num_kv_heads * 128), device=device)
+    query = torch.randn((num_tokens, num_q_heads * 128), device=device, dtype=dtype)
+    key = torch.randn((num_tokens, num_kv_heads * 128), device=device, dtype=dtype) if has_key else None
     query_ref = query.clone()
-    key_ref = key.clone()
+    key_ref = key.clone() if has_key else query_ref
 
     out_q, out_k = layer.forward_oot(positions, query, key)
     exp_q, exp_k = _reference_forward_partial_dim(layer, positions, query_ref, key_ref)
 
     assert out_q.shape == query.shape
-    assert out_k.shape == key.shape
-    assert torch.allclose(out_q, exp_q, atol=1e-4, rtol=1e-4)
-    assert torch.allclose(out_k, exp_k, atol=1e-4, rtol=1e-4)
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 1e-4
+    assert torch.allclose(out_q, exp_q, atol=tolerance, rtol=tolerance)
+    if has_key:
+        assert out_k.shape == key.shape
+        assert torch.allclose(out_k, exp_k, atol=tolerance, rtol=tolerance)
+    else:
+        assert out_k is None
     # Pass-through dims must be untouched by the fused path.
     q_view = out_q.view(num_tokens, num_q_heads, 128)
     exp_view = exp_q.view(num_tokens, num_q_heads, 128)
