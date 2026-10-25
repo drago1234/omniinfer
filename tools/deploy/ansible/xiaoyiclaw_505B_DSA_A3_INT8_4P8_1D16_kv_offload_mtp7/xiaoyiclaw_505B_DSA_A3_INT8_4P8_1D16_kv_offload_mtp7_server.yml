@@ -178,8 +178,6 @@
         - --hccl-buffsize "${HCCL_BUFFSIZE}"
         - --hccl-op-expansion-mode "${HCCL_OP_EXPANSION_MODE}"
         - --num-speculative-tokens 7
-        - --rejection-sample-method standard
-        - --draft-sample-method probabilistic
 
     run_server_common_profile:
       restart_proxy: true
