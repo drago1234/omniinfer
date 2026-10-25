@@ -96,6 +96,7 @@ from omni_npu.connector.kv_dump import (
     maybe_note_mome_cache,
 )
 from omni_npu.diagnostics.nan_inf.detector import NanInfDetector
+from omni_npu.diagnostics.msprobe import build_debugger, resolve_dump_config_path
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -153,6 +154,7 @@ class NPUModelRunner(GPUModelRunner):
             omni_add = OmniAdditionalConfig.from_vllm_config(vllm_config)
             self.combine_block = omni_add.combine_block
         else:
+            omni_add = None
             self.combine_block = 1
         self.use_spec_decode = False
         num_tokens_per_reqs_decode = (
@@ -197,6 +199,24 @@ class NPUModelRunner(GPUModelRunner):
         # Dormant until configured through /collective_rpc collective_feature.
         self.nan_inf_detector = NanInfDetector(
             dp_rank=vllm_config.parallel_config.data_parallel_rank)
+
+        # msprobe precision debugger (mirrors vllm-ascend model_runner_v1.py
+        # :326-344). Only constructed when a dump config is supplied; the
+        # default (both fields None) yields debugger=None and zero overhead.
+        # The deferred msprobe import inside build_debugger means a missing
+        # msprobe only fails when dump is actually enabled.
+        if omni_add is not None:
+            use_graph = self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            self.debugger = build_debugger(
+                resolve_dump_config_path(
+                    omni_add.msprobe_dump_config_path,
+                    omni_add.msprobe_dump_config,
+                ),
+                use_graph=use_graph,
+            )
+            self._debugger_started = False
+        else:
+            self.debugger = None
 
         # Number of valid entries in req_indices for the in-flight
         # _prepare_inputs; None outside it (dummy runs, capture).
@@ -850,6 +870,14 @@ class NPUModelRunner(GPUModelRunner):
         self._hook_model_load_weights(self.get_model())
         self._hook_model_load_weights(self.get_drafter_model())
 
+        # In graph mode the AclGraphDumper must be started once the model is
+        # wrapped and before graph capture; eager mode starts the debugger
+        # lazily on the first execute_model instead (mirrors vllm-ascend
+        # model_runner_v1.py:3531-3532). _debugger_started guards against a
+        # double start if load_model is called more than once.
+        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            self._start_dump_data()
+
         # Static-kernel cache pool pull: fetch the pooled bundle into the
         # default product dir BEFORE any compilation runs (profile/warmup come
         # after load_model). Main process, rank0-of-pod pulls + barrier; any
@@ -945,6 +973,37 @@ class NPUModelRunner(GPUModelRunner):
                 if isinstance(layer, ACLGraphWrapper):
                     yield layer
 
+    def _start_dump_data(self) -> None:
+        """Begin an msprobe dump window around the model forward.
+
+        No-op when dump is disabled (``self.debugger is None``) or when a
+        window is already open (``self._debugger_started`` guards against
+        double ``start``). Mirrors vllm-ascend model_runner_v1.py:3540-3544.
+        """
+        if self.debugger is None or self._debugger_started:
+            return
+        self.debugger.start(self.model)
+        self._debugger_started = True
+
+    def _finalize_dump_data(self, **kwargs) -> None:
+        """Close the current msprobe dump window and advance the step.
+
+        Called from the ``execute_model`` ``finally`` block on *every*
+        return path, so a complete dataset is captured even when the parent
+        returns early or raises. Only debuggers with a ``stop`` method are
+        stopped here (eager ``PrecisionDebugger`` has one; the graph
+        ``AclGraphDumper`` only exposes ``start``/``step``, so it stays
+        started across steps — matching vllm-ascend model_runner_v1.py
+        :3546-3553).
+        """
+        if self.debugger is None or not self._debugger_started:
+            return
+        if hasattr(self.debugger, "stop"):
+            self.debugger.stop()
+            self._debugger_started = False
+        self.debugger.step(**kwargs)
+
+
     @torch.inference_mode()
     @model_output_decorator
     @maybe_dump_kv("update")
@@ -953,21 +1012,28 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
-        with (switch_torch_device()
-              if self.use_async_scheduling else nullcontext()):
-            current_device = torch.npu.current_device()
-            if intermediate_tensors:
-                tensors = intermediate_tensors.tensors
-                for key in tensors:
-                    tensors[key] = tensors[key].to(current_device)
-            # To avoid a bug of vllm which uses self.drafter in pp stages without a drafter
-            if not hasattr(self, "drafter"):
-                self.drafter = None
-            res = super().execute_model(scheduler_output,
-                                        intermediate_tensors)
-            if self.drafter is None:
-                del self.drafter
-            return self._attach_nan_inf_report(res)
+        self._start_dump_data()
+        try:
+            with (switch_torch_device()
+                  if self.use_async_scheduling else nullcontext()):
+                current_device = torch.npu.current_device()
+                if intermediate_tensors:
+                    tensors = intermediate_tensors.tensors
+                    for key in tensors:
+                        tensors[key] = tensors[key].to(current_device)
+                # To avoid a bug of vllm which uses self.drafter in pp stages without a drafter
+                if not hasattr(self, "drafter"):
+                    self.drafter = None
+                res = super().execute_model(scheduler_output,
+                                            intermediate_tensors)
+                if self.drafter is None:
+                    del self.drafter
+                return self._attach_nan_inf_report(res)
+        finally:
+            # finalize runs on every return path (and on exceptions), so the
+            # dump window opened by _start_dump_data is always closed and the
+            # step advanced — even if super() returns early or raises.
+            self._finalize_dump_data()
 
     @torch.inference_mode
     @model_output_decorator
@@ -1587,7 +1653,10 @@ class NPUModelRunner(GPUModelRunner):
         kv_caches = super().initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
         engram_hash_state = None
         if self.engram_config is not None:
-            engram_hash_state = self.get_model().model.engram_hash
+            model = self.get_model()
+            if hasattr(model, "language_model"):
+                model = model.language_model
+            engram_hash_state = model.model.engram_hash
         if engram_hash_state is not None:
             # group_id indexes the KV group and its matching block table.
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups):

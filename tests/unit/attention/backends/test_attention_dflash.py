@@ -171,3 +171,45 @@ def test_draft_attention_rejects_noncausal_sink_path():
             object(), torch.zeros((1, 2, 4)), None, None, (),
             SimpleNamespace(causal=False), output=torch.empty((1, 2, 4)),
         )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("capturing", [False, True])
+def test_no_sink_prefill_uses_paged_kv_without_swapping_inputs(monkeypatch, causal, capturing):
+    monkeypatch.setattr(backend.NPUAttentionBackendImpl, "SHARE_MASK_TRIL_SPARSE", torch.zeros(1))
+    monkeypatch.setattr(backend.NPUAttentionBackendImpl, "_init_cross_layer_shared_ops", lambda self: None)
+    impl = backend.NPUAttentionBackendImpl(2, 4, 0.5, num_kv_heads=1, sink_len=None)
+    monkeypatch.setattr(backend, "model_extra_config", _config(kv_nz=True))
+    monkeypatch.setattr(backend, "get_forward_context", lambda: SimpleNamespace(capturing=capturing))
+    monkeypatch.setattr(backend, "get_nz_dim", lambda **kwargs: 1)
+    scatter = Mock()
+    monkeypatch.setattr(backend.torch_npu, "npu_scatter_pa_kv_cache", scatter)
+    query = torch.ones((2, 2, 4))
+    key, value = torch.zeros((2, 1, 4)), torch.ones((2, 1, 4))
+    cache = (torch.full((1, 4, 32, 1), 2.), torch.full((1, 4, 32, 1), 3.))
+    metadata = backend.NPUMetadata(num_actual_tokens=2, query_start_loc=[0, 2], seq_lens=[2],
+        block_tables=torch.zeros((1, 1), dtype=torch.int32), max_query_len=2,
+        slot_mapping=torch.tensor([0, 1]), causal=causal,
+        is_pure_prefill_without_prefix_and_use_kvnz=True)
+    monkeypatch.setattr(backend.torch_npu, "_npu_fused_infer_attention_score_v2_infer_output", Mock(return_value=(torch.empty_like(query), torch.empty(2))))
+    fused = Mock(return_value=(torch.ones_like(query),))
+    monkeypatch.setattr(backend.torch_npu, "npu_fused_infer_attention_score_v2", fused)
+    task = Mock(side_effect=lambda **kwargs: kwargs["out_tensors"][0].fill_(1.))
+    monkeypatch.setattr(backend, "capture_graph_task", task)
+    sink = Mock(side_effect=AssertionError("DFlash zero-sink must use FIA V2"))
+    monkeypatch.setattr(torch.ops.custom, "npu_fused_infer_attention_sink", sink)
+    layer = SimpleNamespace(_k_scale_float=1., _v_scale_float=1., layer_name="attention")
+    output = torch.empty_like(query)
+    impl.forward(layer, query, key, value, cache, metadata, output=output)
+    kwargs = task.call_args.kwargs["op_kwargs"] if capturing else fused.call_args.kwargs
+    assert kwargs["key"].data_ptr() == cache[0].data_ptr()
+    assert kwargs["value"].data_ptr() == cache[1].data_ptr()
+    assert kwargs["block_table"] is metadata.block_tables
+    assert kwargs["block_size"] == 32
+    assert kwargs["sparse_mode"] == (3 if causal else 0)
+    assert kwargs["atten_mask"] is (backend.NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE if causal else None)
+    if capturing:
+        assert task.call_args.kwargs["op_desc"] is backend.OP_FIA_V2
+    sink.assert_not_called()
+    scatter.assert_called_once()
+    torch.testing.assert_close(output, torch.ones_like(query))

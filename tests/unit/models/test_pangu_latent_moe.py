@@ -87,6 +87,7 @@ def build_moe(monkeypatch, default_vllm_config):
 
     def build(latent=2, norm=True, limit=10, quant=None):
         config = SimpleNamespace(
+            num_hidden_layers=1,
             hidden_size=4,
             n_routed_experts=1,
             n_shared_experts=1,

@@ -328,7 +328,15 @@ class OpenPanguV2MOE(nn.Module):
 
         # Load balancing settings.
         eplb_config = parallel_config.eplb_config
-        self.enable_eplb = parallel_config.enable_eplb
+        # MTP layers are owned by the speculative drafter and are not part of
+        # the target model's redundant-expert EPLB registry.  Preserve the
+        # original EPLB path when no redundant experts are configured, but do
+        # not give MTP layers redundant physical slots because their replica
+        # routing and migration state would be left uninitialized.
+        self.is_mtp_layer = self.layer_idx >= config.num_hidden_layers
+        self.enable_eplb = parallel_config.enable_eplb and not (
+            self.is_mtp_layer and eplb_config.num_redundant_experts > 0
+        )
 
         assert config.n_shared_experts is not None
         intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -348,7 +356,9 @@ class OpenPanguV2MOE(nn.Module):
             os.environ.get('USE_MOE_FORCE_LOAD_BALANCE', 'False').lower() == 'true'
         )
         
-        self.n_redundant_experts = eplb_config.num_redundant_experts
+        self.n_redundant_experts = (
+            eplb_config.num_redundant_experts if self.enable_eplb else 0
+        )
 
         self.aux_load_balance_tensor = torch.arange(
             self.n_routed_experts,
@@ -384,6 +394,12 @@ class OpenPanguV2MOE(nn.Module):
             self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         else:
             self.n_physical_experts = self.n_logical_experts
+        if self.n_physical_experts % self.ep_size != 0:
+            raise ValueError(
+                "The number of physical experts must be divisible by EP size: "
+                f"logical={self.n_logical_experts}, "
+                f"redundant={self.n_redundant_experts}, ep_size={self.ep_size}."
+            )
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
         self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
         self.physical_expert_end = (

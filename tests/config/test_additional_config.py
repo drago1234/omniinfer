@@ -63,6 +63,7 @@ def test_all_supported_keys_present():
         "enable_full_async_rl",
         "combine_block", "npugraph_ex_config",
         "enable_pd_elastic_scaling", "enable_low_latency", "enable_omni_cache",
+        "msprobe_dump_config_path", "msprobe_dump_config",
     }
     assert expected == fields
 
@@ -76,6 +77,8 @@ def test_all_supported_keys_present():
         ("enable_omni_cache", []),
         ("combine_block", True),
         ("npugraph_ex_config", []),
+        ("msprobe_dump_config", "not-a-dict"),
+        ("msprobe_dump_config_path", 0),
     ],
 )
 def test_known_keys_reject_wrong_types(name, value):
@@ -110,3 +113,56 @@ def test_vllm_config_is_parsed_on_each_access():
 
     assert second is not first
     assert second.combine_block == 8
+
+
+# ---------------------------------------------------------------------------
+# msprobe dump config fields (msprobe_dump_config_path / msprobe_dump_config)
+# ---------------------------------------------------------------------------
+
+def test_dump_config_defaults_none():
+    cfg = OmniAdditionalConfig.from_vllm_config(_vllm({}))
+    assert cfg.msprobe_dump_config_path is None
+    assert cfg.msprobe_dump_config is None
+
+
+def test_dump_config_and_path_mutually_exclusive():
+    with pytest.raises(ValueError, match="Only one of"):
+        OmniAdditionalConfig.from_vllm_config(_vllm({
+            "msprobe_dump_config_path": "/data/msprobe_config.json",
+            "msprobe_dump_config": {"task": "statistics"},
+        }))
+
+
+@pytest.mark.parametrize("value", ["/data/cfg.json", "/another/path.json"])
+def test_dump_config_path_passthrough(value):
+    cfg = OmniAdditionalConfig.from_vllm_config(_vllm({
+        "msprobe_dump_config_path": value,
+    }))
+    assert cfg.msprobe_dump_config_path == value
+    assert cfg.msprobe_dump_config is None
+
+
+def test_dump_config_passthrough_dict():
+    inline = {"task": "statistics", "level": "L1"}
+    cfg = OmniAdditionalConfig.from_vllm_config(_vllm({
+        "msprobe_dump_config": inline,
+    }))
+    assert cfg.msprobe_dump_config == inline
+    assert cfg.msprobe_dump_config_path is None
+
+
+@pytest.mark.parametrize("value", ["not-a-dict", 0, False, []])
+def test_dump_config_must_be_dict(value):
+    with pytest.raises(TypeError, match="msprobe_dump_config must be dict"):
+        OmniAdditionalConfig.from_vllm_config(
+            _vllm({"msprobe_dump_config": value})
+        )
+
+
+@pytest.mark.parametrize("value", [0, False, [], {}])
+def test_dump_config_path_must_be_str(value):
+    # Note: {} / [] / 0 / False are not str and not None -> TypeError.
+    with pytest.raises(TypeError, match="msprobe_dump_config_path must be str"):
+        OmniAdditionalConfig.from_vllm_config(_vllm({
+            "msprobe_dump_config_path": value,
+        }))

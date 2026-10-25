@@ -52,6 +52,11 @@ Data flow
     │ combine_block ──► NPUModelRunner block-table sizing    │
     │                                                        │
     │ enable_full_async_rl ──► NPUWorker RL lifecycle        │
+    │                                                        │
+    │ msprobe_dump_config / msprobe_dump_config_path          │
+    │                    ──► NPUModelRunner                    │
+    │                       msprobe precision debugger        │
+    │                       (diagnostics/msprobe.py)          │
     └────────────────────────────────────────────────────────┘
 
 Cross-source invariant (validators.omni_cache_consistent, REJECT):
@@ -80,7 +85,7 @@ _POSITIVE_INT_FIELDS = ("combine_block",)
 class OmniAdditionalConfig:
     """Validated omni-npu fields parsed from ``additional_config``.
 
-    Field catalogue (6 fields). "Consumer" lists the actual read site in the
+    Field catalogue (8 fields). "Consumer" lists the actual read site in the
     current tree.
     """
 
@@ -176,6 +181,29 @@ class OmniAdditionalConfig:
     #     are accepted.
     enable_omni_cache: bool = False
 
+    # ------------------------------------------------------------------
+    # msprobe precision debugging (consumed by NPUModelRunner +
+    # diagnostics/msprobe.py)
+    # ------------------------------------------------------------------
+    # Direct path to an msprobe dump config JSON file. When set, the runner
+    # builds a PrecisionDebugger (eager) or AclGraphDumper (graph) around
+    # the resolved path and drives start/stop/step per forward.
+    #
+    # MUTUALLY EXCLUSIVE with ``msprobe_dump_config``: only one may be set.
+    # The dump config schema (task/level/dump_path/rank/step/scope/list/...)
+    # is documented in docs/msprobe_guide.md.
+    msprobe_dump_config_path: str | None = None
+
+    # Inline msprobe dump config dict. When set, it is materialized to
+    # ``.omni_npu/msprobe/msprobe_dump_config.json`` at startup and the
+    # resulting path is handed to the debugger — equivalent to writing the
+    # same JSON to a file and pointing ``msprobe_dump_config_path`` at it.
+    #
+    # MUTUALLY EXCLUSIVE with ``msprobe_dump_config_path``. Must be a real
+    # dict; nested value types are not validated here (msprobe validates
+    # its own schema). Consumer: diagnostics/msprobe.py.resolve_dump_config_path.
+    msprobe_dump_config: Dict[str, Any] | None = None
+
     def __post_init__(self) -> None:
         # Type-check the bool group: JSON "true" (str), 1 (int), None, []
         # are all rejected.
@@ -207,6 +235,37 @@ class OmniAdditionalConfig:
             raise TypeError(
                 "additional_config.npugraph_ex_config must be dict, "
                 f"got {type(self.npugraph_ex_config).__name__}"
+            )
+
+        # msprobe dump config: the two entry points are mutually exclusive
+        # and type-checked. ``msprobe_dump_config`` must be a dict (inline
+        # config to be materialized to a file); ``msprobe_dump_config_path``
+        # must be a str (path to an existing config file). Both ``None``
+        # means msprobe is disabled — the default and the common case.
+        # Mirrors the checks in diagnostics/msprobe.py.resolve_dump_config_path
+        # so a mistake surfaces here, at construction, before any debugger
+        # import.
+        if (
+            self.msprobe_dump_config_path is not None
+            and self.msprobe_dump_config is not None
+        ):
+            raise ValueError(
+                "Only one of additional_config.msprobe_dump_config_path or "
+                "additional_config.msprobe_dump_config can be set."
+            )
+        if self.msprobe_dump_config is not None and not isinstance(
+            self.msprobe_dump_config, dict
+        ):
+            raise TypeError(
+                "additional_config.msprobe_dump_config must be dict, "
+                f"got {type(self.msprobe_dump_config).__name__}"
+            )
+        if self.msprobe_dump_config_path is not None and not isinstance(
+            self.msprobe_dump_config_path, str
+        ):
+            raise TypeError(
+                "additional_config.msprobe_dump_config_path must be str, "
+                f"got {type(self.msprobe_dump_config_path).__name__}"
             )
 
     @classmethod

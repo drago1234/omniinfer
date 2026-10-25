@@ -48,6 +48,7 @@ class SpeculativePatch(VLLMPatch):
 
 
 _origin_hf_config_override = SpeculativeConfig.hf_config_override
+_origin_post_init = SpeculativeConfig.__post_init__
 
 
 @register_patch("OpenPanguV2SpeculativeConfigPatch", SpeculativeConfig)
@@ -56,7 +57,22 @@ _origin_hf_config_override = SpeculativeConfig.hf_config_override
 class PanguV2MoeSpeculativeConfigPatch(VLLMPatch):
     """Patch to add openpangu_v2 -> openpangu_mtp MTP mapping."""
 
-    _attr_names_to_apply = ['hf_config_override']
+    _attr_names_to_apply = ['hf_config_override', '__post_init__']
+
+    def __post_init__(self) -> None:
+        _origin_post_init(self)
+        if self.method != "dspark" or self.draft_model_config is None:
+            return
+        hf_config = self.draft_model_config.hf_config
+        # Upstream rewrites non-Qwen DSpark architectures. AutoConfig still
+        # identifies the PanGu checkpoint after that rewrite.
+        auto_map = getattr(hf_config, "auto_map", {}) or {}
+        if auto_map.get("AutoConfig") == (
+            "configuration_pangu_diffusion_mtp.PanguDiffusionMTPConfig"
+        ):
+            hf_config.model_type = "pangu_diffusion_mtp"
+            hf_config.architectures = ["DFlashPanguDraftModel"]
+            self.update_arch_()
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:

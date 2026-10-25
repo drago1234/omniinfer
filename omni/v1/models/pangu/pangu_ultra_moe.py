@@ -80,6 +80,7 @@ from omni_npu.v1.layers.vocab_parallel_embedding import (
     NPUParallelLMHead,
     NPUVocabParallelEmbedding,
 )
+from omni_npu.attention.backends.utils import SPManager
 
 from .utils import (
     _has_mla_config,
@@ -836,7 +837,7 @@ class OpenPanguModel(PanGuEngramModelMixin, nn.Module):
                     layer._mhc_tail_refs = (None, None, None, False, None)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids, enable_scatter=model_extra_config.parall_config.ena_seq_parallel)
+        return self.embed_tokens(input_ids)
 
     def forward(
         self,
@@ -855,8 +856,14 @@ class OpenPanguModel(PanGuEngramModelMixin, nn.Module):
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
+                if model_extra_config.parall_config.ena_seq_parallel:
+                    sp_manager = SPManager.init_sp(hidden_states.size(0))
+                    hidden_states = sp_manager.slice_tokens(hidden_states)
             else:
-                hidden_states = self.embed_input_ids(input_ids)
+                hidden_states = self.embed_tokens(
+                    input_ids,
+                    enable_scatter=model_extra_config.parall_config.ena_seq_parallel,
+                )
                 if self.use_mhc:
                     hidden_states = hidden_states.repeat(1, self.num_stream)
             residual = None
