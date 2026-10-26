@@ -20,3 +20,7 @@
  ### 配置
  - 云道启动命令，为：bash /path_to_script/cloud_run_v0.sh
  - 云道需要配置的环境变量见ENV.xlsx
+
+## License
+
+Omni_Infer is licensed under the [MIT License](../../LICENSE).
