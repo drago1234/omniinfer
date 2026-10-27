@@ -644,22 +644,19 @@ class EagleProposerPatch(VLLMPatch):
                 )
             slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
 
-            num_tokens = common_attn_metadata.num_actual_tokens
-            num_valid = slot_mapping.numel()
-            slot_buffer = blk_table.slot_mapping.gpu
-
-            # Later draft steps can use fewer tokens than the first pass.
-            # Rebind every group's view to this step's execution size while
-            # retaining its persistent backing storage for graph execution.
-            group_cm = (
-                common_attn_metadata
-                if group.kv_cache_group_id == self.kv_cache_gid
-                else copy(common_attn_metadata)
-            )
-            group_cm.block_table_tensor = blk_table_tensor
-            group_cm.slot_mapping = slot_buffer[:num_tokens]
-            group_cm.slot_mapping[:num_valid].copy_(slot_mapping)
-            group_cm.slot_mapping[num_valid:].fill_(PADDING_SLOT_ID)
+            if group.kv_cache_group_id == self.kv_cache_gid:
+                # Update base CM in-place (preserves current behaviour)
+                common_attn_metadata.block_table_tensor = blk_table_tensor
+                common_attn_metadata.slot_mapping[:slot_mapping.numel()] = slot_mapping
+                group_cm = common_attn_metadata
+            else:
+                group_cm = copy(common_attn_metadata)
+                group_cm.block_table_tensor = blk_table_tensor
+                group_cm.slot_mapping = (
+                    blk_table.slot_mapping.gpu[:common_attn_metadata.num_actual_tokens]
+                )
+                group_cm.slot_mapping[:slot_mapping.numel()] = slot_mapping
+            group_cm.slot_mapping[slot_mapping.numel():] = -1
 
             extra_attn_metadata_args = {}
             if isinstance(builder, NPUMomeAttentionMetadataBuilder):

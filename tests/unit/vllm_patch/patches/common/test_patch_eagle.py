@@ -435,9 +435,9 @@ def _rebuild_proposer(groups, block_tables, *, kv_cache_gid):
 class TestRebuildPerGroupMetadataForStep:
     """``_rebuild_per_group_metadata_for_step`` writes slots into the live buffer.
 
-    Each group's view covers this step's execution tokens, backed by its
-    persistent block-table buffer. Only padding within that view is consumed
-    by this step; storage beyond the view is not part of its metadata.
+    The base group preserves the caller's slot view; non-base groups select
+    an execution-sized view of their own block-table buffer. Each selected
+    view is padded after its valid slots, leaving storage beyond it untouched.
     """
 
     BUFFER_LEN = 8
@@ -628,13 +628,13 @@ def test_dummy_run_respects_prefill_single_step(monkeypatch, prefill_single_step
     assert fake.num_speculative_tokens == 7
 
 
-class TestDraftSlotExecutionSize:
+class TestDraftSlotGroupViews:
     @pytest.mark.parametrize('initial,execution,valid', [
         (2048, 3, 3), (24, 3, 3), (8, 1, 1),
         (2048, 8, 3), (24, 24, 3), (3, 3, 3),
     ])
     @pytest.mark.parametrize('uses_mrope', [False, True])
-    def test_each_group_uses_current_execution_view(self, initial, execution, valid, uses_mrope):
+    def test_base_preserves_caller_view_and_other_uses_execution_view(self, initial, execution, valid, uses_mrope):
         # Base group is deliberately group 1, with a different block size.
         capacity = max(initial, execution) + 4
         tables = [
@@ -650,7 +650,10 @@ class TestDraftSlotExecutionSize:
         buffers = [torch.full((capacity,), -7, dtype=torch.int64) for _ in tables]
         for table, buffer in zip(proposer.runner.input_batch.block_table, buffers):
             table.slot_mapping.gpu = buffer
-        cm = SimpleNamespace(num_reqs=valid, num_actual_tokens=execution, slot_mapping=buffers[1][:initial])
+        # The caller's base slots need not alias the block table's slot buffer.
+        base_storage = torch.full((capacity,), -9, dtype=torch.int64)
+        base_view = base_storage[:initial]
+        cm = SimpleNamespace(num_reqs=valid, num_actual_tokens=execution, slot_mapping=base_view)
         positions = torch.arange(valid, dtype=torch.int64) + 3
         supplied_positions = torch.stack([positions]*3) if uses_mrope else positions
         exceeds = torch.zeros(valid, dtype=torch.bool)
@@ -669,11 +672,17 @@ class TestDraftSlotExecutionSize:
                 ids = tables[gid].gather(1, (positions // size).view(-1, 1)).view(-1)
                 expected = ids * size + positions % size
                 expected.masked_fill_(exceeds, PADDING_SLOT_ID)
-                assert group_cm.slot_mapping.numel() == execution
-                assert group_cm.slot_mapping.data_ptr() == buffers[gid].data_ptr()
+                if group.is_base:
+                    assert group_cm.slot_mapping is base_view
+                    assert group_cm.slot_mapping.numel() == initial
+                    assert (base_storage[initial:] == -9).all()
+                    assert (buffers[gid] == -7).all()
+                else:
+                    assert group_cm.slot_mapping.numel() == execution
+                    assert group_cm.slot_mapping.data_ptr() == buffers[gid].data_ptr()
+                    assert (buffers[gid][execution:] == -7).all()
                 assert torch.equal(group_cm.slot_mapping[:valid], expected)
                 assert (group_cm.slot_mapping[valid:] == PADDING_SLOT_ID).all()
-                assert (buffers[gid][execution:] == -7).all()
                 assert group_cm.block_table_tensor is tables[gid]
                 assert (group_cm is cm) == (gid == proposer.kv_cache_gid)
             assert set(per_layer) == {'base', 'other'}
