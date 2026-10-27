@@ -41,7 +41,10 @@ for index in "${!head_ip_list[@]}"; do
     fi
     IFS=',' read -ra instance_ip_list <<< "$instance_ip_str"
     if [[ $index -lt $((instance_num - DECODE_INSTANCE_NUM)) ]]; then
-        PREFILL_API_SERVER_LIST+="${instance_ip_list[0]}:${base_api_port},"
+        # prefill.sh sorts each group with `sort -V` and only the first pod in
+        # that order runs vllm serve, so the endpoint must use the sorted head.
+        mapfile -t prefill_head_ips < <(printf '%s\n' "${instance_ip_list[@]}" | sort -V)
+        PREFILL_API_SERVER_LIST+="${prefill_head_ips[0]}:${base_api_port},"
     else
         base_api_port=$((base_api_port + 100))
         for j in "${!instance_ip_list[@]}"; do

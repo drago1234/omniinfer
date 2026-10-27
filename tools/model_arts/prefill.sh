@@ -39,19 +39,8 @@ IFS=',' read -ra first_instance_ip_list <<< "${ip_list[0]}"
 PREFILL_POD_NUM_PER_INSTANCE=${#first_instance_ip_list[@]}
 echo "env_PREFILL_POD_NUM_PER_INSTANCE is ${PREFILL_POD_NUM_PER_INSTANCE}" >> ${LOG_PATH}/server.log 2>&1
 
-IFS=',;' read -ra arr <<< "$all_ip_list"
 cur_pod_ip=${POD_IP}
 echo "cur_pod_ip is ${cur_pod_ip}" >> ${LOG_PATH}/server.log 2>&1
-for index in "${!arr[@]}"; do
-    if [[ "${arr[$index]}" == "$cur_pod_ip" ]]; then
-        if [[ $(($index % $PREFILL_POD_NUM_PER_INSTANCE)) == 0 ]]; then
-            HOST_IP=${cur_pod_ip}
-        else
-            HOST_IP=${arr[$((index / PREFILL_POD_NUM_PER_INSTANCE * PREFILL_POD_NUM_PER_INSTANCE))]}
-        fi
-        break
-    fi
-done
 
 DECODE_INSTANCE_NUM=${DECODE_INSTANCE_NUM:-1}
 IFS=';' read -ra head_ip_list <<< "$all_ip_list"
@@ -91,6 +80,26 @@ if [[ -n "$P_NODE_LIST" ]]; then
     done
     P_NODE_LIST=$(IFS=';'; echo "${p_node_groups[*]}")
     P_NODE_LIST="${P_NODE_LIST};"
+fi
+
+# Derive the instance head from the sorted prefill list so it matches the pod
+# that actually runs the Ray head and vllm serve (see below).
+HOST_IP=""
+if [[ -n "$P_NODE_LIST" ]]; then
+    IFS=';' read -ra p_groups <<< "${P_NODE_LIST%;}"
+    for group in "${p_groups[@]}"; do
+        IFS=',' read -ra group_ips <<< "$group"
+        for ip in "${group_ips[@]}"; do
+            if [[ "$ip" == "$cur_pod_ip" ]]; then
+                HOST_IP=${group_ips[0]}
+                break 2
+            fi
+        done
+    done
+fi
+if [[ -z "$HOST_IP" ]]; then
+    echo "ERROR: cur_pod_ip ${cur_pod_ip} not found in prefill node list ${P_NODE_LIST}" >&2
+    exit 1
 fi
 
 export GLOBAL_DECODE_SERVER_IP_LIST=${SERVER_IP_LIST}
