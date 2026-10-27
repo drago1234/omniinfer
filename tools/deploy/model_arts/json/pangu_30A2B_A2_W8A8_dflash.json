@@ -1,0 +1,164 @@
+{
+  "name": "deploy-hybrid-30B-dflash-12f8",
+  "version": "1.0.0",
+  "description": "",
+  "type": "REAL_TIME",
+  "deploy_type": "SINGLE",
+  "group_configs": [
+    {
+      "advanced_config": {
+        "custom_metrics_path": "",
+        "deploy_timeout_minutes": 60,
+        "dynamic_routing_enable": false,
+        "ems_enable": false,
+        "mooncake_enable": false,
+        "port": 7000,
+        "protocol": "HTTP",
+        "service_secret": {
+          "group_enable": false,
+          "secret_enable": false,
+          "secret_volumes": []
+        },
+        "upgrade_config": {
+          "rolling_update": {
+            "max_surge": "25%",
+            "max_unavailable": "25%"
+          },
+          "type": "ROLLING"
+        }
+      },
+      "count": 1,
+      "deploy_type": "SINGLE",
+      "description": "",
+      "framework": "COMMON",
+      "high_avail_switch": true,
+      "mirror_traffic_enable": false,
+      "mirror_traffic_weight": 0,
+      "model": {
+        "source": "EFS",
+        "mount_path": "/home/ma-user/work/",
+        "efs_sub_path": "/",
+        "read_only": false,
+        "host_cache": true,
+        "source_id": "126f3932-99e6-11f1-b6c6-fa165115aea8",
+        "os_warm_up": false
+      },
+      "pool_id": "pool-0f355a2a-4594-4ff7-9d79-a118021caff5",
+      "priority": 1,
+      "schedule_strategy": "HIGH_AVAILABILITY",
+      "secret_type": "dew",
+      "system_log_dump_enable": false,
+      "unit_configs": [
+        {
+          "cmd": "source ~/.bashrc && bash /home/ma-user/work/s3-asset-g-wl-infra-infer-exp/hwq/ma_2b/1019/hybrid_server.sh  --enable-auto-tool-choice && sleep infinity",
+          "codes": [],
+          "count": 1,
+          "custom_spec": {
+            "arch": "arm64",
+            "ascend": 1,
+            "card": 1,
+            "cpu": 180,
+            "memory": 1300000,
+            "ratio": 1,
+            "type_alias": "Snt9b2"
+          },
+          "dumps": [],
+          "envs": {
+            "HCCL_OP_EXPANSION_MODE": "AIV",
+            "HCCL_BUFFSIZE": "500",
+            "HCCL_DETERMINISTIC": "false",
+            "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+            "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+            "VLLM_DISABLE_COMPILE_CACHE": "1",
+            "VLLM_DISABLE_PYNCCL": "1",
+            "ASCEND_GLOBAL_LOG_LEVEL": "3",
+            "ASCEND_PLATFORM": "A2",
+            "ASCEND_RT_VISIBLE_DEVICES": "0",
+            "OMNI_NPU_VLLM_PATCHES": "ALL",
+            "OMNI_VLLM_PATCHES_DIR": "high_throughout,openpangu_v1_vl",
+            "OMP_NUM_THREADS": "64",
+            "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": "1200",
+            "VLLM_VIDEO_LOADER_BACKEND": "npu_opencv_dynamic",
+            "VLLM_PLUGINS": "omni-npu,omni_pangu_models,omni_npu_patches",
+            "CLEAN_COMPILE_CACHE": "1",
+            "LOG_DIR": "/home/ma-user/work/logs/pangu30b",
+            "OMNI_CUSTOM_MODEL_CONFIG_PATH": "high_throughout/openpangu_v2/openpangu_v2_omni_30b_bf16_a2_hybrid_dflash.json",
+            "VLLM_USE_V2_MODEL_RUNNER": "1",
+
+            "SPECULATIVE_CONFIG": "{\"method\":\"dflash\",\"model\":\"/home/ma-user/work/s3-asset-g-wl-infra-infer-exp/l00935240/ckpt/dflash2_30A2_pr/iter_1600\",\"num_speculative_tokens\":7}",
+            "MODEL_PATH": "/home/ma-user/work/s3-asset-g-wl-infra-infer-exp/l00935240/ckpt/pangu_30BA2B_iter_0002430_W8A8_no_quant_vit",
+            "MODEL_NAME":"pangu-omni-30b-dflash",
+            "MEDIA_IO_KWARGS": "{\"image\":{\"rgba_background_color\":[128,128,128]},\"video\":{\"num_frames\":256,\"sample_fps\":1}}",
+            "HOST": "0.0.0.0",
+            "PORT": "7000",
+            "DTYPE": "bfloat16",
+            "MAX_MODEL_LEN": "32768",
+            "MAX_NUM_BATCHED_TOKENS": "32768",
+            "MAX_NUM_SEQS": "1",
+            "DISTRIBUTED_EXECUTOR_BACKEND": "mp",
+            "GPU_MEMORY_UTILIZATION": "0.80",
+            "TP_SIZE": "1",
+            "DP_SIZE": "1",
+            "TRUST_REMOTE_CODE": "1",
+            "PREFIX_CACHING": "disable",
+            "CHUNKED_PREFILL": "disable",
+            "COMPILATION_CONFIG": "{\"mode\":3,\"cudagraph_mode\":\"FULL\",\"cudagraph_capture_sizes\":[8],\"backend\":\"eager\",\"compile_sizes\":[8]}",
+            "ENABLE_EXPERT_PARALLEL": "1",
+            "API_SERVER_COUNT": "1",
+            "TOOL_CALL_PARSER": "pangu"
+          },
+          "files": [],
+          "group_count": 1,
+          "image": {
+            "category": "CPU",
+            "id": "8ee7aa0f-502f-11f1-aca0-0255ac10016a",
+            "source": "SWR_PRO",
+            "swr_path": "swr-aifm-exp-z7c82y.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a2-cann9.1.0-pta_v2.12.0-ai-infra-op_1.7.0-omni_master-vllm-202610271620:0.0.1"
+          },
+          "models": [],
+          "name": "role-0",
+          "npu_reset_enable": false,
+          "recovery": "Instance",
+          "role": "COMMON",
+          "security_config": {},
+          "termination_grace": {
+            "termination_grace_period_seconds": 30
+          }
+        }
+      ],
+      "weight": 100,
+      "workload_type": "LWS",
+      "name": "deploy-deploy-hybrid-30B-dflash-12f8"
+    }
+  ],
+  "workspace_id": "0491adff50a74bccbc1abc637c27da1f",
+  "workload_type": "LWS",
+  "runtime_config": {
+    "service_invoke": {
+      "port": 7000,
+      "protocol": "HTTPS",
+      "auth_type": "API_KEY",
+      "dynamic_routing_enable": false,
+      "ems_enable": false,
+      "internet_access_enable": true,
+      "intranet_approval_enable": true,
+      "request_retry_enable": false
+    },
+    "service_limit": {
+      "rate_limit": {
+        "num": 200,
+        "unit": "SECONDS"
+      },
+      "request_size_limit": 20,
+      "request_timeout": 1200,
+      "ip_white_list": [],
+      "ip_black_list": []
+    },
+    "service_secret": {
+      "group_enable": false,
+      "secret_enable": false,
+      "secret_volumes": []
+    }
+  }
+}
