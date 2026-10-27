@@ -81,35 +81,34 @@ def ai_infra_engram_proj_gate_kernel(
         pypto.set_semantic_label("value_proj")
         pypto.set_cube_tile_shapes([128, 128], [128, 256], [128, 128])
         embeddings = embeddings_in[offset:offset + tile]
-        value_proj = pypto.matmul(embeddings, proj_weights_value_in, pypto.DT_FP32)
+        value_proj = pypto.matmul(embeddings, proj_weights_value_in, pypto.DT_BF16)
         if return_cache:
             pypto.set_vec_tile_shapes(first_axis, h)
-            value_bf16 = pypto.cast(value_proj, pypto.DT_BF16)
-            value_cache_out[offset:offset + tile] = value_bf16
+            value_cache_out[offset:offset + tile] = value_proj
 
         # ── 逐头 key/query/gate/output ──
         for m_idx in pypto.loop(m):
             pypto.set_semantic_label("key_proj")
             pypto.set_cube_tile_shapes([128, 128], [128, 256], [128, 128])
             embeddings = embeddings_in[offset:offset + tile]
-            key_proj = pypto.matmul(embeddings, proj_weights_key_in[m_idx], pypto.DT_FP32)
+            key_proj = pypto.matmul(embeddings, proj_weights_key_in[m_idx], pypto.DT_BF16)
             if return_cache:
                 pypto.set_vec_tile_shapes(first_axis, h)
-                key_bf16 = pypto.cast(key_proj, pypto.DT_BF16)
-                key_cache_out[offset:offset + tile, m_idx] = key_bf16
+                key_cache_out[offset:offset + tile, m_idx] = key_proj
 
             pypto.set_semantic_label("score")
             pypto.set_vec_tile_shapes(first_axis, h)
+            key_proj_fp32 = pypto.cast(key_proj, pypto.DT_FP32)
             query = hidden_states_in[offset:offset + tile, m_idx]
             query_fp32 = pypto.cast(query, pypto.DT_FP32)
-            rms_k = pypto.sqrt(pypto.sum(key_proj * key_proj, dim=-1) * (1.0 / h) + eps)
+            rms_k = pypto.sqrt(pypto.sum(key_proj_fp32 * key_proj_fp32, dim=-1) * (1.0 / h) + eps)
             rms_q = pypto.sqrt(pypto.sum(query_fp32 * query_fp32, dim=-1) * (1.0 / h) + eps)
             pypto.set_pass_options(sg_set_scope=1)
             gamma_key = pypto.cast(gamma_key_in[m_idx:m_idx + 1], pypto.DT_FP32)
             gamma_query = pypto.cast(gamma_query_in[m_idx:m_idx + 1], pypto.DT_FP32)
             gamma_qk = gamma_key * gamma_query
             pypto.set_pass_options(sg_set_scope=-1)
-            prod = (key_proj * query_fp32) * gamma_qk
+            prod = (key_proj_fp32 * query_fp32) * gamma_qk
             score = pypto.div(pypto.div(pypto.sum(prod, dim=-1), (rms_k * rms_q),
                                         pypto.PrecisionType.INTRINSIC), sqrt_h, pypto.PrecisionType.INTRINSIC)
             if return_cache:
@@ -123,7 +122,8 @@ def ai_infra_engram_proj_gate_kernel(
                 gate_cache_out[offset:offset + tile, m_idx] = gate
             gate_unsq = gate.unsqueeze(-1)
             pypto.set_vec_tile_shapes(first_axis, h)
-            out = pypto.cast(gate_unsq * value_proj, pypto.DT_BF16)
+            value_proj_fp32 = pypto.cast(value_proj, pypto.DT_FP32)
+            out = pypto.cast(gate_unsq * value_proj_fp32, pypto.DT_BF16)
             output[offset:offset + tile, m_idx] = out
 
 
@@ -146,7 +146,7 @@ def ai_infra_engram_proj_gate(
       proj_weights_value: [de, h]           BF16
       gamma_key:          [m, h]            BF16
       gamma_query:        [m, h]            BF16
-      return_cache: False skips full-sized caches and uses four minimal, uninitialized placeholders.
+      return_cache:            推理场景置 False, 跳过 4 个 cache 的分配/写出/回传, 节省开销
 
     Returns:
       5 元组 (output, score_cache, key_cache, value_cache, gate_cache)
@@ -175,14 +175,12 @@ def ai_infra_engram_proj_gate(
         gate_cache = torch.zeros([b * s, m], dtype=torch.float32, device=device)
         score_cache = torch.zeros([b * s, m], dtype=torch.float32, device=device)
     else:
-        # The inference kernel neither reads nor writes these minimal placeholders.
-        key_cache = torch.empty([1], dtype=torch.bfloat16, device=device)
-        value_cache = torch.empty([1], dtype=torch.bfloat16, device=device)
-        gate_cache = torch.empty([1], dtype=torch.float32, device=device)
-        score_cache = torch.empty([1], dtype=torch.float32, device=device)
-    # Every valid output element is written by the kernel. Keep training unchanged.
-    allocate_output = torch.zeros if return_cache else torch.empty
-    output = allocate_output([b * s, m, h], dtype=torch.bfloat16, device=device)
+        # 推理场景: 不分配 cache, 传最小 dummy 占位 (kernel 不生成 cache 写出代码)
+        key_cache = torch.zeros([1], dtype=torch.bfloat16, device=device)
+        value_cache = torch.zeros([1], dtype=torch.bfloat16, device=device)
+        gate_cache = torch.zeros([1], dtype=torch.float32, device=device)
+        score_cache = torch.zeros([1], dtype=torch.float32, device=device)
+    output = torch.zeros([b * s, m, h], dtype=torch.bfloat16, device=device)
 
     ai_infra_engram_proj_gate_kernel(
         hidden_states.view(b * s, m, h),

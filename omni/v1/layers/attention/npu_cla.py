@@ -192,7 +192,9 @@ class CLAReuseLayerMixin:
         swa_attn_kwargs.update(
             prefix=self.cla_swa_attn_name,
             kv_b_proj=self.kv_b_proj_swa,
-            sliding_window=window,
+            # The KV cache spec retains one extra token for Decode to recompute
+            # the last prompt token; attention computation uses cla_swa_gate_window.
+            sliding_window=window + 1,
             page_size_padded=self._cla_swa_page_size_padded(config, cache_config),
             num_extra_reserved_blocks=(
                 model_extra_config.operator_opt_config.num_extra_reserved_blocks

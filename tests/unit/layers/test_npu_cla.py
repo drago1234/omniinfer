@@ -531,7 +531,8 @@ def test_init_cla_reuse_wires_the_local_branch_and_reserves_its_own_keys(
     # Past the real layers and any MTP one, so the cache binder keys it apart.
     assert host.cla_swa_attn_name == f"model.cla_swa_layers.{virtual_idx}.attn"
     swa_kwargs = swa_attn.call_args.kwargs
-    assert swa_kwargs["sliding_window"] == 512 and swa_kwargs["page_size_padded"] == 1024
+    assert swa_kwargs["sliding_window"] == 513 and swa_kwargs["page_size_padded"] == 1024
+    assert host.cla_swa_gate_window == 512
     assert swa_kwargs["num_extra_reserved_blocks"] == 2
 
     expected = (

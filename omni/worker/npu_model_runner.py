@@ -5,6 +5,7 @@ import time
 from collections.abc import Iterable
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import replace
 from typing import TYPE_CHECKING, Optional, Union, Any, TypeAlias, cast
 
 import torch
@@ -230,29 +231,48 @@ class NPUModelRunner(GPUModelRunner):
             local_layers = tuple(layer_idx for layer_idx in self.engram_config.layer_ids if start <= layer_idx < end)
             if not local_layers:
                 self.engram_config = None
-        self.lookback_token_ids = None
-        self._lookback_copy_event = None
+        self.lookback_token_ids = None  # Engram lookback token IDs: CpuGpuBuffer int64 [max_num_reqs, lookback_depth]
+        self._lookback_candidates = None  # column 0 is candidate_start, the remaining are candidate lookback token IDs
+        self._lookback_offsets = None  # fixed relative offsets for lookback token IDs: NPU int64 [lookback_depth]
+        self._lookback_copy_event = None  # npu event to protect CPU buffer reuse until the previous H2D copy completes
 
     def _prepare_lookback_token_ids(self, num_reqs: int) -> torch.Tensor:
-        # Same policy as vLLM's legacy runner: only known prompt IDs come from
-        # CPU; generated history comes from the device slot cache.
+        """Prepare nearest-first lookback_token_ids for Engram n-gram hashing.
+
+        Unknown IDs are -1; generated token IDs come from Engram's device slot cache.
+        Async MTP selects a wider window using corrected NPU positions.
+        """
+        # Finish the previous H2D copy before rewriting its pinned CPU buffer.
         if self._lookback_copy_event is not None:
             self._lookback_copy_event.synchronize()
-        buf = self.lookback_token_ids
-        # CPU tensor, NumPy view, and NPU tensor all have shape [max_num_reqs, lookback_depth].
+        buf = self.lookback_token_ids if self._lookback_candidates is None else self._lookback_candidates
         buf.np.fill(-1)
-        lookback_depth = buf.np.shape[1]
-        starts = self.input_batch.num_computed_tokens_cpu[:num_reqs, None]
-        pos = starts - np.arange(1, lookback_depth + 1)
+        lookback_token_ids_cpu = buf.np if self._lookback_candidates is None else buf.np[:, 1:]
+        candidate_start_cpu = self.input_batch.num_computed_tokens_cpu[:num_reqs, None]
+        pos = candidate_start_cpu - np.arange(1, lookback_token_ids_cpu.shape[1] + 1)
         prompt_lens = self.input_batch.num_prompt_tokens[:num_reqs, None]
         valid = (pos >= 0) & (pos < prompt_lens)
         rows, cols = np.nonzero(valid)
-        buf.np[rows, cols] = self.input_batch.token_ids_cpu[rows, pos[rows, cols]]
-        result = buf.copy_to_gpu(self.max_num_reqs)
+        lookback_token_ids_cpu[rows, cols] = self.input_batch.token_ids_cpu[rows, pos[rows, cols]]
+        if self._lookback_candidates is not None:
+            buf.np[:num_reqs, 0] = candidate_start_cpu[:, 0]
+        copied = buf.copy_to_gpu(self.max_num_reqs)
         if self._lookback_copy_event is None:
             self._lookback_copy_event = torch.npu.Event()
         self._lookback_copy_event.record()
-        return result
+        if self._lookback_candidates is None:
+            return copied
+
+        lookback_token_ids = self.lookback_token_ids.gpu
+        lookback_token_ids.fill_(-1)
+        if num_reqs:
+            # CPU counts assume all drafts accepted; NPU counts already exclude rejections.
+            candidate_start = copied[:num_reqs, 0]
+            candidate_lookback_token_ids = copied[:num_reqs, 1:]
+            delta = candidate_start - self.num_computed_tokens[:num_reqs]
+            columns = delta[:, None] + self._lookback_offsets
+            torch.gather(candidate_lookback_token_ids, 1, columns, out=lookback_token_ids[:num_reqs])
+        return lookback_token_ids
 
     def _init_model_kwargs(self, num_reqs: int | None = None) -> dict[str, Any]:
         model_kwargs = super()._init_model_kwargs()
@@ -443,25 +463,24 @@ class NPUModelRunner(GPUModelRunner):
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor]:
-        tensors = super()._allocate_kv_cache_tensors(kv_cache_config)
         if (
             self.vllm_config.kv_transfer_config is not None
-            and model_extra_config.operator_opt_config.use_ai_infra_fa_for_gpt_oss_sink
+            and not model_extra_config.operator_opt_config.use_noncontiguous_kv
         ):
-            # HCCL IPC export requires 2 MiB alignment for these KV buffers.
+            # Let the parent allocate once with padding for HCCL IPC alignment.
             alignment = 2 * 1024 * 1024
-            for tensor in tensors.values():
-                if tensor.data_ptr() % alignment:
-                    backing = torch.empty(
-                        tensor.numel() + alignment - 1,
-                        dtype=tensor.dtype, device=tensor.device,
-                    )
-                    offset = -backing.data_ptr() % alignment
-                    aligned = backing[offset:offset + tensor.numel()]
-                    aligned.copy_(tensor)
-                    # Preserve aliases for layers sharing the same raw tensor.
-                    tensor.set_(aligned)
-        return tensors
+            padded_config = replace(kv_cache_config, kv_cache_tensors=[
+                replace(tensor, size=tensor.size + alignment - 1)
+                for tensor in kv_cache_config.kv_cache_tensors
+            ])
+            tensors = super()._allocate_kv_cache_tensors(padded_config)
+            # Adjust each shared tensor once, preserving aliases and storage.
+            for tensor in set(tensors.values()):
+                offset = -tensor.data_ptr() % alignment
+                tensor.set_(tensor[offset:offset + tensor.numel() - alignment + 1])
+            return tensors
+
+        return super()._allocate_kv_cache_tensors(kv_cache_config)
 
     def _reshape_kv_cache_tensors(
         self,
@@ -806,6 +825,12 @@ class NPUModelRunner(GPUModelRunner):
         lookback_depth = getattr(self.get_model(), "token_lookback_depth", 0)
         if lookback_depth:
             self.lookback_token_ids = self._make_buffer(self.max_num_reqs, lookback_depth, dtype=torch.int64)
+            if self.use_async_spec_decode:
+                # Previous-step rejection can shift the history origin by at most num_spec_tokens.
+                self._lookback_candidates = self._make_buffer(
+                    self.max_num_reqs, 1 + lookback_depth + self.num_spec_tokens, dtype=torch.int64,
+                )
+                self._lookback_offsets = torch.arange(lookback_depth, dtype=torch.int64, device=self.device)
 
         if hasattr(self.model, "model"):
             prefetch_post_load_hook = getattr(self.model.model, "prefetch_post_load", None)

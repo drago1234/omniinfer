@@ -36,10 +36,10 @@ logger = init_logger(__name__)
 
 def _sorted_topk_weights(topk_weights: torch.Tensor, expanded_row_idx: torch.Tensor) -> torch.Tensor:
     """Map source token/expert probabilities to sorted rows; -1 denotes remote experts."""
-    return torch.zeros_like(topk_weights, dtype=torch.float32).flatten().scatter_add(
+    return torch.zeros_like(topk_weights).flatten().scatter_add_(
         0,
         expanded_row_idx.flatten().clamp_min(0).long(),
-        topk_weights.float().flatten() * (expanded_row_idx.flatten() >= 0),
+        topk_weights.flatten() * (expanded_row_idx.flatten() >= 0),
     )
 
 

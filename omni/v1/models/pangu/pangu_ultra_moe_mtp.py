@@ -284,7 +284,7 @@ class OpenPanguMTP(nn.Module, SupportsPP):
             name = self._rewrite_spec_layer_name(spec_layer, name)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
+                if f".{weight_name}." not in name:
                     continue
                 # We have mlp.experts[0].gate_proj in the checkpoint.
                 # Since we handle the experts below in expert_params_mapping,
@@ -294,7 +294,7 @@ class OpenPanguMTP(nn.Module, SupportsPP):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
-                name_mapped = name.replace(weight_name, param_name)
+                name_mapped = name.replace(f".{weight_name}.", f".{param_name}.")
 
                 # QKV fusion is optional, fall back to normal
                 # weight loading if it's not enabled

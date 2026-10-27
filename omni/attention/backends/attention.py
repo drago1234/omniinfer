@@ -452,9 +452,7 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata], GptOssSinkMixin):
         use_aicpu_fa_tiling = model_extra_config.operator_opt_config.use_aicpu_fa_tiling
         if self.sink_len is not None or self.use_ai_infra_fa_for_gpt_oss_sink:
             input_layout = "TND"
-            pre_tokens = self.sliding_window if self.sliding_window is not None else 0
-            if self.use_ai_infra_fa_for_gpt_oss_sink:
-                pre_tokens = self.sliding_window - 1 if self.sliding_window is not None else (1 << 31) - 1
+            pre_tokens = self.sliding_window - 1 if self.sliding_window is not None else (1 << 31) - 1
             next_tokens = 0
             block_size = kv_cache[0].shape[-2] if use_kv_nz else kv_cache[0].shape[1]
             key_cache, value_cache = kv_cache

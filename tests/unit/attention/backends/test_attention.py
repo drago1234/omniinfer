@@ -48,11 +48,15 @@ def make_model_extra_config(
     )
 
 
-@pytest.mark.parametrize("num_heads,num_kv_heads", [(24, 4), (6, 1)])
+@pytest.mark.parametrize("num_heads,num_kv_heads,window,pre_tokens", [
+    (24, 4, None, (1 << 31) - 1),
+    (6, 1, 256, 255),
+    (6, 1, 1, 0),
+])
 @pytest.mark.parametrize("capturing", [False, True])
 @pytest.mark.parametrize("kv_nz", [False, True])
 def test_zero_sink_aicpu_uses_device_metadata_without_graph_task_updates(
-    npu_attention_classes, monkeypatch, capturing, kv_nz, num_heads, num_kv_heads,
+    npu_attention_classes, monkeypatch, capturing, kv_nz, num_heads, num_kv_heads, window, pre_tokens,
 ):
     module = npu_attention_classes["attention_module"]
     impl_cls = npu_attention_classes["NPUAttentionBackendImpl"]
@@ -76,7 +80,7 @@ def test_zero_sink_aicpu_uses_device_metadata_without_graph_task_updates(
     monkeypatch.setattr(module, "npu_fused_infer_attention_sink_metadata", metadata_op)
     monkeypatch.setattr(module, "capture_graph_task", graph_task)
     monkeypatch.setattr(torch.ops.custom, "npu_fused_infer_attention_sink", sink_op)
-    impl = impl_cls(num_heads, 128, 128 ** -0.5, num_kv_heads=num_kv_heads, sink_len=0)
+    impl = impl_cls(num_heads, 128, 128 ** -0.5, num_kv_heads=num_kv_heads, sliding_window=window, sink_len=0)
     shape = (2, num_kv_heads * 8, 128, 16) if kv_nz else (2, 128, num_kv_heads * 128)
     cache = (torch.zeros(shape), torch.zeros(shape))
     metadata = types.SimpleNamespace(
@@ -93,6 +97,7 @@ def test_zero_sink_aicpu_uses_device_metadata_without_graph_task_updates(
     assert metadata_args["num_heads_q"] == num_heads
     assert metadata_args["num_heads_kv"] == num_kv_heads
     assert metadata_args["sink_num"] == 0
+    assert metadata_args["pre_tokens"] == pre_tokens
     assert metadata_args["actual_seq_lengths"].dtype == torch.int64
     kwargs = sink_op.call_args.kwargs
     assert kwargs["meta_data"] is meta_tensor
@@ -107,7 +112,8 @@ def test_zero_sink_aicpu_uses_device_metadata_without_graph_task_updates(
         kwargs["actual_seq_kvlen"], metadata.seq_lens.to(torch.int64),
     )
     assert kwargs["sink_number"] == 0
-    assert kwargs["sparse_mode"] == 3
+    assert kwargs["sparse_mode"] == (4 if window is not None else 3)
+    assert kwargs["pre_tokens"] == pre_tokens
     assert kwargs["key"].shape == ((2, num_kv_heads, 8, 128, 16) if kv_nz else shape)
     assert kwargs["key"].data_ptr() == cache[0].data_ptr()
     assert kwargs["value"].shape == kwargs["key"].shape
@@ -799,6 +805,7 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
             args, kwargs = mock_decode.call_args
             self.assertEqual(kwargs["sparse_mode"], 3)
             self.assertEqual(kwargs["sink_number"], 0)
+            self.assertEqual(kwargs["pre_tokens"], (1 << 31) - 1)
             self.assertEqual(kwargs["actual_seq_qlen"], [10])
             self.assertEqual(kwargs['num_query_heads'], 8)
             self.assertEqual(kwargs['num_key_value_heads'], 4)
@@ -865,7 +872,7 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
             )
             kwargs = mock_decode.call_args.kwargs
             self.assertEqual(kwargs["sparse_mode"], 4)
-            self.assertEqual(kwargs["pre_tokens"], 256)
+            self.assertEqual(kwargs["pre_tokens"], 255)
             self.assertEqual(kwargs["next_tokens"], 0)
             self.assertEqual(kwargs["sink_number"], 128)
             self.assertEqual(kwargs["actual_seq_qlen"], [10])

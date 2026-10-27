@@ -64,23 +64,26 @@ class NPUDeepseekScalingRotaryEmbedding(
             self.base
             ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
         )
-        freq_inter = 1.0 / (
-            self.scaling_factor
-            * self.base
-            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
-        )
+        # Avoid rounding from an identity YaRN blend when no scaling is needed.
+        inv_freq = freq_extra
+        if self.scaling_factor != 1:
+            freq_inter = 1.0 / (
+                self.scaling_factor
+                * self.base
+                ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+            )
 
-        low, high = yarn_find_correction_range(
-            self.beta_fast,
-            self.beta_slow,
-            dim,
-            self.base,
-            self.max_position_embeddings,
-        )
-        inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2, dtype=torch.float32).to(
-            device=device
-        )
-        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+            low, high = yarn_find_correction_range(
+                self.beta_fast,
+                self.beta_slow,
+                dim,
+                self.base,
+                self.max_position_embeddings,
+            )
+            inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2, dtype=torch.float32).to(
+                device=device
+            )
+            inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         t = torch.arange(seq_len * self.scaling_factor, device=device, dtype=torch.float32)
