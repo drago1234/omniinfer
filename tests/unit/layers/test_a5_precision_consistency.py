@@ -117,7 +117,7 @@ def test_mla_consistency_core_a5_requires_both_flags(monkeypatch, strong, noncon
         _consistency_config(strong=strong, noncontiguous=noncontiguous),
     )
     fake = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
-    with pytest.raises(AssertionError, match="must be both True"):
+    with pytest.raises(ValueError, match="must be both True"):
         NPUDeepseekMLAAttention._apply_sink_attention_consistency_core(
             fake,
             query=torch.zeros(1, 1, 1),

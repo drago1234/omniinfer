@@ -148,7 +148,9 @@ def _prepare_sink_consistency_metadata(layer, query, kv_cache, q_cumlens, kv_len
     """Validate consistency mode and normalize shared MLA metadata inputs."""
     options = model_extra_config.operator_opt_config
     if not options.use_noncontiguous_kv or not options.enable_precision_strong_consistency:
-        raise AssertionError(
+        # Configuration precondition, not a programming error: report it
+        # as ValueError so callers surface a clear config mismatch.
+        raise ValueError(
             f"use_noncontiguous_kv ({options.use_noncontiguous_kv}) "
             f"and enable_precision_strong_consistency ({options.enable_precision_strong_consistency}) "
             "must be both True."
@@ -1147,9 +1149,16 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         sin: torch.Tensor,  # BNSD
         slots: torch.Tensor | NPUMLAMetadata | None,  # None for dummy_run
         kv_cache: tuple[torch.Tensor] | None,  # None for dummy_run
-        fused_op: bool = True,
         kv_a_layernorm: torch.nn.Module | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:  # k_nope: T1D, k_pe: T1D
+        """Normalise latent KV and write it (plus RoPE) into the MLA cache.
+
+        ``kv_cache`` is ``(nope_cache, rope_cache)``: ``[0]`` holds the latent
+        of width ``L`` and ``[1]`` the RoPE of width ``R``. Both fused kernels
+        take rope before nope, i.e. ``kv_cache[1]`` then ``kv_cache[0]``.
+        Fused execution is decided by configuration only
+        (``enable_kv_rmsnorm_rope_cache``); callers cannot override it.
+        """
         # A CLA layer's local branch normalises with its own gamma.
         kv_a_layernorm = self.kv_a_layernorm if kv_a_layernorm is None else kv_a_layernorm
         R, L = self.qk_rope_head_dim, self.kv_lora_rank
@@ -1162,9 +1171,9 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             latent_kv, cos, sin = latent_kv[:n], cos[:n], sin[:n]
         valid_cache = None not in [kv_cache, slots]
         nope_cache, rope_cache = kv_cache or (None, None)
-        fused_op = fused_op and model_extra_config.operator_opt_config.enable_kv_rmsnorm_rope_cache
+        use_fused_op = model_extra_config.operator_opt_config.enable_kv_rmsnorm_rope_cache
 
-        if valid_cache and fused_op and self.noncontiguous_kv:
+        if valid_cache and use_fused_op and self.noncontiguous_kv:
             k_pe, k_nope = torch.ops.custom.npu_ai_infra_kv_rmsnorm_rope_cache_v2(
                 latent_kv.view(-1, 1, 1, L + R),  # BNSD
                 kv_a_layernorm.weight,
@@ -1181,7 +1190,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
                 quant_mode="none",
                 is_output_kv=True,
             )
-        elif valid_cache and fused_op and self.rope_interleaved:
+        elif valid_cache and use_fused_op and self.rope_interleaved:
             _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
                 latent_kv.view(-1, 1, 1, L + R),  # BNSD
                 kv_a_layernorm.weight,
@@ -1195,7 +1204,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
                 epsilon=kv_a_layernorm.variance_epsilon,
                 cache_mode="PA_NZ" if (self.kv_nz and self.dtype != torch.float16) else "PA",
                 is_output_kv=True,
-            )  # -> [*, pg, 1, L], [*, pg, 1, R], BNSD, BNSD
+            )  # -> rope cache [*, pg, 1, R], nope cache [*, pg, 1, L], k_pe BNSD, k_nope BNSD
         else:
             k_nope, k_pe = torch.split(latent_kv, [L, R], dim=-1)  # TD
             k_nope = kv_a_layernorm(k_nope)  # TD
@@ -1210,7 +1219,6 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
                         assert slots_2d is not None
                         torch.ops.custom.npu_ai_infra_scatter_block_update_(cache, slots_2d, x)
                     else:
-                        assert not self.noncontiguous_kv
                         torch_npu.npu_scatter_nd_update_(
                             cache.view(-1, 1, cache.size(-1)),  # T1D
                             slots.view(-1, 1),  # T1

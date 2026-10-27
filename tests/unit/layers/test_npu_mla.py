@@ -1614,7 +1614,7 @@ def test_kv_norm_rope_cache_truncates_when_slots_shorter_than_latent_kv():
     slots = torch.arange(T_short, dtype=torch.int64)
 
     k_nope, k_pe = NPUDeepseekMLAAttention._kv_norm_rope_cache(
-        fake, latent_kv, cos, sin, slots, kv_cache=None, fused_op=False,
+        fake, latent_kv, cos, sin, slots, kv_cache=None,
     )
     assert k_nope.shape == (T_short, 1, L)
     assert k_pe.shape == (T_short, 1, R)
@@ -2630,8 +2630,8 @@ def test_forward_prefill_standard_passes_metadata_to_chunked_context(monkeypatch
 def test_kv_norm_rope_cache_noncontiguous_batch_invariant_uses_scatter_block_update(
     monkeypatch,
 ):
-    """When enable_kv_rmsnorm_rope_cache is enabled, fused_op is disabled and the non-contiguous
-    cache update falls back to npu_ai_infra_scatter_block_update_."""
+    """When enable_kv_rmsnorm_rope_cache is disabled, the fused path is skipped and the
+    non-contiguous cache update falls back to npu_ai_infra_scatter_block_update_."""
     from omni_npu.v1.layers.attention import npu_mla as mla_mod
     from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 
@@ -3032,7 +3032,7 @@ def test_apply_sink_attention_consistency_core_requires_flags(monkeypatch):
             )
         ),
     )
-    with pytest.raises(AssertionError, match="must be both True"):
+    with pytest.raises(ValueError, match="must be both True"):
         NPUDeepseekMLAAttention._apply_sink_attention_consistency_core(
             fake,
             query=torch.zeros(1, 1, 1),

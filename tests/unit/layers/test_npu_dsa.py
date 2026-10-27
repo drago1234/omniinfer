@@ -325,6 +325,174 @@ def test_forward_decode_a5_multistream_runs_three_stream_pipeline(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("split_q_up_in_multistream", [True, False])
+def test_forward_decode_multistream_runs_two_stream_pipeline(
+    monkeypatch, split_q_up_in_multistream
+):
+    from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
+    from omni_npu.v1.layers.attention.npu_dsa import (
+        NPUDeepseekSparseAttention,
+    )
+
+    submitted = []
+    core_limits = []
+    main_stream = object()
+    side_stream = object()
+
+    configure_multistream_npu(monkeypatch, submitted, core_limits, main_stream)
+    monkeypatch.setattr(
+        dsa_mod,
+        "model_extra_config",
+        SimpleNamespace(
+            operator_opt_config=SimpleNamespace(
+                enable_precision_strong_consistency=True,
+            ),
+        ),
+    )
+
+    def mark(name, result):
+        submitted.append(name)
+        return result
+
+    indexer = SimpleNamespace(
+        n_head=1,
+        head_dim=3,
+        wq_b=make_marked_constant(mark, "indexer_q", (torch.zeros(2, 3),)),
+        wk=make_marked_constant(mark, "indexer_k", (torch.zeros(2, 3),)),
+        k_norm=make_marked_input(mark, "indexer_k_norm"),
+        _apply_rope=make_marked_input(mark, "indexer_rope"),
+        _update_cache=make_marked_constant(mark, "indexer_cache", None),
+        weights_proj=make_marked_constant(
+            mark, "indexer_weights", (torch.ones(2, 1),)
+        ),
+        weights_scale=2.0,
+        softmax_scale=0.5,
+        _apply_lightning_indexer=make_marked_constant(
+            mark,
+            "lightning_indexer",
+            torch.zeros(2, 1, 2, dtype=torch.int32),
+        ),
+    )
+
+    fake = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    fake.split_q_up_in_multistream = split_q_up_in_multistream
+    fake.noncontiguous_kv = False
+    fake.side_stream = side_stream
+    fake.num_local_heads = 1
+    fake.qk_nope_head_dim = 4
+    fake.qk_rope_head_dim = 2
+    fake.indexer = indexer
+    fake.q_a_proj = make_marked_constant(mark, "q_a", (torch.zeros(2, 3),))
+    mome_args = []
+
+    def maybe_mome_q(value, get_mome_args):
+        submitted.append("q_mome")
+        mome_args.append(get_mome_args())
+        return value
+
+    fake._maybe_mome_q = maybe_mome_q
+    fake.q_a_layernorm = make_marked_input(mark, "q_norm")
+    fake.q_b_nope_proj = make_marked_constant(
+        mark, "q_b_nope", (torch.zeros(2, 4),)
+    )
+    fake.q_b_pe_proj = make_marked_constant(
+        mark, "q_b_pe", (torch.zeros(2, 2),)
+    )
+    fake._q_nope_absorb = make_marked_input(mark, "q_nope_absorb")
+    fake._q_absorb = make_marked_constant(
+        mark, "q_absorb", (torch.ones(2, 1, 4), torch.ones(2, 1, 2))
+    )
+    fake._apply_rope = make_marked_input(mark, "q_rope")
+    fake.kv_a_proj_with_mqa = make_marked_constant(
+        mark, "kv_a", (torch.zeros(2, 6),)
+    )
+    fake._maybe_mome_kv = make_marked_input(mark, "kv_mome")
+    fake._get_li_caches = MagicMock(return_value=(None, None))
+    kv_cache_calls = []
+
+    def kv_norm_rope_cache(kv, cos, sin, attn_metadata, cache):
+        submitted.append("kv_rope_cache")
+        kv_cache_calls.append((kv, cos, sin, attn_metadata, cache))
+
+    fake._kv_norm_rope_cache = kv_norm_rope_cache
+    fake._apply_sink_offset = make_marked_input(mark, "sink_offset")
+    fake._apply_attn_absorb = make_marked_constant(
+        mark, "attention", torch.ones(2, 1, 4)
+    )
+    fake._decode_attn_epilog = make_marked_input(mark, "epilog")
+
+    metadata = SimpleNamespace(
+        query_cumlens=torch.tensor([0, 1, 2], dtype=torch.int64),
+        seq_lens=torch.tensor([8, 9], dtype=torch.int64),
+        block_table=torch.zeros(2, 1, dtype=torch.int32),
+    )
+    kv_cache = (object(), object(), object())
+    raw = torch.zeros(2, 4)
+
+    with patch.object(torch.Tensor, "record_stream", return_value=None):
+        output, next_topk_indices = (
+            NPUDeepseekSparseAttention._forward_decode_multistream(
+                fake,
+                x=raw,
+                cos=torch.zeros(2, 1, 1, 2),
+                sin=torch.zeros(2, 1, 1, 2),
+                attn_metadata=metadata,
+                kv_cache=kv_cache,
+                pd_mixed_flag=2,
+            )
+        )
+
+    assert torch.equal(output, torch.ones(2, 1, 4))
+    assert torch.equal(
+        next_topk_indices,
+        torch.zeros(2, 1, 2, dtype=torch.int32),
+    )
+    assert mome_args == [{"force_decode": False, "short_prefill": True}]
+    q_up_ops = (
+        ["q_b_nope", "q_b_pe", "q_nope_absorb", "q_rope"]
+        if split_q_up_in_multistream
+        else ["q_absorb"]
+    )
+    assert [entry for entry in submitted if isinstance(entry, str)] == [
+        "record",  # input_ready: main -> side
+        "q_a",
+        "q_mome",
+        "q_norm",
+        "record",  # q_lora_ready: main -> side
+        "indexer_k",
+        "indexer_k_norm",
+        "indexer_weights",
+        "record",  # indexer_kw_ready: main -> side
+        "kv_a",
+        "kv_mome",
+        "record",  # kv_ready: side -> main
+        "indexer_q",
+        "indexer_rope",
+        "indexer_rope",
+        "indexer_cache",
+        "lightning_indexer",
+        "record",  # side_done: side -> main
+        *q_up_ops,
+        "kv_rope_cache",
+        "sink_offset",
+        "attention",
+        "epilog",
+    ]
+    assert [entry for entry in submitted if not isinstance(entry, str)] == [
+        ("wait", side_stream),  # side waits for input_ready
+        ("wait", side_stream),  # side waits for q_lora_ready
+        ("wait", side_stream),  # side waits for indexer_kw_ready
+        ("wait", main_stream),  # main waits for kv_ready
+        ("wait", main_stream),  # main waits for side_done
+    ]
+    assert core_limits == [(16, 24), (8, 24), (20, 40), (12, 24)]
+    # L-30: the fused-op switch is config-driven, callers pass no fused_op.
+    assert len(kv_cache_calls) == 1
+    assert kv_cache_calls[0][3] is metadata
+    assert kv_cache_calls[0][4] is kv_cache
+
+
+@pytest.mark.unit
 def test_indexer_apply_rope_fusion_op(monkeypatch):
     from omni_npu.v1.layers.attention.npu_dsa import Indexer
 
@@ -1846,6 +2014,40 @@ def test_indexer_update_cache_uses_a5_scatter(monkeypatch):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "ki_len, has_slots, has_cache, expect",
+    [
+        (0, False, False, "noop"),  # dummy_run, nothing wired yet
+        (0, True, True, "noop"),    # no local_kv: nothing to write
+        (0, False, True, "noop"),   # DummyKVSPMaganer fallback: ki is empty
+        (0, True, False, "noop"),   # same, only the slots side is set
+        (3, False, False, "noop"),  # dummy_run with dummy tokens
+        (3, True, False, "raise"),  # a real update must not drop the cache
+        (3, False, True, "raise"),  # nor the slots
+    ],
+)
+def test_indexer_update_cache_requires_both_slots_and_cache(
+    ki_len, has_slots, has_cache, expect
+):
+    from omni_npu.v1.layers.attention.npu_dsa import Indexer
+
+    idx = Indexer.__new__(Indexer)
+    ki = torch.zeros((ki_len, 1, 8))
+    slots_2d = (
+        torch.arange(ki_len, dtype=torch.int64).view(-1, 1) if has_slots else None
+    )
+    ki_cache = torch.zeros((4, 8, 1, 8)) if has_cache else None
+
+    if expect == "raise":
+        with pytest.raises(
+            AssertionError, match="slots_2d and ki_cache must both be None"
+        ):
+            Indexer._update_cache(idx, ki, slots_2d, ki_cache)
+    else:
+        Indexer._update_cache(idx, ki, slots_2d, ki_cache)
+
+
+@pytest.mark.unit
 def test_indexer_noncontiguous_lightning_uses_a5_op(monkeypatch):
     from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
     from omni_npu.v1.layers.attention.npu_dsa import Indexer
@@ -2008,8 +2210,8 @@ def test_post_attn_absorb_a5_uses_transposed_input(monkeypatch):
 def test_kv_norm_rope_cache_noncontiguous_batch_invariant_uses_scatter_block_update(
     monkeypatch,
 ):
-    """When enable_kv_rmsnorm_rope_cache is enabled, fused_op is disabled and the non-contiguous
-    cache update falls back to npu_ai_infra_scatter_block_update_."""
+    """When enable_kv_rmsnorm_rope_cache is disabled, the fused path is skipped and the
+    non-contiguous cache update falls back to npu_ai_infra_scatter_block_update_."""
     from omni_npu.v1.layers.attention import npu_dsa as dsa_mod
     from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
 

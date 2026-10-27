@@ -358,9 +358,18 @@ class Indexer(torch.nn.Module):
     ):
         metadata = slots_2d
         slots_2d = getattr(metadata, "slot_mapping_2d", metadata)
-        if None in [slots_2d, ki_cache] or ki.size(0) == 0:
-            assert (slots_2d is None and ki_cache is None) or ki.size(0) == 0
-            return  # dummy_run or no local_kv
+        # An empty update writes nothing, so it must not depend on the cache
+        # being wired yet: dummy_run, ranks that own no local tokens under KVSP
+        # and the DummyKVSPMaganer fallback (local_slots_2d is None there) all
+        # land here with ki.size(0) == 0.
+        if ki.size(0) == 0:
+            return
+        # dummy_run leaves both sides absent; a non-empty update needs both.
+        if slots_2d is None or ki_cache is None:
+            assert slots_2d is None and ki_cache is None, (
+                "slots_2d and ki_cache must both be None"
+            )
+            return
         assert slots_2d.dim() == 2 and ki.dim() in [2, 3] and ki_cache.dim() in [3, 4]
         assert slots_2d.size(0) == ki.size(0)
 
@@ -590,6 +599,19 @@ class Indexer(torch.nn.Module):
             ki_scale_cache=ki_scale_cache,
         )
         return tok_idx, ki
+
+
+# Core budgets for the ``limit_core_num(Cube, Vector)`` scopes in
+# ``_forward_decode_multistream``: the first value is the cube-core budget and
+# the second the vector-core budget granted to the scope. Tuning these trades
+# core utilization between the two streams; keep each pair aligned with the
+# workload of its scope.
+_MULTISTREAM_PROLOG_CORE_NUM = (16, 24)
+# Scope covers the latent-KV projection as well as the indexer key/query
+# projection and its cache update.
+_MULTISTREAM_KV_INDEXER_CORE_NUM = (8, 24)
+_MULTISTREAM_INDEXER_CORE_NUM = (20, 40)
+_MULTISTREAM_Q_ABSORB_CORE_NUM = (12, 24)
 
 
 class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Module):
@@ -1125,7 +1147,6 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         sin: torch.Tensor,  # BNSD
         slots: torch.Tensor | NPUDSAMetadata | None,  # None for dummy_run
         kv_cache: tuple[torch.Tensor] | None,  # None for dummy_run
-        fused_op: bool = True,
         kv_a_layernorm: torch.nn.Module | None = None,
         packed_kv: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:  # k_nope: T1D, k_pe: T1D
@@ -1141,10 +1162,15 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         valid_cache = None not in [kv_cache, slots]
         if latent_kv.size(0) == 0:  # no local_kv
             return cos.new_zeros(0, 1, L), cos.new_zeros(0, 1, R)
-        # Quantized packed caches use explicit per-tile packing below.
-        fused_op = fused_op and model_extra_config.operator_opt_config.enable_kv_rmsnorm_rope_cache and not is_c8_cache
+        # Quantized packed (C8) caches always take the explicit per-tile packing
+        # path below, so the fused-op switch does not apply to them.
+        use_fused_op = (
+            model_extra_config.operator_opt_config.enable_kv_rmsnorm_rope_cache
+            and not is_c8_cache
+        )
 
-        if valid_cache and fused_op and packed_kv:
+        if valid_cache and use_fused_op and packed_kv:
+            # Packed layout: one cache tensor holds latent (L) + RoPE (R).
             assert kv_cache[0].size(-1) == L + R
             k_pe, k_nope = torch.ops.custom.npu_ai_infra_kv_rmsnorm_rope_cache_v2(
                 latent_kv.view(-1, 1, 1, L + R),  # BNSD
@@ -1162,7 +1188,8 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 quant_mode="none",
                 is_output_kv=True,
             )
-        elif valid_cache and fused_op and self.rope_interleaved:
+        elif valid_cache and use_fused_op and self.rope_interleaved:
+            # Dense layout: kv_cache[0] = nope (L), kv_cache[1] = rope (R).
             _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
                 latent_kv.view(-1, 1, 1, L + R),  # BNSD
                 kv_a_layernorm.weight,
@@ -1174,13 +1201,14 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 epsilon=kv_a_layernorm.variance_epsilon,
                 cache_mode="PA_NZ" if (self.kv_nz and self.dtype != torch.float16) else "PA",
                 is_output_kv=True,
-            )  # -> [*, pg, 1, L], [*, pg, 1, R], BNSD, BNSD
+            )  # -> rope cache [*, pg, 1, R], nope cache [*, pg, 1, L], k_pe BNSD, k_nope BNSD
         else:
             k_nope, k_pe = torch.split(latent_kv, [L, R], dim=-1)  # TD
             k_nope = kv_a_layernorm(k_nope)  # TD
             k_pe = self._apply_rope(k_pe, cos, sin)  # TD
             if valid_cache:
                 if is_c8_cache:
+                    # Quantized packed cache: per-tile scatter of nope and rope.
                     assert slots_2d is not None or slots is not None
                     self._scatter_c8_kv_cache(k_nope, k_pe, kv_cache, slots, slots_2d)
                 elif self.on_ascend950 and self.noncontiguous_kv:
@@ -1192,15 +1220,18 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                         torch_npu.npu_scatter_nd_update_(kv_cache[0], slots_2d, k_nope)
                         torch_npu.npu_scatter_nd_update_(kv_cache[1], slots_2d, k_pe)
                 elif packed_kv:
+                    # Packed layout: nope+rope written together into kv_cache[0].
                     assert slots_2d is not None
                     slot_indices = slots_2d
                     kv = torch.cat([k_nope, k_pe], dim=-1)
                     torch.ops.custom.npu_ai_infra_scatter_block_update_(kv_cache[0], slot_indices, kv)
                 elif self.noncontiguous_kv:
+                    # Dense layout, block scatter: kv_cache[0] nope, kv_cache[1] rope.
                     assert slots_2d is not None
                     torch.ops.custom.npu_ai_infra_scatter_block_update_(kv_cache[0], slots_2d, k_nope)
                     torch.ops.custom.npu_ai_infra_scatter_block_update_(kv_cache[1], slots_2d, k_pe)
                 else:
+                    # Dense layout, dense scatter: kv_cache[0] nope, kv_cache[1] rope.
 
                     def cache_kv(x: torch.Tensor, cache: torch.Tensor):
                         torch_npu.npu_scatter_nd_update_(
@@ -1584,7 +1615,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             return self._rescale_gpt_oss_sink_output(attn_out, softmax_lse, self.gpt_oss_sink, "TND")
 
         if self.noncontiguous_kv:
-            assert self.param_sink_number > 1
+            assert self.param_sink_number > 0
             if model_extra_config.operator_opt_config.enable_precision_strong_consistency:
                 return self._apply_attention_rescale_pioneer(
                     q_nope, q_pe, q_cumlens, kv_lens,
@@ -2128,7 +2159,16 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         topk_indices_buffer: torch.Tensor | None = None,
         pd_mixed_flag: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Overlap attention Q/KV-cache work with the complete indexer path."""
+        """Overlap attention Q/KV-cache work with the complete indexer path.
+
+        Event DAG, one event per cross-stream dependency:
+
+        - ``input_ready`` (main -> side): x / cos / sin ready for side-stream ops.
+        - ``q_lora_ready`` (main -> side): q_lora ready for the indexer query path.
+        - ``indexer_kw_ready`` (main -> side): indexer_k / indexer_weights ready.
+        - ``kv_ready`` (side -> main): kv ready for ``_kv_norm_rope_cache``.
+        - ``side_done`` (side -> main): topk_idx ready for the decode epilog.
+        """
 
         q_cumlens = attn_metadata.query_cumlens.to(torch.int32)
         kv_lens = attn_metadata.seq_lens.to(torch.int32)
@@ -2146,17 +2186,17 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         main_stream = torch.npu.current_stream()
         side_stream = self.side_stream
         input_ready = torch.npu.Event()
-        input_ready.record()
+        input_ready.record()  # main -> side
         x.record_stream(side_stream)
         cos.record_stream(side_stream)
         sin.record_stream(side_stream)
 
-        with torch.npu.npugraph_ex.scope.limit_core_num(16, 24):
+        with torch.npu.npugraph_ex.scope.limit_core_num(*_MULTISTREAM_PROLOG_CORE_NUM):
             q_lora = self.q_a_proj(x)[0]
             q_lora = self._maybe_mome_q(q_lora, get_mome_args)
             q_lora = self.q_a_layernorm(q_lora)
             q_lora_ready = torch.npu.Event()
-            q_lora_ready.record()
+            q_lora_ready.record()  # main -> side
             q_lora.record_stream(side_stream)
 
             indexer_k = self.indexer.wk(x)[0]
@@ -2167,21 +2207,21 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                     indexer_weights * self.indexer.weights_scale * self.indexer.softmax_scale
                 )
             indexer_kw_ready = torch.npu.Event()
-            indexer_kw_ready.record()
+            indexer_kw_ready.record()  # main -> side
             indexer_k.record_stream(side_stream)
             indexer_weights.record_stream(side_stream)
 
         kv_ready = torch.npu.Event()
 
         with torch.npu.stream(side_stream):
-            input_ready.wait(side_stream)
-            with torch.npu.npugraph_ex.scope.limit_core_num(8, 24):
+            input_ready.wait(side_stream)  # side waits for main's x / cos / sin
+            with torch.npu.npugraph_ex.scope.limit_core_num(*_MULTISTREAM_KV_INDEXER_CORE_NUM):
                 kv = self.kv_a_proj_with_mqa(x)[0]
                 kv = self._maybe_mome_kv(kv, get_mome_args)
                 kv.record_stream(main_stream)
-                kv_ready.record()
+                kv_ready.record()  # side -> main
 
-                q_lora_ready.wait(side_stream)
+                q_lora_ready.wait(side_stream)  # side waits for main's q_lora
                 indexer_q = self.indexer.wq_b(q_lora)[0].view(
                     -1, self.indexer.n_head, self.indexer.head_dim
                 )
@@ -2190,16 +2230,16 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 indexer_kw_ready.wait(side_stream)
                 indexer_k = self.indexer._apply_rope(indexer_k, cos, sin)
                 self.indexer._update_cache(indexer_k, attn_metadata, ki_cache, ki_scale_cache)
-            with torch.npu.npugraph_ex.scope.limit_core_num(20, 40):
+            with torch.npu.npugraph_ex.scope.limit_core_num(*_MULTISTREAM_INDEXER_CORE_NUM):
                 topk_idx = self.indexer._apply_lightning_indexer(
                     indexer_weights, indexer_q, ki_cache,
                     q_cumlens, kv_lens, block_table, ki_scale_cache,
                     metadata_caller="decode",
                 )
             side_done = torch.npu.Event()
-            side_done.record()
+            side_done.record()  # side -> main
 
-        with torch.npu.npugraph_ex.scope.limit_core_num(12, 24):
+        with torch.npu.npugraph_ex.scope.limit_core_num(*_MULTISTREAM_Q_ABSORB_CORE_NUM):
             if self.split_q_up_in_multistream:
                 q_nope = self.q_b_nope_proj(q_lora)[0].view(
                     -1, self.num_local_heads, self.qk_nope_head_dim
@@ -2211,9 +2251,9 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 q_pe = self._apply_rope(q_pe, cos, sin)
             else:
                 q_nope, q_pe = self._q_absorb(q_lora, cos, sin)
-            kv_ready.wait(main_stream)
+            kv_ready.wait(main_stream)  # main waits for side's kv
             self._kv_norm_rope_cache(kv, cos, sin, attn_metadata, kv_cache)
-        side_done.wait(main_stream)
+        side_done.wait(main_stream)  # main waits for side's topk_idx
         topk_idx.record_stream(main_stream)
 
         return self._finish_multistream_decode(
