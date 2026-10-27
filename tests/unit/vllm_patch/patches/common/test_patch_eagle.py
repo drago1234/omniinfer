@@ -217,6 +217,69 @@ def test_mtp_proposal_counts_each_draft_forward(monkeypatch, num_speculative_tok
     assert fake.model.call_count == num_speculative_tokens
     assert fake.mtp_exec_count == num_speculative_tokens
 
+@pytest.mark.unit
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_mtp_preserves_target_query_lengths_until_async_copy_finishes(
+    monkeypatch, batch_size,
+):
+    num_tokens = batch_size * 4
+    # Keep a view, as an outstanding H2D transfer would. Include a padded row.
+    target_cpu = torch.tensor([4 * i for i in range(batch_size + 1)] + [num_tokens])
+    pending_copy_source = target_cpu[:]
+    expected_target = target_cpu.clone()
+    cm = SimpleNamespace(
+        query_start_loc_cpu=target_cpu,
+        query_start_loc=target_cpu.clone(),
+        seq_lens=torch.full((batch_size + 1,), 20),
+        _seq_lens_cpu=None,
+        _num_computed_tokens_cpu=None,
+        slot_mapping=torch.zeros(num_tokens),
+    )
+    fake = _fake_proposer(cm)
+    fake.method = "mtp"
+    fake.n_predict = 1
+    fake.uses_mrope = False
+    fake.allowed_attn_types = None
+    fake.parallel_drafting = False
+    fake.max_model_len = 1024
+    fake.positions = torch.arange(num_tokens)
+    fake.arange = torch.arange(num_tokens + 1)
+    fake.token_arange_np = fake.arange.numpy()
+    fake.runner.batch_execution_and_padding_state = (
+        CUDAGraphMode.FULL, SimpleNamespace(num_tokens=num_tokens), None,
+    )
+    fake.model = MagicMock(return_value=torch.zeros(num_tokens, 2))
+    fake.model_returns_tuple = lambda: False
+    indices = torch.arange(3, num_tokens, 4)
+    fake.set_inputs_first_pass = MagicMock(return_value=(num_tokens, indices, cm))
+    fake.build_model_inputs_first_pass = MagicMock(return_value=(
+        {"input_ids": None, "inputs_embeds": torch.zeros(num_tokens, 2)}, num_tokens,
+    ))
+    fake._get_slot_mapping = MagicMock(return_value=cm.slot_mapping)
+    fake._sample_draft_tokens = MagicMock(return_value=(torch.ones(batch_size), None))
+
+    class MetadataReady(Exception):
+        pass
+
+    fake._rebuild_per_group_metadata_for_step = MagicMock(side_effect=MetadataReady)
+    monkeypatch.setattr(eagle_mod, "set_forward_context", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(eagle_mod, "get_forward_context", lambda: SimpleNamespace())
+    with pytest.raises(MetadataReady):
+        EagleProposerPatch.propose(
+            fake, num_speculative_tokens=3,
+            target_token_ids=torch.zeros(num_tokens, dtype=torch.int64),
+            target_positions=fake.positions,
+            target_hidden_states=torch.zeros(num_tokens, 2),
+            next_token_ids=torch.zeros(batch_size, dtype=torch.int64),
+            token_indices_to_sample=indices,
+            common_attn_metadata=cm, sampling_metadata=SimpleNamespace(),
+        )
+
+    assert torch.equal(pending_copy_source, expected_target)
+    assert cm.query_start_loc_cpu.tolist() == list(range(batch_size + 1)) + [batch_size]
+    assert torch.equal(cm.query_start_loc, cm.query_start_loc_cpu)
+
+
 # --------------------------------------------------------------------------
 # draft attention groups: which one is the base, and what step0 passes down
 # --------------------------------------------------------------------------
