@@ -235,7 +235,6 @@
         export TORCH_COMPILE_DISABLE=0
         export VLLM_CACHE_ROOT='./graph_cache'
         export TASK_QUEUE_ENABLE=1
-        export LOCAL_WORLD_SIZE=16
         export HCCL_SOCKET_IFNAME=enp23s0f3
         # export OMNI_CACHE_V2_DIAGNOSTICS=3
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True

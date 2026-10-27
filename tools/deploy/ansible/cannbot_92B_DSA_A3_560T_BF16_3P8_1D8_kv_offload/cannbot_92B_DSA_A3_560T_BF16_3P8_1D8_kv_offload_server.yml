@@ -3,7 +3,7 @@
 #
 # 92B BF16 3P1D — vLLM 0.25.1 (A3)
 # 参数对齐 A2: omni_infer_server_template_performance3P1D_92B_open_A2.yml
-# 保留 A3 差异: 镜像/路径、pd_run.sh、OMNI_* 环境名、16 卡 LOCAL_WORLD_SIZE、kv_offload
+# 保留 A3 差异: 镜像/路径、pd_run.sh、OMNI_* 环境名、kv_offload
 # Inventory: omni_infer_inventory_used_for_3P8_1D8.yml
 ---
 - name: Run PanguV2 92B BF16 3P1D Prefill, Decode, and Omni Proxy (vllm 0.25.1, A2-aligned).
@@ -108,7 +108,7 @@
 
     # --- Decode：最大图档位 [32] + GPU_UTIL 0.85 + kv_offload ---
     # max-model-len 524288, seqs 8 (=32/(1+MTP3)), batched 2048,
-    # cudagraph FULL [32], npugraph_ex, MTP 3；A3 保持 LOCAL_WORLD_SIZE=16
+    # cudagraph FULL [32], npugraph_ex, MTP 3
     run_server_decode_profile:
       runner: pd_run.sh
       workdir: "{{ container_workspace }}/omniinfer/tools/deploy/start_server"
@@ -144,8 +144,6 @@
         export VLLM_DATA_PARALLEL_EXTERNAL_LB=false
         export VLLM_CACHE_ROOT='./graph_cache'
         export TASK_QUEUE_ENABLE=1
-        # A3 单机 16 卡；A2 原配置 LOCAL_WORLD_SIZE=8
-        export LOCAL_WORLD_SIZE=16
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
         rm -rf ./graph_cache /workspace/omniinfer/tools/deploy/start_server/static_kernel_compile_outputs 2>/dev/null || true
         EXTRA_ARGS="${EXTRA_ARGS} --no-disable-hybrid-kv-cache-manager --enable-expert-parallel"
