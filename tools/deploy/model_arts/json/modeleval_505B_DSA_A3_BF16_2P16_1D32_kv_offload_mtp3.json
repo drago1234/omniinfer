@@ -1,0 +1,256 @@
+{
+  "name": "505B-bf16-2p16-1d32-kv-offload-mtp7",
+  "version": "1.0.0",
+  "description": "",
+  "type": "REAL_TIME",
+  "deploy_type": "MULTI",
+  "group_configs": [
+    {
+      "description": "",
+      "framework": "COMMON",
+      "count": 1,
+      "weight": 100,
+      "priority": 3,
+      "system_log_dump_enable": false,
+      "secret_type": "dew",
+      "unit_configs": [
+        {
+          "role": "COMMON",
+          "image": {
+            "source": "SWR_PRO",
+            "swr_path": "swr-aifm-exp-t3bbun.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.1-omni_master-vllm-202610162336:0.0.1",
+            "id": "1ee3ce93-436a-11f1-9299-0255ac10016b"
+          },
+          "count": 2,
+          "name": "prefill-0",
+          "group_count": 1,
+          "cmd": "bash /workspace/omniinfer/tools/deploy/model_arts/proxy.sh --core-num 16 --start-core-index 16 --subrequest-output-buffer-size 10M --omni-proxy-pd-policy sequential --omni-proxy-max-batch-num-token 49152 --omni-proxy-prefill-max-num-seqs 4 --omni-proxy-decode-max-num-seqs 3 && bash /workspace/omniinfer/tools/deploy/model_arts/prefill.sh --max-model-len 524288 --additional-config '{\"enable_low_latency\":true}' --enable-logging-iteration-details --no-disable-hybrid-kv-cache-manager --max-num-batched-tokens 4096 --max-num-seqs 4 --enable-prompt-tokens-details --enable-chunked-prefill --dtype bfloat16 --enforce-eager --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu --reasoning-config '{\"reasoning_start_str\":\"<think>\",\"reasoning_end_str\":\"</think>\",\"thinking_token_budget\":262144}' --block-size 128 --mamba-block-size 128 --enable-prefix-caching --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity\n",
+          "custom_spec": {
+            "memory": 2000000,
+            "cpu": 300,
+            "card": 8
+          },
+          "envs": {
+            "OMNI_LLMDATADIST_LINK_RECYCLE_DELAY": "36000",
+            "VLLM_DISABLE_PYNCCL": "1",
+            "VLLM_MQ_MAX_CHUNK_BYTES_MB": "100",
+            "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+            "RAY_CGRAPH_get_timeout": "7200",
+            "OMNI_CUSTOM_MODEL_CONFIG_PATH": "low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_p_kv_offload.json",
+            "gpu_util": "0.95",
+            "HYBRID_ATTN_GROUP_SIZE": "18",
+            "HCCL_OP_RETRY_ENABLE": "L0:0,L1:0,L2:0",
+            "HCCL_BUFFSIZE": "100",
+            "HCCL_CONNECT_TIMEOUT": "120",
+            "HCCL_EXEC_TIMEOUT": "120",
+            "HCCL_OP_EXPANSION_MODE": "AIV",
+            "ASCEND_GLOBAL_LOG_LEVEL": "3",
+            "TASK_QUEUE_ENABLE": "2",
+            "OMNI_PIGGYBACK_INPUT_IDS": "1",
+            "OMNI_SKIP_DECODE_TOKENIZE": "0",
+            "OMNI_VLLM_PATCHES_DIR": "low_latency",
+            "OMNI_VLLM_PATCHES": "ALL",
+            "VLLM_PLUGINS": "omni-npu,omni_npu_patches,omni_custom_models",
+            "OMNI_HYBRID_ATTN_GROUP_SIZE": "18",
+            "TORCH_COMPILE_DISABLE": "1",
+            "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+            "ENABLE_KV_EVENT": "true",
+            "kv_offload": "true",
+            "hugepage_enabled": "false",
+            "OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE": "true",
+            "cpu_bytes_to_use": "1048500000000",
+            "MODEL_PATH": "/model_path",
+            "LOG_PATH": "/home/ma-user/",
+            "PREFILL_INSTANCE_NUM": "2",
+            "DECODE_INSTANCE_NUM": "1",
+            "MODEL_NAME": "pangu-v2-505b",
+            "PROXY_PORT": "7000",
+            "LOG_PATH_PROXY": "/home/ma-user/",
+            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+            "PYTHONHASHSEED": "1234"
+          },
+          "termination_grace": {
+            "termination_grace_period_seconds": 30
+          },
+          "npu_reset_enable": false,
+          "recovery": "Instance"
+        },
+        {
+          "role": "COMMON",
+          "image": {
+            "source": "SWR_PRO",
+            "swr_path": "swr-aifm-exp-t3bbun.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.1-omni_master-vllm-202610162336:0.0.1",
+            "id": "1ee3ce93-436a-11f1-9299-0255ac10016b"
+          },
+          "count": 2,
+          "name": "prefill-1",
+          "group_count": 1,
+          "cmd": "bash /workspace/omniinfer/tools/deploy/model_arts/prefill.sh --max-model-len 524288 --additional-config '{\"enable_low_latency\":true}' --enable-logging-iteration-details --no-disable-hybrid-kv-cache-manager --max-num-batched-tokens 4096 --max-num-seqs 4 --enable-prompt-tokens-details --enable-chunked-prefill --dtype bfloat16 --enforce-eager --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu --reasoning-config '{\"reasoning_start_str\":\"<think>\",\"reasoning_end_str\":\"</think>\",\"thinking_token_budget\":262144}' --block-size 128 --mamba-block-size 128 --enable-prefix-caching --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity\n",
+          "custom_spec": {
+            "memory": 2000000,
+            "cpu": 300,
+            "card": 8
+          },
+          "envs": {
+            "OMNI_LLMDATADIST_LINK_RECYCLE_DELAY": "36000",
+            "VLLM_DISABLE_PYNCCL": "1",
+            "VLLM_MQ_MAX_CHUNK_BYTES_MB": "100",
+            "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+            "RAY_CGRAPH_get_timeout": "7200",
+            "OMNI_CUSTOM_MODEL_CONFIG_PATH": "low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_p_kv_offload.json",
+            "gpu_util": "0.95",
+            "HYBRID_ATTN_GROUP_SIZE": "18",
+            "HCCL_OP_RETRY_ENABLE": "L0:0,L1:0,L2:0",
+            "HCCL_BUFFSIZE": "100",
+            "HCCL_CONNECT_TIMEOUT": "120",
+            "HCCL_EXEC_TIMEOUT": "120",
+            "HCCL_OP_EXPANSION_MODE": "AIV",
+            "ASCEND_GLOBAL_LOG_LEVEL": "3",
+            "TASK_QUEUE_ENABLE": "2",
+            "OMNI_PIGGYBACK_INPUT_IDS": "1",
+            "OMNI_SKIP_DECODE_TOKENIZE": "0",
+            "OMNI_VLLM_PATCHES_DIR": "low_latency",
+            "OMNI_VLLM_PATCHES": "ALL",
+            "VLLM_PLUGINS": "omni-npu,omni_npu_patches,omni_custom_models",
+            "OMNI_HYBRID_ATTN_GROUP_SIZE": "18",
+            "TORCH_COMPILE_DISABLE": "1",
+            "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+            "ENABLE_KV_EVENT": "true",
+            "kv_offload": "true",
+            "hugepage_enabled": "false",
+            "OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE": "true",
+            "cpu_bytes_to_use": "1048500000000",
+            "MODEL_PATH": "/model_path",
+            "LOG_PATH": "/home/ma-user/",
+            "PREFILL_INSTANCE_NUM": "2",
+            "DECODE_INSTANCE_NUM": "1",
+            "MODEL_NAME": "pangu-v2-505b"
+          },
+          "termination_grace": {
+            "termination_grace_period_seconds": 30
+          },
+          "npu_reset_enable": false,
+          "recovery": "Instance"
+        },
+        {
+          "role": "COMMON",
+          "image": {
+            "source": "SWR_PRO",
+            "swr_path": "swr-aifm-exp-t3bbun.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.1-omni_master-vllm-202610162336:0.0.1",
+            "id": "1ee3ce93-436a-11f1-9299-0255ac10016b"
+          },
+          "count": 4,
+          "name": "decode-0",
+          "group_count": 1,
+          "cmd": "bash /workspace/omniinfer/tools/deploy/model_arts/decode.sh --max-model-len 524288 --additional-config '{\"enable_low_latency\":true,\"npugraph_ex_config\":{\"enable\":true,\"super_kernel_optimize\":true,\"static_kernel_compile\":true}}' --no-disable-hybrid-kv-cache-manager --max-num-seqs 3 --enable-prompt-tokens-details --enable-chunked-prefill --distributed-executor-backend mp --dtype bfloat16 --compilation-config '{\"mode\":3,\"cudagraph_mode\":\"FULL\",\"cudagraph_capture_sizes\":[4,8,12],\"backend\":\"\",\"compile_sizes\":[4,8,12]}' --enable-logging-iteration-details --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu --reasoning-config '{\"reasoning_start_str\":\"<think>\",\"reasoning_end_str\":\"</think>\",\"thinking_token_budget\":262144}' --block-size 128 --mamba-block-size 128 --enable-prefix-caching --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity\n",
+          "custom_spec": {
+            "memory": 2000000,
+            "cpu": 300,
+            "card": 8
+          },
+          "envs": {
+            "OMNI_LLMDATADIST_LINK_RECYCLE_DELAY": "36000",
+            "VLLM_DISABLE_PYNCCL": "1",
+            "VLLM_MQ_MAX_CHUNK_BYTES_MB": "100",
+            "ENABLE_DP_LB": "false",
+            "VLLM_CACHE_ROOT": "./graph_cache",
+            "OMNI_CUSTOM_MODEL_CONFIG_PATH": "low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_d_claw.json",
+            "TORCH_COMPILE_DISABLE": "0",
+            "VLLM_DISABLE_COMPILE_CACHE": "1",
+            "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+            "gpu_util": "0.95",
+            "HCCL_OP_EXPANSION_MODE": "AI_CPU",
+            "HCCL_BUFFSIZE": "1200",
+            "HCCL_CONNECT_TIMEOUT": "1800",
+            "HCCL_EXEC_TIMEOUT": "1800",
+            "HCCL_OP_RETRY_ENABLE": "L0:0,L1:0,L2:0",
+            "ASCEND_GLOBAL_LOG_LEVEL": "3",
+            "OMNI_PIGGYBACK_INPUT_IDS": "1",
+            "OMNI_SKIP_DECODE_TOKENIZE": "0",
+            "TASK_QUEUE_ENABLE": "1",
+            "OMNI_VLLM_PATCHES_DIR": "low_latency",
+            "OMNI_VLLM_PATCHES": "ALL",
+            "VLLM_PLUGINS": "omni-npu,omni_npu_patches,omni_custom_models",
+            "MODEL_PATH": "/model_path",
+            "LOG_PATH": "/home/ma-user/",
+            "OMNI_HYBRID_ATTN_GROUP_SIZE": "18",
+            "HYBRID_ATTN_GROUP_SIZE": "18",
+            "LOCAL_WORLD_SIZE": "16",
+            "kv_offload": "false",
+            "OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE": "true",
+            "hugepage_enabled": "false",
+            "cpu_bytes_to_use": "1048500000000",
+            "PREFILL_INSTANCE_NUM": "2",
+            "DECODE_INSTANCE_NUM": "1",
+            "MODEL_NAME": "pangu-v2-505b"
+          },
+          "termination_grace": {
+            "termination_grace_period_seconds": 30
+          },
+          "npu_reset_enable": false,
+          "recovery": "Instance"
+        }
+      ],
+      "advanced_config": {
+        "protocol": "HTTP",
+        "port": 7000,
+        "deploy_timeout_minutes": 60,
+        "dynamic_routing_enable": false,
+        "upgrade_config": {
+          "type": "ROLLING",
+          "rolling_update": {
+            "max_surge": "25%",
+            "max_unavailable": "25%"
+          }
+        },
+        "service_secret": {
+          "secret_volumes": [],
+          "secret_enable": false
+        }
+      },
+      "model": {
+        "source": "EFS",
+        "mount_path": "/mnt",
+        "efs_sub_path": "/",
+        "read_only": false,
+        "host_cache": false,
+        "source_id": "631e010d-948c-11f1-88b7-fa163ee29cb4",
+        "os_warm_up": false
+      },
+      "schedule_strategy": "HIGH_AVAILABILITY",
+      "pool_id": "pool-b1f625b8-e05e-4977-ada7-7ec9b550c481",
+      "workload_type": "LWS",
+      "deploy_type": "MULTI",
+      "name": "deploy-505B-bf16-2p16-1d32-kv-offload-mtp7"
+    }
+  ],
+  "workspace_id": "1d670a16e0b34acbb27975dfec4d3790",
+  "workload_type": "LWS",
+  "runtime_config": {
+    "service_invoke": {
+      "port": 7000,
+      "protocol": "HTTPS",
+      "auth_type": "API_KEY",
+      "dynamic_routing_enable": false,
+      "ems_enable": false,
+      "internet_access_enable": true,
+      "intranet_approval_enable": true,
+      "request_retry_enable": false
+    },
+    "service_limit": {
+      "rate_limit": {
+        "num": 200,
+        "unit": "SECONDS"
+      },
+      "request_size_limit": 20,
+      "request_timeout": 3600,
+      "ip_white_list": [],
+      "ip_black_list": []
+    },
+    "service_secret": {
+      "group_enable": false,
+      "secret_enable": false,
+      "secret_volumes": []
+    }
+  }
+}
