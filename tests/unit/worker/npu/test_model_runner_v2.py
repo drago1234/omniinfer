@@ -820,14 +820,87 @@ def test_rejection_sample_greedy_no_draft_logits():
 
 @requires_npu_sampling
 @requires_npu
-def test_rejection_sample_block_verification_with_draft_logits():
+@pytest.mark.parametrize("num_reqs", [1, 4])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_rejection_sample_large_vocab_preserves_every_greedy_prefix(num_reqs, dtype):
+    """Exercise adjacent per-block writes at the real PanGu vocabulary size."""
+    import torch
+
+    from omni_npu.worker.npu.ops.rejection_sampler_utils import rejection_sample
+
+    dev, steps, vocab = "npu", 7, 151552
+    rows = num_reqs * (steps + 1)
+    top = (torch.arange(rows, device=dev) * 19003 + 6988) % vocab
+    logits = torch.full((rows, vocab), -10., dtype=getattr(torch, dtype), device=dev)
+    logits.scatter_(1, top[:, None], 10.)
+    logits.scatter_(1, ((top + 60000) % vocab)[:, None], 9.)
+    cu = torch.arange(0, rows + 1, steps + 1, dtype=torch.int32, device=dev)
+    idx = torch.arange(num_reqs, dtype=torch.int32, device=dev)
+    expanded_idx = idx.repeat_interleave(steps + 1)
+    local_pos = torch.arange(steps + 1, dtype=torch.int32, device=dev).repeat(num_reqs)
+    positions = torch.arange(rows, dtype=torch.int32, device=dev)
+    temperature = torch.zeros(num_reqs, device=dev)
+    seeds = torch.ones(num_reqs, dtype=torch.int64, device=dev)
+    expected = top.reshape(num_reqs, steps + 1)
+    for accepted in range(steps + 1):
+        draft = torch.cat((expected.new_zeros(num_reqs, 1), expected[:, :steps]), 1)
+        if accepted < steps:
+            draft[:, accepted + 1] = 42
+        for _ in range(10):
+            sampled, counts = rejection_sample(
+                logits, None, draft.flatten(), cu, positions, idx,
+                expanded_idx, local_pos, temperature, seeds, steps,
+            )
+            assert counts.cpu().tolist() == [accepted + 1] * num_reqs
+            torch.testing.assert_close(
+                sampled[:, :accepted + 1].cpu(), expected[:, :accepted + 1].cpu(),
+            )
+
+
+@requires_npu_sampling
+@requires_npu
+@pytest.mark.parametrize("block", [False, True])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_rejection_sample_mixed_temperatures_and_request_slots(block, dtype):
+    """Greedy skipping must preserve stochastic neighbors and request mapping."""
+    import torch
+    from omni_npu.worker.npu.ops.rejection_sampler_utils import rejection_sample
+
+    n, steps, vocab, dev = 3, 3, 151552, "npu"
+    rows = n * (steps + 1)
+    peaks = (torch.arange(rows, device=dev) * 19003 + 6988) % vocab
+    logits = torch.full((rows, vocab), -100., dtype=getattr(torch, dtype), device=dev)
+    logits.scatter_(1, peaks[:, None], 10.)
+    mapping = torch.tensor([2, 0, 1], dtype=torch.int32, device=dev)
+    draft = logits.new_empty(n, steps, vocab)
+    draft[mapping.long()] = logits.reshape(n, steps + 1, vocab)[:, :steps]
+    expected = peaks.reshape(n, steps + 1)
+    ids = torch.cat((expected.new_zeros(n, 1), expected[:, :steps]), 1)
+    ids[0, 1] = 42  # This greedy row must reject immediately.
+    sampled, counts = rejection_sample(
+        logits, draft, ids.flatten(),
+        torch.arange(n + 1, dtype=torch.int32, device=dev) * (steps + 1),
+        torch.arange(rows, device=dev), mapping, mapping.repeat_interleave(steps + 1),
+        torch.arange(steps + 1, dtype=torch.int32, device=dev).repeat(n),
+        torch.tensor([1., 0., 0.], device=dev),
+        torch.tensor([17, 29, 43], dtype=torch.int64, device=dev), steps,
+        use_block_verification=block,
+    )
+    assert counts.cpu().tolist() == [1, steps + 1, steps + 1]
+    for row, length in enumerate(counts.cpu().tolist()):
+        torch.testing.assert_close(sampled[row, :length].cpu(), expected[row, :length].cpu())
+
+
+@requires_npu_sampling
+@requires_npu
+@pytest.mark.parametrize("vocab", [1024, 151552])
+def test_rejection_sample_block_verification_with_draft_logits(vocab):
     """Block verification path accepts matching draft distributions."""
     import torch
 
     from omni_npu.worker.npu.ops.rejection_sampler_utils import rejection_sample
 
     dev = "npu"
-    vocab = 1024
     target_logits = torch.full((3, vocab), -20.0, dtype=torch.float32, device=dev)
     target_logits[0, 5] = 20.0
     target_logits[1, 9] = 20.0
@@ -864,7 +937,7 @@ def test_rejection_sample_block_verification_with_draft_logits():
     num_sampled_cpu = num_sampled.cpu()
     assert num_sampled_cpu.tolist() == [3]
     assert sampled_cpu[0, :2].tolist() == [5, 9]
-    assert 0 <= sampled_cpu[0, 2].item() < vocab
+    assert sampled_cpu[0, 2].item() == 13
 
 
 def test_mrv1_path_does_not_import_upstream_gpu_package():

@@ -436,6 +436,9 @@ def rejection_sample(
         num_speculative_steps,
         BLOCK_SIZE=VOCAB_BLOCK_SIZE,
         HAS_DRAFT_LOGITS=has_draft_logits,
+        # Disable AutoBlockify to avoid incorrect max-with-index reductions
+        # in Triton-Ascend
+        has_auto_blockify_blacklist_op=True,
     )
 
     # Precompute the running joint ratio and residual mass for block
@@ -488,7 +491,8 @@ def rejection_sample(
         else:
             local_residual_mass = target_logits.new_empty(1, 1)
     else:
-        cumulative_log_p = target_logits.new_empty(1)
+        # Triton-Ascend type-checks the disabled block branch as FP32.
+        cumulative_log_p = target_logits.new_empty(1, dtype=torch.float32)
         local_residual_mass = target_logits.new_empty(1, 1)
 
     # Sample up until the first rejected/bonus token, and store
@@ -558,6 +562,9 @@ def rejection_sample(
         HAS_DRAFT_LOGITS=has_draft_logits,
         USE_FP64=use_fp64,
         USE_BLOCK_VERIFICATION=use_block_verification,
+        # Disable AutoBlockify to avoid incorrect max-with-index reductions
+        # in Triton-Ascend
+        has_auto_blockify_blacklist_op=True,
     )
 
     # Insert the resampled tokens into the output sampled.
