@@ -92,7 +92,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prompt-tokens-details --enable-chunked-prefill"
         EXTRA_ARGS="${EXTRA_ARGS} --dtype bfloat16 --enforce-eager"
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu"
-        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","thinking_token_budget":262144}'
+        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
         {% if enable_prefix_caching | bool %}
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prefix-caching --mamba-block-size 128"
@@ -152,7 +152,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --compilation-config ${COMPILATION_CONFIG}"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-parser pangu --enable-auto-tool-choice --tool-call-parser pangu"
-        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","thinking_token_budget":262144}'
+        REASONING_CONFIG='{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
         EXTRA_ARGS="${EXTRA_ARGS} --reasoning-config ${REASONING_CONFIG}"
         {% if enable_prefix_caching | bool %}
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prefix-caching --mamba-block-size 128"
