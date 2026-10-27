@@ -1,12 +1,12 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Compose Omni's thinking ban with the vLLM #46662 MRv1 budget backport.
+"""Add Omni's thinking-ban feature beside vLLM's native thinking budget.
 
 vLLM 0.25.1 owns all thinking-token-budget request fields, validation, state,
-and sampler wiring. The shared sampler hooks use the optimized budget processors
-and committed-output state update together, then apply Omni's ban mask. Keeping
-one patch owner per sampler method avoids patch conflicts and import-order bugs.
+and sampler wiring. This module deliberately does not patch any of that logic.
+It only extends ReasoningConfig and grafts ThinkingBanStateHolder into the same
+InputBatch/SamplingMetadata/Sampler lifecycle used by the native budget holder.
 """
 
 from __future__ import annotations
@@ -19,27 +19,22 @@ import vllm.config.reasoning as reasoning_config_module
 import vllm.config.vllm as vllm_config_impl_module
 import vllm.engine.arg_utils as engine_arg_utils_module
 import vllm.v1.worker.gpu_input_batch as gpu_input_batch_module
-from omni_npu.v1.config import ReasoningConfig
-from omni_npu.v1.sample.thinking_ban_state import (
-    ThinkingBanStateHolder,
-    maybe_create_thinking_ban_state_holder,
-)
-from omni_npu.v1.sample.thinking_budget import (
-    rejection_apply_logits_processors,
-    sampler_apply_logits_processors,
-    update_thinking_budget_state,
-)
-from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.logger import init_logger
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.sample.thinking_budget_state import ThinkingBudgetStateHolder
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
+
+from omni_npu.v1.config import ReasoningConfig
+from omni_npu.v1.sample.thinking_ban_state import (
+    ThinkingBanStateHolder,
+    maybe_create_thinking_ban_state_holder,
+)
+from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 logger = init_logger(__name__)
 
@@ -203,31 +198,14 @@ class InputBatchPatch(VLLMPatch):
         return holder is None or not holder.has_tracked_requests()
 
 
-class ThinkingBudgetCommittedOutputsPatch(VLLMPatch):
-    """Pair the #46662 processors with their committed-output state contract."""
-
-    _target = ThinkingBudgetStateHolder
-    _attr_names_to_apply = ("update_state",)
-    update_state = update_thinking_budget_state
-
-    @classmethod
-    def apply(cls):
-        if cls._target.update_state is not update_thinking_budget_state:
-            super().apply()
+_original_sampler_apply_logits_processors = Sampler.apply_logits_processors
 
 
 @register_patch("ThinkingBanSamplerPatch", Sampler)
 class SamplerPatch(VLLMPatch):
-    """Run budget-backported processors, then apply Omni's ban mask."""
+    """Run native processors first, then apply only Omni's ban mask."""
 
     _attr_names_to_apply = ["apply_logits_processors"]
-
-    @classmethod
-    def apply(cls):
-        # Keep the state contract paired even with an explicit patch allowlist.
-        ThinkingBudgetCommittedOutputsPatch.apply()
-        if cls._target.apply_logits_processors is not cls.apply_logits_processors:
-            super().apply()
 
     def apply_logits_processors(
         self,
@@ -235,7 +213,7 @@ class SamplerPatch(VLLMPatch):
         sampling_metadata: SamplingMetadata,
         predict_bonus_token: bool,
     ) -> torch.Tensor:
-        logits = sampler_apply_logits_processors(
+        logits = _original_sampler_apply_logits_processors(
             self,
             logits,
             sampling_metadata,
@@ -264,18 +242,16 @@ class SamplerPatch(VLLMPatch):
         )
 
 
+_original_rejection_apply_logits_processors = (
+    RejectionSampler.apply_logits_processors
+)
+
+
 @register_patch("ThinkingBanRejectionSamplerPatch", RejectionSampler)
 class RejectionSamplerPatch(VLLMPatch):
     """Apply the ban mask after native speculative-decoding processors."""
 
     _attr_names_to_apply = ["apply_logits_processors"]
-
-    @classmethod
-    def apply(cls):
-        # Bonus sampling must also pass committed outputs to the budget holder.
-        SamplerPatch.apply()
-        if cls._target.apply_logits_processors is not cls.apply_logits_processors:
-            super().apply()
 
     def apply_logits_processors(
         self,
@@ -283,7 +259,7 @@ class RejectionSamplerPatch(VLLMPatch):
         sampling_metadata: SamplingMetadata,
         metadata: SpecDecodeMetadata,
     ) -> torch.Tensor:
-        logits = rejection_apply_logits_processors(
+        logits = _original_rejection_apply_logits_processors(
             self,
             logits,
             sampling_metadata,
