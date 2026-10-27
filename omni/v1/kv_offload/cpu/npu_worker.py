@@ -161,7 +161,6 @@ class Transfer:
     batch_src: torch.Tensor | None = None
     batch_dst: torch.Tensor | None = None
     batch_sizes: torch.Tensor | None = None
-    wait_event: torch.npu.Event | None = None
     # Freed only when the stream passes end_event: the sharded load's row
     # indices are still being read after transfer_async returns.
     shard_keepalive: list | None = None
