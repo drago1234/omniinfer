@@ -2908,9 +2908,9 @@ class OpenPanguV2ForCausalLM(
         loaded_params: set[str] = set()
 
         def _skip_weight(name: str) -> bool:
-            if "rotary_emb.inv_freq" in name:
-                return True
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+            if "rotary_emb.inv_freq" in name or (
+                self.config.tie_word_embeddings and "lm_head.weight" in name
+            ):
                 return True
             return get_spec_layer_idx_from_weight_name(self.config, name) is not None
 
@@ -2984,16 +2984,15 @@ class OpenPanguV2ForCausalLM(
             # DeepSeek checkpoint naming; the table parameter owns its shard loader.
             name = name.replace(".engram.embed.weight", ".engram.embed_tokens.weight")
 
-            loaded_name = _try_load_stacked(name, loaded_weight)
-            if loaded_name is not None:
-                loaded_params.add(loaded_name)
+            stacked_name = _try_load_stacked(name, loaded_weight)
+            if stacked_name is not None:
+                loaded_params.add(stacked_name)
                 continue
 
-            loaded_name = _try_load_expert(name, loaded_weight)
-            if loaded_name == "":
-                continue
-            if loaded_name is not None:
-                loaded_params.add(loaded_name)
+            expert_name = _try_load_expert(name, loaded_weight)
+            if expert_name == "" or expert_name is not None:
+                if expert_name:
+                    loaded_params.add(expert_name)
                 continue
 
             if name.endswith(".bias") and name not in params_dict:

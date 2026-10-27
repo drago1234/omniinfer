@@ -397,3 +397,56 @@ def test_swiglu_expanded_topk_weights_with_remote_experts(build_moe, monkeypatch
             expected[token] += output if enabled else output * probabilities[token, k]
     expected = moe._project_routed_output(expected) + moe.shared_experts(x)
     torch.testing.assert_close(moe._forward_allgather(x, use_allreduce=True), expected)
+
+
+def test_load_weights_routes_expert_weight_through_expert_loader(monkeypatch):
+    """A checkpoint weight that matches an expert params mapping must be
+    consumed by ``_try_load_expert`` and recorded under the mapped param name.
+
+    This exercises the expert-success branch (``if expert_name:
+    loaded_params.add(expert_name)``) of ``OpenPanguV2ForCausalLM.load_weights``,
+    which the existing weight-loading tests skip by stubbing the expert
+    params mapping to an empty list.
+    """
+    cls = model.OpenPanguV2ForCausalLM
+    wrapper = cls.__new__(cls)
+    nn.Module.__init__(wrapper)
+    wrapper.config = SimpleNamespace(
+        n_routed_experts=1,
+        tie_word_embeddings=False,
+        num_hidden_layers=1,
+        num_nextn_predict_layers=0,
+    )
+    wrapper.num_redundant_experts = 0
+    wrapper.model = nn.Module()
+    wrapper.model.layers = nn.ModuleList([nn.Module()])
+    layer0 = wrapper.model.layers[0]
+    layer0.mlp = nn.Module()
+    layer0.mlp.experts = nn.Module()
+    expert_param = nn.Parameter(torch.zeros(2, 2))
+
+    def _loader(param, value, name, *, shard_id, expert_id, return_success=False):
+        param.data.copy_(value)
+        return True
+
+    expert_param.weight_loader = _loader
+    layer0.mlp.experts.weight_1 = expert_param
+
+    # Route checkpoint fragment "foo_weight" onto the registered param
+    # "weight_1"; name.replace("foo_weight", "weight_1") yields the param key.
+    monkeypatch.setattr(
+        model,
+        "fused_moe_make_expert_params_mapping",
+        lambda *a, **kw: [("weight_1", "foo_weight", 0, 0)],
+    )
+    monkeypatch.setattr(model, "is_pp_missing_parameter", lambda *a: False)
+    monkeypatch.setattr(
+        model, "get_spec_layer_idx_from_weight_name", lambda *a, **kw: None
+    )
+    monkeypatch.setattr(model, "high_throughout", lambda: False)
+
+    weight = torch.ones(2, 2)
+    loaded = wrapper.load_weights([("model.layers.0.mlp.experts.foo_weight", weight)])
+
+    assert loaded == {"model.layers.0.mlp.experts.weight_1"}
+    torch.testing.assert_close(expert_param.data, weight)
