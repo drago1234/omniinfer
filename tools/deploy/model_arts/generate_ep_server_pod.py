@@ -4,12 +4,15 @@
 
 """Generate UB endpoint configuration files from HCCL topology data."""
 
+import logging
 import argparse
 import json
 import os
 import sys
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def find_peer_eid_from_1dmesh(
@@ -159,10 +162,10 @@ def resolve_input_paths(args: argparse.Namespace) -> tuple[Path, Path]:
 def main() -> int:
     args = parse_args()
     rootinfo_path, topo_path = resolve_input_paths(args)
-    print(f"Loading: {rootinfo_path}")
+    logger.info(f"Loading: {rootinfo_path}")
     with rootinfo_path.open(encoding="utf-8") as file:
         rootinfo = json.load(file)
-    print(f"Loading topology: {topo_path}")
+    logger.info(f"Loading topology: {topo_path}")
     with topo_path.open(encoding="utf-8") as file:
         topo_data = json.load(file)
 
@@ -171,7 +174,7 @@ def main() -> int:
         for rank in rootinfo.get("rank_list", [])
     }
     if not device_id_to_local_id:
-        print(f"Error: rank_list in {rootinfo_path} is empty", file=sys.stderr)
+        logger.error(f"Error: rank_list in {rootinfo_path} is empty")
         return 1
 
     output_dir = (
@@ -191,10 +194,9 @@ def main() -> int:
             local_id, device_info, topo_data, rootinfo
         )
         if not endpoint_list:
-            print(
+            logger.error(
                 f"Error: no endpoint resolved for device_id {device_id} "
                 f"(local_id {local_id})",
-                file=sys.stderr,
             )
             return 1
 
@@ -213,7 +215,7 @@ def main() -> int:
         }
         output_path = output_dir / f"ub_endpoint_npu_{device_id}.json"
         if args.dry_run:
-            print(f"[Dry run] Would generate: {output_path}")
+            logger.info(f"[Dry run] Would generate: {output_path}")
             continue
 
         temporary_path = output_path.with_name(
@@ -222,12 +224,13 @@ def main() -> int:
         with temporary_path.open("w", encoding="utf-8") as file:
             json.dump(output, file, indent=2)
         os.replace(temporary_path, output_path)
-        print(f"Generated: {output_path}")
+        logger.info(f"Generated: {output_path}")
 
     action = "Would generate" if args.dry_run else "Generated"
-    print(f"{action} {len(device_id_to_local_id)} endpoint configuration files.")
+    logger.info(f"{action} {len(device_id_to_local_id)} endpoint configuration files.")
     return 0
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     sys.exit(main())

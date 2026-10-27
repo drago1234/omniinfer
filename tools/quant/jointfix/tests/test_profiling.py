@@ -7,6 +7,7 @@ so the whole Q1/Q2/Q3 pipeline is validated here without an NPU. The profiler it
 checked for the contract that matters: zero output when JOINTFIX_PROFILE is unset.
 """
 import json
+import logging
 import pathlib
 import sys
 
@@ -20,6 +21,7 @@ import analyze_profile as ap  # noqa: E402
 
 
 # ── analyzer pure math (no NPU) ──────────────────────────────────────────────
+
 
 def test_parse_prof_lines_extracts_json_and_skips_garbage():
     log = ('startup noise\n'
@@ -93,6 +95,7 @@ def test_analyze_reports_search_fraction_from_layer_records():
 
 # ── profiler contract: silent unless explicitly enabled ──────────────────────
 
+
 def test_disabled_by_default(monkeypatch):
     monkeypatch.delenv("JOINTFIX_PROFILE", raising=False)
     assert prof.enabled() is False
@@ -105,22 +108,25 @@ def test_enabled_via_env(monkeypatch):
     assert prof.clock() > 0.0
 
 
-def test_emit_layer_is_noop_when_disabled(monkeypatch, capsys):
+def test_emit_layer_is_noop_when_disabled(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=prof.__name__)
     monkeypatch.delenv("JOINTFIX_PROFILE", raising=False)
     prof.emit_layer(0, 128, 1.0, 2.0, 3.0)
-    assert capsys.readouterr().out == ""
+    assert caplog.text == ""
 
 
-def test_emit_layer_payload_when_enabled(monkeypatch, capsys):
+def test_emit_layer_payload_when_enabled(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=prof.__name__)
     monkeypatch.setenv("JOINTFIX_PROFILE", "1")
     prof.emit_layer(5, 128, 1.0, 2.0, 3.0)
-    out = capsys.readouterr().out
+    out = "\n".join(record.getMessage() for record in caplog.records)
     assert "[PROF]" in out
     payload = json.loads(out.split("[PROF] ", 1)[1])
     assert payload["kind"] == "layer" and payload["layer"] == 5
 
 
-def test_emit_routed_down_payload_on_cpu(monkeypatch, capsys):
+def test_emit_routed_down_payload_on_cpu(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=prof.__name__)
     monkeypatch.setenv("JOINTFIX_PROFILE", "1")
     tensors = {"e0.down": torch.zeros(3, 2)}            # h_out=3, h_in=2
     stats = {"X_sample": torch.zeros(7, 2)}             # tok=7
@@ -128,7 +134,7 @@ def test_emit_routed_down_payload_on_cpu(monkeypatch, capsys):
     prof.emit_routed_down(layer_idx=2, routed=routed, tensors=tensors,
                           get_stats=lambda ask: stats, devices=[torch.device("cpu")],
                           t_start=0.0, config=object())  # object() -> default candidate count
-    payload = json.loads(capsys.readouterr().out.split("[PROF] ", 1)[1])
+    payload = json.loads(caplog.records[-1].getMessage().split("[PROF] ", 1)[1])
     assert payload["h_out"] == 3 and payload["h_in"] == 2
     assert payload["toks"] == [7] and payload["n_experts"] == 1
     assert payload["n_candidates"] == 34            # 9 (stage1 default) + 25 (5x5 stage2)
@@ -136,24 +142,28 @@ def test_emit_routed_down_payload_on_cpu(monkeypatch, capsys):
 
 # ── live progress: heartbeat / eta / timestamp (same silent-unless-enabled contract) ──
 
-def test_heartbeat_and_eta_noop_when_disabled(monkeypatch, capsys):
+
+def test_heartbeat_and_eta_noop_when_disabled(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=prof.__name__)
     monkeypatch.delenv("JOINTFIX_PROFILE", raising=False)
     prof.heartbeat("loading weights…")
     prof.eta(1, 8, 0.0)
-    assert capsys.readouterr().out == ""
+    assert caplog.text == ""
 
 
-def test_heartbeat_when_enabled(monkeypatch, capsys):
+def test_heartbeat_when_enabled(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=prof.__name__)
     monkeypatch.setenv("JOINTFIX_PROFILE", "1")
     prof.heartbeat("layer 0: weights loaded")
-    out = capsys.readouterr().out
+    out = "\n".join(record.getMessage() for record in caplog.records)
     assert "[PROF " in out and "layer 0: weights loaded" in out
 
 
-def test_eta_reports_progress_and_eta(monkeypatch, capsys):
+def test_eta_reports_progress_and_eta(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=prof.__name__)
     monkeypatch.setenv("JOINTFIX_PROFILE", "1")
     prof.eta(2, 8, prof.clock() - 100.0)            # 2/8 done, ~100s elapsed
-    out = capsys.readouterr().out
+    out = "\n".join(record.getMessage() for record in caplog.records)
     assert "progress 2/8 layers" in out and "25%" in out and "ETA" in out
 
 
@@ -163,15 +173,17 @@ def test_fmt_durations():
     assert prof.fmt(3725) == "1h02m"
 
 
-def test_emit_layer_includes_ts_and_t_load(monkeypatch, capsys):
+def test_emit_layer_includes_ts_and_t_load(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=prof.__name__)
     monkeypatch.setenv("JOINTFIX_PROFILE", "1")
     prof.emit_layer(3, 32, t_forward=2.0, t_search_quant=4.0, t_reforward=1.0, t_load=9.0)
-    payload = json.loads(capsys.readouterr().out.split("[PROF] ", 1)[1])
+    payload = json.loads(caplog.records[-1].getMessage().split("[PROF] ", 1)[1])
     assert payload["t_load_s"] == 9.0          # the formerly-untimed weight-load phase
     assert "ts" in payload                       # absolute wall-clock stamp on every data line
 
 
 # ── phase breakdown: where the layer wall actually goes (the next-bottleneck finder) ──
+
 
 def test_phase_breakdown_totals_dominant_and_stat_overhead():
     recs = [

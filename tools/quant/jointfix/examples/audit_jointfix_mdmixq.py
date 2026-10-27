@@ -5,8 +5,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
+import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Keep machine-readable command output on stdout without log prefixes.
+output_logger = logging.getLogger(f"{__name__}.output")
+output_logger.setLevel(logging.INFO)
+output_logger.propagate = False
+if not output_logger.handlers:
+    output_handler = logging.StreamHandler(sys.stdout)
+    output_handler.setFormatter(logging.Formatter("%(message)s"))
+    output_logger.addHandler(output_handler)
 
 
 def main() -> None:
@@ -107,8 +120,9 @@ def main() -> None:
         "weight_nmse_sum_after_scale_refine": after_sum,
         "weight_nmse_relative_improvement": relative_gain,
     }
-    print(json.dumps(report, indent=2, ensure_ascii=False))
+    output_logger.info("%s", json.dumps(report, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

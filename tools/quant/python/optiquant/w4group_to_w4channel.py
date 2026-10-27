@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import logging
 import os
 import json
 import re
@@ -16,6 +17,9 @@ except:
 
 from safetensors.torch import load_file, save_file
 from huggingface_hub import snapshot_download
+
+logger = logging.getLogger(__name__)
+
 
 class QType:
     desc: str
@@ -201,6 +205,7 @@ def pack_4bit(x):
     y = y.view(shape[0], shape[1] // 2)
     return y.T.contiguous()
 
+
 def unpack_from_int32(
     value: torch.Tensor,
     num_bits: int,
@@ -264,6 +269,7 @@ def unpack_from_int32(
 
     return unpacked
 
+
 def copy_config_files(bf16_path, int8_path):
     files_to_copy = [f for f in os.listdir(bf16_path) if not f.endswith(".safetensors") and not f.startswith(".")]
     for file_name in files_to_copy:
@@ -271,6 +277,7 @@ def copy_config_files(bf16_path, int8_path):
         if os.path.exists(src_path):
             dst_path = os.path.join(int8_path, file_name)
             shutil.copy2(src_path, dst_path)
+
 
 def main(args, bf16_path, output_path, model_name="deepseek-ai/DeepSeek-R1"):
     torch.set_default_dtype(torch.bfloat16)
@@ -334,7 +341,7 @@ def main(args, bf16_path, output_path, model_name="deepseek-ai/DeepSeek-R1"):
             if ("weight_scale" in weight_name) or ("weight_shape" in weight_name):
                 continue
             elif weight_name in int8_names:
-                # print(weight_name, "int8")
+                # logger.debug("%s int8", weight_name)
                 assert weight.element_size() == 2
                 int8_weight, scale_inv = weight_quant(weight)
                 new_state_dict[weight_name] = int8_weight
@@ -376,10 +383,10 @@ def main(args, bf16_path, output_path, model_name="deepseek-ai/DeepSeek-R1"):
                 new_weight_map[new_scale_int4] = file_name
                 new_weight_map[new_bias] = file_name
 
-                print(weight_name, "int4", int4_weight.shape)
+                logger.info('%s %s %s', weight_name, "int4", int4_weight.shape)
 
             else:
-                # print(weight_name, "bf16")
+                # logger.debug("%s bf16", weight_name)
                 new_state_dict[weight_name] = weight
                 new_weight_map[weight_name] = file_name
 
@@ -388,12 +395,12 @@ def main(args, bf16_path, output_path, model_name="deepseek-ai/DeepSeek-R1"):
         del state_dict
         del new_state_dict
 
-    print(quant_count, scale_count)
-    print(f"{quant_count} weights are quantized")
+    logger.info('%s %s', quant_count, scale_count)
+    logger.info(f"{quant_count} weights are quantized")
 
     with open(model_index_file, "r") as f:
         model_index = json.load(f)
     model_index["weight_map"] = new_weight_map
     with open(model_index_file, "w", encoding="utf-8") as f:
         json.dump(model_index, f, indent=2, ensure_ascii=False, sort_keys=True)
-    print(f"model.safetensors.index.json modified and saved to {model_index_file}")
+    logger.info(f"model.safetensors.index.json modified and saved to {model_index_file}")

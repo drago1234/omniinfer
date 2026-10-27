@@ -2,11 +2,23 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Build Mooncake and MultiConnector configuration for public ModelArts entries."""
 import json
+import logging
 import os
 import socket
 import sys
 import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Keep machine-readable command output on stdout without log prefixes.
+output_logger = logging.getLogger(f"{__name__}.output")
+output_logger.setLevel(logging.INFO)
+output_logger.propagate = False
+if not output_logger.handlers:
+    output_handler = logging.StreamHandler(sys.stdout)
+    output_handler.setFormatter(logging.Formatter("%(message)s"))
+    output_logger.addHandler(output_handler)
 
 
 def build_transfer(role, rank, parallel_size, port, store_events=False, load_events=False):
@@ -27,10 +39,20 @@ def main():
     role = sys.argv[1]
     env = os.environ
     if "--dry-run" in sys.argv:
-        print(json.dumps(build_transfer(role, int(env["prefill_instance_rank"]), int(env["FUSION_POOL_PARALLEL_SIZE"]),
-                         int(env.get("OMNI_LLMDATADIST_ZMQ_PORT", "5568")),
-                         env.get("FUSION_POOL_ENABLE_STORE_EVENTS", "false") == "true",
-                         env.get("FUSION_POOL_ENABLE_LOAD_EVENTS", "false") == "true"), separators=(",", ":")))
+        output_logger.info(
+            "%s",
+            json.dumps(
+                build_transfer(
+                    role,
+                    int(env["prefill_instance_rank"]),
+                    int(env["FUSION_POOL_PARALLEL_SIZE"]),
+                    int(env.get("OMNI_LLMDATADIST_ZMQ_PORT", "5568")),
+                    env.get("FUSION_POOL_ENABLE_STORE_EVENTS", "false") == "true",
+                    env.get("FUSION_POOL_ENABLE_LOAD_EVENTS", "false") == "true",
+                ),
+                separators=(",", ":"),
+            ),
+        )
         return
     master = env["MOONCAKE_MASTER_IP"]
     metadata = int(env.get("MOONCAKE_METADATA_PORT", "8081"))
@@ -59,8 +81,9 @@ def main():
                               int(env.get("OMNI_LLMDATADIST_ZMQ_PORT", "5568")),
                               env.get("FUSION_POOL_ENABLE_STORE_EVENTS", "false") == "true",
                               env.get("FUSION_POOL_ENABLE_LOAD_EVENTS", "false") == "true")
-    print(json.dumps(transfer, separators=(",", ":")))
+    output_logger.info("%s", json.dumps(transfer, separators=(",", ":")))
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

@@ -253,11 +253,12 @@ def main():
     text = open(args.logfile).read() if args.logfile else sys.stdin.read()
     records = parse_prof_lines(text)
     if not records:
-        print("no [PROF] lines found — did you run with JOINTFIX_PROFILE=1 ?", file=sys.stderr)
+        _LOGGER.error("no [PROF] lines found — did you run with JOINTFIX_PROFILE=1 ?")
         sys.exit(1)
     result = analyze(records, peak_tflops=args.peak_tflops, hbm_budget_frac=args.hbm_frac)
-    print(format_report(result))
+    _LOGGER.info("%s", format_report(result))
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

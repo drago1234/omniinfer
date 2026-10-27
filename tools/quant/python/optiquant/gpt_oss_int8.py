@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import logging
 import os
 import shutil
 import json
@@ -15,6 +16,8 @@ except:
 from safetensors.torch import load_file, save_file
 from huggingface_hub import snapshot_download
 
+logger = logging.getLogger(__name__)
+
 
 def weight_quant(tensor: torch.Tensor):
     assert tensor.dim() == 3
@@ -25,6 +28,7 @@ def weight_quant(tensor: torch.Tensor):
     quantized = torch.round(tensor / scale)
     quantized = torch.clamp(quantized, -qmax, qmax)
     return quantized.to(torch.int8), scale.to(torch.float32)
+
 
 def copy_except_safetensors(src_dir: str, dst_dir: str):
     src_dir = os.path.abspath(src_dir)
@@ -89,7 +93,7 @@ def main(args, bf16_path, output_path, model_type):
                 if new_scale_name.endswith(".weight.scale"):
                     new_scale_name = new_scale_name.replace(".weight.scale", ".scale")
                 new_state_dict[new_scale_name] = scale_inv
-                print(weight_name, "int8", "scale_inv.shape", scale_inv.shape)
+                logger.info('%s %s %s %s', weight_name, "int8", "scale_inv.shape", scale_inv.shape)
 
                 new_weight_map[weight_name] = file_name
                 new_weight_map[new_scale_name] = file_name
@@ -100,11 +104,11 @@ def main(args, bf16_path, output_path, model_type):
         new_safetensor_file = os.path.join(output_path, file_name)
         save_file(new_state_dict, new_safetensor_file)
 
-    print(f"{quant_count} weights are quantized")
+    logger.info(f"{quant_count} weights are quantized")
 
     with open(model_index_file, "r") as f:
         model_index = json.load(f)
     model_index["weight_map"] = new_weight_map
     with open(model_index_file, "w", encoding="utf-8") as f:
         json.dump(model_index, f, indent=2, ensure_ascii=False, sort_keys=True)
-    print(f"model.safetensors.index.json modified and saved to {model_index_file}")
+    logger.info(f"model.safetensors.index.json modified and saved to {model_index_file}")

@@ -4,10 +4,22 @@
 import argparse
 import ipaddress
 import json
+import logging
 import os
 import shlex
 import sys
 import time
+
+logger = logging.getLogger(__name__)
+
+# Keep machine-readable command output on stdout without log prefixes.
+output_logger = logging.getLogger(f"{__name__}.output")
+output_logger.setLevel(logging.INFO)
+output_logger.propagate = False
+if not output_logger.handlers:
+    output_handler = logging.StreamHandler(sys.stdout)
+    output_handler.setFormatter(logging.Formatter("%(message)s"))
+    output_logger.addHandler(output_handler)
 
 
 def ordered_groups(data, env):
@@ -113,14 +125,15 @@ def main():
         groups = ordered_groups(read_rank_table(path, int(os.getenv("RANK_TABLE_WAIT_SECONDS", "600"))), os.environ)
         if args.role:
             for key, value in topology(groups, os.environ, args.role).items():
-                print(f"export {key}={shlex.quote(value)}")
+                output_logger.info(f"export {key}={shlex.quote(value)}")
         else:
-            print(";".join(",".join(group) for group in groups))
+            output_logger.info("%s", ";".join(",".join(group) for group in groups))
         return 0
     except (ValueError, KeyError, TypeError) as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+        logger.error(f"ERROR: {error}")
         return 1
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     sys.exit(main())

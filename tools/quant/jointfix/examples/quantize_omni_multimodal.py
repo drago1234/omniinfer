@@ -3,6 +3,7 @@
 """Calibrate OpenPangu Omni ViT/Audio with JointFix and merge the artifacts."""
 from __future__ import annotations
 
+import logging
 import argparse
 
 from jointfix.multimodal.deploy import (
@@ -121,4 +122,5 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

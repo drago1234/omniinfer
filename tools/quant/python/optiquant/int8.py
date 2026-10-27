@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import logging
 import os
 import json
 from glob import glob
@@ -13,6 +14,8 @@ except:
 
 from safetensors.torch import load_file, save_file
 from huggingface_hub import snapshot_download
+
+logger = logging.getLogger(__name__)
 
 
 def weight_quant(tensor: torch.Tensor):
@@ -58,7 +61,7 @@ def main(args, bf16_path, output_path, pangu_mode, model_name="deepseek-ai/DeepS
             local_dir=output_path,
             local_dir_use_symlinks=False
         )
-        print(f"model index file and config file download to {output_path}")
+        logger.info(f"model index file and config file download to {output_path}")
 
     with open(model_index_file, "r") as f:
         model_index = json.load(f)
@@ -81,7 +84,7 @@ def main(args, bf16_path, output_path, pangu_mode, model_name="deepseek-ai/DeepS
         new_state_dict = {}
         for weight_name, weight in state_dict.items():
             if weight_name in disable_names:
-                # print(weight_name, "bf16")
+                # logger.debug("%s bf16", weight_name)
                 new_state_dict[weight_name] = weight
                 new_weight_map[weight_name] = file_name
                 continue
@@ -89,7 +92,7 @@ def main(args, bf16_path, output_path, pangu_mode, model_name="deepseek-ai/DeepS
             if scale_inv_name in weight_map or pangu_mode:
                 assert weight.element_size() == 2
                 quant_count += 1
-                # print(weight_name, "int8")
+                # logger.debug("%s int8", weight_name)
                 int8_weight, scale_inv = weight_quant(weight)
                 new_state_dict[weight_name] = int8_weight
                 new_scale_name = scale_inv_name.replace("_scale_inv", "_scale")
@@ -104,12 +107,12 @@ def main(args, bf16_path, output_path, pangu_mode, model_name="deepseek-ai/DeepS
         new_safetensor_file = os.path.join(output_path, file_name)
         save_file(new_state_dict, new_safetensor_file)
 
-    print(quant_count, scale_count)
-    print(f"{quant_count} weights are quantized")
+    logger.info('%s %s', quant_count, scale_count)
+    logger.info(f"{quant_count} weights are quantized")
 
     with open(model_index_file, "r") as f:
         model_index = json.load(f)
     model_index["weight_map"] = new_weight_map
     with open(model_index_file, "w", encoding="utf-8") as f:
         json.dump(model_index, f, indent=2, ensure_ascii=False, sort_keys=True)
-    print(f"model.safetensors.index.json modified and saved to {model_index_file}")
+    logger.info(f"model.safetensors.index.json modified and saved to {model_index_file}")

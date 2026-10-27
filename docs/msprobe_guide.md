@@ -116,7 +116,7 @@ eager 模式：
 
 ## 3. 在 omni-npu 中启用 `msprobe`
 
-omni-npu 通过 `--additional-config` 传入 dump 配置，与 vllm-ascend 的入口一致。下面给出两种部署形态的用法。
+omni-npu 通过 `--additional-config` 传入 dump 配置，与 vllm-ascend 的入口一致。下面以直接使用 vLLM 启动为例。
 
 ### 3.1 直接用 vLLM 启动
 
@@ -147,28 +147,6 @@ vllm serve Qwen/Qwen2.5-0.5B-Instruct \
   --host 0.0.0.0 \
   --port 8000 \
   --additional-config '{"msprobe_dump_config_path": "/data/msprobe_config.json"}' &
-```
-
-### 3.2 通过 omni_cli 启动
-
-omni-npu 的多机部署通常使用 `omni_cli`，`--additional-config` 通过 `omni_cli cfg` 设置：
-
-```bash
-# 内联 msprobe_dump_config
-omni_cli cfg --set all args --additional-config '{
-  "msprobe_dump_config": {
-    "task": "statistics",
-    "level": "L1",
-    "dump_path": "/data/msprobe_dump",
-    "statistics": { "list": [] }
-  }
-}'
-
-# 或指向配置文件
-omni_cli cfg --set all args --additional-config '{"msprobe_dump_config_path": "/data/msprobe_config.json"}'
-
-omni_cli run_docker
-omni_cli start
 ```
 
 ## 4. 发送请求并采集 dump

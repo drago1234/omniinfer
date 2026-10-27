@@ -223,7 +223,7 @@ fusion_pool_main() {
         export DECODE_SERVER_LIST="$ASCEND_RT_VISIBLE_DEVICES"
         # One device list per D machine, without a hard-coded two-machine list.
         export DECODE_DATA_PARALLEL_SIZE
-        DECODE_DATA_PARALLEL_SIZE=$(python3 -c 'import os; print(",".join([os.environ["DECODE_SERVER_LIST"]] * len(os.environ["LOCAL_DECODE_SERVER_IP_LIST"].split(","))))') || return 1
+        DECODE_DATA_PARALLEL_SIZE=$(python3 -c 'import logging,os,sys; logging.basicConfig(level=logging.INFO,format="%(message)s",stream=sys.stdout); logger=logging.getLogger(__name__); logger.info(",".join([os.environ["DECODE_SERVER_LIST"]] * len(os.environ["LOCAL_DECODE_SERVER_IP_LIST"].split(","))))') || return 1
     fi
     prepare_pool || return 1
     run_vllm "$@"

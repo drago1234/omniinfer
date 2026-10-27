@@ -2,12 +2,15 @@
 """Manifest readers and production-matching Omni modality preprocessing."""
 from __future__ import annotations
 
+import logging
 import json
 from pathlib import Path
 from typing import List
 
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def _manifest_paths(path: str, keys: tuple[str, ...], limit: int | None) -> List[str]:
@@ -80,10 +83,9 @@ def load_vision_calibration(
             )
         patches.append(encoded["pixel_values"].to(torch.bfloat16))
         grids.append(encoded["image_grid_thw"].to(torch.long))
-        print(
+        logger.info(
             f"  [vision-data] {len(patches)}/{len(paths)} {path} "
             f"grid={grids[-1].tolist()} patches={patches[-1].shape[0]}",
-            flush=True,
         )
     return torch.cat(patches, dim=0), torch.cat(grids, dim=0)
 
@@ -143,10 +145,9 @@ def load_audio_calibration(
         for feature, length in extract_audio_chunks(extractor, waveform):
             features.append(feature)
             lengths.append(length)
-        print(
+        logger.info(
             f"  [audio-data] {len(features)} chunks from {path} "
             f"seconds={len(waveform) / extractor.sampling_rate:.2f}",
-            flush=True,
         )
     if not features:
         raise ValueError("audio calibration set produced no non-empty features")

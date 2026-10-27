@@ -10,6 +10,7 @@ Core args are parsed here; method-specific args are contributed by the method
 """
 from __future__ import annotations
 
+import logging
 import argparse
 
 import jointfix  # noqa: F401  (populates the registries)
@@ -17,6 +18,8 @@ from jointfix.registry import (
     available_backends, available_methods, get_backend, get_method,
 )
 from jointfix.core.runner import RunConfig, calibrate_and_quantize
+
+logger = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -125,6 +128,7 @@ def _finalize_deploy(model_dir, quant_dir, skip_patterns, *, enabled):
 
 
 def main(argv=None) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = build_parser().parse_args(argv)
 
     if args.cmd == "finalize":
@@ -133,7 +137,7 @@ def main(argv=None) -> None:
         out = finalize_model(args.model, args.quantized, args.output,
                              skip_patterns=_deploy_skip_patterns(backend, args),
                              rtn_uncalibrated=not args.calibrated_only)
-        print(f"deployment model written to: {out}")
+        logger.info(f"deployment model written to: {out}")
         return
 
     backend = get_backend(args.backend)(args.model)
@@ -159,12 +163,14 @@ def main(argv=None) -> None:
                               _deploy_skip_patterns(backend, args),
                               enabled=not args.no_finalize)
     if deploy is not None:
-        print(f"deployment model written to: {deploy}")
+        logger.info(f"deployment model written to: {deploy}")
     else:
-        print(f"per-layer outputs written to: {args.output}\n"
-              f"  (--no-finalize set — assemble later with: jointfix finalize "
-              f"--model {args.model} --quantized {args.output} --output <deploy_dir> "
-              f"--method {args.method})")
+        logger.info(
+            f"per-layer outputs written to: {args.output}\n"
+            f"  (--no-finalize set — assemble later with: jointfix finalize "
+            f"--model {args.model} --quantized {args.output} --output <deploy_dir> "
+            f"--method {args.method})",
+        )
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 Opt-in profiling for the smooth-search hot path — sizes the batched expert search.
 
 Default OFF (zero overhead). Enable with the env var ``JOINTFIX_PROFILE=1``. When on,
-each profiled block prints one ``[PROF] {json}`` line to stdout; feed the run log to
+each profiled block logs one ``[PROF] {json}`` line at INFO level; feed the run log to
 ``examples/analyze_profile.py`` to get the table that decides whether — and how — to
 batch the per-expert output-recon search across experts.
 
@@ -30,9 +30,9 @@ import os
 import time
 from typing import List, Optional
 
-_LOGGER = logging.getLogger(__name__)
-
 import torch
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def enabled() -> bool:
@@ -68,7 +68,7 @@ def heartbeat(msg: str) -> None:
     """
     if not enabled():
         return
-    print(f"[PROF {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    _LOGGER.info("[PROF %s] %s", time.strftime('%H:%M:%S'), msg)
 
 
 def eta(done: int, total: int, t_run_start: float) -> None:
@@ -80,9 +80,16 @@ def eta(done: int, total: int, t_run_start: float) -> None:
         return
     elapsed = clock() - t_run_start
     avg = elapsed / done
-    print(f"[PROF {time.strftime('%H:%M:%S')}] progress {done}/{total} layers "
-          f"({100 * done / total:.0f}%) | elapsed {fmt(elapsed)} | "
-          f"avg {fmt(avg)}/layer | ETA ~{fmt(avg * max(0, total - done))}", flush=True)
+    _LOGGER.info(
+        "[PROF %s] progress %s/%s layers (%.0f%%) | elapsed %s | avg %s/layer | ETA ~%s",
+        time.strftime('%H:%M:%S'),
+        done,
+        total,
+        100 * done / total,
+        fmt(elapsed),
+        fmt(avg),
+        fmt(avg * max(0, total - done)),
+    )
 
 
 def _mem_backend(dev: torch.device):
@@ -138,8 +145,10 @@ def _emit(record: dict) -> None:
         return
     # prepend an absolute wall-clock stamp so the log shows *when* each line landed
     # (durations alone can't reveal a stall); analyzer reads by key, extra field is safe.
-    print("[PROF] " + json.dumps({"ts": time.strftime("%H:%M:%S"), **record},
-                                 ensure_ascii=False), flush=True)
+    _LOGGER.info(
+        "[PROF] %s",
+        json.dumps({"ts": time.strftime("%H:%M:%S"), **record}, ensure_ascii=False),
+    )
 
 
 def _n_candidates(config) -> int:

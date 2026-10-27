@@ -50,7 +50,6 @@ docs/
 │   ├── ansible_deployment.md             # Ansible 部署脚本使用指南（Inventory 约定、Profile 配置、Tags、常用命令）
 │   ├── k8s_deployment.md                 # 现有 tools/deploy/k8s/README.md 迁入（KubeInfer k8s 环境服务拉起）
 │   ├── kv_dump.md                        # 现有 docs/kv_dump.md 迁入（KV cache 传输校验与踩踏检测工具使用）
-│   ├── cli_usage.md                      # 现有 omni_cli_usage.md 迁入
 │   └── troubleshooting.md                # FAQ / 常见报错
 ├── design/
 │   ├── overview.md                       # 总体架构（对应 high_level_arch 图）
@@ -80,7 +79,6 @@ docs/
 |---|---|
 | `docs/omni_infer_installation_guide.md` | `installation/installation_guide.md` |
 | `docs/omni_infer_quick_start.md` | `quick_start.md` |
-| `docs/omni_cli_usage.md` | `user_guide/cli_usage.md` |
 | `docs/kv_dump.md` | `user_guide/kv_dump.md`（不改名） |
 | `omni/docs/config_dev_guide.md`、`config_validation_rules.md` | `developer/config_dev_guide.md` / `reference/model_extra_config.md`（校验规则部分合入） |
 | `omni/model_config/README.md`、`omni/vllm_patches/README.md` | 分别迁入 `developer/model_config_dev_guide.md`、`developer/vllm_patches_guide.md` |

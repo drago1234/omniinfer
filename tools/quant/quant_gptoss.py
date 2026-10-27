@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import logging
 import optiquant.gpt_oss_int8 as qint8
 import optiquant.faquant as faquant
 from argparse import ArgumentParser
@@ -7,6 +8,7 @@ import json
 import os
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = ArgumentParser()
     parser.add_argument("--input-bf16-hf-path", type=str, required=True, help="bf16 weight path")
     parser.add_argument("--output-path", type=str, required=True, help="quantized weight path")

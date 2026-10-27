@@ -1,11 +1,16 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import logging
 import torch
 import os
 import json
 import shutil
 from safetensors.torch import load_file, save_file
 from transformers import AutoConfig
+
+logger = logging.getLogger(__name__)
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 # ================= 配置区 =================
 MODEL_DIR = "/opt/data/models/MiniMax-M2.5" # 原始模型权重路径
@@ -15,6 +20,7 @@ BLOCK_SIZE = 128 # MiniMax 2.5 默认为 128x128
 # =========================================
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 
 def restore_block_quant(weight, scale_inv):
     """
@@ -36,6 +42,7 @@ def restore_block_quant(weight, scale_inv):
 
     restored = (w_view * s_view).reshape(out_features, in_features)
     return restored.to(TARGET_DTYPE)
+
 
 def verify_weight(original_fp8, scale_inv, converted_bf16):
     """
@@ -62,15 +69,16 @@ def verify_weight(original_fp8, scale_inv, converted_bf16):
 
     return pass_count
 
-print(f"开始转换任务: FP8 -> {TARGET_DTYPE}")
-print("-" * 50)
+
+logger.info(f"开始转换任务: FP8 -> {TARGET_DTYPE}")
+logger.info("%s", "-" * 50)
 
 all_stats = []
 if not os.path.isdir(MODEL_DIR):
     raise FileNotFoundError(f"{MODEL_DIR} is not a valid directory")
 for filename in sorted(os.listdir(MODEL_DIR)):
     if filename.endswith(".safetensors"):
-        print(f"正在处理: {filename}...")
+        logger.info(f"正在处理: {filename}...")
         state_dict = load_file(os.path.join(MODEL_DIR, filename), device="cpu")
         new_state_dict = {}
         processed_keys = set()
@@ -105,10 +113,10 @@ for filename in sorted(os.listdir(MODEL_DIR)):
 
         save_file(new_state_dict, os.path.join(OUTPUT_DIR, filename))
         del state_dict, new_state_dict
-        print(f" 文件 {filename} 已保存")
+        logger.info(f" 文件 {filename} 已保存")
 
 # --- 后处理：修正配置 ---
-print("\n修正配置文件...")
+logger.info("\n修正配置文件...")
 config_path = os.path.join(MODEL_DIR, "config.json")
 if os.path.exists(config_path):
     with open(config_path, "r") as f:
@@ -129,16 +137,16 @@ for ext in [".py", ".model", ".json", ".md", ".jinja", ".txt"]:
             shutil.copy(os.path.join(MODEL_DIR, f), os.path.join(OUTPUT_DIR, f))
 
 # --- 最终报告 ---
-print("\n" + "="*30)
-print("转换任务完成！精度验证报告：")
-print("="*30)
+logger.info("%s", "\n" + "="*30)
+logger.info("转换任务完成！精度验证报告：")
+logger.info("%s", "="*30)
 overall_pass = True
 for key, score in all_stats:
     status = "优" if score >= 98 else "偏差较大"
     if score < 95: overall_pass = False
-    print(f"层: {key[:40]}... | 抽样匹配率: {score}% | 状态: {status}")
+    logger.info(f"层: {key[:40]}... | 抽样匹配率: {score}% | 状态: {status}")
 
 if overall_pass:
-    print("\n结论：权重还原在数学上是一致的。你可以放心加载模型。")
+    logger.info("\n结论：权重还原在数学上是一致的。你可以放心加载模型。")
 else:
-    print("\n结论：存在异常偏差，请检查 Scale 因子的乘除关系或存储顺序。")
+    logger.info("\n结论：存在异常偏差，请检查 Scale 因子的乘除关系或存储顺序。")

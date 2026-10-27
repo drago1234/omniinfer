@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import logging
 import os
 import json
 from argparse import ArgumentParser
@@ -11,6 +12,8 @@ try:
 except:
     pass
 from safetensors.torch import load_file, save_file
+
+logger = logging.getLogger(__name__)
 
 
 def main(args, bf16_path, int8_path, model_name="deepseek-ai/DeepSeek-R1"):
@@ -39,11 +42,11 @@ def main(args, bf16_path, int8_path, model_name="deepseek-ai/DeepSeek-R1"):
         new_state_dict = {}
         for weight_name, weight in state_dict.items():
             if "weight_offset" in weight_name:
-                print(weight_name, "drop!")
+                logger.info('%s %s', weight_name, "drop!")
                 continue
             elif "scale_bias" in weight_name:
                 new_weight_name = weight_name.replace("scale_bias", "weight_bias")
-                print(new_weight_name, weight.dtype)
+                logger.info('%s %s', new_weight_name, weight.dtype)
                 weight = weight.sum(dim=1, keepdim=True)
                 weight = weight.view(weight.numel())
                 new_state_dict[new_weight_name] = weight
@@ -56,18 +59,18 @@ def main(args, bf16_path, int8_path, model_name="deepseek-ai/DeepSeek-R1"):
                     bestScaleInt64 = bestScaleInt64.view(torch.int64).reshape(bestScale.shape)
                     bestScaleInt64 = bestScaleInt64.view(1, -1)
                     new_weight_name = weight_name.replace("weight_scale", "weight_int4_scale")
-                    print(new_weight_name, bestScaleInt64.dtype)
+                    logger.info('%s %s', new_weight_name, bestScaleInt64.dtype)
                     new_state_dict[new_weight_name] = bestScaleInt64
                     new_weight_map[new_weight_name] = file_name
                 else:
-                    print(weight_name, weight.dtype)
+                    logger.info('%s %s', weight_name, weight.dtype)
                     new_state_dict[weight_name] = weight
                     new_weight_map[weight_name] = file_name
             elif ".offset" in weight_name:
-                print(weight_name, "drop!")
+                logger.info('%s %s', weight_name, "drop!")
                 continue
             else:
-                print(weight_name, weight.dtype)
+                logger.info('%s %s', weight_name, weight.dtype)
                 new_state_dict[weight_name] = weight
                 new_weight_map[weight_name] = file_name
                 continue
@@ -81,10 +84,11 @@ def main(args, bf16_path, int8_path, model_name="deepseek-ai/DeepSeek-R1"):
     model_index["weight_map"] = new_weight_map
     with open(new_model_index_file, "w", encoding="utf-8") as f:
         json.dump(model_index, f, indent=2, ensure_ascii=False, sort_keys=True)
-    print(f"model.safetensors.index.json modified and saved to {model_index_file}")
+    logger.info(f"model.safetensors.index.json modified and saved to {model_index_file}")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = ArgumentParser()
     parser.add_argument("--input_path", type=str, required=True)
     parser.add_argument("--output_path", type=str, required=True)
@@ -93,4 +97,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     main(args, args.input_path, args.output_path)
-    print("done")
+    logger.info("done")

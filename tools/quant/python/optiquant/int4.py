@@ -1,3 +1,4 @@
+import logging
 import os
 import json
 import re
@@ -16,6 +17,8 @@ except:
     pass
 
 from safetensors.torch import load_file, save_file
+
+logger = logging.getLogger(__name__)
 
 
 def parse_devices(device):
@@ -339,10 +342,10 @@ def copy_model_files(bf16_path, output_path):
 
     def copy_and_print(src, dst):
         copied_file = shutil.copy2(src, dst)
-        print(f"copied: {os.path.relpath(src, source)}", flush=True)
+        logger.info(f"copied: {os.path.relpath(src, source)}")
         return copied_file
 
-    print(f"copying non-safetensors files from {bf16_path} to {output_path}", flush=True)
+    logger.info(f"copying non-safetensors files from {bf16_path} to {output_path}")
     shutil.copytree(
         source,
         destination,
@@ -457,7 +460,7 @@ def main(
         return file_quant_count, file_weight_map
 
     devices = parse_devices(args.device)
-    print(f"quantizing with {len(devices)} worker(s): {', '.join(devices)}")
+    logger.info(f"quantizing with {len(devices)} worker(s): {', '.join(devices)}")
     with tqdm(total=len(safetensor_files)) as progress:
         file_results = run_file_workers(
             safetensor_files,
@@ -471,12 +474,12 @@ def main(
     new_weight_map = {}
     for _, file_weight_map in file_results:
         new_weight_map.update(file_weight_map)
-    print(quant_count, scale_count)
-    print(f"{quant_count} weights are quantized")
+    logger.info('%s %s', quant_count, scale_count)
+    logger.info(f"{quant_count} weights are quantized")
 
     with open(model_index_file, "r") as f:
         model_index = json.load(f)
     model_index["weight_map"] = new_weight_map
     with open(model_index_file, "w", encoding="utf-8") as f:
         json.dump(model_index, f, indent=2, ensure_ascii=False, sort_keys=True)
-    print(f"model.safetensors.index.json modified and saved to {model_index_file}")
+    logger.info(f"model.safetensors.index.json modified and saved to {model_index_file}")

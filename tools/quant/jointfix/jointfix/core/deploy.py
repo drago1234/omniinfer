@@ -14,6 +14,7 @@ ignore-list semantics.
 """
 from __future__ import annotations
 
+import logging
 import json
 import shutil
 from collections import defaultdict
@@ -23,6 +24,8 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from jointfix.core.primitives import rtn_quantize, should_quantize
+
+logger = logging.getLogger(__name__)
 
 
 def build_quantization_config(ignore_list, global_compression_ratio=None,
@@ -113,9 +116,9 @@ def finalize_model(orig_model_dir, quant_dir, out_dir=None, skip_patterns=None,
         names = by_shard[shard]
         has_calibrated = any(n in layer_map for n in names)
         if not rtn_uncalibrated and not has_calibrated:
-            print(f"  [finalize {si + 1}/{len(shards)}] skip {shard} (no calibrated layer)")
+            logger.info(f"  [finalize {si + 1}/{len(shards)}] skip {shard} (no calibrated layer)")
             continue
-        print(f"  [finalize {si + 1}/{len(shards)}] {shard} ...", flush=True)
+        logger.info(f"  [finalize {si + 1}/{len(shards)}] {shard} ...")
 
         out_tensors = {}
         # load the per-layer files this shard needs (cache once each)

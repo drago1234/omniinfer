@@ -7,6 +7,7 @@ coordinate descent + output-side GPTQ. The first concrete QuantMethod.
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
@@ -24,6 +25,8 @@ from jointfix.methods.smooth_search import (
     make_smooth_scale,
 )
 from jointfix.registry import register_method
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -358,4 +361,4 @@ class JointFixMethod(QuantMethod):
         path = Path(out_dir) / "joint_search_traces.json"
         with open(path, "w") as f:
             json.dump(scalar, f, indent=2)
-        print(f"  search traces       : {path}  ({len(scalar)} groups)")
+        logger.info(f"  search traces       : {path}  ({len(scalar)} groups)")

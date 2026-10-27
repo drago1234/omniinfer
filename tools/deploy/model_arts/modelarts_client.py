@@ -15,6 +15,7 @@ ModelArts v2 在线服务创建客户端
     MODELARTS_WORKSPACE_ID / MODELARTS_ENTERPRISE_PROJECT_ID
 """
 
+import logging
 import json
 import os
 import sys
@@ -24,6 +25,8 @@ import datetime
 import urllib.request
 import urllib.parse
 import urllib.error
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------- 常量
 REGION = os.environ.get("MODELARTS_REGION", "cn-east-4")
@@ -96,6 +99,7 @@ def make_auth(method: str, path: str, body: bytes, extra_headers=None):
         ak, signed_headers, signature)
     return auth, x_sdk_date
 
+
 def signed_request(method: str, path: str, body: bytes = b"",
                    extra_headers=None, timeout: int = 180):
     """发送签名请求, 返回 (HTTP状态码, 响应文本)。"""
@@ -149,19 +153,18 @@ def create_service(body_file: str):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv:
-        print(__doc__)
-        print("用法: python modelarts_client.py <规范请求体json路径>",
-              file=sys.stderr)
+        logger.info("%s", __doc__)
+        logger.info("用法: python modelarts_client.py <规范请求体json路径>")
         return 2
     body_file = argv[0]
 
     if not (os.environ.get("HW_AK") and os.environ.get("HW_SK")):
-        print("缺少环境变量 HW_AK / HW_SK (临时凭证还需 HW_ST)", file=sys.stderr)
+        logger.error("缺少环境变量 HW_AK / HW_SK (临时凭证还需 HW_ST)")
         return 2
 
     status, text = create_service(body_file)
-    print("HTTP %s" % status)
-    print(text)
+    logger.info("HTTP %s", status)
+    logger.info("%s", text)
 
     try:
         obj = json.loads(text) if text else {}
@@ -169,10 +172,10 @@ def main(argv=None):
     except Exception:
         ok = False
     if ok:
-        print("\n创建成功: id=%s name=%s status=%s"
-              % (obj["id"], obj.get("name"), obj.get("status")))
+        logger.info("\n创建成功: id=%s name=%s status=%s", obj["id"], obj.get("name"), obj.get("status"))
     return 0 if (200 <= status < 300) else 1
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     sys.exit(main())

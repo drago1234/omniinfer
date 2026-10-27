@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import logging
 import os
 import json
 from argparse import ArgumentParser
@@ -9,10 +10,13 @@ import math
 import torch
 from safetensors.torch import load_file, save_file
 
+logger = logging.getLogger(__name__)
+
 FP4_VALUES = [
     +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ]
+
 
 def main(args):
     fp4_path = args.input_fp4_hf_path
@@ -71,7 +75,7 @@ def main(args):
         new_state_dict = {}
         for weight_name, weight in current_state_dict.items():
             weight_path = weight_map[weight_name]
-            print(weight_name)
+            logger.info("%s", weight_name)
             if weight_name.endswith("_scales"):
                 weight_map.pop(weight_name)
             elif weight_name.endswith("_blocks"):
@@ -84,7 +88,12 @@ def main(args):
                     bf16_weight = bf16_weight.transpose(-2,-1).contiguous()
                 new_state_dict[bf16_weight_name] = bf16_weight
                 weight_map[bf16_weight_name] = weight_path
-                print(bf16_weight_name, new_state_dict[bf16_weight_name].shape, new_state_dict[bf16_weight_name].dtype)
+                logger.info(
+                    '%s %s %s',
+                    bf16_weight_name,
+                    new_state_dict[bf16_weight_name].shape,
+                    new_state_dict[bf16_weight_name].dtype,
+                )
             elif weight_name.endswith("_bias"):
                 weight_map.pop(weight_name)
                 bf16_weight_name = weight_name.replace("_bias", ".bias")
@@ -107,7 +116,9 @@ def main(args):
     with open(new_model_index_file, "w") as f:
         json.dump({"metadata": {}, "weight_map": weight_map}, f, indent=2)
 
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = ArgumentParser()
     parser.add_argument("--input-fp4-hf-path", type=str, required=True)
     parser.add_argument("--output-bf16-hf-path", type=str, required=True)

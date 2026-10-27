@@ -71,6 +71,7 @@
 #       audio_tower.*     -> 由一条正则覆盖：re:^audio_tower\..*
 # =============================================================================
 
+import logging
 import argparse
 import json
 import math
@@ -80,6 +81,8 @@ import shutil
 import sys
 import time
 from glob import glob
+
+logger = logging.getLogger(__name__)
 
 INDEX_NAME = "model.safetensors.index.json"
 CONFIG_NAME = "config.json"
@@ -190,14 +193,15 @@ def get_weight_quant():
         sys.path.insert(0, optiquant_root)
     from optiquant.int8 import weight_quant  # noqa: E402
     _weight_quant = weight_quant
-    print("[env]    项目根   : %s" % root)
-    print("[env]    量化内核 : %s" % optiquant_root)
+    logger.info("[env]    项目根   : %s", root)
+    logger.info("[env]    量化内核 : %s", optiquant_root)
     return _weight_quant
 
 
 # -----------------------------------------------------------------------------
 # ignore 名单：由产物反推
 # -----------------------------------------------------------------------------
+
 
 def build_ignore_list(weight_map):
     """凡是有 `.weight` 但没有同名 `.weight_scale` 的模块 = 未量化，必须进 ignore。"""
@@ -274,6 +278,7 @@ def selftest_ignore(ignore, weight_map):
 # -----------------------------------------------------------------------------
 # 通用小工具
 # -----------------------------------------------------------------------------
+
 
 def load_index(d):
     with open(os.path.join(d, INDEX_NAME), encoding="utf-8") as f:
@@ -357,6 +362,7 @@ def expected_scope_counts(layers, experts, dense, blocks):
 # 子命令：scope —— 离线自检量化范围
 # =============================================================================
 
+
 def cmd_scope(args):
     layers = args.layers
     experts = args.experts
@@ -365,10 +371,10 @@ def cmd_scope(args):
     exp = expected_scope_counts(layers, experts, dense, blocks)
     total = sum(exp.values())
 
-    print("=" * 78)
-    print("离线量化范围自检")
-    print("  参数: layers=%d  experts=%d  dense=%d  blocks=%d" % (layers, experts, dense, blocks))
-    print("=" * 78)
+    logger.info("%s", "=" * 78)
+    logger.info("离线量化范围自检")
+    logger.info("  参数: layers=%d  experts=%d  dense=%d  blocks=%d", layers, experts, dense, blocks)
+    logger.info("%s", "=" * 78)
 
     # 构造「标准模型」的全部模块名
     mods = []
@@ -391,23 +397,22 @@ def cmd_scope(args):
                  "visual.blocks.%d.mlp.down_proj" % b]
 
     full_re, mod_re = build_matchers(list(GROUPS))
-    print("")
-    print("[1] 逐组命中")
+    logger.info("")
+    logger.info("[1] 逐组命中")
     bad = 0
     for g in sorted(GROUPS):
         rx = re.compile(r"^(?:" + GROUPS[g] + r")$")
         hit = [m for m in mods if rx.match(m)]
         ok = len(hit) == exp[g]
         bad += 0 if ok else 1
-        print("   %s%-18s 预期 %6d  命中 %6d"
-              % ("OK  " if ok else "!!  ", g, exp[g], len(hit)))
+        logger.info("   %s%-18s 预期 %6d  命中 %6d", "OK  " if ok else "!!  ", g, exp[g], len(hit))
     hit_all = [m for m in mods if mod_re.match(m)]
     ok_all = len(hit_all) == total
     bad += 0 if ok_all else 1
-    print("   %s%-18s 预期 %6d  命中 %6d" % ("OK  " if ok_all else "!!  ", "合计", total, len(hit_all)))
+    logger.info("   %s%-18s 预期 %6d  命中 %6d", "OK  " if ok_all else "!!  ", "合计", total, len(hit_all))
 
-    print("")
-    print("[2] 误伤检查（这些必须一个都不命中）")
+    logger.info("")
+    logger.info("[2] 误伤检查（这些必须一个都不命中）")
     must_not = ["lm_head", "model.embed_tokens", "model.norm"]
     for i in (0, 1, layers // 2, layers - 1):
         must_not += ["model.layers.%d.mlp.gate" % i,
@@ -426,23 +431,25 @@ def cmd_scope(args):
     hurt = [m for m in must_not if mod_re.match(m)]
     if hurt:
         bad += 1
-        print("   !! 被误命中 %d 个:" % len(hurt))
+        logger.info("   !! 被误命中 %d 个:", len(hurt))
         for m in hurt[:10]:
-            print("      ", m)
+            logger.info('%s %s', "      ", m)
     else:
-        print("   无 —— lm_head / router.gate / norm / MHC.phi / merger /")
-        print("        vision_projection / patch_embed / audio_tower / embed_tokens 均未被命中")
+        logger.info("   无 —— lm_head / router.gate / norm / MHC.phi / merger /")
+        logger.info("        vision_projection / patch_embed / audio_tower / embed_tokens 均未被命中")
 
-    print("")
-    print("[3] 白名单正则")
+    logger.info("")
+    logger.info("[3] 白名单正则")
     for g in sorted(GROUPS):
-        print("   %-16s %s" % (g, GROUPS[g]))
+        logger.info("   %-16s %s", g, GROUPS[g])
 
-    print("")
-    print("=" * 78)
-    print("RESULT: %s" % ("PASS —— 范围精确，可用于生产" if not bad
-                          else "FAIL —— 请先修正则"))
-    print("=" * 78)
+    logger.info("")
+    logger.info("%s", "=" * 78)
+    logger.info(
+        "RESULT: %s",
+        "PASS —— 范围精确，可用于生产" if not bad else "FAIL —— 请先修正则",
+    )
+    logger.info("%s", "=" * 78)
     return 0 if not bad else 1
 
 
@@ -450,14 +457,15 @@ def cmd_scope(args):
 # 子命令：survey —— 勘察
 # =============================================================================
 
+
 def cmd_survey(args):
     d = os.path.abspath(args.path)
     if not os.path.isdir(d):
         raise SystemExit("[FATAL] 目录不存在: %s" % d)
 
-    print("=" * 78)
-    print("勘察: %s" % d)
-    print("=" * 78)
+    logger.info("%s", "=" * 78)
+    logger.info("勘察: %s", d)
+    logger.info("%s", "=" * 78)
     try:
         cfg = load_config(d)
     except Exception:
@@ -470,7 +478,7 @@ def cmd_survey(args):
             if isinstance(v, dict):
                 v = {kk: v[kk] for kk in ("depth", "hidden_size", "intermediate_size")
                      if kk in v} or "{...}"
-            print("  %-26s %s" % (k, v))
+            logger.info("  %-26s %s", k, v)
 
     try:
         wm = load_index(d)
@@ -479,54 +487,52 @@ def cmd_survey(args):
 
     names = set(wm)
     scale = [k for k in names if k.endswith("weight_scale")]
-    print("")
-    print("  index 条目        %d" % len(wm))
-    print("  weight_scale      %d  (%s)" % (len(scale), "已量化产物" if scale else "bf16 源"))
-    print("  顶层命名空间      %s" % sorted({k.split(".")[0] for k in names}))
+    logger.info("")
+    logger.info("  index 条目        %d", len(wm))
+    logger.info("  weight_scale      %d  (%s)", len(scale), "已量化产物" if scale else "bf16 源")
+    logger.info("  顶层命名空间      %s", sorted({k.split(".")[0] for k in names}))
 
     layers = sorted({int(m.group(1)) for m in
                      (re.match(r"model\.layers\.(\d+)\.", k) for k in names) if m})
     if layers:
-        print("  model.layers 层号 %d 层: %s%s"
-              % (len(layers), layers[:4], " ..." if len(layers) > 4 else ""))
+        logger.info("  model.layers 层号 %d 层: %s%s", len(layers), layers[:4], " ..." if len(layers) > 4 else "")
 
     shards = shards_of(d)
-    print("")
-    print("  分片 %d 个:" % len(shards))
+    logger.info("")
+    logger.info("  分片 %d 个:", len(shards))
     for s in shards:
-        print("     %-58s %8.2f MB" % (os.path.basename(s), os.path.getsize(s) / 1e6))
-    print("  目录总大小 %.2f GB" % (dir_size(d) / 1e9))
+        logger.info("     %-58s %8.2f MB", os.path.basename(s), os.path.getsize(s) / 1e6)
+    logger.info("  目录总大小 %.2f GB", dir_size(d) / 1e9)
 
     if scale:
         qc = cfg.get("quantization_config") or {}
         ig = qc.get("ignore") or []
-        print("")
-        print("  量化范围:")
+        logger.info("")
+        logger.info("  量化范围:")
         for g, (n, q) in sorted(group_counts(wm).items()):
-            print("     %-18s 共 %6d 个, 已量化 %6d" % (g, n, q))
-        print("  ignore 条数       %d  (%s / %s)"
-              % (len(ig), qc.get("quant_method"), qc.get("quantize")))
-        print("")
-        print("  ignore 覆盖自洽性:")
+            logger.info("     %-18s 共 %6d 个, 已量化 %6d", g, n, q)
+        logger.info("  ignore 条数       %d  (%s / %s)", len(ig), qc.get("quant_method"), qc.get("quantize"))
+        logger.info("")
+        logger.info("  ignore 覆盖自洽性:")
         problems = selftest_ignore(ig, wm)
         if problems:
-            print("     FAIL(%d):" % len(problems))
+            logger.info("     FAIL(%d):", len(problems))
             for p in problems[:8]:
-                print("       ", p)
+                logger.info('%s %s', "       ", p)
         else:
-            print("     PASS")
+            logger.info("     PASS")
     else:
         full_re, _ = build_matchers(list(GROUPS))
         q = [k for k in wm if full_re.match(k)]
-        print("")
-        print("  按默认五组量化，将命中 %d 个张量；保留 %d 个"
-              % (len(q), len(wm) - len(q)))
+        logger.info("")
+        logger.info("  按默认五组量化，将命中 %d 个张量；保留 %d 个", len(q), len(wm) - len(q))
     return 0
 
 
 # =============================================================================
 # 子命令：quant —— 从 bf16 全量量化
 # =============================================================================
+
 
 def cmd_quant(args):
     wq = get_weight_quant()
@@ -536,10 +542,10 @@ def cmd_quant(args):
     src = os.path.abspath(args.src)
     dst = os.path.abspath(args.dst)
 
-    print("[groups] 量化范围 : %s" % ", ".join(groups))
-    print("[groups] 白名单   : %s" % full_re.pattern)
+    logger.info("[groups] 量化范围 : %s", ", ".join(groups))
+    logger.info("[groups] 白名单   : %s", full_re.pattern)
     st = os.statvfs(os.path.dirname(dst) or "/")
-    print("[disk]  输出盘可用 %.2f GB" % (st.f_bavail * st.f_frsize / 1e9))
+    logger.info("[disk]  输出盘可用 %.2f GB", st.f_bavail * st.f_frsize / 1e9)
 
     try:
         weight_map = load_index(src)
@@ -553,8 +559,7 @@ def cmd_quant(args):
 
     quant = [k for k in weight_map if full_re.match(k)]
     keep = [k for k in weight_map if not full_re.match(k)]
-    print("[plan]  分片=%d  张量=%d  量化=%d  保留bf16=%d"
-          % (len(shards), len(weight_map), len(quant), len(keep)))
+    logger.info("[plan]  分片=%d  张量=%d  量化=%d  保留bf16=%d", len(shards), len(weight_map), len(quant), len(keep))
 
     report_quant_plan(src, shards, weight_map, quant, keep, groups, full_re)
 
@@ -577,16 +582,16 @@ def cmd_quant(args):
     if not (os.path.isfile(index_out) and os.path.isfile(config_out)):
         if args.allow_hf_download and args.model_name:
             from huggingface_hub import snapshot_download
-            print("[meta] 从 HuggingFace 下载 %s 的元数据 -> %s" % (args.model_name, dst))
+            logger.info("[meta] 从 HuggingFace 下载 %s 的元数据 -> %s", args.model_name, dst)
             snapshot_download(repo_id=args.model_name,
                               ignore_patterns=["*.safetensors"],
                               local_dir=dst, local_dir_use_symlinks=False)
         else:
-            print("[meta] 输出目录缺少元数据，从 %s 复制非权重文件 ..." % src)
+            logger.info("[meta] 输出目录缺少元数据，从 %s 复制非权重文件 ...", src)
             for entry in copy_metadata(src, dst):
-                print("       + %s" % entry)
+                logger.info("       + %s", entry)
     else:
-        print("[meta] 元数据已存在，跳过复制")
+        logger.info("[meta] 元数据已存在，跳过复制")
 
     torch.set_default_dtype(torch.bfloat16)
     new_wm, stat = {}, {"quantized": 0, "kept": 0}
@@ -604,17 +609,16 @@ def cmd_quant(args):
             dst_path = os.path.join(dst, base)
             if not os.path.isfile(dst_path):
                 shutil.copy2(src_path, dst_path)
-                print("[copy ] %-46s %.2f GB（无量化目标，原样复制）"
-                      % (base, os.path.getsize(src_path) / 1e9))
+                logger.info("[copy ] %-46s %.2f GB（无量化目标，原样复制）", base, os.path.getsize(src_path) / 1e9)
             else:
-                print("[copy ] %-46s （已存在，跳过）" % base)
+                logger.info("[copy ] %-46s （已存在，跳过）", base)
             for key in keys:
                 new_wm[key] = base
             stat["kept"] += len(keys)
             continue
 
         out_name = base.replace("model", args.quant_prefix, 1)
-        print("[shard] %s -> %s  （量化 %d / 共 %d）" % (base, out_name, len(qk), len(keys)))
+        logger.info("[shard] %s -> %s  （量化 %d / 共 %d）", base, out_name, len(qk), len(keys))
         sd = load_file(src_path, device=args.device)
         out = {}
         for name, tensor in sd.items():
@@ -643,11 +647,10 @@ def cmd_quant(args):
 
     ignore = build_ignore_list(new_wm)
     problems = selftest_ignore(ignore, new_wm)
-    print("")
-    print("[ignore] 未量化模块 %d 个；自洽性自检：%s"
-          % (len(ignore), "PASS" if not problems else "FAIL(%d)" % len(problems)))
+    logger.info("")
+    logger.info("[ignore] 未量化模块 %d 个；自洽性自检：%s", len(ignore), "PASS" if not problems else "FAIL(%d)" % len(problems))
     for p in problems[:10]:
-        print("   !! %s" % p)
+        logger.info("   !! %s", p)
     if problems:
         raise SystemExit("[FATAL] ignore 与产物不一致，已中止写入 config.json")
 
@@ -662,20 +665,20 @@ def cmd_quant(args):
     with open(config_out, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=4, ensure_ascii=False)
 
-    print("")
-    print("[done] 量化=%d  保留bf16=%d" % (stat["quantized"], stat["kept"]))
-    print("[done] 权重     -> %s" % dst)
-    print("[done] 索引     -> %s" % index_out)
-    print("[done] 量化配置 -> %s" % config_out)
-    print("[done] 目录体积 %.2f GB" % (dir_size(dst) / 1e9))
+    logger.info("")
+    logger.info("[done] 量化=%d  保留bf16=%d", stat["quantized"], stat["kept"])
+    logger.info("[done] 权重     -> %s", dst)
+    logger.info("[done] 索引     -> %s", index_out)
+    logger.info("[done] 量化配置 -> %s", config_out)
+    logger.info("[done] 目录体积 %.2f GB", dir_size(dst) / 1e9)
     return 0
 
 
 def report_quant_plan(src, shards, weight_map, quant, keep, groups, full_re):
-    print("")
-    print("=" * 78)
-    print("量化计划 —— 只读 header，不加载权重")
-    print("=" * 78)
+    logger.info("")
+    logger.info("%s", "=" * 78)
+    logger.info("量化计划 —— 只读 header，不加载权重")
+    logger.info("%s", "=" * 78)
 
     rx_layer = re.compile(r"\.layers\.\d+\.")
     rx_exp = re.compile(r"\.experts\.\d+\.")
@@ -683,33 +686,31 @@ def report_quant_plan(src, shards, weight_map, quant, keep, groups, full_re):
     for name in quant:
         key = rx_exp.sub(".experts.M.", rx_layer.sub(".layers.N.", name))
         buckets[key] = buckets.get(key, 0) + 1
-    print("")
-    print("[将量化为 int8]  共 %d 个" % len(quant))
+    logger.info("")
+    logger.info("[将量化为 int8]  共 %d 个", len(quant))
     for key in sorted(buckets, key=lambda k: -buckets[k]):
-        print("   %7d  %s" % (buckets[key], key))
+        logger.info("   %7d  %s", buckets[key], key)
 
     shard_q = {}
     for name in quant:
         shard_q.setdefault(os.path.basename(weight_map[name]), []).append(name)
-    print("")
-    print("[分片分布]  共 %d 个分片" % len(shards))
+    logger.info("")
+    logger.info("[分片分布]  共 %d 个分片", len(shards))
     for base in sorted(set(os.path.basename(s) for s in shards)):
         n = len(shard_q.get(base, []))
-        print("   %-58s %6d 个量化张量%s"
-              % (base, n, "（无目标，将原样复制）" if n == 0 else ""))
+        logger.info("   %-58s %6d 个量化张量%s", base, n, "（无目标，将原样复制）" if n == 0 else "")
 
     try:
         shapes = read_shapes(shards)
     except Exception as exc:  # noqa: BLE001
-        print("\n[形状统计] 跳过：%s" % exc)
+        logger.warning("\n[形状统计] 跳过：%s", exc)
         shapes = None
     if shapes:
         def nparam(ns):
             return sum(math.prod(shapes[n]) for n in ns if n in shapes)
         pq, pk = nparam(quant), nparam(keep)
-        print("")
-        print("[参数量]  量化目标 = %.3fB   保留 bf16 = %.3fB   合计 = %.3fB"
-              % (pq / 1e9, pk / 1e9, (pq + pk) / 1e9))
+        logger.info("")
+        logger.info("[参数量]  量化目标 = %.3fB   保留 bf16 = %.3fB   合计 = %.3fB", pq / 1e9, pk / 1e9, (pq + pk) / 1e9)
 
     n_base = int(cfg_get(src, "num_hidden_layers", 0) or 0)
     n_mtp = int(cfg_get(src, "num_nextn_predict_layers", 0) or 0)
@@ -719,41 +720,43 @@ def report_quant_plan(src, shards, weight_map, quant, keep, groups, full_re):
             return int(m.group(1)) if m else -1
         base_q = [n for n in quant if 0 <= layer_of(n) < n_base]
         mtp_q = [n for n in quant if layer_of(n) >= n_base]
-        print("")
-        print("[按层拆分] num_hidden_layers=%d  num_nextn_predict_layers=%d"
-              % (n_base, n_mtp))
-        print("   主干层 0~%d        : %d 个量化张量" % (n_base - 1, len(base_q)))
+        logger.info("")
+        logger.info("[按层拆分] num_hidden_layers=%d  num_nextn_predict_layers=%d", n_base, n_mtp)
+        logger.info("   主干层 0~%d        : %d 个量化张量", n_base - 1, len(base_q))
         if mtp_q:
-            print("   MTP 层 %d~%d       : %d 个量化张量（占 %.1f%%）"
-                  % (n_base, max(layer_of(n) for n in mtp_q), len(mtp_q),
-                     len(mtp_q) / len(quant) * 100))
+            logger.info(
+                "   MTP 层 %d~%d       : %d 个量化张量（占 %.1f%%）",
+                n_base,
+                max(layer_of(n) for n in mtp_q),
+                len(mtp_q),
+                len(mtp_q) / len(quant) * 100,
+            )
 
     if shapes:
         odd = sorted(n for n in shapes if len(shapes[n]) == 2 and not n.endswith(".weight"))
-        print("")
-        print("[风险提示] 2-D 但不以 .weight 结尾的张量: %d 个" % len(odd))
+        logger.info("")
+        logger.info("[风险提示] 2-D 但不以 .weight 结尾的张量: %d 个", len(odd))
         for n in odd[:10]:
-            print("      %s  %s" % (n, shapes[n]))
+            logger.info("      %s  %s", n, shapes[n])
         if not odd:
-            print("      （无，说明所有 2-D 参数都按 .weight 命名，ignore 推导无盲区）")
+            logger.info("      （无，说明所有 2-D 参数都按 .weight 命名，ignore 推导无盲区）")
 
     projected = set(weight_map)
     for key in list(projected):
         if full_re.match(key):
             projected.add(key.replace("weight", "weight_scale"))
     ignore = build_ignore_list(projected)
-    print("")
-    print("[运行时 ignore 名单]  共 %d 个未量化模块（精确层名，非正则）" % len(ignore))
+    logger.info("")
+    logger.info("[运行时 ignore 名单]  共 %d 个未量化模块（精确层名，非正则）", len(ignore))
     for name in ignore[:8]:
-        print("   %s" % name)
+        logger.info("   %s", name)
     if len(ignore) > 8:
-        print("   ... 另 %d 个" % (len(ignore) - 8))
+        logger.info("   ... 另 %d 个", len(ignore) - 8)
     problems = selftest_ignore(ignore, projected)
-    print("[ignore 自洽性自检]  %s"
-          % ("PASS —— 与产物状态一致" if not problems else "FAIL(%d)" % len(problems)))
+    logger.info("[ignore 自洽性自检]  %s", "PASS —— 与产物状态一致" if not problems else "FAIL(%d)" % len(problems))
     for p in problems[:10]:
-        print("     %s" % p)
-    print("=" * 78)
+        logger.info("     %s", p)
+    logger.info("%s", "=" * 78)
 
 
 def cfg_get(d, key, default=None):
@@ -802,19 +805,19 @@ def compare_reference(ignore, ref_config_path):
         ref_cfg = json.load(f)
     ref = set(ref_cfg.get("quantization_config", {}).get("ignore") or [])
     cur = set(ignore)
-    print("")
-    print("[交叉核验] 参考产物: %s" % ref_config_path)
-    print("   参考 ignore = %d   本次 ignore = %d" % (len(ref), len(cur)))
-    print("   参考有而本次没有 (%d):" % len(ref - cur))
+    logger.info("")
+    logger.info("[交叉核验] 参考产物: %s", ref_config_path)
+    logger.info("   参考 ignore = %d   本次 ignore = %d", len(ref), len(cur))
+    logger.info("   参考有而本次没有 (%d):", len(ref - cur))
     for x in sorted(ref - cur)[:10]:
-        print("      - %s" % x)
-    print("   本次有而参考没有 (%d):" % len(cur - ref))
+        logger.info("      - %s", x)
+    logger.info("   本次有而参考没有 (%d):", len(cur - ref))
     for x in sorted(cur - ref)[:10]:
-        print("      + %s" % x)
+        logger.info("      + %s", x)
     if ref == cur:
-        print("   => 完全一致：运行时 ignore 与已验证产物同构")
+        logger.info("   => 完全一致：运行时 ignore 与已验证产物同构")
     else:
-        print("   => 存在差异，请人工确认（结构不同则应分别验证）")
+        logger.info("   => 存在差异，请人工确认（结构不同则应分别验证）")
     return ref == cur
 
 
@@ -822,23 +825,24 @@ def compare_reference(ignore, ref_config_path):
 # 子命令：more —— 给已有 W8A8 产物补量化
 # =============================================================================
 
+
 def cmd_more(args):
     wq = get_weight_quant()
     groups = parse_groups(args.groups) if args.groups else []
     pat_strs = list(args.module_re or []) + [GROUPS[g] for g in groups]
     if not pat_strs:
-        print("[FATAL] 必须指定 --groups 或 --module-re")
+        logger.info("[FATAL] 必须指定 --groups 或 --module-re")
         return 2
     mod_re = re.compile(r"^(?:" + "|".join("(?:%s)" % p for p in pat_strs) + r")$")
 
     src, dst = os.path.abspath(args.src), os.path.abspath(args.dst)
-    print("=" * 78)
-    print("源目录  : %s" % src)
-    print("目标目录: %s" % dst)
+    logger.info("%s", "=" * 78)
+    logger.info("源目录  : %s", src)
+    logger.info("目标目录: %s", dst)
     if groups:
-        print("模块组  : %s" % ", ".join(groups))
-    print("匹配正则: %s" % mod_re.pattern)
-    print("=" * 78)
+        logger.info("模块组  : %s", ", ".join(groups))
+    logger.info("匹配正则: %s", mod_re.pattern)
+    logger.info("%s", "=" * 78)
 
     with open(os.path.join(src, INDEX_NAME), encoding="utf-8") as f:
         index = json.load(f)
@@ -862,14 +866,14 @@ def cmd_more(args):
         targets.add(mod)
     tkeys = sorted(m + ".weight" for m in targets)
 
-    print("")
-    print("[计划] 命中模块 %d 个（已是量化状态的跳过 %d 个）" % (len(targets), len(skipped)))
+    logger.info("")
+    logger.info("[计划] 命中模块 %d 个（已是量化状态的跳过 %d 个）", len(targets), len(skipped))
     for m in sorted(targets)[:6]:
-        print("         %s" % m)
+        logger.info("         %s", m)
     if len(targets) > 6:
-        print("         ... 另 %d 个" % (len(targets) - 6))
+        logger.info("         ... 另 %d 个", len(targets) - 6)
     if not targets:
-        print("   没有需要量化的模块，退出。")
+        logger.info("   没有需要量化的模块，退出。")
         return 0
 
     shard_keys = {}
@@ -878,13 +882,12 @@ def cmd_more(args):
     all_shards = sorted(set(wm.values()))
     plain = [s for s in all_shards if s not in shard_keys]
 
-    print("")
-    print("[计划] 需重写分片 %d 个 / 共 %d 个；直接复制 %d 个"
-          % (len(shard_keys), len(all_shards), len(plain)))
+    logger.info("")
+    logger.info("[计划] 需重写分片 %d 个 / 共 %d 个；直接复制 %d 个", len(shard_keys), len(all_shards), len(plain))
     for f_, ks in sorted(shard_keys.items()):
-        print("   重写 %-58s %4d 个张量" % (f_, len(ks)))
+        logger.info("   重写 %-58s %4d 个张量", f_, len(ks))
     for f_ in plain:
-        print("   复制 %s" % f_)
+        logger.info("   复制 %s", f_)
 
     removed = [e for e in old_ignore if strip_prefix(e) in targets]
     new_ignore = [e for e in old_ignore if strip_prefix(e) not in targets]
@@ -893,101 +896,101 @@ def cmd_more(args):
         for k in tkeys:
             projected.add(k.replace("weight", "weight_scale"))
         new_ignore = build_ignore_list(projected)
-        print("")
-        print("[计划] ignore 由产物反推重建: %d -> %d" % (len(old_ignore), len(new_ignore)))
+        logger.info("")
+        logger.info("[计划] ignore 由产物反推重建: %d -> %d", len(old_ignore), len(new_ignore))
     else:
-        print("")
-        print("[计划] ignore 删除 %d 条: %d -> %d"
-              % (len(removed), len(old_ignore), len(new_ignore)))
+        logger.info("")
+        logger.info("[计划] ignore 删除 %d 条: %d -> %d", len(removed), len(old_ignore), len(new_ignore))
 
     st = os.statvfs(os.path.dirname(dst) or "/")
-    print("[计划] 目标目录约需 %.2f GB，所在盘可用 %.2f GB"
-          % (sum(os.path.getsize(os.path.join(src, s)) for s in all_shards) / 1e9,
-             st.f_bavail * st.f_frsize / 1e9))
+    logger.info(
+        "[计划] 目标目录约需 %.2f GB，所在盘可用 %.2f GB",
+        sum(os.path.getsize(os.path.join(src, s)) for s in all_shards) / 1e9,
+        st.f_bavail * st.f_frsize / 1e9,
+    )
     if os.path.exists(dst):
-        print("   !! 目标目录已存在，将被写入（不删除其中已有内容）")
+        logger.info("   !! 目标目录已存在，将被写入（不删除其中已有内容）")
 
     if not args.apply:
-        print("")
-        print("（计划模式，未改动任何文件；加 --apply 执行）")
+        logger.info("")
+        logger.info("（计划模式，未改动任何文件；加 --apply 执行）")
         return 0
 
     # ---------------- 执行 ----------------
-    print("")
-    print("=" * 78)
+    logger.info("")
+    logger.info("%s", "=" * 78)
     if not os.path.isdir(dst):
         os.makedirs(dst)
-        print("[执行] 新建目录 %s" % dst)
+        logger.info("[执行] 新建目录 %s", dst)
 
     stat = {"bf16": 0, "i8": 0, "scale": 0, "tensors": len(tkeys)}
     made_tmp, done = [], {}
     try:
-        print("[执行] 构建新分片（只写临时文件）")
+        logger.info("[执行] 构建新分片（只写临时文件）")
         for shard in sorted(shard_keys):
             keys = shard_keys[shard]
-            print("  --- %s ---" % shard)
+            logger.info("  --- %s ---", shard)
             tmp_path, problems = _build_shard(wq, src, dst, shard, keys, stat)
             made_tmp.append(tmp_path)
             if problems:
-                print("   !! 校验失败:")
+                logger.info("   !! 校验失败:")
                 for p in problems[:10]:
-                    print("      %s" % p)
+                    logger.info("      %s", p)
                 raise RuntimeError("分片校验未通过: " + shard)
-            print("   OK")
+            logger.info("   OK")
             done[shard] = tmp_path
 
-        print("")
-        print("[执行] 落定分片")
+        logger.info("")
+        logger.info("[执行] 落定分片")
         for shard, tmp_path in sorted(done.items()):
             os.replace(tmp_path, os.path.join(dst, shard))
             made_tmp.remove(tmp_path)
-            print("   %s" % shard)
+            logger.info("   %s", shard)
         for shard in plain:
             dst_p = os.path.join(dst, shard)
             if os.path.exists(dst_p):
-                print("   复制 %s  (已存在，跳过)" % shard)
+                logger.info("   复制 %s  (已存在，跳过)", shard)
                 continue
             t0 = time.time()
             shutil.copy2(os.path.join(src, shard), dst_p)
-            print("   复制 %-58s (%.1fs)" % (shard, time.time() - t0))
+            logger.info("   复制 %-58s (%.1fs)", shard, time.time() - t0)
 
-        print("")
-        print("[执行] 复制元数据")
+        logger.info("")
+        logger.info("[执行] 复制元数据")
         items = copy_metadata(src, dst)
-        print("   %d 项: %s%s" % (len(items), ", ".join(items[:6]),
-                                  " ..." if len(items) > 6 else ""))
+        logger.info("   %d 项: %s%s", len(items), ", ".join(items[:6]), " ..." if len(items) > 6 else "")
 
-        print("")
-        print("[执行] 更新索引")
+        logger.info("")
+        logger.info("[执行] 更新索引")
         for shard, keys in sorted(shard_keys.items()):
             for k in keys:
                 wm[k.replace("weight", "weight_scale")] = shard
         index["weight_map"] = wm
         with open(os.path.join(dst, INDEX_NAME), "w", encoding="utf-8") as f:
             json.dump(index, f, ensure_ascii=False)
-        print("   新增 %d 条 weight_scale，索引总数 %d" % (len(tkeys), len(wm)))
+        logger.info("   新增 %d 条 weight_scale，索引总数 %d", len(tkeys), len(wm))
 
-        print("")
-        print("[执行] 更新 config.json 的 ignore")
+        logger.info("")
+        logger.info("[执行] 更新 config.json 的 ignore")
         cfg["quantization_config"]["ignore"] = new_ignore
         with open(os.path.join(dst, CONFIG_NAME), "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=4, ensure_ascii=False)
-        print("   ignore: %d -> %d" % (len(old_ignore), len(new_ignore)))
+        logger.info("   ignore: %d -> %d", len(old_ignore), len(new_ignore))
 
     except Exception as exc:  # noqa: BLE001
-        print("")
-        print("[中止] 出错: %r" % (exc,))
+        logger.info("")
+        logger.error("[中止] 出错: %r", exc)
         for tmp in made_tmp:
             if os.path.isfile(tmp):
                 os.remove(tmp)
-                print("   已清理 %s" % os.path.basename(tmp))
-        print("   目标目录中未落定的分片已清理；请检查后重试。")
+                logger.info("   已清理 %s", os.path.basename(tmp))
+        logger.error("   目标目录中未落定的分片已清理；请检查后重试。")
         return 1
 
     # ---------------- 终检 ----------------
-    print("")
-    print("=" * 78)
-    print("[终检] 从磁盘重新读取")
+    logger.info("")
+    logger.info("%s", "=" * 78)
+    logger.info("[终检] 从磁盘重新读取")
     from safetensors import safe_open
     wm2 = load_index(dst)
     ig2 = load_config(dst)["quantization_config"]["ignore"]
@@ -1001,27 +1004,31 @@ def cmd_more(args):
         dw, ds = f_.get_slice(k).get_dtype(), f_.get_slice(ks).get_dtype()
         ok = (dw == "I8" and ds == "F32")
         bad += [] if ok else [k]
-        print("   %-58s %-4s scale %-4s %s" % (k, dw, ds, "OK" if ok else "FAIL"))
+        logger.info("   %-58s %-4s scale %-4s %s", k, dw, ds, "OK" if ok else "FAIL")
 
-    print("")
+    logger.info("")
     problems = selftest_ignore(ig2, wm2)
     if problems:
         bad.append("selftest")
-        print("[终检] 自检 FAIL，共 %d 项:" % len(problems))
+        logger.info("[终检] 自检 FAIL，共 %d 项:", len(problems))
         for p in problems[:15]:
-            print("   %s" % p)
-        print("   提示：可加 --rebuild-ignore 让 ignore 由产物反推重建")
+            logger.info("   %s", p)
+        logger.info("   提示：可加 --rebuild-ignore 让 ignore 由产物反推重建")
     else:
-        print("[终检] 自检 PASS —— ignore 与磁盘产物完全自洽")
+        logger.info("[终检] 自检 PASS —— ignore 与磁盘产物完全自洽")
 
-    print("")
-    print("[统计] 目标 %d 个张量 | bf16 %.2f MB -> I8 %.2f MB + scale %.2f MB | 净省 %.2f MB"
-          % (stat["tensors"], stat["bf16"] / 1e6, stat["i8"] / 1e6, stat["scale"] / 1e6,
-             (stat["bf16"] - stat["i8"] - stat["scale"]) / 1e6))
+    logger.info("")
+    logger.info(
+        "[统计] 目标 %d 个张量 | bf16 %.2f MB -> I8 %.2f MB + scale %.2f MB | 净省 %.2f MB",
+        stat["tensors"],
+        stat["bf16"] / 1e6,
+        stat["i8"] / 1e6,
+        stat["scale"] / 1e6,
+        (stat["bf16"] - stat["i8"] - stat["scale"]) / 1e6,
+    )
     st = os.statvfs(dst)
-    print("[统计] 新目录体积 %.2f GB | 盘余 %.2f GB" % (dir_size(dst) / 1e9,
-                                                        st.f_bavail * st.f_frsize / 1e9))
-    print("[终检] 结论: %s" % ("全部通过" if not bad else "存在问题"))
+    logger.info("[统计] 新目录体积 %.2f GB | 盘余 %.2f GB", dir_size(dst) / 1e9, st.f_bavail * st.f_frsize / 1e9)
+    logger.info("[终检] 结论: %s", "全部通过" if not bad else "存在问题")
     return 0 if not bad else 1
 
 
@@ -1034,7 +1041,7 @@ def _build_shard(wq, src_dir, dst_dir, shard, keys, stat):
 
     t0 = time.time()
     sd = load_file(src_path, device="cpu")
-    print("      读入 %d 个张量  (%.1fs)" % (len(sd), time.time() - t0))
+    logger.info("      读入 %d 个张量  (%.1fs)", len(sd), time.time() - t0)
 
     new, t0 = {}, time.time()
     for k, v in sd.items():
@@ -1051,12 +1058,11 @@ def _build_shard(wq, src_dir, dst_dir, shard, keys, stat):
             stat["scale"] += s.numel() * 4
         else:
             new[k] = v
-    print("      量化 %d 个张量  (%.1fs)" % (len(keys), time.time() - t0))
+    logger.info("      量化 %d 个张量  (%.1fs)", len(keys), time.time() - t0)
 
     t0 = time.time()
     save_file(new, tmp_path)
-    print("      写出临时文件 %.2f GB  (%.1fs)"
-          % (os.path.getsize(tmp_path) / 1e9, time.time() - t0))
+    logger.info("      写出临时文件 %.2f GB  (%.1fs)", os.path.getsize(tmp_path) / 1e9, time.time() - t0)
 
     expect = set(sd.keys()) | {k.replace("weight", "weight_scale") for k in keys}
     problems, t0 = [], time.time()
@@ -1081,14 +1087,14 @@ def _build_shard(wq, src_dir, dst_dir, shard, keys, stat):
                     or not torch.equal(g, v)):
                 problems.append("未改动张量发生变化: " + k)
             nchk += 1
-    print("      校验：%d 个未改动张量逐一比对 + %d 个新张量  (%.1fs)"
-          % (nchk, len(keys), time.time() - t0))
+    logger.info("      校验：%d 个未改动张量逐一比对 + %d 个新张量  (%.1fs)", nchk, len(keys), time.time() - t0)
     return tmp_path, problems
 
 
 # =============================================================================
 # 子命令：verify —— 核对产物
 # =============================================================================
+
 
 def cmd_verify(args):
     dst = os.path.abspath(args.dst)
@@ -1110,11 +1116,17 @@ def cmd_verify(args):
     names = set(wm)
     scale = [k for k in names if k.endswith("weight_scale")]
 
-    print("=" * 78)
-    print("核对: %s" % dst)
-    print("=" * 78)
-    print("  index 条目 %d | weight_scale %d | ignore %d | %s / %s"
-          % (len(wm), len(scale), len(ig), qc.get("quant_method"), qc.get("quantize")))
+    logger.info("%s", "=" * 78)
+    logger.info("核对: %s", dst)
+    logger.info("%s", "=" * 78)
+    logger.info(
+        "  index 条目 %d | weight_scale %d | ignore %d | %s / %s",
+        len(wm),
+        len(scale),
+        len(ig),
+        qc.get("quant_method"),
+        qc.get("quantize"),
+    )
 
     cache = {}
 
@@ -1125,8 +1137,8 @@ def cmd_verify(args):
         return cache[fn].get_slice(k)
 
     # --- 1) 逐组 dtype ---
-    print("")
-    print("[1] 逐组 dtype")
+    logger.info("")
+    logger.info("[1] 逐组 dtype")
     bad_total, skipped = 0, []
     for g in sorted(groups):
         rx = re.compile(r"^(?:" + GROUPS[g] + r")$")
@@ -1135,7 +1147,7 @@ def cmd_verify(args):
         with_scale = [m for m in mods if (m + ".weight_scale") in names]
         if not with_scale:
             skipped.append((g, len(mods)))
-            print("   %-18s 共 %5d 个 | 未量化（不在本次范围）" % (g, len(mods)))
+            logger.info("   %-18s 共 %5d 个 | 未量化（不在本次范围）", g, len(mods))
             continue
         bad = []
         for m in mods:
@@ -1148,17 +1160,15 @@ def cmd_verify(args):
             if a.get_dtype() != "I8" or b.get_dtype() != "F32":
                 bad.append("%s dtype=%s scale=%s" % (k, a.get_dtype(), b.get_dtype()))
         bad_total += len(bad)
-        print("   %-18s 共 %5d 个 | I8+F32 正确 %5d | 异常 %d"
-              % (g, len(mods), len(mods) - len(bad), len(bad)))
+        logger.info("   %-18s 共 %5d 个 | I8+F32 正确 %5d | 异常 %d", g, len(mods), len(mods) - len(bad), len(bad))
         for b in bad[:3]:
-            print("        !! %s" % b)
+            logger.info("        !! %s", b)
     if skipped:
-        print("   范围外（未量化，符合预期）: %s"
-              % ", ".join("%s %d 个" % (t, n) for t, n in skipped))
+        logger.info("   范围外（未量化，符合预期）: %s", ", ".join("%s %d 个" % (t, n) for t, n in skipped))
 
     # --- 2) 不该量化的仍无 scale ---
-    print("")
-    print("[2] 不应被量化的模块是否被误量化")
+    logger.info("")
+    logger.info("[2] 不应被量化的模块是否被误量化")
     must_not = [("visual.blocks.*.norm1/norm2", r"^visual\.blocks\.\d+\.norm[12]$"),
                 ("visual.patch_embed.proj", r"^visual\.patch_embed\.proj$"),
                 ("visual.merger.*", r"^visual\.merger"),
@@ -1172,38 +1182,36 @@ def cmd_verify(args):
               if k.endswith(".weight") and rx.match(k[: -len(".weight")])]
         q = [m for m in ms if (m + ".weight_scale") in names]
         hurt += len(q)
-        print("   %-32s 共 %4d 个, 有 scale %3d  %s"
-              % (tag, len(ms), len(q), "OK" if not q else "!! 不该有"))
+        logger.info("   %-32s 共 %4d 个, 有 scale %3d  %s", tag, len(ms), len(q), "OK" if not q else "!! 不该有")
     bad_total += hurt
 
     # --- 3) ignore 自洽性 + 覆盖率 ---
-    print("")
-    print("[3] ignore 自洽性 / 覆盖率")
+    logger.info("")
+    logger.info("[3] ignore 自洽性 / 覆盖率")
     problems = selftest_ignore(ig, wm)
     if problems:
         bad_total += len(problems)
-        print("   FAIL(%d):" % len(problems))
+        logger.info("   FAIL(%d):", len(problems))
         for p in problems[:10]:
-            print("      %s" % p)
+            logger.info("      %s", p)
     else:
-        print("   PASS —— ignore 与磁盘产物完全自洽")
+        logger.info("   PASS —— ignore 与磁盘产物完全自洽")
     re_entries = [e for e in ig if e.startswith("re:")]
     if re_entries:
-        print("   注意：ignore 含 %d 条正则项（已纳入匹配）：%s"
-              % (len(re_entries), ", ".join(re_entries[:3])))
+        logger.info("   注意：ignore 含 %d 条正则项（已纳入匹配）：%s", len(re_entries), ", ".join(re_entries[:3]))
 
     # --- 4) 精度（若给了参考目录） ---
     rels = []
     if ref:
-        print("")
-        print("[4] 精度（以 %s 的同名张量为基准）" % os.path.basename(ref))
+        logger.info("")
+        logger.info("[4] 精度（以 %s 的同名张量为基准）", os.path.basename(ref))
         rwm = load_index(ref)
         quant_mods = [m for m in sorted({k[: -len(".weight")] for k in names
                                          if k.endswith(".weight")})
                       if (m + ".weight_scale") in names]
         picks = quant_mods[:2] + quant_mods[len(quant_mods) // 2:
                                             len(quant_mods) // 2 + 2] + quant_mods[-2:]
-        print("   %-52s %9s %11s %9s" % ("tensor", "rel_err", "cos(fp64)", "SQNR_dB"))
+        logger.info("   %-52s %9s %11s %9s", "tensor", "rel_err", "cos(fp64)", "SQNR_dB")
         for m in picks:
             k = m + ".weight"
             ks = m + ".weight_scale"
@@ -1221,35 +1229,43 @@ def cmd_verify(args):
             cos = (torch.dot(dq.flatten(), w.flatten()) / (dq.norm() * w.norm())).item()
             sqnr = (20 * torch.log10(w.norm() / err.norm())).item()
             rels.append(rel)
-            print("   %-52s %8.3f%% %11.6f %9.2f"
-                  % (m.replace("model.layers.", "L").replace("visual.blocks.", "b"),
-                     rel * 100, cos, sqnr))
+            logger.info(
+                "   %-52s %8.3f%% %11.6f %9.2f",
+                m.replace("model.layers.", "L").replace("visual.blocks.", "b"),
+                rel * 100,
+                cos,
+                sqnr,
+            )
         if rels:
-            print("   平均相对误差 %.3f%%" % (sum(rels) / len(rels) * 100))
+            logger.info("   平均相对误差 %.3f%%", sum(rels) / len(rels) * 100)
     else:
-        print("")
-        print("[4] 精度  跳过（未给 --ref）")
+        logger.info("")
+        logger.info("[4] 精度  跳过（未给 --ref）")
 
     # --- 5) 体积 ---
-    print("")
-    print("[5] 体积")
+    logger.info("")
+    logger.info("[5] 体积")
     if ref:
-        print("   参考 %.2f GB  ->  产物 %.2f GB  (减少 %.2f MB)"
-              % (dir_size(ref) / 1e9, dir_size(dst) / 1e9,
-                 (dir_size(ref) - dir_size(dst)) / 1e6))
+        logger.info(
+            "   参考 %.2f GB  ->  产物 %.2f GB  (减少 %.2f MB)",
+            dir_size(ref) / 1e9,
+            dir_size(dst) / 1e9,
+            (dir_size(ref) - dir_size(dst)) / 1e6,
+        )
     else:
-        print("   产物 %.2f GB" % (dir_size(dst) / 1e9))
+        logger.info("   产物 %.2f GB", dir_size(dst) / 1e9)
 
-    print("")
-    print("=" * 78)
-    print("RESULT: %s" % ("PASS" if bad_total == 0 else "FAIL(%d)" % bad_total))
-    print("=" * 78)
+    logger.info("")
+    logger.info("%s", "=" * 78)
+    logger.info("RESULT: %s", "PASS" if bad_total == 0 else "FAIL(%d)" % bad_total)
+    logger.info("%s", "=" * 78)
     return 0 if bad_total == 0 else 1
 
 
 # =============================================================================
 # CLI
 # =============================================================================
+
 
 def main():
     ap = argparse.ArgumentParser(
@@ -1319,4 +1335,5 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

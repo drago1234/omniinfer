@@ -9,6 +9,7 @@ light.
 """
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import Dict, List
 
@@ -18,6 +19,8 @@ import torch.nn as nn
 from jointfix.backends.base import LayerSpec, ModelBackend
 from jointfix.core.primitives import UNIVERSAL_SKIP_PATTERNS
 from jointfix.registry import register_backend
+
+logger = logging.getLogger(__name__)
 
 # Pangu-specific non-quantized linears (DSA LightningIndexer + MHC).
 _PANGU_SKIP_PATTERNS = [
@@ -76,7 +79,7 @@ def _meta_build_layer(layer_tensors, model_config, pangu_spec, device):
         try:
             torch.npu.synchronize()
         except RuntimeError as e:
-            print(f"  [WARN] npu.synchronize after build failed: {str(e)[:80]}")
+            logger.warning("  [WARN] npu.synchronize after build failed: %s", str(e)[:80])
 
     layer.train(False)   # .eval() without the literal string
     return layer

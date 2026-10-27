@@ -1,3 +1,4 @@
+import logging
 import optiquant.int8 as qint8
 import optiquant.int4 as qint4
 import optiquant.w4group_to_w4channel as qint4_pergroup_to_perchannel
@@ -251,6 +252,7 @@ def normalize_device(device):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = ArgumentParser()
     parser.add_argument("--input-bf16-hf-path", type=str, required=True, help="bf16 weight path")
     parser.add_argument("--output-path", type=str, required=True, help="quantized weight path")

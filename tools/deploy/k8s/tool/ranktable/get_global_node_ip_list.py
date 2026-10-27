@@ -1,7 +1,20 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import json
+import logging
 import os
+import sys
+
+logger = logging.getLogger(__name__)
+
+# Keep machine-readable command output on stdout without log prefixes.
+output_logger = logging.getLogger(f"{__name__}.output")
+output_logger.setLevel(logging.INFO)
+output_logger.propagate = False
+if not output_logger.handlers:
+    output_handler = logging.StreamHandler(sys.stdout)
+    output_handler.setFormatter(logging.Formatter("%(message)s"))
+    output_logger.addHandler(output_handler)
 
 GLOBAL_RANK_TABLE_KEY_ENV = 'GLOBAL_RANK_TABLE_FILE_PATH_KEY'
 
@@ -20,9 +33,10 @@ def get_global_node_ip_list():
                 server_ip_list.append(server['server_ip'])
         return server_ip_list
     except Exception as e:
-        print(e)
+        logger.error("%s", e)
         return None
 
 
 if __name__ == "__main__":
-    print(*get_global_node_ip_list(), sep=',')
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    output_logger.info("%s", ','.join(map(str, get_global_node_ip_list())))

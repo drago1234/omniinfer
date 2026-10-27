@@ -264,12 +264,12 @@ Ansible 详细说明参考
 2. `tools/deploy/ansible/playbooks/` 保存当前维护的 Playbook，应根据模型、拓扑和
    性能场景选择对应入口；
 3. `tools/deploy/ansible/roles/` 保存公共任务和弹性生命周期实现，由 Playbook
-   调用，用户不需要直接执行 Role；
-4. `tools/deploy/omni_cli/` 提供独立的命令行部署流程，与 Ansible Playbook
-   相互独立。
+   调用，用户不需要直接执行 Role。
 
 ### 准备密钥文件
-首先介绍执行机和目标机的概念，执行机就是运行 `omni_cli` 和 `ansible` 命令的主机，而目标机就是被 `omni_cli` 和 `ansible` 管理的远程主机，也就是用户部署服务所用到的机器。在使用一键式部署命令前，用户需要在执行机上准备好密钥文件（公钥文件和私钥文件），将公钥文件部署到目标机上，执行机使用 `ansible` 命令时就可以通过私钥文件去登录目标机。密钥文件的生成和部署可以参考如下步骤，如果你已经有登录目标机的密钥文件，就不需要执行下列步骤：
+执行机是运行 `ansible` 命令的主机，目标机是部署服务的远程主机。
+部署前需要在执行机准备好 SSH 密钥文件，并将公钥部署到目标机，使执行机能够
+通过私钥登录目标机。已有可用密钥时，可以跳过以下生成和部署步骤：
 
 1. 首先在执行机生成密钥对：
     ```bash
@@ -286,77 +286,6 @@ Ansible 详细说明参考
     # 当前只能通过目标机的登录密码去传输公钥文件到远程目标机
     ssh-copy-id -i ~/.ssh/id_ed25519.pub user@remote-host
     ```
-
-### omni_cli 一键部署
-
-该工具目前支持拉起**MTP+入图+omni_placement**的服务配置，若需要修改配置请参考**通过 ansible 部署**章节；
-提供的docker镜像中默认安装 omni_cli 工具，在宿主机 **下载omni_infer以及vllm源码并安装vllm** 时 omni_cli 也安装好了，通过以下命令查看是否安装：
-
-```
-omni_cli --help
-```
-![image](./figures/53e799d4-b756-46d0-8cc8-8ff2c99c1dd8.png)
-
-#### 配置文件说明
-
-进入 omni_infer 代码路径下，`cd omniinfer/omni/cli` 进入配置文件所在目录，有 `omni_infer_deployment.yml` 和 `omni_infer_server.yml` 两个配置文件，前者的 `services` 字段下配置参数最终会替换后者中相同的配置，用户只需要修改 `omni_infer_deployment.yml` 中的参数即可，`omni_infer_server.yml` 内的参数修改不涉及（参数修改参考**通过 ansible 部署**章节），
-`omni_infer_deployment.yml` 是一个 4P1D 的模板，如果需要增加 P，在 `prefill` 中增加一个 `group5` ，其他配置参考其他 group 配置即可，需要继续增加 P，以此类推；`group` 中的各个字段说明如下：
-
-| 字段                            | 含义                                                                                                                               |
-| :-------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------- |
-| `user`                      | 远程目标机的用户名， 如 user 等                                                                                                    |
-| `hosts`                     | 组成 P/D 所有机器的IP地址，其中 master 节点的 IP地址需要放在首位                                                                                                                     |
-| `master_port`               | 即 Prefill 和 Decode 的实际 `master-port`                                                                                      |
-| `base_api_port`             | API Server 的端口号                                                                                                                |
-| `private_key`               | 连接目标机的私钥文件路径。也可以使用密码登录目标机的方式， 则使用 `password` 字段并将密码填入， 如：password: "passwod"        |
-| `ascend_rt_visible_devices` | 每个 Prefill 或 Decode 实例需要使用的卡号， 参数值需要严格按照以下格式: "x,x,x,x" (用英文逗号分隔的连续值) ， 不能有多余逗号和空格 |
-
-如果需要增加 D 的从机器，在 `decode` 的 `group1` 中的 `hosts` 增加对应的机器 ip 即可。
-
-`services` 中的各个字段说明如下：
-
-| 字段                         | 含义                                                                                         |
-| :----------------------------- | :--------------------------------------------------------------------------------------------- |
-| `local_code_path`    | 执行机上的代码路径，即用户通过 git clone 拉取的代码存放路径。例如用户在 `/workspace/local_code_path` 下 git clone 了代码，那路径就是 `/workspace/local_code_path` |
-| `model_path`         | 加载的模型路径，要求 Prefill 和 Decode 所有实例所在的节点提前拷贝好模型并且模型路径保持一致 |
-| `code_path`          | 执行机上的 omniinfer 源码路径，即用户通过 `git clone` 拉取的代码存放路径；例如你在 `/workspace/local_code_path` 下 git clone 了代码，那路径就是 `/workspace/local_code_path`；脚本会将执行机上的源码同步到目标机内相同路径下，并且将路径挂载到容器中 |
-| `docker_image`       | omniai 服务实例均在容器里面运行，用来指定运行的容器镜像，如: `swr.cn-southwest-2.myhuaweicloud.com/omni-ai/omniinfer:202506272026`，其中 `swr.cn-southwest-2.myhuaweicloud.com/omni-ai/omniinfer` 表示镜像仓地址，`202506272026` 表示镜像版本号，如果远程目标机没有此容器镜像，脚本会自动下载 |
-| `prefill: max_model_len` | Prefill 侧模型的最大生成长度， 包含 prompt 长度和 generated 长度， 默认值为32000             |
-| `decode: max_model_len`  | Decode 侧模型的最大生成长度， 包含 prompt 长度和 generated 长度， 默认值为16384              |
-
-注意到 P/D 中所有机器的配置都是统一的，但是多数情况下机器的配置是各异的，比如登录目标机的私钥文件路径可能就不一样，所以，如果需要修改 P/D 的某一台机器的配置，可以参照如下，**注意缩进**即可：
-
-```
-group1:
-  user: "root"
-  hosts: "127.0.0.5,127.0.0.6,127.0.0.7,127.0.0.8" # The first IP address of hosts must be the IP address of the master decode instance. 
-  master_port: "8080"
-  base_api_port: "9000"
-  private_key: "/workspace/pem/keypair.pem"
-  ascend_rt_visible_devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
-  
-  # 修改 IP 为 127.0.0.6 的机器的配置
-  host 127.0.0.6:
-    private_key: "/workspace/new_pem/keypair.pem"
-    base_api_port: "9100"
-
-```
-
-#### 命令执行
-
-```
-# 进入到工作目录下
-cd /work_path
-
-# 拉起 服务
-omni_cli serve /download_path/omni_infer/omni/cli/omni_infer_deployment.yml
-
-# 查看服务是否拉起成功
-omni_cli status
-
-# 进入远程目标机日志目录下查看日志
-cd /data/omniinfer/log
-```
 
 ### 通过 ansible 部署（高阶）
 

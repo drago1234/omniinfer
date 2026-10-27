@@ -2,6 +2,7 @@
 """Merge calibrated modality artifacts into an existing language+MTP checkpoint."""
 from __future__ import annotations
 
+import logging
 import json
 import os
 import re
@@ -12,6 +13,8 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
+
+logger = logging.getLogger(__name__)
 
 
 def _expected_vision_weights(depth: int = 24):
@@ -189,12 +192,11 @@ def validate_text_base_checkpoint(model_dir: str) -> None:
     n_mtp = int(config.get("num_nextn_predict_layers", 0))
     if counts[("mtp", "I8")] != 0 or (n_mtp and counts[("mtp", "BF16")] == 0):
         raise RuntimeError(f"MTP must be entirely BF16: {dict(counts)}")
-    print(
+    logger.info(
         "VALID text base: "
         f"LLM_INT8={counts[('language', 'I8')]} "
         f"MTP_BF16={counts[('mtp', 'BF16')]} "
         f"ViT=BF16({expected_vision}) Audio=BF16({expected_audio}); serving config valid",
-        flush=True,
     )
 
 
@@ -373,10 +375,9 @@ def validate_multimodal_artifacts(artifact_dir: str, *, require_vision=True,
         failed = [name for name, values in metrics.items() if values.get("passed") is not True]
         if failed:
             raise RuntimeError(f"{kind} layers failed reconstruction: {failed}")
-    print(
+    logger.info(
         f"VALID multimodal artifacts: ViT={vision_count} Audio={audio_count} "
         "strict-GPTQ-v2 weights; bounded smooth; GELU smooth=off; recon=PASS; RTN=0",
-        flush=True,
     )
     return replacements, int8_weights, vision_count, audio_count
 
@@ -435,7 +436,7 @@ def merge_multimodal_artifacts(
             tensors = load_file(str(source))
             tensors.update(by_shard[shard])
             save_file(tensors, str(target))
-        print(f"  [merge {index_in_run}/{len(shards)}] {shard}", flush=True)
+        logger.info(f"  [merge {index_in_run}/{len(shards)}] {shard}")
 
     (output / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": index.get("metadata", {}), "weight_map": new_map}, indent=2)
@@ -493,9 +494,8 @@ def merge_multimodal_artifacts(
     (output / "multimodal_merge_metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False) + "\n"
     )
-    print(
+    logger.info(
         f"VALID merged checkpoint: ViT={vision_count} Audio={audio_count} "
         "all modality INT8 weights are calibrated strict-GPTQ; serving config valid",
-        flush=True,
     )
     return output

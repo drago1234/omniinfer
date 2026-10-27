@@ -118,8 +118,12 @@
 bash install.sh
 #### 3. **修复 pad_token (重要!)**
 BF16 模型的 tokenizer 默认没有 pad_token，msmodelslim 校准数据对齐时会报错。到BF16权重目录下执行下面脚本，以添加"pad_token"到tokenizer_config.json
-```bash
-import json, os, sys
+```python
+import json
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
 path = './tokenizer_config.json'
 with open(path) as f:
@@ -130,9 +134,9 @@ if 'pad_token' not in cfg or cfg['pad_token'] is None:
     cfg['pad_token'] = cfg.get('eos_token', '</s>')
     with open(path, 'w') as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
-    print(f'[OK] pad_token set to: {cfg[\"pad_token\"]}')
+    logger.info("[OK] pad_token set to: %s", cfg["pad_token"])
 else:
-    print(f'[OK] pad_token already exists: {cfg[\"pad_token\"]}')
+    logger.info("[OK] pad_token already exists: %s", cfg["pad_token"])
 ```
 #### 4. 量化
 采用 msmodelslim 默认的 model_adapter 进行量化，安装msmodelslim 后需要准备两个文件，分别为run.sh 以及 minimax_quant.yaml，run.sh 文件指定model_adapter，minimax_quant.yaml 中描述模型量化具体细节，文件参照如下：
@@ -200,13 +204,17 @@ echo "Quantization finished! Check /opt/data/models/MiniMax-M2.5_W8A8 for the ou
 ```
 - 拷贝相关文件
 将下面脚本保存到自己目录下，修改"--input_dir"，"--output_file"，"--index_file"为对应路径并执行.py文件
-```bash
+```python
+import logging
 import os
 import json
 import argparse
 from pathlib import Path
 from safetensors.torch import load_file, save_file
 import torch
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--input_dir", type=str, default="/docker/models/GLM-5")
@@ -228,29 +236,29 @@ if not input_path.exists():
 
 safetensor_files = sorted(input_path.glob("*.safetensors"))
 
-print(f"Found {len(safetensor_files)} safetensor files")
+logger.info(f"Found {len(safetensor_files)} safetensor files")
 
 for file in safetensor_files:
-    print(f"Reading: {file}")
+    logger.info(f"Reading: {file}")
     tensors = load_file(str(file))
 
     for key, value in tensors.items():
         if "e_score_correction_bias" in key:
-            print(f"  -> Matched key: {key}, shape={tuple(value.shape)}")
+            logger.info(f"  -> Matched key: {key}, shape={tuple(value.shape)}")
             collected_tensors[key] = value.clone()
 
-print(f"\nTotal matched tensors: {len(collected_tensors)}")
+logger.info(f"\nTotal matched tensors: {len(collected_tensors)}")
 
 if len(collected_tensors) == 0:
-    print("WARNING: No matching keys found!")
+    logger.warning("WARNING: No matching keys found!")
 
 output_dir = Path(OUTPUT_FILE).parent
 output_dir.mkdir(parents=True, exist_ok=True)
 
 save_file(collected_tensors, OUTPUT_FILE)
 
-print(f"\nSaved to: {OUTPUT_FILE}")
-print("Done.")
+logger.info(f"\nSaved to: {OUTPUT_FILE}")
+logger.info("Done.")
 
 # ===== 更新 index.json =====
 with open(INDEX_FILE, "r") as f:
@@ -264,7 +272,7 @@ for key in collected_tensors:
 with open(INDEX_FILE, "w") as f:
     json.dump(index, f, indent=2)
 
-print(f"Updated index.json with {len(collected_tensors)} new keys")
+logger.info(f"Updated index.json with {len(collected_tensors)} new keys")
 ```
 #### 5. 修改配置
 从 BF16 模型复制缺失的辅助文件（tokenizer, modeling 代码等），并将上面生成的W8A8C16权重的config.json文件替换为：

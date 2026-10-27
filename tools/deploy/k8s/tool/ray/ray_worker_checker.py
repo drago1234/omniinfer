@@ -1,9 +1,12 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import logging
 import json
 import os
 import ray
 import time
+
+logger = logging.getLogger(__name__)
 
 GLOBAL_RANK_TABLE_KEY_ENV = 'GLOBAL_RANK_TABLE_FILE_PATH_KEY'
 GROUP_ID_ENV = 'SERVER_GROUP_ID'
@@ -17,13 +20,13 @@ def wait_ray_workers_ready():
         try:
             nodes = ray.nodes()
             if len(nodes) == target_count:
-                print("ray workers are ready.")
+                logger.info("ray workers are ready.")
                 break
             else:
-                print("ray workers not ready, check 5s later....")
+                logger.warning("ray workers not ready, check 5s later....")
                 time.sleep(5)
         except Exception as e:
-            print(e)
+            logger.error("%s", e)
 
 
 def get_role_node_size():
@@ -39,9 +42,10 @@ def get_role_node_size():
         target_group = rank_table['server_group_list'][group_id]
         return len(target_group['server_list'])
     except Exception as e:
-        print(e)
+        logger.error("%s", e)
         return None
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     wait_ray_workers_ready()

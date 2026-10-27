@@ -1,7 +1,20 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import json
+import logging
 import os
+import sys
+
+logger = logging.getLogger(__name__)
+
+# Keep machine-readable command output on stdout without log prefixes.
+output_logger = logging.getLogger(f"{__name__}.output")
+output_logger.setLevel(logging.INFO)
+output_logger.propagate = False
+if not output_logger.handlers:
+    output_handler = logging.StreamHandler(sys.stdout)
+    output_handler.setFormatter(logging.Formatter("%(message)s"))
+    output_logger.addHandler(output_handler)
 
 GLOBAL_RANK_TABLE_KEY_ENV = 'GLOBAL_RANK_TABLE_FILE_PATH_KEY'
 GROUP_ID_ENV = 'SERVER_GROUP_ID'
@@ -21,9 +34,10 @@ def get_role_head_ip():
         head = target_group['server_list'][0]
         return head['server_ip']
     except Exception as e:
-        print(e)
+        logger.error("%s", e)
         return None
 
 
 if __name__ == "__main__":
-    print(get_role_head_ip())
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    output_logger.info("%s", get_role_head_ip())

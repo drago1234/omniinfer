@@ -1,8 +1,11 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import logging
 import json
 import os
 import time
+
+logger = logging.getLogger(__name__)
 
 GLOBAL_RANK_TABLE_KEY_ENV = 'GLOBAL_RANK_TABLE_FILE_PATH_KEY'
 POD_IP_ENV = 'POD_IP'
@@ -16,7 +19,7 @@ def wait_completed_global_rank_table():
             global_rank_table_path_key = os.getenv(GLOBAL_RANK_TABLE_KEY_ENV)
             global_rank_table_path = os.getenv(global_rank_table_path_key)
             if not global_rank_table_path:
-                print('read env \"{}\" failed'.format(global_rank_table_path_key))
+                logger.error("%s", 'read env \"{}\" failed'.format(global_rank_table_path_key))
             with open(global_rank_table_path, 'r') as file:
                 buf = file.read()
             rank_table = json.loads(buf)
@@ -28,13 +31,14 @@ def wait_completed_global_rank_table():
                     for i in range(len(server_list)):
                         if server_list[i]["server_ip"] == pod_ip:
                             return
-                print("cannot find local ip in ranktable!")
+                logger.error("cannot find local ip in ranktable!")
             else:
-                print("status of ranktable is not completed!")
+                logger.info("status of ranktable is not completed!")
         except Exception as e:
-            print(e)
+            logger.error("%s", e)
         time.sleep(1)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     wait_completed_global_rank_table()

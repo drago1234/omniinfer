@@ -16,9 +16,12 @@ this path normally never fires.
 """
 from __future__ import annotations
 
+import logging
 from typing import List
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_parquet_deps() -> None:
@@ -27,7 +30,7 @@ def _ensure_parquet_deps() -> None:
     import sys
     for pkg, mod in [("pandas", "pandas"), ("pyarrow", "pyarrow")]:
         if importlib.util.find_spec(mod) is None:
-            print(f"[preflight] {pkg} not found — installing...")
+            logger.info("[preflight] %s not found — installing...", pkg)
             ret = subprocess.call([
                 sys.executable, "-m", "pip", "install", pkg, "-q",
                 "--trusted-host", "pypi.org",
@@ -35,8 +38,10 @@ def _ensure_parquet_deps() -> None:
                 "--trusted-host", "pypi.python.org",
             ])
             if ret != 0:
-                print(f"[preflight] WARNING: failed to install {pkg} (ret={ret}), "
-                      f"will try import anyway")
+                logger.warning(
+                    f"[preflight] WARNING: failed to install {pkg} (ret={ret}), "
+                    f"will try import anyway",
+                )
 
 
 def _load_parquet_texts(calib_path: str) -> List[str]:
@@ -97,25 +102,25 @@ def load_calibration_data(calib_path: str, tokenizer_path: str, n_samples: int,
         if abs(sum(weights) - 1.0) > 0.01:
             raise ValueError(f"--calib-weights must sum to 1.0, got {sum(weights)}")
 
-    print(f"Tokenizer        : {tokenizer_path}")
+    logger.info(f"Tokenizer        : {tokenizer_path}")
     tok = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
     if len(paths) == 1:
-        print(f"Calibration data : {paths[0]}")
+        logger.info(f"Calibration data : {paths[0]}")
         texts = _load_parquet_texts(paths[0])
         samples = _texts_to_samples(texts, tok, n_samples, seq_len)
     else:
-        print(f"Calibration data : {len(paths)} sources (multi-source)")
+        logger.info(f"Calibration data : {len(paths)} sources (multi-source)")
         per_source_n = [int(n_samples * w) for w in weights]
         per_source_n[0] += n_samples - sum(per_source_n)
         samples = []
         for path, w, n_i in zip(paths, weights, per_source_n):
-            print(f"  source: {path}  weight={w:.2f}  → {n_i} samples")
+            logger.info(f"  source: {path}  weight={w:.2f}  → {n_i} samples")
             if n_i <= 0:
                 continue
             texts_i = _load_parquet_texts(path)
             samples.extend(_texts_to_samples(texts_i, tok, n_i, seq_len))
 
     input_ids = torch.tensor(samples, dtype=torch.long)
-    print(f"  {n_samples} x {seq_len} = {n_samples * seq_len:,} calibration tokens")
+    logger.info(f"  {n_samples} x {seq_len} = {n_samples * seq_len:,} calibration tokens")
     return input_ids

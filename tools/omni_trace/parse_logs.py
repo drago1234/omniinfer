@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import logging
 import csv
 import re
 import os
@@ -11,6 +12,7 @@ import pandas as pd
 import openpyxl
 import traceback
 
+logger = logging.getLogger(__name__)
 
 _CHAT_REQUEST_ID_RE = re.compile(
     r"^(?P<base>chatcmpl-.+)-(?P<suffix>[0-9a-f]{8})$"
@@ -89,12 +91,10 @@ def parse_trace_logs(log_dir, disable_encode=False):
                 df_summary = pd.DataFrame(summary_data)
                 df_summary.to_excel(writer, sheet_name="Summary", index=False)
 
-            print(
-                f"Successfully parsed time analysis files. Check {time_analysis_path}."
-            )
+            logger.info(f"Successfully parsed time analysis files. Check {time_analysis_path}.")
 
         else:
-            print("No valid action record found in any log files.")
+            logger.info("No valid action record found in any log files.")
 
         # Process engine_step_lines
         prefill_engine_step_headers = _get_prefill_engine_step_headers()
@@ -124,8 +124,7 @@ def parse_trace_logs(log_dir, disable_encode=False):
                 decode_engine_step_headers,
             )
     except Exception as e:
-        print(f"Error occurred: {str(e)}")
-        print(traceback.print_exc())
+        logger.exception("Error occurred: %s", e)
 
 
 def _get_prefill_engine_step_headers():
@@ -253,7 +252,7 @@ def _get_step_line(
 ):
     if filename.endswith(".log"):
         log_file_path = os.path.join(dirpath, filename)
-        print(f"Processing log file: {log_file_path}")
+        logger.info(f"Processing log file: {log_file_path}")
         try:
             with open(log_file_path, "r", encoding="latin1") as file:
                 for line in file:
@@ -298,8 +297,7 @@ def _get_step_line(
                             ):
                                 action_timestamps[action] = timestamp
         except Exception as e:
-            print(f"Error reading {log_file_path}: {str(e)}")
-            print(traceback.print_exc())
+            logger.exception("Error reading %s: %s", log_file_path, e)
 
 
 def _collect_engine_core_info(engine_core_info, log_file_path):
@@ -311,8 +309,7 @@ def _collect_engine_core_info(engine_core_info, log_file_path):
                 elif "profile_mtpmodel:" in line:
                     _get_mtp_model_info(engine_core_info, line)
     except Exception as e:
-        print(f"Error reading {log_file_path}: {str(e)}")
-        print(traceback.print_exc())
+        logger.exception("Error reading %s: %s", log_file_path, e)
 
 
 def _decode_engine_step_sheet(
@@ -335,16 +332,16 @@ def _decode_engine_step_sheet(
         )
         df_decode.to_excel(writer, sheet_name="decode_engine_step", index=False)
 
-        print(
+        logger.info(
             f"Successfully parsed decode engine step logs. "
-            f"Added 'decode_engine_step' sheet to {engine_step_path}."
+            f"Added 'decode_engine_step' sheet to {engine_step_path}.",
         )
 
         # dump die load and die time
         _decode_die_load_sheet(engine_step_path, writer, df_decode)
 
     else:
-        print("No valid decode engine step record found in log files.")
+        logger.info("No valid decode engine step record found in log files.")
 
 
 def _get_mtp_model_main_model_headers():
@@ -380,11 +377,9 @@ def _engine_step_sheet(
         df_engine = pd.DataFrame(engine_data, columns=engine_step_headers)
         df_engine.to_excel(writer, sheet_name=sheet_name, index=False)
 
-        print(
-            f"Successfully parsed {sheet_name} logs. Added '{sheet_name}' {engine_step_path}."
-        )
+        logger.info(f"Successfully parsed {sheet_name} logs. Added '{sheet_name}' {engine_step_path}.")
     else:
-        print(f"No valid {sheet_name} record found in log files.")
+        logger.info(f"No valid {sheet_name} record found in log files.")
 
 
 def _encode_engine_step_sheet(
@@ -401,12 +396,12 @@ def _encode_engine_step_sheet(
         df_encode = pd.DataFrame(encode_data, columns=engine_step_headers)
         df_encode.to_excel(writer, sheet_name="encode_engine_step", index=False)
 
-        print(
+        logger.info(
             f"Successfully parsed encode engine step logs. "
-            f"Added 'encode_engine_step' sheet to {engine_step_path}."
+            f"Added 'encode_engine_step' sheet to {engine_step_path}.",
         )
     else:
-        print("No valid encode engine step record found in log files.")
+        logger.info("No valid encode engine step record found in log files.")
 
 
 def _set_encode_info(encode_engine_step_lines, engine_core_info, line):
@@ -450,9 +445,9 @@ def _decode_die_load_sheet(engine_step_path, writer, df_decode):
         wide_blocks.append(filtered.reset_index(drop=True))
     final_df = pd.concat(wide_blocks, axis=1)
     final_df.to_excel(writer, sheet_name="decode_die_load", index=False)
-    print(
+    logger.info(
         f"Successfully parsed decode die load. "
-        f"Added 'decode_die_load' sheet to {engine_step_path}."
+        f"Added 'decode_die_load' sheet to {engine_step_path}.",
     )
 
 
@@ -591,6 +586,7 @@ def _get_main_model_info(engine_core_info, line):
 
 if __name__ == "__main__":
     # Usage: python parse_logs.py <trace_log_dir> [--disable-encode]
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("log_dir")
     parser.add_argument("--disable-encode", action="store_true")

@@ -8,11 +8,14 @@ never silently falls back to RTN.
 """
 from __future__ import annotations
 
+import logging
 from typing import Dict, Iterable, Tuple
 
 import torch
 
 from jointfix.methods.jointfix import JointSearchConfig, joint_grid_search_ab
+
+logger = logging.getLogger(__name__)
 
 
 def strict_block_gptq(
@@ -94,10 +97,9 @@ def strict_block_gptq(
                     error.unsqueeze(1) * chol_inv[column, column + 1:].unsqueeze(0)
                 )
 
-    print(
+    logger.info(
         f"[GPTQ-MM] {tag} h_out={h_out} h_in={h_in} "
         f"N={activations.shape[0]} block={block_size}",
-        flush=True,
     )
     return quant.to(original_device), scale.to(torch.bfloat16).to(original_device)
 
@@ -149,13 +151,12 @@ def bound_smooth_scale(scale: torch.Tensor, *, minimum: float, maximum: float,
         "smooth_scale_bound_max": float(maximum),
     }
     if info["smooth_scale_clamped_low"] or info["smooth_scale_clamped_high"]:
-        print(
+        logger.info(
             f"[SMOOTH-CLAMP] {tag} raw=[{info['smooth_scale_raw_min']:.3e},"
             f" {info['smooth_scale_raw_max']:.3e}] -> "
             f"[{info['smooth_scale_min']:.3e}, {info['smooth_scale_max']:.3e}] "
             f"low={info['smooth_scale_clamped_low']} "
             f"high={info['smooth_scale_clamped_high']}",
-            flush=True,
         )
     return bounded.cpu(), info
 

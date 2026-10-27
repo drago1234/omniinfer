@@ -18,6 +18,7 @@
 # limitations under the License.
 # ============================================================================
 
+import logging
 import os
 import subprocess
 import argparse
@@ -28,6 +29,8 @@ import sys
 import socket
 import json
 import shutil
+
+logger = logging.getLogger(__name__)
 
 # Get the terminal width
 terminal_width = shutil.get_terminal_size().columns
@@ -47,12 +50,12 @@ def find_available_port(base_port, max_attempts=10, host="0.0.0.0"):
     """Find the next available port starting from base_port."""
     for offset in range(max_attempts):
         port = base_port + offset
-        print(f"INFO: Try to bind port {port}.")
+        logger.info(f"INFO: Try to bind port {port}.")
         if is_port_available(port, host):
-            print(f"INFO: Port {port} is available.")
+            logger.info(f"INFO: Port {port} is available.")
             return port
         else:
-            print(f"WARNING: Port {port} is not available!")
+            logger.warning(f"WARNING: Port {port} is not available!")
 
     raise RuntimeError(f"No available port found between {base_port} and {base_port + max_attempts - 1}")
 
@@ -62,12 +65,14 @@ class ProcessManager:
     def __init__(self, processes):
         self.processes = processes
 
+
 def process_space_split(arg_temp, out_list):
     if "--compilation-config" in arg_temp:
         out_list.extend(["--compilation-config", arg_temp[len("--compilation-config "):]])
     else:
         out_list.extend(arg_temp.split(" "))
     return out_list
+
 
 def process_extra_args(extra_args):
     out_list = []
@@ -81,6 +86,7 @@ def process_extra_args(extra_args):
         else:
             out_list.extend([arg_temp])
     return out_list
+
 
 def start_single_node_api_servers(
     num_servers,
@@ -120,7 +126,7 @@ def start_single_node_api_servers(
 
     # Hard code dp=1, cuz current we want one api server one DP
     dp_per_server = 1
-    print(f"kv_transfer_config in {kv_transfer_config}")
+    logger.info(f"kv_transfer_config in {kv_transfer_config}")
 
     if additional_config:
         try:
@@ -141,15 +147,15 @@ def start_single_node_api_servers(
     def cleanup_processes():
         for i, (proc, log) in enumerate(process_manager.processes):
             if proc.poll() is None:  # Process is still running
-                print(f"Cleaning up: Terminating server {i} (PID: {proc.pid})")
+                logger.info(f"Cleaning up: Terminating server {i} (PID: {proc.pid})")
                 proc.terminate()
                 try:
                     proc.wait(timeout=5)  # Wait up to 5 seconds for clean exit
                 except subprocess.TimeoutExpired:
                     proc.kill()  # Force kill if timeout occurs
-                    print(f"API Server {i} did not terminate gracefully, killed")
+                    logger.warning(f"API Server {i} did not terminate gracefully, killed")
             log.close()
-            print(f"Closed log file for server {i}")
+            logger.info(f"Closed log file for server {i}")
 
     for rank in range(num_servers):
         # Set environment variables for each server
@@ -186,7 +192,7 @@ def start_single_node_api_servers(
             else:
                 port = find_available_port(api_port_start, max_attempts=max_port_attempts)
         except RuntimeError as e:
-            print(f"Error: {e}")
+            logger.error(f"Error: {e}")
             cleanup_processes()
             if fail_on_port_conflict:
                 raise
@@ -245,10 +251,10 @@ def start_single_node_api_servers(
         log_file = open(os.path.join(log_dir, f"server_{rank}.log"), "w")
 
         # Start the server process in the background with combined log redirection
-        print('=' * terminal_width)
-        print(f"Starting API server {rank} on port {port}, logging to {log_dir}/server_{rank}.log")
-        print('=' * terminal_width)
-        print(f"Server {rank} on port {port}>>>{' '.join(cmd)}")
+        logger.info("%s", '=' * terminal_width)
+        logger.info(f"Starting API server {rank} on port {port}, logging to {log_dir}/server_{rank}.log")
+        logger.info("%s", '=' * terminal_width)
+        logger.info(f"Server {rank} on port {port}>>>{' '.join(cmd)}")
         process = subprocess.Popen(
             cmd,
             env=env,
@@ -261,29 +267,31 @@ def start_single_node_api_servers(
     weakref.finalize(process_manager, cleanup_processes)
 
     # Provide feedback on how to monitor logs
-    print('-' * terminal_width)
-    print(f"Started {num_servers} servers. Logs are in {log_dir}/")
-    print(f"Run 'tail -f {log_dir}/server_*.log' to monitor logs in real-time.")
+    logger.info("%s", '-' * terminal_width)
+    logger.info(f"Started {num_servers} servers. Logs are in {log_dir}/")
+    logger.info(f"Run 'tail -f {log_dir}/server_*.log' to monitor logs in real-time.")
     return processes, process_manager, servers_api_ports
 
 
 def signal_handler(sig, frame):
     """Handle SIGINT (Ctrl+C) to cleanly exit."""
-    print("\nReceived SIGINT, shutting down servers...")
+    logger.info("\nReceived SIGINT, shutting down servers...")
     for i, (proc, log) in enumerate(process_manager.processes):
         if proc.poll() is None:
-            print(f"Terminating API server {i} (PID: {proc.pid})")
+            logger.info(f"Terminating API server {i} (PID: {proc.pid})")
             proc.terminate()
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-                print(f"API Server {i} did not terminate gracefully, killed")
+                logger.warning(f"API Server {i} did not terminate gracefully, killed")
         log.close()
-        print(f"Closed log file for server {i}")
+        logger.info(f"Closed log file for server {i}")
     sys.exit(0)
 
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(
     description=(
         "Start multiple VLLM API servers with combined "
@@ -382,16 +390,16 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
 
     # Keep the script running to allow servers to operate
-    print(f"{args.num_servers} API servers are running. Press Ctrl+C to stop.")
+    logger.info(f"{args.num_servers} API servers are running. Press Ctrl+C to stop.")
     try:
         server_down=False
         while True:
             time.sleep(1)  # Keep script alive, check processes periodically
             for i, (proc, _) in enumerate(processes):
                 if proc.poll() is not None:
-                    print(
+                    logger.info(
                         f"API Server {i} (PID: {proc.pid}) stopped with exit code {proc.returncode}. "
-                        f"Check {args.log_dir}/server_{i}.log for details."
+                        f"Check {args.log_dir}/server_{i}.log for details.",
                     )
                     server_down=True
             if server_down:

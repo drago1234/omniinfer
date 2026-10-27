@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import logging
 import os
 import json
 from glob import glob
@@ -13,6 +14,8 @@ except:
 
 from safetensors.torch import load_file, save_file
 from huggingface_hub import snapshot_download
+
+logger = logging.getLogger(__name__)
 
 
 def cal_scale(faquant_path, layer_idx, method='max'):
@@ -50,7 +53,7 @@ def main(args, model_path, faquant_path, kvs_safetensor_name, layer_num=61):
 
     for layer_idx in range(layer_num):
         kvs = cal_scale(faquant_path, layer_idx)
-        print(f"the kvscale of layer_idx={layer_idx} is {kvs}")
+        logger.info(f"the kvscale of layer_idx={layer_idx} is {kvs}")
         faquant_scale[f'model.layers.{layer_idx}.self_attn.kv_scale'] = kvs
         weight_map[f'model.layers.{layer_idx}.self_attn.kv_scale'] = kvs_safetensor_name
 
@@ -67,4 +70,4 @@ def main(args, model_path, faquant_path, kvs_safetensor_name, layer_num=61):
     save_file(state_dict, file)
     with open(model_config, "w", encoding="utf-8") as f:
         json.dump(model_index, f, indent=2, ensure_ascii=False, sort_keys=True)
-    print(f"save to {file}")
+    logger.info(f"save to {file}")

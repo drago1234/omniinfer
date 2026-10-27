@@ -19,6 +19,7 @@ inferred from the extension.
 """
 from __future__ import annotations
 
+import logging
 import json
 from collections import defaultdict
 from dataclasses import dataclass
@@ -41,6 +42,7 @@ from jointfix.multimodal.models import (
 )
 from jointfix.multimodal.runner import CheckpointReader
 
+logger = logging.getLogger(__name__)
 
 _IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 _AUDIO_SUFFIXES = {".flac", ".m4a", ".mp3", ".ogg", ".wav"}
@@ -205,9 +207,9 @@ def _encode_images(
             )
         patches.append(encoded["pixel_values"].to(torch.bfloat16))
         grids.append(encoded["image_grid_thw"].to(torch.long))
-        print(
+        logger.info(
             f"  [omni-llm/image] {count}/{len(image_records)} {path} "
-            f"grid={grids[-1].tolist()}", flush=True,
+            f"grid={grids[-1].tolist()}",
         )
 
     vision_config = model_config["vision_config"]
@@ -277,9 +279,9 @@ def _load_audio_features(records: List[OmniCalibrationRecord], model_dir: str):
             lengths.append(length)
             owners.append(record_idx)
             valid += 1
-        print(
+        logger.info(
             f"  [omni-llm/audio] {record.audio} chunks={valid} "
-            f"seconds={len(waveform) / extractor.sampling_rate:.2f}", flush=True,
+            f"seconds={len(waveform) / extractor.sampling_rate:.2f}",
         )
     if not features:
         return None, None, []
@@ -421,12 +423,11 @@ def load_omni_calibration_hidden(
     records = load_omni_manifest(manifest, n_samples)
     reader = CheckpointReader(model_dir)
     model_config = json.loads((Path(model_dir) / "config.json").read_text())
-    print(
+    logger.info(
         f"Omni calibration : {manifest} ({len(records)} requests; "
         f"text_only={sum(not r.image and not r.audio for r in records)}, "
         f"images={sum(bool(r.image) for r in records)}, "
         f"audio={sum(bool(r.audio) for r in records)})",
-        flush=True,
     )
     vision = _encode_images(
         records, reader, model_config, device,
@@ -472,10 +473,9 @@ def load_omni_calibration_hidden(
         )
     del vision, audio
     clear_device_cache(device)
-    print(
+    logger.info(
         "  built decoder inputs: "
         f"samples={len(hidden)} seq={[x.shape[1] for x in hidden]} "
         f"hidden={hidden[0].shape[-1]} dtype={hidden[0].dtype}",
-        flush=True,
     )
     return CalibrationInputs(hidden=hidden, token_is_text=token_is_text)

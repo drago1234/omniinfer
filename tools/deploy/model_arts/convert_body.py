@@ -34,10 +34,14 @@ model 处理规则(核心):
     MODELARTS_MODEL_SOURCE_ID / MODELARTS_MODEL_MOUNT_PATH /
     MODELARTS_MODEL_KEEP_EXTRA=1 / MODELARTS_BODY_OUTPUT
 """
+import logging
 import copy
 import json
 import os
 import sys
+
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------- 可配置默认值
 def _env(name, default):
@@ -416,7 +420,7 @@ def parse_args(argv):
             i += 1
             continue
         if a.startswith("--"):
-            print("警告: 未知参数 %s(已忽略)" % a, file=sys.stderr)
+            logger.warning("警告: 未知参数 %s(已忽略)", a)
             i += 1
             continue
         positional.append(a)
@@ -427,7 +431,7 @@ def parse_args(argv):
 def main(argv=None):
     opts, positional = parse_args(list(sys.argv[1:] if argv is None else argv))
     if not positional:
-        print(__doc__)
+        logger.info("%s", __doc__)
         return 2
     src = positional[0]
     dst = (positional[1] if len(positional) > 1
@@ -458,19 +462,20 @@ def main(argv=None):
 
     g = body["group_configs"][0]
     ok, problems = check_body(body)
-    print("源文件  :", src)
-    print("输出文件:", dst)
-    print("服务名  :", body["name"])
-    print("组      :", g.get("name"), "| pool:", g.get("pool_id"))
-    print("model   :", json.dumps(g.get("model"), ensure_ascii=False))
-    print("units   :", [(u.get("name"), u.get("count")) for u in g["unit_configs"]])
+    logger.info('%s %s', "源文件  :", src)
+    logger.info('%s %s', "输出文件:", dst)
+    logger.info('%s %s', "服务名  :", body["name"])
+    logger.info('%s %s %s %s', "组      :", g.get("name"), "| pool:", g.get("pool_id"))
+    logger.info('%s %s', "model   :", json.dumps(g.get("model"), ensure_ascii=False))
+    logger.info('%s %s', "units   :", [(u.get("name"), u.get("count")) for u in g["unit_configs"]])
     for r in report:
-        print("  -", r)
-    print("自检    :", "PASS" if ok else "FAIL")
+        logger.info('%s %s', "  -", r)
+    logger.info('%s %s', "自检    :", "PASS" if ok else "FAIL")
     for p in problems:
-        print("    !", p)
+        logger.info('%s %s', "    !", p)
     return 0 if ok else 1
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     sys.exit(main())

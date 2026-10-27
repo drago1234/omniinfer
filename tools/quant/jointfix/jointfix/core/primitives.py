@@ -9,10 +9,12 @@ This module must NOT import from jointfix.methods or jointfix.backends.
 """
 from __future__ import annotations
 
+import logging
 from typing import List, Optional, Tuple
 
 import torch
 
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Quant layout (which weights get INT8)
@@ -159,7 +161,7 @@ def gptq_quantize(
     # GPTQ is now COMMITTED (passed N>=h_in AND Cholesky succeeded). Emit a positive,
     # greppable signal so "did GPTQ actually run?" is answered by presence:
     #   grep -c '\[GPTQ-RUN\]' <log>                 # total real GPTQ executions
-    print(f"[GPTQ-RUN] {tag} h_out={h_out} h_in={h_in} N={N}")
+    logger.info(f"[GPTQ-RUN] {tag} h_out={h_out} h_in={h_in} N={N}")
 
     scale_row = W.abs().amax(dim=1, keepdim=True).clamp(min=1e-10) / 127.0
 

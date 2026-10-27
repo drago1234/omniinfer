@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import logging
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -171,12 +174,13 @@ def process_time_analysis(input_path: Path, disable_encode: bool = False) -> int
     out_df = pd.DataFrame([row]).reindex(columns=ordered_cols)
     out_df = out_df.fillna("-").replace(r"^\s*$", "-", regex=True)
     out_df.to_excel(output_path, index=False, engine="openpyxl")
-    print(f"Processed time analysis saved to: {output_path}")
+    logger.info(f"Processed time analysis saved to: {output_path}")
     return 0
 
 
 if __name__ == "__main__":
     # Usage: python process_time_analysis.py <time_analysis.xlsx> [--disable-encode]
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(
         description="Aggregate time_analysis.xlsx into process_time_analysis.xlsx using time_analysis_rules.yaml."
     )

@@ -1,10 +1,13 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import logging
 import json
 import os
 import pathlib
 import stat
 import sys
+
+logger = logging.getLogger(__name__)
 
 GLOBAL_RANK_TABLE_KEY_ENV = 'GLOBAL_RANK_TABLE_FILE_PATH_KEY'
 TRANS_GLOBAL_RANK_TABLE_FILE_PATH_ENV = 'TRANS_GLOBAL_RANK_TABLE_FILE_PATH'
@@ -24,7 +27,7 @@ def gen_global_rank_table():
             group['group_id'] = str(int(group['group_id']) - 1)
         return global_rank_table
     except Exception as e:
-        print(e)
+        logger.error("%s", e)
         return None
 
 
@@ -46,11 +49,11 @@ def save_rank_table_to(rank_table):
 
     # 同时挂载尚未生成的rank table目录可能创建同名空文件夹，检测并移除该目录
     if os.path.exists(file_path) and os.path.isdir(file_path):
-        print("dir: {} already exists, remove it first.".format(file_path))
+        logger.warning("%s", "dir: {} already exists, remove it first.".format(file_path))
         dir_path = pathlib.Path(file_path)
         dir_path.rmdir()
     elif os.path.exists(file_path) and os.path.isfile(file_path):
-        print("file: {} already exists, replace it with the latest version.".format(file_path))
+        logger.warning("%s", "file: {} already exists, replace it with the latest version.".format(file_path))
         os.remove(file_path)
 
     # 读写权限
@@ -60,8 +63,9 @@ def save_rank_table_to(rank_table):
     with os.fdopen(os.open(file_path, flags, mode), 'w') as table_fp:
         json.dump(rank_table, table_fp, indent=4)
     sys.stdout.flush()
-    print("succeed to save global rank table in: " + file_path)
+    logger.info("%s", "succeed to save global rank table in: " + file_path)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     save_rank_table_to(gen_global_rank_table())

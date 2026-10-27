@@ -8,7 +8,10 @@ hence the best-effort import.
 """
 from __future__ import annotations
 
+import logging
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def clear_device_cache(device: torch.device) -> None:
@@ -31,9 +34,9 @@ def set_npu_compile_mode() -> None:
     try:
         import torch_npu
         torch_npu.npu.set_compile_mode(jit_compile=False)
-        print("[npu] compile mode: jit_compile=False (aclnn kernels)")
+        logger.info("[npu] compile mode: jit_compile=False (aclnn kernels)")
     except (AttributeError, ImportError, RuntimeError) as e:
-        print(f"[npu] set_compile_mode skipped: {type(e).__name__}: {e}")
+        logger.warning(f"[npu] set_compile_mode skipped: {type(e).__name__}: {e}")
 
 
 def resolve_device(name: str = "auto") -> torch.device:
@@ -55,7 +58,7 @@ def resolve_device(name: str = "auto") -> torch.device:
         except (ImportError, RuntimeError) as error:
             if name == "npu":
                 raise RuntimeError("failed to initialize the NPU backend") from error
-            print(f"[npu] auto detection skipped: {type(error).__name__}: {error}")
+            logger.warning(f"[npu] auto detection skipped: {type(error).__name__}: {error}")
     if name == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")

@@ -3,6 +3,7 @@
 """Build a reproducible text/image/audio calibration JSONL."""
 from __future__ import annotations
 
+import logging
 import argparse
 import json
 import re
@@ -10,6 +11,8 @@ from pathlib import Path
 
 import pandas as pd
 from transformers import AutoTokenizer
+
+logger = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -80,11 +83,12 @@ def main() -> None:
     with output.open("w", encoding="utf-8") as handle:
         for item in records:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
-    print(
+    logger.info(
         f"wrote {output}: total={len(records)} text={len(text_records)} "
-        f"image={len(images)} audio={len(audios)} text_tokens={args.text_tokens}"
+        f"image={len(images)} audio={len(audios)} text_tokens={args.text_tokens}",
     )
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

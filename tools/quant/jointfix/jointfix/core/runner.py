@@ -14,6 +14,7 @@ the degenerate single-device case. It is NOT a separate forked path. Per-layer
 """
 from __future__ import annotations
 
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ from jointfix.core.devices import clear_device_cache, resolve_devices, set_npu_c
 from jointfix.core.stats import merge_collectors
 from jointfix.core.modality import CalibrationInputs
 from jointfix.methods.base import QuantMethod
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -302,9 +305,11 @@ def calibrate_and_quantize(backend: ModelBackend, method: QuantMethod,
         _done = _i + 1
         _el = time.time() - _run_t0
         _avg = _el / _done
-        print(f"  [layer {li}] done {_done}/{n_layers} ({n} samples) | "
-              f"elapsed {_prof.fmt(_el)} | avg {_prof.fmt(_avg)}/layer | "
-              f"ETA ~{_prof.fmt(_avg * (n_layers - _done))}", flush=True)
+        logger.info(
+            f"  [layer {li}] done {_done}/{n_layers} ({n} samples) | "
+            f"elapsed {_prof.fmt(_el)} | avg {_prof.fmt(_avg)}/layer | "
+            f"ETA ~{_prof.fmt(_avg * (n_layers - _done))}",
+        )
 
     # persist any method-side diagnostics (jointfix -> joint_search_traces.json)
     method.dump_traces(out_dir)

@@ -1,9 +1,12 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import logging
 import requests
 import argparse
 import sys
 import json
+
+logger = logging.getLogger(__name__)
 
 
 def check_health(ip, port):
@@ -14,7 +17,7 @@ def check_health(ip, port):
 
         # 检查HTTP状态码是否为2xx
         if not response.ok:
-            print(f"ERROR: Health check failed - HTTP {response.status_code}", file=sys.stderr)
+            logger.error(f"ERROR: Health check failed - HTTP {response.status_code}")
             return False
 
         # 解析JSON响应
@@ -23,23 +26,24 @@ def check_health(ip, port):
             status = data.get('status')
 
             if status != 'running':
-                print(f"ERROR: Service status is '{status}', expected 'running'", file=sys.stderr)
+                logger.error(f"ERROR: Service status is '{status}', expected 'running'")
                 return False
 
-            print("OK: Service is healthy and running")
+            logger.info("OK: Service is healthy and running")
             return True
 
         except json.JSONDecodeError:
-            print("ERROR: Invalid JSON response", file=sys.stderr)
+            logger.error("ERROR: Invalid JSON response")
             return False
 
     except requests.exceptions.RequestException as e:
-        print(f"ERROR: Request failed - {str(e)}", file=sys.stderr)
+        logger.error(f"ERROR: Request failed - {str(e)}")
         return False
 
 
 if __name__ == "__main__":
     # 设置命令行参数解析
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description='Service health checker')
     parser.add_argument('--ip', required=True, help='Service IP address')
     parser.add_argument('--port', required=True, help='Service port number')

@@ -2,6 +2,7 @@
 """Sequential error-propagating JointFix runner for Omni ViT and Audio Tower."""
 from __future__ import annotations
 
+import logging
 import json
 import os
 from collections import defaultdict
@@ -29,6 +30,8 @@ from jointfix.multimodal.models import (
 from jointfix.multimodal.quant import (
     quantize_dense_transformer_layer,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CheckpointReader:
@@ -158,13 +161,12 @@ def enforce_reconstruction_gate(
         },
         "checks": checks,
     }
-    print(
+    logger.info(
         f"[RECON-GATE] {tag} pass={passed} "
         f"output_rel_rmse={metrics['output_rel_rmse']:.4e} "
         f"output_cos={metrics['output_cosine']:.7f} "
         f"update_rel_rmse={metrics['update_rel_rmse']:.4e} "
         f"update_cos={metrics['update_cosine']:.7f}",
-        flush=True,
     )
     if not passed:
         failed = [name for name, ok in checks.items() if not ok]
@@ -238,10 +240,9 @@ def _quantize_vision(reader: CheckpointReader, model_config: dict, manifest: str
     traces = _read_traces(trace_path)
     metrics_path = output / "vision_reconstruction_metrics.json"
     reconstruction = _read_traces(metrics_path)
-    print(
+    logger.info(
         f"[vision] initial hidden={tuple(state.hidden.shape)} "
         f"segments={len(state.segments)} tokens={sum(state.segments)}",
-        flush=True,
     )
 
     depth = int(vision_config["depth"])
@@ -265,10 +266,7 @@ def _quantize_vision(reader: CheckpointReader, model_config: dict, manifest: str
             state = VisionState(hidden, state.cos, state.sin, state.segments)
             del layer, hidden, reference, weights, quantized
             clear_device_cache(device)
-            print(
-                f"  [vision layer {layer_idx}] resume artifact + reconstruction PASS",
-                flush=True,
-            )
+            logger.info(f"  [vision layer {layer_idx}] resume artifact + reconstruction PASS")
             continue
         weights = reader.load_prefix(prefix + ".")
         layer = VisionBlock(weights, prefix, vision_config, device).eval()
@@ -298,10 +296,10 @@ def _quantize_vision(reader: CheckpointReader, model_config: dict, manifest: str
         state = VisionState(hidden.cpu(), state.cos, state.sin, state.segments)
         del layer, hidden, reference, weights, quantized
         clear_device_cache(device)
-        print(f"  [vision layer {layer_idx}] JointFix+strict-GPTQ complete", flush=True)
+        logger.info(f"  [vision layer {layer_idx}] JointFix+strict-GPTQ complete")
 
     _write_traces(trace_path, traces)
-    print(f"[vision] complete: {depth * 4} strict-GPTQ backbone weights", flush=True)
+    logger.info(f"[vision] complete: {depth * 4} strict-GPTQ backbone weights")
 
 
 def _quantize_audio(reader: CheckpointReader, model_config: dict, manifest: str,
@@ -319,10 +317,9 @@ def _quantize_audio(reader: CheckpointReader, model_config: dict, manifest: str,
     traces = _read_traces(trace_path)
     metrics_path = output / "audio_reconstruction_metrics.json"
     reconstruction = _read_traces(metrics_path)
-    print(
+    logger.info(
         f"[audio] initial hidden={tuple(state.hidden.shape)} "
         f"segments={len(state.segments)} tokens={sum(state.segments)}",
-        flush=True,
     )
 
     depth = int(audio_config["encoder_layers"])
@@ -346,10 +343,7 @@ def _quantize_audio(reader: CheckpointReader, model_config: dict, manifest: str,
             state = AudioState(hidden, state.segments)
             del layer, hidden, reference, weights, quantized
             clear_device_cache(device)
-            print(
-                f"  [audio layer {layer_idx}] resume artifact + reconstruction PASS",
-                flush=True,
-            )
+            logger.info(f"  [audio layer {layer_idx}] resume artifact + reconstruction PASS")
             continue
         weights = reader.load_prefix(prefix + ".")
         layer = AudioLayer(weights, prefix, audio_config, device).eval()
@@ -378,10 +372,10 @@ def _quantize_audio(reader: CheckpointReader, model_config: dict, manifest: str,
         state = AudioState(hidden.cpu(), state.segments)
         del layer, hidden, reference, weights, quantized
         clear_device_cache(device)
-        print(f"  [audio layer {layer_idx}] JointFix+strict-GPTQ complete", flush=True)
+        logger.info(f"  [audio layer {layer_idx}] JointFix+strict-GPTQ complete")
 
     _write_traces(trace_path, traces)
-    print(f"[audio] complete: {depth * 6} strict-GPTQ weights", flush=True)
+    logger.info(f"[audio] complete: {depth * 6} strict-GPTQ weights")
 
 
 def quantize_omni_multimodal(

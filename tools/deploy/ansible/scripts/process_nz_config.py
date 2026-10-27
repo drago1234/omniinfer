@@ -1,13 +1,18 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import logging
 import json
 import sys
+
+logger = logging.getLogger(__name__)
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 config_file = ""
 if len(sys.argv) > 1:
     config_file = sys.argv[1]
 else:
-    print("file name is empty")
+    logger.info("file name is empty")
     exit()
 
 with open(config_file, 'r')as f:
@@ -52,6 +57,6 @@ if size == 26:
 
     with open(config_file, 'w') as f:
         json.dump(config, f, indent=4)
-    print("process aic-ascend910_93-ops-info.json done")
+    logger.info("process aic-ascend910_93-ops-info.json done")
 else:
-    print("nothing changed")
+    logger.info("nothing changed")

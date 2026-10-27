@@ -2,7 +2,7 @@
 """
 Atomic shard write + integrity check + resume — model/method-agnostic.
 
-Pure I/O. The print() resume messages are kept for parity.
+Pure I/O. Resume progress is recorded through the module logger.
 """
 from __future__ import annotations
 
@@ -103,12 +103,12 @@ def load_checkpoint(output_dir: Path, weight_map: Dict[str, str]) -> Tuple[int, 
             corrupted.append(sfn)
 
     if corrupted:
-        print(f"  [resume] Corrupted/missing shards detected: {corrupted}")
+        _LOGGER.warning("  [resume] Corrupted/missing shards detected: %s", corrupted)
         for sfn in corrupted:
             p = output_dir / sfn
             if p.exists():
                 p.unlink()
-                print(f"    Deleted corrupted: {sfn}")
+                _LOGGER.info(f"    Deleted corrupted: {sfn}")
 
         # Find the earliest layer that touches a corrupted shard — re-process from there.
         earliest_bad_layer = last_layer + 1
@@ -134,6 +134,8 @@ def load_checkpoint(output_dir: Path, weight_map: Dict[str, str]) -> Tuple[int, 
     else:
         resume_layer = last_layer + 1
 
-    print(f"  [resume] Checkpoint: last_layer={last_layer}, "
-          f"verified={len(verified)} shards, resume from layer {resume_layer}")
+    _LOGGER.info(
+        f"  [resume] Checkpoint: last_layer={last_layer}, "
+        f"verified={len(verified)} shards, resume from layer {resume_layer}",
+    )
     return resume_layer, verified
