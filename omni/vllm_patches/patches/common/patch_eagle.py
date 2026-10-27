@@ -1067,6 +1067,13 @@ class EagleProposerPatch(VLLMPatch):
             common_attn_metadata.max_query_len = 1
             common_attn_metadata.query_start_loc[: batch_size + 1] = self.arange[: batch_size + 1]
             common_attn_metadata.query_start_loc[batch_size:] = self.arange[batch_size]
+            # The target runner's pinned CPU buffer may still be the source
+            # of an asynchronous H2D copy. Unlike the device writes above,
+            # CPU writes are not ordered after the target by the NPU stream.
+            # Give drafting its own storage before changing query lengths.
+            common_attn_metadata.query_start_loc_cpu = (
+                common_attn_metadata.query_start_loc_cpu.clone()
+            )
             common_attn_metadata.query_start_loc_cpu[: batch_size + 1] = torch.from_numpy(
                 self.token_arange_np[: batch_size + 1]).clone()
             common_attn_metadata.query_start_loc_cpu[batch_size:] = common_attn_metadata.query_start_loc_cpu[batch_size]
