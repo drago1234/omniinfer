@@ -10,17 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 USER_EXTRA_ARGS=("$@")
 
 required_vars=(
-    MODEL_NAME
     MODEL_PATH
-    PORT
-    ASCEND_RT_VISIBLE_DEVICES
-    TP_SIZE
-    DP_SIZE
-    MAX_MODEL_LEN
-    MAX_NUM_BATCHED_TOKENS
-    MAX_NUM_SEQS
-    GPU_MEMORY_UTILIZATION
-    VLLM_PLUGINS
 )
 for name in "${required_vars[@]}"; do
     if [[ -z "${!name:-}" ]]; then
@@ -29,26 +19,16 @@ for name in "${required_vars[@]}"; do
     fi
 done
 
-HOST="${HOST:-0.0.0.0}"
-DTYPE="${DTYPE:-bfloat16}"
-DISTRIBUTED_EXECUTOR_BACKEND="${DISTRIBUTED_EXECUTOR_BACKEND:-mp}"
-TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
-ADD_DATA_PARALLEL_ARG="${ADD_DATA_PARALLEL_ARG:-1}"
+HOST="${HOST:-}"
+DTYPE="${DTYPE:-}"
+DISTRIBUTED_EXECUTOR_BACKEND="${DISTRIBUTED_EXECUTOR_BACKEND:-}"
+TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-0}"
 PREFIX_CACHING="${PREFIX_CACHING:-auto}"
 CHUNKED_PREFILL="${CHUNKED_PREFILL:-auto}"
-EXECUTION_MODE="${EXECUTION_MODE:-auto}"
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-0}"
 ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-0}"
 
-export ASCEND_RT_VISIBLE_DEVICES
-export ASCEND_GLOBAL_LOG_LEVEL="${ASCEND_GLOBAL_LOG_LEVEL:-3}"
-export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-500}"
-export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-1800}"
-export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
-export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"
-export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-1}"
-export VLLM_DISABLE_PYNCCL="${VLLM_DISABLE_PYNCCL:-1}"
-export VLLM_PLUGINS
+ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 
 if [[ "${CLEAN_COMPILE_CACHE:-0}" == "1" ]]; then
     cache_dir="${VLLM_COMPILE_CACHE_DIR:-/root/.cache/vllm/torch_compile_cache}"
@@ -61,29 +41,49 @@ fi
 
 cmd=(
     vllm serve "$MODEL_PATH"
-    --served-model-name "$MODEL_NAME"
-    --host "$HOST"
-    --port "$PORT"
-    --dtype "$DTYPE"
-    --max-model-len "$MAX_MODEL_LEN"
-    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
-    --max-num-seqs "$MAX_NUM_SEQS"
-    --distributed-executor-backend "$DISTRIBUTED_EXECUTOR_BACKEND"
-    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
-    --tensor-parallel-size "$TP_SIZE"
 )
 
-if [[ "$TRUST_REMOTE_CODE" == "1" ]]; then
-    cmd+=(--trust-remote-code)
-fi
-if [[ "$ADD_DATA_PARALLEL_ARG" == "1" ]]; then
-    cmd+=(--data-parallel-size "$DP_SIZE")
+if [[ -n "${MODEL_NAME:-}" ]]; then
+    cmd+=(--served-model-name "$MODEL_NAME")
 fi
 if [[ -n "${ALLOWED_LOCAL_MEDIA_PATH:-}" ]]; then
     cmd+=(--allowed-local-media-path "$ALLOWED_LOCAL_MEDIA_PATH")
 fi
 if [[ -n "${MEDIA_IO_KWARGS:-}" ]]; then
     cmd+=(--media-io-kwargs "$MEDIA_IO_KWARGS")
+fi
+if [[ -n "$HOST" ]]; then
+    cmd+=(--host "$HOST")
+fi
+if [[ -n "${PORT:-}" ]]; then
+    cmd+=(--port "$PORT")
+fi
+if [[ -n "$DTYPE" ]]; then
+    cmd+=(--dtype "$DTYPE")
+fi
+if [[ -n "${MAX_MODEL_LEN:-}" ]]; then
+    cmd+=(--max-model-len "$MAX_MODEL_LEN")
+fi
+if [[ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]]; then
+    cmd+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS")
+fi
+if [[ -n "${MAX_NUM_SEQS:-}" ]]; then
+    cmd+=(--max-num-seqs "$MAX_NUM_SEQS")
+fi
+if [[ -n "$DISTRIBUTED_EXECUTOR_BACKEND" ]]; then
+    cmd+=(--distributed-executor-backend "$DISTRIBUTED_EXECUTOR_BACKEND")
+fi
+if [[ -n "${GPU_MEMORY_UTILIZATION:-}" ]]; then
+    cmd+=(--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION")
+fi
+if [[ -n "${TP_SIZE:-}" ]]; then
+    cmd+=(--tensor-parallel-size "$TP_SIZE")
+fi
+if [[ "$TRUST_REMOTE_CODE" == "1" ]]; then
+    cmd+=(--trust-remote-code)
+fi
+if [[ -n "${DP_SIZE:-}" ]]; then
+    cmd+=(--data-parallel-size "$DP_SIZE")
 fi
 if [[ -n "${MM_PROCESSOR_KWARGS:-}" ]]; then
     cmd+=(--mm-processor-kwargs "$MM_PROCESSOR_KWARGS")
@@ -101,18 +101,23 @@ case "$CHUNKED_PREFILL" in
     auto) ;;
     *) echo "ERROR: CHUNKED_PREFILL must be enable, disable, or auto" >&2; exit 2 ;;
 esac
-case "$EXECUTION_MODE" in
-    eager) cmd+=(--enforce-eager) ;;
-    graph)
-        if [[ -z "${COMPILATION_CONFIG:-}" ]]; then
-            echo "ERROR: COMPILATION_CONFIG is required when EXECUTION_MODE=graph" >&2
+if [[ "$ENFORCE_EAGER" == "1" ]]; then
+    cmd+=(--enforce-eager)
+elif [[ "$ENFORCE_EAGER" != "0" ]]; then
+    echo "ERROR: ENFORCE_EAGER must be 0 or 1" >&2
+    exit 2
+fi
+
+if [[ -n "${COMPILATION_CONFIG:-}" ]]; then
+    if [[ "$COMPILATION_CONFIG" == *'${MAX_NUM_SEQS}'* ]]; then
+        if [[ -z "${MAX_NUM_SEQS:-}" ]]; then
+            echo "ERROR: MAX_NUM_SEQS is required when COMPILATION_CONFIG uses \${MAX_NUM_SEQS}" >&2
             exit 2
         fi
-        cmd+=(--compilation-config "$COMPILATION_CONFIG")
-        ;;
-    auto) ;;
-    *) echo "ERROR: EXECUTION_MODE must be eager, graph, or auto" >&2; exit 2 ;;
-esac
+        COMPILATION_CONFIG="${COMPILATION_CONFIG//\$\{MAX_NUM_SEQS\}/${MAX_NUM_SEQS}}"
+    fi
+    cmd+=(--compilation-config "$COMPILATION_CONFIG")
+fi
 
 if [[ "$ASYNC_SCHEDULING" == "1" ]]; then
     cmd+=(--async-scheduling)
@@ -157,11 +162,12 @@ cmd+=("${USER_EXTRA_ARGS[@]}")
 
 
 # 日志存储
-start_time="$(date +'%Y-%m-%d %H:%M:%S')"
 log_timestamp="$(date +'%Y%m%d_%H%M%S')"
-safe_model_name="${MODEL_NAME//[^a-zA-Z0-9._-]/_}"
+log_model_name="${MODEL_NAME:-${MODEL_PATH##*/}}"
+safe_model_name="${log_model_name//[^a-zA-Z0-9._-]/_}"
 LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs}"
-LOG_FILE="${LOG_FILE:-${LOG_DIR}/hybrid_${safe_model_name}_port${PORT}_${log_timestamp}.log}"
+log_port="${PORT:-default}"
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/hybrid_${safe_model_name}_port${log_port}_${log_timestamp}.log}"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
