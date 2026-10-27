@@ -450,10 +450,18 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                     )
                 gathered_topk_ids = gathered_topk_ids.to(torch.int32)
             else:
-                x_quant = get_ep_group().all_gather(x_quant, dim=0)
-                if x_scale is not None:
-                    x_scale = get_ep_group().all_gather(x_scale, dim=0)
-                gathered_topk_ids = get_ep_group().all_gather(topk_ids, dim=0)
+                if model_extra_config.operator_opt_config.enable_omni_agb:
+                    if x_scale is not None:
+                        x_quant, x_scale, gathered_topk_ids = get_ep_group().all_gather_batch(
+                            [x_quant, x_scale, topk_ids])
+                    else:
+                        x_quant, gathered_topk_ids = get_ep_group().all_gather_batch(
+                            [x_quant, topk_ids])
+                else:
+                    x_quant = get_ep_group().all_gather(x_quant, dim=0)
+                    if x_scale is not None:
+                        x_scale = get_ep_group().all_gather(x_scale, dim=0)
+                    gathered_topk_ids = get_ep_group().all_gather(topk_ids, dim=0)
             if (
                 model_extra_config.operator_opt_config.shared_expert_multi_stream
                 and model_extra_config.operator_opt_config.shared_expert_parallel_schedule == "with_routed_experts_cv"

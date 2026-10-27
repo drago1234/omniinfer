@@ -64,8 +64,10 @@ from omni_npu.plugin_decorators import attn_decorator
 from omni_npu.v1.layers.attention.npu_mla import (
     MomeAttentionMixin,
     _a5_sink_attention_kwargs,
+    _prefill_o_proj_sp_slice,
     NPUMLAAttention,
 )
+from omni_npu.v1.layers.attention.dsa_local_query import ZigzagQueryLayout
 from omni_npu.v1.layers.attention.weight_utils import (
     install_q_b_split_loaders,
     release_q_b_proj_storage,
@@ -666,6 +668,14 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         self.use_mlaprolog = model_extra_config.operator_opt_config.enable_mlaprolog
         self.ena_sp = model_extra_config.parall_config.ena_seq_parallel
         self.ena_cp = model_extra_config.parall_config.ena_context_parallel
+        self.enable_prefill_graph_token_parallel = (
+            model_extra_config.operator_opt_config.enable_prefill_graph_token_parallel
+        )
+        if self.enable_prefill_graph_token_parallel:
+            supported_layout = self.on_ascend950 and self.ena_sp and self.ena_cp
+            supported_projection = self.tp_size > 1 and self.q_lora_rank is not None
+            if not (supported_layout and supported_projection):
+                raise ValueError("DSA local query requires A5 TP>1, q_lora_rank and external SPCP enabled")
         self.ena_kvsp = bool(get_dcp_group().world_size > 1)
         self.sharded_o_proj = model_extra_config.parall_config.sharded_o_proj
         self.num_speculative_tokens = (
@@ -1658,6 +1668,8 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         kv_cache: tuple[torch.Tensor] = None,
         topk_indices_buffer: torch.Tensor | None = None,
         pd_mixed_flag: bool = False,
+        use_local_query: bool = False,
+        output_sp_slice: slice | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert not self.sharded_o_proj  # TODO: sharded_o_proj only support cp
         assert not attn_metadata or not self.ena_kvsp  # TODO: kvsp only support cp
@@ -1690,7 +1702,17 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         q = self.q_a_layernorm(q)  # TD
         q_lora = sp_manager.ag_tokens(q) if self.ena_sp and not self.use_mome else q
 
-        q_nope, q_pe = self._q_absorb(q_lora, cos, sin)  # TND
+        if use_local_query:
+            # The PR graph wrapper has gathered full tokens and disabled SP.
+            assert not self.ena_sp and self.q_b_proj.tp_size == 1 and not is_dummy
+            assert not pd_mixed_flag and q_lora.size(0) == x.size(0)
+            group = get_tp_group()
+            query_layout = ZigzagQueryLayout(x.size(0), group.world_size, group.rank_in_group)
+            local_q, local_cos, local_sin = map(query_layout.select, (q_lora, cos, sin))
+            q_nope, q_pe = self._q_absorb(local_q, local_cos, local_sin)
+            local_q_cumlens, local_kv_lens, local_blocks = query_layout.metadata(q_cumlens, kv_lens, block_table)
+        else:
+            q_nope, q_pe = self._q_absorb(q_lora, cos, sin)  # TND
 
         kv = self.kv_a_proj_with_mqa(x)[0]  # TD
         kv = self._maybe_mome_kv(kv, get_mome_args)  # TD
@@ -1701,11 +1723,17 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         cur_stream = torch.npu.current_stream()
 
         if not self.skip_topk:
+            if use_local_query:
+                local_x = query_layout.select(x)
             if model_extra_config.operator_opt_config.li_prolog_multi_stream:
                 self.ki_stream.wait_stream(cur_stream)
                 self.wi_stream.wait_stream(cur_stream)
 
-            if self.ena_sp:
+            if use_local_query:
+                wi, qi, ki = self.indexer._li_prolog_ext(
+                    local_x, local_q, x,
+                    (local_cos, local_sin), (cos, sin))
+            elif self.ena_sp:
                 wi, qi, ki = self.indexer._li_prolog(x, q, sp_cos, sp_sin)
                 ki = sp_manager.ag_tokens(ki)
                 wi = sp_manager.ag_tokens(wi)
@@ -1713,18 +1741,28 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
             else:
                 wi, qi, ki = self.indexer._li_prolog(x, q, cos, sin)
             self.indexer._update_cache(ki, attn_metadata, ki_cache, ki_scale_cache)
+            if use_local_query:
+                q_cumlens, kv_lens, block_table = local_q_cumlens, local_kv_lens, local_blocks
             topk_idx = self.indexer._apply_lightning_indexer(
                 wi, qi, ki_cache, q_cumlens, kv_lens, block_table,
                 ki_scale_cache, metadata_caller="prefill"
             )
         elif not is_dummy:
-            topk_idx = topk_indices_buffer
+            if use_local_query:
+                q_cumlens, kv_lens, block_table = local_q_cumlens, local_kv_lens, local_blocks
+                topk_idx = topk_indices_buffer[:local_q.size(0)]
+            else:
+                topk_idx = topk_indices_buffer
         else:
             topk_idx = None
 
         next_topk_indices_buffer = (
             topk_idx if topk_idx is not None else topk_indices_buffer
         )
+        if use_local_query:
+            # The SP caller already owns this rank's zigzag query count.
+            # Reuse layers keep these indices local, without AG or re-slicing.
+            assert next_topk_indices_buffer.shape == topk_indices_buffer.shape
         topk_idx = self._apply_sink_offset(topk_idx)
 
         out = self._apply_attn_absorb(
@@ -1740,7 +1778,12 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         )  # -> TND
 
         out = self._post_attn_absorb(out)  # T,ND
+        if use_local_query:
+            out = query_layout.gather_full_tokens(out)
         out = self._maybe_mome_out(out, get_mome_args)  # T,ND
+        if output_sp_slice is not None:
+            assert not self.ena_sp  # The graph wrapper owns the final SP output.
+            out = out[output_sp_slice].contiguous()
         if self.ena_sp:
             out = sp_manager.align_tokens(out)  # T,ND
         out = self._apply_o_proj(out)
@@ -2429,24 +2472,53 @@ def npu_dsa_forward(
         ):
             # The builder laid this batch out for a FULL graph and left out the
             # CP metadata, whose layout a graph cannot follow. That needs the
-            # whole sequence: run plain prefill with SP disabled. sp_disabled
-            # returns all-gathered hidden states, so topk_indices_buffer is
-            # gathered and split back too, as in the has_decode branch above.
+            # whole sequence: run prefill with SP disabled. Query-parallel
+            # prefill selects zigzag fragments and keeps TopK indices local;
+            # otherwise gather/split indices as in the decode branch.
+            use_local_query = (
+                self.enable_prefill_graph_token_parallel
+                and attn_metadata.num_actual_tokens % (2 * self.tp_size) == 0
+            )
             sp_enabled = self.ena_sp
-            if sp_enabled:
+            output_sp_slice = _prefill_o_proj_sp_slice(self, attn_metadata.num_actual_tokens)
+            if sp_enabled and not use_local_query:
                 topk_indices_buffer = get_tp_group().all_gather(
                     topk_indices_buffer, dim=0
                 )
-            with sp_disabled(self, hs) as (x, y, out):
-                y[p_slice], topk_indices_buffer[p_slice] = self._forward_prefill(
-                    x[p_slice],
-                    cos[p_slice],
-                    sin[p_slice],
-                    prefill,
-                    kv_cache,
-                    topk_indices_buffer[p_slice],
-                )
-            if sp_enabled:
+            if output_sp_slice is not None:
+                # TP1 projection already returns this rank's SP rows. Keep
+                # the ordinary full-output sp_disabled contract unchanged.
+                self.ena_sp = False
+                try:
+                    x = get_tp_group().all_gather(hs, dim=0)
+                    out[:], next_topk_indices = self._forward_prefill(
+                        x[p_slice],
+                        cos[p_slice],
+                        sin[p_slice],
+                        prefill,
+                        kv_cache,
+                        topk_indices_buffer if use_local_query else topk_indices_buffer[p_slice],
+                        use_local_query=use_local_query,
+                        output_sp_slice=output_sp_slice,
+                    )
+                finally:
+                    self.ena_sp = sp_enabled
+            else:
+                with sp_disabled(self, hs) as (x, y, out):
+                    y[p_slice], next_topk_indices = self._forward_prefill(
+                        x[p_slice],
+                        cos[p_slice],
+                        sin[p_slice],
+                        prefill,
+                        kv_cache,
+                        topk_indices_buffer if use_local_query else topk_indices_buffer[p_slice],
+                        use_local_query=use_local_query,
+                    )
+            if use_local_query:
+                topk_indices_buffer = next_topk_indices
+            else:
+                topk_indices_buffer[p_slice] = next_topk_indices
+            if sp_enabled and not use_local_query:
                 topk_indices_buffer = topk_indices_buffer.split(hs.size(0))[
                     get_tp_group().rank_in_group
                 ]

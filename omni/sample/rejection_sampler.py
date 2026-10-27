@@ -10,7 +10,10 @@ from vllm.logger import init_logger
 
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+from vllm.v1.sample.ops.topk_topp_sampler import (
+    apply_top_k_top_p,
+    apply_top_k_top_p_pytorch,
+)
 from vllm.v1.sample.rejection_sampler import (
     MAX_SPEC_LEN,
     PLACEHOLDER_TOKEN_ID,
@@ -26,10 +29,31 @@ from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.sample.ops.topk_topp_sampler import apply_top_k_top_p_npu
 from omni_npu.sample.ops.block_acceptance import compute_block_acceptance_triton
 from omni_npu.sample.ops.block_selection import select_block_tokens_triton
+from omni_npu.v1.utils import on_ascend950
 
 logger = init_logger(__name__)
 
 NEW_GREEDY_TEMPERATURE = 1e-6 # convert greedy cases into random cases
+
+
+def _apply_top_k_top_p_fallback(
+    logits: torch.Tensor,
+    top_k: Optional[torch.Tensor],
+    top_p: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """非 NPU 采样路径下的 top-k/top-p 实现，由
+    ``operator_opt_config.top_k_top_p_sample_backend`` 指定后端。
+
+    A5（Ascend950）工具链的 libdevice 缺 ``cumsum_1d_bool_dim0`` 符号，
+    vLLM triton kernel 无法编译链接，因此 A5 上默认走 pytorch 实现；
+    其他平台默认 triton（上游行为）。后端设为 "triton" 可强制走 triton。
+    """
+    backend = model_extra_config.operator_opt_config.top_k_top_p_sample_backend
+    if backend == "auto":
+        backend = "pytorch" if on_ascend950() else "triton"
+    if backend == "triton":
+        return apply_top_k_top_p(logits, top_k, top_p)
+    return apply_top_k_top_p_pytorch(logits, top_k, top_p)
 
 
 class NPURejectionSampler(RejectionSampler):
@@ -443,7 +467,7 @@ def compute_probs(
     # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
     # which is slow for large vocab sizes. This may cause performance issues.
     if not use_npu_sample:
-        logits = apply_top_k_top_p(logits, top_k, top_p)
+        logits = _apply_top_k_top_p_fallback(logits, top_k, top_p)
     else:
         logits = apply_top_k_top_p_npu(logits, top_k, top_p)
     return logits
@@ -926,7 +950,7 @@ def compute_probs_and_sample(
     # `q` was generated once in NPURejectionSampler.forward (on the side
     # stream, already synced) and sliced here as a default-stream copy.
     if not use_npu_sample:
-        logits = apply_top_k_top_p(logits, top_k, top_p)
+        logits = _apply_top_k_top_p_fallback(logits, top_k, top_p)
         probs = logits.softmax(dim=-1, dtype=torch.float32)
         token_ids = probs.div_(q).argmax(dim=-1).view(-1)
         return token_ids.to(torch.int32), logits

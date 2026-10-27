@@ -193,6 +193,7 @@ class ModelOperatorOptConfig:
     shared_expert_down_prefetch: int = 14
 
     enable_moe_agrs: bool = False
+    enable_omni_agb: bool = False  # Batch EP AllGather for quantized inputs and routing IDs.
     enable_moe_allreduce: bool = False
     enable_round_pipeline_comm: bool = False
     enable_pipeline_comm: bool = False
@@ -204,6 +205,11 @@ class ModelOperatorOptConfig:
     use_quant_lightning_indexer_v2: bool = False
     merge_q_kv_conv: bool = False # 是否合并qa_conv和compresskv_conv
     disable_npu_top_k_top_p_sample: bool = False
+    # 非 NPU 采样路径（disable_npu_top_k_top_p_sample=True）下 top-k/top-p 的后端：
+    # "auto"：A5（Ascend950）默认 pytorch——该工具链 libdevice 缺 cumsum 符号，
+    #         vLLM triton kernel 无法编译；其他平台默认 triton（上游行为）。
+    # "pytorch" / "triton"：强制指定后端。
+    top_k_top_p_sample_backend: str = "auto"
     use_mome_inplace_update: bool = False
     enable_multi_stream: bool = False
     use_batch_invariant_op: bool = False
@@ -242,6 +248,9 @@ class ModelOperatorOptConfig:
     # buffers and drops the host-rebuilt SP/CP layout; wider batches stay
     # eager with SP/CP intact.
     enable_prefill_cudagraph: bool = False
+    # A5 prefill graph: shard DSA queries and project local SP tokens after
+    # full-token convolution, preserving full-head weights and cache layouts.
+    enable_prefill_graph_token_parallel: bool = False
 
     def __post_init__(self):
         if self.engram_table_location != "cpu_shared":
@@ -253,6 +262,10 @@ class ModelOperatorOptConfig:
 
         if type(self.mome_sp_token_threshold) is not int or self.mome_sp_token_threshold < 0:
             raise ValueError("mome_sp_token_threshold must be a non-negative integer")
+
+        if self.top_k_top_p_sample_backend not in ("auto", "pytorch", "triton"):
+            raise ValueError(
+                "top_k_top_p_sample_backend must be 'auto', 'pytorch' or 'triton'")
 
         # Check the dependencies of use_prefetch and prefetch_Mb
         if not self.enable_prefetch:

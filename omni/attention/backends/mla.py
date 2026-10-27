@@ -591,7 +591,7 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
                     for seq in metadata.prefill.seq_lens_list
                 ]
                 if model_extra_config.operator_opt_config.use_aicpu_fa_tiling:
-                    metadata.prefill.seq_lens[metadata.prefill.seq_lens == 0] = self.sink_len
+                    metadata.prefill.seq_lens.masked_fill_(metadata.prefill.seq_lens == 0, self.sink_len)
                 else:
                     metadata.prefill.seq_lens = metadata.prefill.seq_lens_list
 

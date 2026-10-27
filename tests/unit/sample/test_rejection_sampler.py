@@ -118,10 +118,17 @@ def rejection_mod(monkeypatch):
 @pytest.mark.parametrize("device_name", ["Ascend910_9391", "Ascend950DT_9582"])
 @pytest.mark.parametrize("disable_npu_sample", [False, True])
 @pytest.mark.parametrize("with_sampling", [False, True])
+@pytest.mark.parametrize("backend", ["auto", "triton", "pytorch"])
 def test_sampler_routes_topk_topp_by_config(
-    rejection_mod, monkeypatch, device_name, disable_npu_sample, with_sampling
+    rejection_mod, monkeypatch, device_name, disable_npu_sample, with_sampling, backend
 ):
-    """A5 uses the same NPU path as A3 unless the operator is explicitly disabled."""
+    """A5 uses the same NPU path as A3 unless the operator is explicitly disabled.
+
+    When disabled, the fallback backend is chosen by
+    ``operator_opt_config.top_k_top_p_sample_backend``: "auto" resolves to
+    pytorch on Ascend950 (A5 toolchain cannot link the Triton kernel) and to
+    triton elsewhere; explicit values force the corresponding backend.
+    """
     mod, fake_torch_npu, _ = rejection_mod
     from omni_npu.v1 import utils
 
@@ -131,7 +138,8 @@ def test_sampler_routes_topk_topp_by_config(
         "model_extra_config",
         SimpleNamespace(
             operator_opt_config=SimpleNamespace(
-                disable_npu_top_k_top_p_sample=disable_npu_sample
+                disable_npu_top_k_top_p_sample=disable_npu_sample,
+                top_k_top_p_sample_backend=backend,
             )
         ),
     )
@@ -151,6 +159,11 @@ def test_sampler_routes_topk_topp_by_config(
         calls.append("native")
         return logits
 
+    def pytorch_filter(logits, k, p):
+        assert disable_npu_sample, "Unexpected pytorch fallback on the NPU path"
+        calls.append("pytorch")
+        return logits
+
     def npu_filter(logits, k, p):
         assert not disable_npu_sample, "Explicit disable must bypass the NPU operator"
         calls.append("npu")
@@ -161,6 +174,7 @@ def test_sampler_routes_topk_topp_by_config(
         return filtered.argmax(dim=-1), filtered
 
     monkeypatch.setattr(mod, "apply_top_k_top_p", native_filter)
+    monkeypatch.setattr(mod, "apply_top_k_top_p_pytorch", pytorch_filter)
     monkeypatch.setattr(mod, "apply_top_k_top_p_npu", npu_filter)
     monkeypatch.setattr(fake_torch_npu, "npu_top_k_top_p_sample", npu_sample)
     # Eight expanded draft rows exercise the batch size that enables Triton upstream.
@@ -181,7 +195,14 @@ def test_sampler_routes_topk_topp_by_config(
     else:
         filtered = mod.compute_probs(logits, cu, metadata, sampler.use_npu_sample)
     assert filtered is logits
-    assert calls == (["native"] if disable_npu_sample else ["npu"])
+    if not disable_npu_sample:
+        expected = ["npu"]
+    else:
+        resolved = backend
+        if resolved == "auto":
+            resolved = "pytorch" if "950" in device_name else "triton"
+        expected = ["native"] if resolved == "triton" else ["pytorch"]
+    assert calls == expected
 
 
 def test_expand_batch_to_tokens_with_replacement(rejection_mod):

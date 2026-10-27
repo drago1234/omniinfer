@@ -59,6 +59,7 @@ from omni_npu.attention.backends.utils import (
     enable_fia_metadata_sharing,
     get_batch_desc,
     get_cross_layer_shared_op,
+    graph_prefill_width,
     lazy_zero_like,
     sp_disabled,
 )
@@ -101,6 +102,27 @@ from omni_npu.v1.utils import on_ascend950
 
 npu_fused_infer_attention_sink_metadata: CrossLayerSharedOp | None = None
 npu_ai_infra_attention_pioneer_metadata: CrossLayerSharedOp | None = None
+
+
+def _prefill_o_proj_sp_slice(attention, num_tokens):
+    """Local contiguous rows for a communication-free TP1 output projection.
+
+    Call only after selecting pure-prefill graph execution, before SP is
+    temporarily disabled. Full-token convolution/cache updates happen first.
+    """
+    if not model_extra_config.operator_opt_config.enable_prefill_graph_token_parallel:
+        return None
+    if not attention.on_ascend950 or not attention.ena_sp:
+        return None
+    projection = attention.o_proj
+    if projection.tp_size != 1 or projection.x_transform != "NoOp" or projection.y_transform != "NoOp":
+        return None
+    group = get_tp_group()
+    if group.world_size <= 1 or num_tokens % group.world_size:
+        return None
+    local_tokens = num_tokens // group.world_size
+    start = group.rank_in_group * local_tokens
+    return slice(start, start + local_tokens)
 
 
 def _a5_sink_attention_kwargs(num_heads, scaling, sink_number):
@@ -834,6 +856,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         self._init_cross_layer_shared_ops()
 
         compilation_config = get_current_vllm_config().compilation_config
+        self.compilation_config = compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
@@ -1600,10 +1623,18 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
 
         if kv_total == kv_a.size(0):
             return kv_a, k_pe, q_cumlens
+        if isinstance(q_cumlens, torch.Tensor) and isinstance(seq_lens, torch.Tensor):
+            # Derive the lengths on the same device as the attention metadata;
+            # constructing a tensor from kv_cumlens would copy a CPU list here.
+            q_lens = torch.diff(q_cumlens, prepend=q_cumlens.new_zeros(1))
+            history_lens = (seq_lens - q_lens).clamp(min=0, max=window_size)
+            output_cumlens = q_cumlens + history_lens.cumsum(0, dtype=q_cumlens.dtype)
+        else:
+            output_cumlens = self._cumlens_like(kv_cumlens, q_cumlens)
         return (
             torch.cat(kv_parts, dim=0),
             torch.cat(rope_parts, dim=0),
-            self._cumlens_like(kv_cumlens, q_cumlens),
+            output_cumlens,
         )
 
     @attn_decorator(type="mla")
@@ -2578,6 +2609,16 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
         # Restore V channels before TP-heads -> SP-tokens redistribution.
         return self._finish_prefill(out, x, sp_manager, get_mome_args)
 
+    def _should_slice_prefill_output(self, sp_manager, mome_sp_out):
+        """Select local output rows only on the ordinary prefill graph path."""
+        if not model_extra_config.operator_opt_config.enable_prefill_graph_token_parallel:
+            return False
+        if sp_manager is None or mome_sp_out is not None:
+            return False
+        return graph_prefill_width(
+            self.compilation_config, 0, sp_manager.tok
+        ) is not None
+
     def _finish_prefill(self, out, x, sp_manager, get_mome_args):
         """Redistribute V channels, project, then restore the local token count."""
         mome_sp_out = self._apply_mome_out_prefill_sp(out, sp_manager)
@@ -2585,6 +2626,12 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             out = mome_sp_out
         else:
             out = self._maybe_mome_out(out, get_mome_args)
+
+        if self._should_slice_prefill_output(sp_manager, mome_sp_out):
+            output_sp_slice = _prefill_o_proj_sp_slice(self, sp_manager.tok)
+            if output_sp_slice is not None:
+                assert out.size(0) == sp_manager.tok
+                out = out[output_sp_slice].contiguous()
 
         if sp_manager and self.o_proj.tp_size > 1:
             out = sp_manager.align_tokens(out)

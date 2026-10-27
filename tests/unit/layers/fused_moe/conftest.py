@@ -98,6 +98,7 @@ def _stub_fused_moe_deps(monkeypatch: pytest.MonkeyPatch) -> None:
             enable_mxfp8_comm_quant=False,
             decode_moe_dispatch_combine=False,
             enable_moe_agrs=False,
+            enable_omni_agb=False,
             enable_moe_allreduce=False,
             prefill_grouped_matmul_finalize_routing=False,
             enable_prefetch=False,

@@ -407,9 +407,33 @@ class ParallelStatePatch(VLLMPatch):
 @register_patch("GroupCoordinatorPatch", GroupCoordinator)
 class GroupCoordinatorPatch(VLLMPatch):
 
-    _attr_names_to_apply = ['__init__', 'use_local_synchronization', 'swap', 'all_gather_into_tensor']
+    _attr_names_to_apply = ['__init__', 'use_local_synchronization', 'swap',
+                            'all_gather_into_tensor', 'all_gather_batch']
 
     use_local_synchronization = False
+
+    def all_gather_batch(self, tensors):
+        """Gather dim-0 tensors together on the existing CCU communicator."""
+        if self.world_size == 1 or not tensors:
+            return list(tensors)
+        if os.environ.get("HCCL_OP_EXPANSION_MODE") not in ("CCU_MS", "CCU_SCHED"):
+            raise RuntimeError("AGB requires global HCCL_OP_EXPANSION_MODE=CCU_MS or CCU_SCHED")
+        if getattr(self, "_omni_agb_hcom_handle", None) is None:
+            import omni_training_custom_ops  # noqa: F401
+            from vllm.platforms import current_platform
+
+            backend = self.device_group._get_backend(torch.device(current_platform.device_type))
+            self._omni_agb_hcom_handle = (
+                str(backend.get_hccl_comm(self.rank_in_group))
+                if hasattr(backend, "get_hccl_comm")
+                else backend.get_hccl_comm_name(self.rank_in_group)
+            )
+        if not hasattr(torch.ops.custom, "npu_ai_infra_all_gather_batch"):
+            raise RuntimeError("AGB requires npu_ai_infra_all_gather_batch from omni_training_custom_ops")
+        return list(torch.ops.custom.npu_ai_infra_all_gather_batch(
+            [tensor.contiguous() for tensor in tensors],
+            self._omni_agb_hcom_handle, self.world_size,
+        ))
 
     def __init__(
         self,

@@ -791,6 +791,57 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             torch.tensor([64])
         ))
 
+    def test_build_prefill_sink_lengths_preserve_shared_storage(self):
+        # Exercise the real builder and its prefill slice, rather than executing
+        # an extracted tensor expression independently of metadata construction.
+        for dtype in (torch.int32, torch.int64):
+            for sink_len in (1, 128, 2048):
+                for values in ([0, 0], [1, 7, 2048], [0, 7, 0, 2048], [7, 0]):
+                    for stride in (1, 2):
+                        with self.subTest(dtype=dtype, sink_len=sink_len, values=values, stride=stride):
+                            builder, mla_mod = self._new_builder_for_current_build(sink_len=sink_len)
+                            original = torch.tensor(values, dtype=dtype)
+                            storage = original.repeat_interleave(stride)
+                            lengths = storage[::stride]
+                            num_reqs = len(values)
+                            # Zero-length rows represent padding. Real queries
+                            # cannot exceed their total sequence lengths.
+                            query_lengths = [min(value, 5) for value in values]
+                            query_start_loc = [0]
+                            for query_length in query_lengths:
+                                query_start_loc.append(query_start_loc[-1] + query_length)
+                            history_lengths = [value - query_length for value, query_length
+                                               in zip(values, query_lengths)]
+                            builder.chunked_prefill_workspace_size = max(sum(history_lengths), 1)
+                            builder.chunked_prefill_workspace = object()
+                            common = self._make_common_for_current_build(
+                                seq_lens=values,
+                                query_start_loc=query_start_loc,
+                                max_query_len=max(query_lengths),
+                            )
+                            common.seq_lens = lengths
+                            before_ptr = lengths.data_ptr()
+                            with (
+                                patch.object(mla_mod, "split_decodes_and_prefills",
+                                             return_value=(0, num_reqs, 0, query_start_loc[-1])),
+                                patch.object(mla_mod.model_extra_config.operator_opt_config,
+                                             "use_aicpu_fa_tiling", True),
+                            ):
+                                result = builder.build(
+                                    common_prefix_len=0,
+                                    common_attn_metadata=common,
+                                    fast_build=False,
+                                )
+                            expected = torch.where(original == 0, sink_len, original)
+                            actual = result.prefill.seq_lens
+                            self.assertEqual(actual.data_ptr(), before_ptr)
+                            self.assertEqual(actual.shape, original.shape)
+                            self.assertEqual(actual.dtype, dtype)
+                            torch.testing.assert_close(actual, expected)
+                            torch.testing.assert_close(storage[::stride], expected)
+                            if stride == 2:
+                                torch.testing.assert_close(storage[1::2], original)
+
     def test_build_decode_with_sink_len_and_fa_tiling(self):
         builder, mla_mod = self._new_builder_for_current_build(sink_len=64)
         common_attn_metadata = self._make_common_for_current_build(

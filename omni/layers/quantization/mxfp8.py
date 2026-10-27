@@ -935,12 +935,20 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
     ):
         shared_experts = shared_expert_mlp(layer)
         orig_num_tokens = hidden_states.shape[0]
-        strategy, strategy_impl = self.select_communication_strategy(orig_num_tokens)
-
         moe_parallel_config = layer.moe_config.moe_parallel_config
         use_ep = getattr(moe_parallel_config, "use_ep", True)
-        is_need_slice = use_ep and self.tp_size > 1 and (
-            strategy == "all2all" or strategy == "dispatch_combine"
+        strategy, strategy_impl = self.select_communication_strategy(orig_num_tokens)
+
+        # AGRS gathers disjoint token shards, not replicated full TP inputs.
+        # Preserve the original layout for callers after its ReduceScatter.
+        agrs_tp_slice = (
+            self.on_ascend950 and strategy == "agrs" and self.tp_size > 1
+            and not model_extra_config.parall_config.ena_seq_parallel
+            and not getattr(layer.moe_config, "is_sequence_parallel", False)
+            and use_ep
+        )
+        is_need_slice = agrs_tp_slice or (
+            use_ep and self.tp_size > 1 and strategy in ("all2all", "dispatch_combine")
         )
         x_slice = hidden_states
         if is_need_slice:
@@ -995,8 +1003,6 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
             force_load_balance=getattr(layer, "use_moe_force_load_balance", False),
         )
 
-        moe_parallel_config = layer.moe_config.moe_parallel_config
-        use_ep = getattr(moe_parallel_config, "use_ep", True)
         if not use_ep:
             if self.on_ascend950:
                 if multi_stream or enable_prefetch:
@@ -1131,7 +1137,13 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
                     routed_output = routed_output + shared_output
 
         if is_need_slice:
+            restore_shared = (
+                agrs_tp_slice and shared_output is not None
+                and shared_experts.gate_up_proj.tp_size == 1
+            )
             routed_output = tensor_model_parallel_all_gather(routed_output, dim=0)[:orig_num_tokens]
+            if restore_shared:
+                shared_output = tensor_model_parallel_all_gather(shared_output, dim=0)[:orig_num_tokens]
 
         if shared_output is not None and shared_experts.gate_up_proj.tp_size > 1 and use_custom_model_add:
             return shared_output, routed_output + shared_output

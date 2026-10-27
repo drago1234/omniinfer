@@ -2390,7 +2390,10 @@ def test_lengths_to_i64_converts_int32_tensor_and_list():
 
 
 @pytest.mark.unit
-def test_prepend_chunked_prefill_context_adds_swa_history_from_paged_cache(monkeypatch):
+@pytest.mark.parametrize("length_dtype", [torch.int32, torch.int64])
+def test_prepend_chunked_prefill_context_adds_swa_history_from_paged_cache(
+    monkeypatch, length_dtype,
+):
     from omni_npu.v1.layers.attention import npu_mla as mla_mod
     from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 
@@ -2404,6 +2407,9 @@ def test_prepend_chunked_prefill_context_adds_swa_history_from_paged_cache(monke
     fake._as_cumlens_list = MagicMock(
         side_effect=AssertionError("CPU lists should avoid the D2H fallback")
     )
+    fake._cumlens_like = MagicMock(
+        side_effect=AssertionError("Device lengths should avoid copying the CPU list")
+    )
 
     L, R = 2, 1
     kv_a = torch.arange(5 * L, dtype=torch.float32).view(5, L)
@@ -2411,7 +2417,7 @@ def test_prepend_chunked_prefill_context_adds_swa_history_from_paged_cache(monke
     nope_cache = torch.arange(4 * 2 * L, dtype=torch.float32).view(4, 2, L)
     rope_cache = torch.arange(200, 200 + 4 * 2 * R, dtype=torch.float32).view(4, 2, R)
     block_table = torch.tensor([[1, 3, 0], [2, 0, 1]], dtype=torch.int32)
-    q_cumlens = torch.tensor([2, 5], dtype=torch.int32)
+    q_cumlens = torch.tensor([2, 5], dtype=length_dtype)
     seq_lens = torch.tensor([5, 6], dtype=torch.int32)
 
     out_kv, out_rope, out_cumlens = NPUDeepseekMLAAttention._prepend_chunked_prefill_context(
@@ -2434,7 +2440,62 @@ def test_prepend_chunked_prefill_context_adds_swa_history_from_paged_cache(monke
 
     assert torch.equal(out_kv, expected_kv)
     assert torch.equal(out_rope, expected_rope)
-    assert torch.equal(out_cumlens, torch.tensor([4, 9], dtype=torch.int32))
+    assert torch.equal(out_cumlens, torch.tensor([4, 9], dtype=length_dtype))
+    assert out_cumlens.dtype == q_cumlens.dtype
+    assert out_cumlens.device == q_cumlens.device
+    assert torch.equal(q_cumlens, torch.tensor([2, 5], dtype=length_dtype))
+    assert torch.equal(seq_lens, torch.tensor([5, 6], dtype=torch.int32))
+    fake._as_cumlens_list.assert_not_called()
+    fake._cumlens_like.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tensor_lengths", [False, True])
+@pytest.mark.parametrize("length_dtype", [torch.int32, torch.int64])
+def test_prepend_chunked_prefill_context_mixed_history_lengths(
+    monkeypatch, tensor_lengths, length_dtype,
+):
+    from omni_npu.v1.layers.attention import npu_mla as mla_mod
+    from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+
+    monkeypatch.setattr(mla_mod, "cache_fit_shape", lambda cache, mode: cache)
+    fake = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
+    fake.on_ascend950 = True
+    fake.enable_chunked_prefill = True
+    fake.noncontiguous_kv = True
+    fake.sliding_window = 4
+    q_values, seq_values = [2, 3, 6], [2, 2, 10]
+    q_cumlens = torch.tensor(q_values, dtype=length_dtype) if tensor_lengths else q_values
+    seq_lens = torch.tensor(seq_values, dtype=torch.int32) if tensor_lengths else seq_values
+    fake._as_cumlens_list = MagicMock(side_effect=AssertionError("Unexpected D2H"))
+    fake._cumlens_like = MagicMock(wraps=NPUDeepseekMLAAttention._cumlens_like)
+
+    kv_a = torch.arange(12, dtype=torch.float32).view(6, 2)
+    k_pe = torch.arange(6, dtype=torch.float32).view(6, 1)
+    nope_cache = torch.arange(32, dtype=torch.float32).view(4, 4, 2)
+    rope_cache = torch.arange(16, dtype=torch.float32).view(4, 4, 1)
+    block_table = torch.tensor([[0, 1, 2], [2, 3, 0], [1, 0, 3]], dtype=torch.int32)
+
+    out_kv, out_rope, out_cumlens = fake._prepend_chunked_prefill_context(
+        kv_a, k_pe, q_cumlens, seq_lens, block_table, (nope_cache, rope_cache),
+        q_values, seq_values,
+    )
+
+    # Requests have respectively zero, one and window-limited history tokens.
+    assert torch.equal(out_kv, torch.cat([
+        kv_a[:2], nope_cache[2, :1], kv_a[2:3], nope_cache[0, :3], kv_a[3:],
+    ]))
+    assert torch.equal(out_rope, torch.cat([
+        k_pe[:2], rope_cache[2, :1], k_pe[2:3], rope_cache[0, :3], k_pe[3:],
+    ]))
+    if tensor_lengths:
+        assert torch.equal(out_cumlens, torch.tensor([2, 4, 10], dtype=length_dtype))
+        assert out_cumlens.dtype == q_cumlens.dtype
+        assert out_cumlens.device == q_cumlens.device
+        fake._cumlens_like.assert_not_called()
+    else:
+        assert out_cumlens == [2, 4, 10]
+        fake._cumlens_like.assert_called_once_with([2, 4, 10], q_cumlens)
     fake._as_cumlens_list.assert_not_called()
 
 

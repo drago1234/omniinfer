@@ -19,15 +19,20 @@
         "enable_kv_rmsnorm_rope_cache": true,
         "decode_moe_dispatch_combine": false,
         "enable_moe_agrs": true,
+        "enable_omni_agb": true,
         "enable_agrs_finalize_metadata_overlap": true,
         "shared_expert_multi_stream": true,
         "enable_mome_sp": true,
-        "mome_sp_min_tokens": 10240,
+        "mome_sp_token_threshold": 10240,
         "swa_prefill_absorb_max_tokens": 8192,
         "use_quant_lightning_indexer_v2": true,
         "kv_nz": false,
         "merge_q_kv_conv": false,
         "use_aicpu_fa_tiling": true,
-        "enable_mxfp8_comm_quant": true
+        "enable_mxfp8_comm_quant": true,
+        "enable_prefill_cudagraph": true,
+        "enable_prefill_graph_token_parallel": true,
+        "disable_npu_top_k_top_p_sample": true,
+        "top_k_top_p_sample_backend": "pytorch"
     }
 }

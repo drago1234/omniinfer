@@ -541,8 +541,14 @@ def test_allreduce_prepare_permute_no_quant(prepare_module):
     assert result.dtype == torch.float32
 
 
-def test_agrs_prepare_permute_hifloat8_uses_cast_without_scale(prepare_module):
+@pytest.mark.parametrize("enable_agb", [False, True])
+def test_agrs_prepare_permute_hifloat8_uses_cast_without_scale(prepare_module, enable_agb):
     module, stubs = prepare_module
+    module.model_extra_config.operator_opt_config.enable_omni_agb = enable_agb
+    stubs.ep_group.all_gather = MagicMock(wraps=stubs.ep_group.all_gather)
+    stubs.ep_group.all_gather_batch = MagicMock(
+        side_effect=lambda tensors: [torch.cat([tensor, tensor], dim=0) for tensor in tensors]
+    )
     layer = _hifloat8_moe_layer(stubs)
     x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
     topk_ids = torch.zeros(2, 1, dtype=torch.int32)
@@ -573,18 +579,36 @@ def test_agrs_prepare_permute_hifloat8_uses_cast_without_scale(prepare_module):
     assert result.dynamic_scale is None
     assert torch.equal(result.hidden_states_sorted_by_experts, expanded_x)
 
+    if enable_agb:
+        stubs.ep_group.all_gather_batch.assert_called_once()
+        tensors = stubs.ep_group.all_gather_batch.call_args.args[0]
+        assert len(tensors) == 2
+        assert torch.equal(tensors[0], x_hif8)
+        assert torch.equal(tensors[1], topk_ids)
+        stubs.ep_group.all_gather.assert_not_called()
+    else:
+        stubs.ep_group.all_gather_batch.assert_not_called()
+        assert stubs.ep_group.all_gather.call_count == 2
+
 
 @pytest.mark.parametrize(
     ("use_mxfp8_w8a8", "use_mxfp4_w4a8"),
     [(True, False), (False, True)],
 )
+@pytest.mark.parametrize("enable_agb", [False, True])
 def test_agrs_prepare_permute_mxfp_quants_before_all_gather(
     prepare_module,
     use_mxfp8_w8a8,
     use_mxfp4_w4a8,
+    enable_agb,
 ):
     """MXFP activations are quantized locally and gathered with E8M0 scales."""
     module, stubs = prepare_module
+    module.model_extra_config.operator_opt_config.enable_omni_agb = enable_agb
+    stubs.ep_group.all_gather = MagicMock(wraps=stubs.ep_group.all_gather)
+    stubs.ep_group.all_gather_batch = MagicMock(
+        side_effect=lambda tensors: [torch.cat([tensor, tensor], dim=0) for tensor in tensors]
+    )
     layer = _moe_layer(
         global_num_experts=4,
         local_num_experts=2,
@@ -623,6 +647,17 @@ def test_agrs_prepare_permute_mxfp_quants_before_all_gather(
     assert torch.equal(quant_args[0], x)
     assert quant_kwargs["dst_type"] is torch.float8_e4m3fn
     assert quant_kwargs["scale_alg"] == 1
+    if enable_agb:
+        stubs.ep_group.all_gather_batch.assert_called_once()
+        tensors = stubs.ep_group.all_gather_batch.call_args.args[0]
+        assert len(tensors) == 3
+        assert torch.equal(tensors[0], local_x_fp8)
+        assert torch.equal(tensors[1], local_scale)
+        assert torch.equal(tensors[2], topk_ids)
+        stubs.ep_group.all_gather.assert_not_called()
+    else:
+        stubs.ep_group.all_gather_batch.assert_not_called()
+        assert stubs.ep_group.all_gather.call_count == 3
     route_args, route_kwargs = stubs.torch_npu.npu_moe_init_routing_v2.call_args
     assert torch.equal(route_args[0], torch.cat([local_x_fp8, local_x_fp8], dim=0))
     assert torch.equal(route_kwargs["scale"], torch.cat([local_scale, local_scale], dim=0))
@@ -2139,6 +2174,7 @@ def test_agrs_prepare_permute_hifloat8_with_routed_experts_cv_runs_shared_gate_u
         operator_opt_config=SimpleNamespace(
             shared_expert_multi_stream=True,
             shared_expert_parallel_schedule="with_routed_experts_cv",
+            enable_omni_agb=False,
             decode_moe_dispatch_combine=False,
             enable_moe_agrs=False,
             enable_moe_allreduce=False,
@@ -2231,6 +2267,7 @@ def test_agrs_prepare_permute_default_finalize_no_shared_gate_up(prepare_module)
         operator_opt_config=SimpleNamespace(
             shared_expert_multi_stream=True,
             shared_expert_parallel_schedule="with_finalize",
+            enable_omni_agb=False,
             decode_moe_dispatch_combine=False,
             enable_moe_agrs=False,
             enable_moe_allreduce=False,
