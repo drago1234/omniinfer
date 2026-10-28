@@ -45,6 +45,7 @@ from omni_npu.vllm_patches.core import (
     VLLMPatch,
     register_patch,
 )
+from omni_npu.diagnostics import kv_conservation
 
 logger = init_logger(__name__)
 
@@ -804,4 +805,11 @@ class PanguV2SpecDecodePadPatch(VLLMPatch):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        # patch start: for kv conservation check
+        interval = kv_conservation.interval()
+        if interval and kv_conservation.due(self, interval):
+            kv_conservation.check(self, trigger="step")
+        # patch end: for kv conservation check
+
         return scheduler_output

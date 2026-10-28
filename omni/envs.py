@@ -524,6 +524,13 @@ env_variables: Dict[str, Callable[[], Any]] = {
         None,
     ),
 
+    # set to 0 to disable kv conservation check.
+    # Validates, during scheduler idle periods and every N scheduling steps, that
+    # Free Blocks + Active Blocks + Cached Evictable Blocks + 1 (null) == N_total
+    "OMNI_KV_CONSERVATION_CHECK_INTERVAL":
+    lambda: get_env_with_fallback(
+        "OMNI_KV_CONSERVATION_CHECK_INTERVAL", None, 20, _as_int),
+
     # =========================================================================
     # Existing OMNI_-prefixed variables
     # =========================================================================

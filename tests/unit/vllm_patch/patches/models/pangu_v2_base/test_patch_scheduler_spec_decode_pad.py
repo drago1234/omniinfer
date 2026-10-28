@@ -25,6 +25,7 @@ from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus
 
+from omni_npu.diagnostics import kv_conservation
 from omni_npu.vllm_patches.patches.models.pangu_v2_base import (
     patch_scheduler_spec_decode_pad as sched_mod,
 )
@@ -39,6 +40,16 @@ FORK_MARKERS = (
     "padded to the full spec-decode",
     "dummy draft slots",
 )
+
+# The fork additionally carries the KV-conservation periodic check at the very
+# tail of schedule() (it owns the schedule attribute, so the old
+# KVConservationSchedulerPatch wrapper could no longer compose). The drift
+# test cuts that tail from the fork -- the "# patch start/end" block, whose
+# lines carry no omni-npu marker -- before the marker filter and upstream
+# diffing; its behaviour is guarded by the test_kv_conservation_* tests
+# below instead.
+KV_CHECK_START = "# patch start: for kv conservation check"
+KV_CHECK_END = "# patch end: for kv conservation check"
 
 # The fork additionally absorbs a later upstream fix (reworked pad branch:
 # `padded_num_tokens` + reserving `num_sampled_tokens_per_step` room near
@@ -289,6 +300,69 @@ def _schedule(fake, throttle_prefills=False):
     return sched_mod.PanguV2SpecDecodePadPatch.schedule(fake, throttle_prefills)
 
 
+# Recording stub for kv_conservation.check. The fork reads the attribute
+# through the module object it imported, so rebinding it there redirects both
+# the pytest path (via the kv_check_calls fixture) and the standalone
+# `python this_file.py` path (no pytest fixtures available).
+_kv_check_calls: list = []
+
+
+def _stub_kv_check(scheduler, *, trigger):
+    _kv_check_calls.append((scheduler, trigger))
+
+
+def _standalone_kv_stub():
+    """Install the module-level recording stub; returns the shared list.
+
+    Only used when the file runs as a script (no pytest fixtures): the
+    stub replaces kv_conservation.check process-wide for the remaining
+    standalone tests, which is fine because nothing else reads it here.
+    """
+    kv_conservation.check = _stub_kv_check
+    _kv_check_calls.clear()
+    return _kv_check_calls
+
+
+@pytest.fixture
+def kv_check_calls(monkeypatch):
+    """Point the fork's kv_conservation.check at a per-test recorder.
+
+    due() stays real so the interval alignment logic itself is under test.
+    """
+    calls = []
+    monkeypatch.setattr(
+        sched_mod.kv_conservation, "check",
+        lambda scheduler, *, trigger: calls.append((scheduler, trigger)),
+    )
+    return calls
+
+
+def _env_override(monkeypatch, initial):
+    """setenv/restore pair working with or without pytest's monkeypatch."""
+    import os
+
+    name = "OMNI_KV_CONSERVATION_CHECK_INTERVAL"
+
+    if monkeypatch is not None:
+        monkeypatch.setenv(name, initial)
+        # monkeypatch undoes every setenv at teardown itself.
+        return monkeypatch.setenv, lambda: None
+
+    old = os.environ.get(name)
+
+    def _set(value):
+        os.environ[name] = value
+
+    def _restore():
+        if old is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = old
+
+    _set(initial)
+    return _set, _restore
+
+
 # --------------------------------------------------------------------------
 # structural checks
 # --------------------------------------------------------------------------
@@ -318,6 +392,19 @@ def test_fork_matches_upstream_except_the_guard():
 
     def normalized(func):
         text = inspect.getsource(func)
+        # Cut the fork-only KV-conservation tail first: its omni-npu comment
+        # block has marker-less continuation lines, so it must go before the
+        # FORK_MARKERS filter. The cut spans the preceding blank line down to
+        # the last check call, and stops before the final
+        # `return scheduler_output`, which both sides share.
+        try:
+            start = text.index(KV_CHECK_START)
+            end = text.index(KV_CHECK_END, start)
+        except ValueError:
+            pass
+        else:
+            block_start = text.rindex("\n\n", 0, start) + 1
+            text = text[:block_start] + text[end + len(KV_CHECK_END):].lstrip("\n")
         # Canonicalize the intentionally-deviating pad condition: upstream
         # keeps `scheduled_running_reqs` on a single line, the fork splits it
         # to add the `num_computed_tokens > 0` arm.
@@ -1106,6 +1193,69 @@ def test_offload_hybrid_missing_mome_waits_for_load(mome_hit):
     assert allocation["delay_cache_blocks"] is True
     assert allocation["num_new_computed_tokens"] == mome_hit
     assert allocation["num_external_computed_tokens"] == 1408 - mome_hit
+
+
+# --------------------------------------------------------------------------
+# KV-conservation periodic check (merged from the KVConservationSchedulerPatch
+# wrapper that used to wrap the same schedule attribute)
+# --------------------------------------------------------------------------
+
+
+def test_kv_conservation_check_fires_on_interval_aligned_step(kv_check_calls=None):
+    calls = kv_check_calls if kv_check_calls is not None else _standalone_kv_stub()
+    interval = kv_conservation.interval()
+    fake = _FakeScheduler(current_step=interval - 1)
+
+    output = _schedule(fake)
+
+    # After the increment, current_step is aligned with the interval, so the
+    # audit fires once, after _update_after_schedule and before returning.
+    assert calls == [(fake, "step")]
+    assert fake.updated_after_schedule == [output]
+
+
+def test_kv_conservation_check_skipped_on_unaligned_step(kv_check_calls=None):
+    calls = kv_check_calls if kv_check_calls is not None else _standalone_kv_stub()
+    interval = kv_conservation.interval()
+    fake = _FakeScheduler(current_step=2 * interval)
+
+    _schedule(fake)
+
+    # Non-aligned steps carry no audit overhead past one due() probe.
+    assert calls == []
+
+
+@pytest.mark.parametrize("interval", [0, -1])
+def test_kv_conservation_check_disabled(kv_check_calls, monkeypatch, interval):
+    _set, _restore = _env_override(monkeypatch, str(interval))
+    fake = _FakeScheduler(current_step=0)
+
+    try:
+        _schedule(fake)
+    finally:
+        _restore()
+
+    # interval <= 0 disables the trigger entirely (due() is never consulted).
+    assert kv_check_calls == []
+
+
+def test_kv_conservation_env_read_lazily_each_call(kv_check_calls=None, monkeypatch=None):
+    """_kv_conservation_interval() reads envs on every step, so runtime
+    changes to OMNI_KV_CONSERVATION_CHECK_INTERVAL apply without restart."""
+    calls = kv_check_calls if kv_check_calls is not None else _standalone_kv_stub()
+    setenv, restore_env = _env_override(monkeypatch, "2")
+    fake = _FakeScheduler(current_step=1)
+
+    try:
+        _schedule(fake)  # lands on step 2: aligned -> fires
+        assert len(calls) == 1
+
+        setenv("0")
+        _schedule(fake)  # lands on step 4 but disabled mid-run -> silent
+        assert len(calls) == 1
+    finally:
+        restore_env()
+
 
 if __name__ == "__main__":
     run_standalone_tests(globals())
