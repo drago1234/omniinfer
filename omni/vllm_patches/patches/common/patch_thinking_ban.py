@@ -3,10 +3,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Add Omni's thinking-ban feature beside vLLM's native thinking budget.
 
-vLLM 0.25.1 owns all thinking-token-budget request fields, validation, state,
-and sampler wiring. This module deliberately does not patch any of that logic.
-It only extends ReasoningConfig and grafts ThinkingBanStateHolder into the same
-InputBatch/SamplingMetadata/Sampler lifecycle used by the native budget holder.
+vLLM 0.25.1 owns the budget state and its update contract. Rejection sampling
+skips repeat-index H2D when neither penalties nor allowed-token masks need it.
+The native Sampler and budget updater are unchanged. ThinkingBanStateHolder
+shares the native InputBatch/SamplingMetadata/Sampler lifecycle.
 """
 
 from __future__ import annotations
@@ -22,7 +22,9 @@ import vllm.v1.worker.gpu_input_batch as gpu_input_batch_module
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.logger import init_logger
+from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -249,7 +251,7 @@ _original_rejection_apply_logits_processors = (
 
 @register_patch("ThinkingBanRejectionSamplerPatch", RejectionSampler)
 class RejectionSamplerPatch(VLLMPatch):
-    """Apply the ban mask after native speculative-decoding processors."""
+    """Skip unused budget-only H2D, then apply the existing ban mask."""
 
     _attr_names_to_apply = ["apply_logits_processors"]
 
@@ -259,12 +261,60 @@ class RejectionSamplerPatch(VLLMPatch):
         sampling_metadata: SamplingMetadata,
         metadata: SpecDecodeMetadata,
     ) -> torch.Tensor:
-        logits = _original_rejection_apply_logits_processors(
-            self,
-            logits,
-            sampling_metadata,
-            metadata,
+        # vLLM 0.25.1's processor, with only `or needs_thinking` removed
+        # from need_repeat_indices. Keep its history/state-update contract.
+        has_penalties = not sampling_metadata.no_penalties
+        any_penalties_or_bad_words = (
+            sampling_metadata.bad_words_token_ids or has_penalties
         )
+        holder = sampling_metadata.thinking_budget_state_holder
+        needs_thinking = holder is not None and holder.has_tracked_requests()
+
+        output_token_ids = sampling_metadata.output_token_ids
+        if any_penalties_or_bad_words or needs_thinking:
+            output_token_ids = self._combine_outputs_with_spec_tokens(
+                output_token_ids,
+                sampling_metadata.spec_token_ids,
+            )
+
+        # Only penalties and allowed-token masks consume these indices.
+        repeat_indices: torch.Tensor | None = None
+        need_repeat_indices = (
+            sampling_metadata.allowed_token_ids_mask is not None
+            or has_penalties
+        )
+        if need_repeat_indices:
+            num_requests = len(metadata.num_draft_tokens)
+            num_draft_tokens = torch.tensor(metadata.num_draft_tokens, device="cpu")
+            original_indices = torch.arange(num_requests, device="cpu")
+            repeat_indices_cpu = original_indices.repeat_interleave(num_draft_tokens)
+            repeat_indices = repeat_indices_cpu.to(
+                device=logits.device, non_blocking=True
+            )
+            logits = self.apply_penalties(
+                logits, sampling_metadata, metadata, repeat_indices, output_token_ids
+            )
+
+            if sampling_metadata.allowed_token_ids_mask is not None:
+                token_mask = sampling_metadata.allowed_token_ids_mask[repeat_indices]
+                logits.masked_fill_(token_mask, float("-inf"))
+
+        if bad_words_token_ids := sampling_metadata.bad_words_token_ids:
+            apply_bad_words_with_drafts(
+                logits, bad_words_token_ids, output_token_ids, metadata.num_draft_tokens
+            )
+
+        for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
+            if isinstance(processor, MinTokensLogitsProcessor):
+                logits = processor.apply_with_spec_decode(
+                    logits, metadata.num_draft_tokens
+                )
+        if holder is not None and holder.has_tracked_requests():
+            logits = holder.apply_to_logits(
+                logits,
+                predict_bonus_token=False,
+                spec_token_ids=sampling_metadata.spec_token_ids,
+            )
 
         holder = getattr(sampling_metadata, "thinking_ban_state_holder", None)
         if holder is None or not holder.has_tracked_requests():
