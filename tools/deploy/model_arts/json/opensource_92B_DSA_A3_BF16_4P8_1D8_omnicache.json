@@ -413,7 +413,7 @@
             "TORCH_COMPILE_DISABLE": "0",
             "VLLM_CACHE_ROOT": "./graph_cache",
             "TASK_QUEUE_ENABLE": "1",
-            "LOCAL_WORLD_SIZE": "16",
+            "NUM_SERVERS": "16",
             "HCCL_SOCKET_IFNAME": "enp23s0f3",
             "tp": "1",
             "gpu_util": "0.82",

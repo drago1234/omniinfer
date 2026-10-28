@@ -175,7 +175,7 @@
             "LOG_PATH": "/home/ma-user/",
             "OMNI_HYBRID_ATTN_GROUP_SIZE": "18",
             "HYBRID_ATTN_GROUP_SIZE": "18",
-            "LOCAL_WORLD_SIZE": "16",
+            "NUM_SERVERS": "16",
             "kv_offload": "false",
             "OMNI_DISABLE_KV_OFFLOAD_MMAP_PREWRITE": "true",
             "hugepage_enabled": "false",

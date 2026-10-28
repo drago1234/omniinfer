@@ -362,7 +362,7 @@
             "OMNI_VLLM_PATCHES": "ALL",
             "ENABLE_DP_LB": "false",
             "VLLM_CACHE_ROOT": "./graph_cache",
-            "LOCAL_WORLD_SIZE": "16",
+            "NUM_SERVERS": "16",
             "OMNI_CUSTOM_MODEL_CONFIG_PATH": "low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_505B_xp1d_d_omnicache_claw.json",
             "TORCH_COMPILE_DISABLE": "0",
             "PREFILL_INSTANCE_NUM": "4",
