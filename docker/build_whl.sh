@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-set -exo pipefail
+set +x
+set -eo pipefail
 
 BASE_DIR=$(
     cd "$(dirname "$0")"
     pwd
 )
 
-# 代码下载需要网络代理
-export http_proxy=${HTTP_PROXY}
-export https_proxy=${HTTP_PROXY}
-# 华为内源需要直连，避免 cargo 访问 mirrors.tools.huawei.com 时走 HIS Proxy。
-export no_proxy="${no_proxy:+${no_proxy},}mirrors.tools.huawei.com,rust.inhuawei.com"
-export NO_PROXY="${NO_PROXY:+${NO_PROXY},}mirrors.tools.huawei.com,rust.inhuawei.com"
+# Inherit build-only proxy and pip settings from the Docker build environment.
 # The incoming value is a branch name (e.g. 'release_v0.6.0' or 'master').
 # Use it directly if provided, otherwise default to 'master'.
 branch="${BRANCH:-master}"

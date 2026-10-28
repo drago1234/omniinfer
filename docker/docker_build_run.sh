@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-set -exo pipefail
+set +x
+set -eo pipefail
 
 # Default parameters (can be overridden via command-line --long-options)
 ARCH="aarch64"
-PROXY="http://username:passward@hostIP:port/"
-HUGGING_FACE_PROXY="http://username:passward@hostIP:port/"
+PROXY=""
+NO_PROXY=""
+HUGGING_FACE_PROXY=""
 PIP_INDEX_URL="https://mirrors.huaweicloud.com/repository/pypi/simple"
 PIP_TRUSTED_HOST="mirrors.huaweicloud.com"
+RUSTUP_DIST_SERVER="https://rsproxy.cn"
+RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
+RUSTUP_INIT_URL="https://rsproxy.cn/rustup-init.sh"
+CARGO_REGISTRY_URL="sparse+https://rsproxy.cn/index/"
 MODEL_NAME="Qwen/Qwen2.5-0.5B"
 ## CANN install mode: whole or split
 CANN_INSTALL_MODE="whole"
@@ -30,7 +36,6 @@ BRANCH=master
 # - L2: only build Dockerfile.omniinfer
 # - both: build Dockerfile.base first, then Dockerfile.omniinfer (default)
 BUILD_TARGET="both"
-OMNI_BUILD_NETWORK="green"
 INSTALL_MODULES="omni-proxy"
 SKIP_PULL="false"
 VLLM_VERSION="v0.14.0"
@@ -46,10 +51,15 @@ Usage: $0 [options]
 Options:
     -h, --help                         Show this help message and exit
     --arch <arch>                      Target architecture (default: ${ARCH})
-    --proxy <proxy>                    HTTP proxy to use when building (default: ${PROXY})
-    --hugging-face-proxy <proxy>      Proxy passed to the runtime container for model downloads (default: ${HUGGING_FACE_PROXY})
+    --proxy <proxy>                    HTTP/HTTPS proxy for builds (default: none; independent of runtime)
+    --no-proxy <hosts>                 Comma-separated proxy bypass hosts for builds (default: none)
+    --hugging-face-proxy <proxy>      HTTP/HTTPS proxy for runtime model downloads (default: none)
     --pip-index-url <url>             PIP index URL used during build (default: ${PIP_INDEX_URL})
     --pip-trusted-host <host>         PIP trusted host (default: ${PIP_TRUSTED_HOST})
+    --rustup-dist-server <url>        Rust toolchain mirror (default: ${RUSTUP_DIST_SERVER})
+    --rustup-update-root <url>        Rustup update mirror (default: ${RUSTUP_UPDATE_ROOT})
+    --rustup-init-url <url>           HTTPS rustup installer URL (default: ${RUSTUP_INIT_URL})
+    --cargo-registry-url <url>        Cargo registry URL (default: ${CARGO_REGISTRY_URL})
     --model-name <name>               Model name used at runtime (default: ${MODEL_NAME})
     --cann-install-mode <mode>        CANN install mode for Dockerfile.base: whole or split (default: ${CANN_INSTALL_MODE})
     --npu-platform <platform>         NPU platform (910B or 910C) (default: ${NPU_PLATFORM})
@@ -60,7 +70,6 @@ Options:
     --branch <tag>                    Omni code version/branch to include (default: ${BRANCH})
     --python-version <version>        Python version to use during build (default: ${PYTHON_VERSION})
     --build-target <L1|L2|both|skip> Select which builds to run (default: ${BUILD_TARGET})
-    --build-network <green|blue>      Network profile for Dockerfile.omniinfer Rust/Cargo setup (default: ${OMNI_BUILD_NETWORK})
     --start-server <True|False>     Whether to start the apiserver after build (default: ${START_SERVER})
     --vllm-version <version>        vLLM version to install (default: ${VLLM_VERSION})
     --build-for-roma <True|False>  Whether to build the Roma image (default: ${BUILD_FOR_ROMA})
@@ -89,6 +98,9 @@ parse_long_option() {
         --proxy)
             PROXY="$2"
             ;;
+        --no-proxy)
+            NO_PROXY="$2"
+            ;;
         --hugging-face-proxy)
             HUGGING_FACE_PROXY="$2"
             ;;
@@ -97,6 +109,18 @@ parse_long_option() {
             ;;
         --pip-trusted-host)
             PIP_TRUSTED_HOST="$2"
+            ;;
+        --rustup-dist-server)
+            RUSTUP_DIST_SERVER="$2"
+            ;;
+        --rustup-update-root)
+            RUSTUP_UPDATE_ROOT="$2"
+            ;;
+        --rustup-init-url)
+            RUSTUP_INIT_URL="$2"
+            ;;
+        --cargo-registry-url)
+            CARGO_REGISTRY_URL="$2"
             ;;
         --custom-ops)
             CUSTOM_OPS="$2"
@@ -146,9 +170,6 @@ parse_long_option() {
         --build-target)
             BUILD_TARGET="$2"
             ;;
-        --build-network)
-            OMNI_BUILD_NETWORK="$2"
-            ;;
         --help)
             print_help
             exit 0
@@ -156,6 +177,7 @@ parse_long_option() {
         *)
             echo "Unknown option: $1" >&2
             print_help
+            return 1
             ;;
     esac
     return 0
@@ -171,6 +193,10 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         --*)
+            if [[ $# -lt 2 || "$2" == --* ]]; then
+                echo "Missing value for option: $1" >&2
+                exit 2
+            fi
             parse_long_option "$1" "$2"
             shift 2
             ;;
@@ -186,8 +212,8 @@ done
 ## Print current configuration
 echo "==== Current Configuration ===="
 echo "ARCH: ${ARCH}"
-echo "HTTP_PROXY: ${PROXY}"
-echo "HUGGING_FACE_PROXY: ${HUGGING_FACE_PROXY}"
+echo "Build proxy: $([[ -n "$PROXY" ]] && echo configured || echo none)"
+echo "Runtime proxy: $([[ -n "$HUGGING_FACE_PROXY" ]] && echo configured || echo none)"
 echo "PIP_INDEX_URL: ${PIP_INDEX_URL}"
 echo "PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST}"
 echo "MODEL_NAME: ${MODEL_NAME}"
@@ -199,7 +225,10 @@ echo "L2_IMAGE: ${L2_IMAGE}"
 echo "BRANCH: ${BRANCH}"
 echo "CUSTOM_OPS: ${CUSTOM_OPS}"
 echo "BUILD_TARGET: ${BUILD_TARGET}"
-echo "OMNI_BUILD_NETWORK: ${OMNI_BUILD_NETWORK}"
+echo "RUSTUP_DIST_SERVER: ${RUSTUP_DIST_SERVER}"
+echo "RUSTUP_UPDATE_ROOT: ${RUSTUP_UPDATE_ROOT}"
+echo "RUSTUP_INIT_URL: ${RUSTUP_INIT_URL}"
+echo "CARGO_REGISTRY_URL: ${CARGO_REGISTRY_URL}"
 echo "START_SERVER: ${START_SERVER}"
 echo "PYTHON_VERSION: ${PYTHON_VERSION}"
 echo "INSTALL_MODULES: ${INSTALL_MODULES}"
@@ -216,12 +245,6 @@ if [[ ! "${BUILD_TARGET}" =~ ^(L1|L2|both|skip)$ ]]; then
     exit 2
 fi
 
-# Validate Dockerfile.omniinfer network profile
-if [[ ! "${OMNI_BUILD_NETWORK}" =~ ^(green|blue)$ ]]; then
-    echo "Unknown OMNI_BUILD_NETWORK: ${OMNI_BUILD_NETWORK}. Use one of: green, blue." >&2
-    exit 2
-fi
-
 # validate cann install mode
 if [[ ! "${CANN_INSTALL_MODE}" =~ ^(whole|split)$ ]]; then
     echo "Unknown CANN_INSTALL_MODE: ${CANN_INSTALL_MODE}. Use one of: whole, split." >&2
@@ -234,12 +257,21 @@ if [[ ! "${NPU_PLATFORM}" =~ ^(910B|910C)$ ]]; then
     exit 2
 fi
 
+# Explicit values also override proxy settings in the user's Docker client config.
+# Use Docker's predefined proxy arguments without declaring them in Dockerfiles.
+BUILD_PROXY_ARGS=(
+    --build-arg HTTP_PROXY="${PROXY}" --build-arg http_proxy="${PROXY}"
+    --build-arg HTTPS_PROXY="${PROXY}" --build-arg https_proxy="${PROXY}"
+    --build-arg NO_PROXY="${NO_PROXY}" --build-arg no_proxy="${NO_PROXY}"
+    --build-arg ALL_PROXY= --build-arg all_proxy=
+)
+
 ## BASE_IMAGE: build base image with CANN pytorch torch_npu
 if [[ "${BUILD_TARGET}" == "L1" || "${BUILD_TARGET}" == "both" ]]; then
     echo "Building base image (Dockerfile.base) -> ${L1_IMAGE}"
     docker build --progress=plain --no-cache -f Dockerfile.base \
         --build-arg ARCHITECTURE="${ARCH}" \
-        --build-arg HTTP_PROXY="${PROXY}" \
+        "${BUILD_PROXY_ARGS[@]}" \
         --build-arg CANN_INSTALL_MODE="${CANN_INSTALL_MODE}" \
         --build-arg PIP_INDEX_URL="${PIP_INDEX_URL}" \
         --build-arg PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST}" \
@@ -265,7 +297,7 @@ fi
 if [[ "${BUILD_TARGET}" == "L2" || "${BUILD_TARGET}" == "both" ]]; then
     echo "Building omniinfer_vllm image (Dockerfile.omniinfer) -> ${L2_IMAGE}"
     docker build --progress=plain --no-cache -f Dockerfile.omniinfer \
-        --build-arg HTTP_PROXY="${PROXY}" \
+        "${BUILD_PROXY_ARGS[@]}" \
         --build-arg PIP_INDEX_URL="${PIP_INDEX_URL}" \
         --build-arg PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST}" \
         --build-arg BRANCH="${BRANCH}" \
@@ -275,7 +307,10 @@ if [[ "${BUILD_TARGET}" == "L2" || "${BUILD_TARGET}" == "both" ]]; then
         --build-arg INSTALL_MODULES="${INSTALL_MODULES}" \
         --build-arg SKIP_PULL="${SKIP_PULL}" \
         --build-arg VLLM_VERSION="${VLLM_VERSION}" \
-        --build-arg OMNI_BUILD_NETWORK="${OMNI_BUILD_NETWORK}" \
+        --build-arg RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER}" \
+        --build-arg RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT}" \
+        --build-arg RUSTUP_INIT_URL="${RUSTUP_INIT_URL}" \
+        --build-arg CARGO_REGISTRY_URL="${CARGO_REGISTRY_URL}" \
         --build-arg DEFAULT_USER=${DEFAULT_USER} \
         --target omininfer_openai \
         -t ${L2_IMAGE} .
@@ -308,8 +343,12 @@ if [[ "${START_SERVER}" == "True" || "${START_SERVER}" == "true" || "${START_SER
         -e PORT=8301 \
         -e ASCEND_RT_VISIBLE_DEVICES=1 \
         -e HTTP_PROXY="${HUGGING_FACE_PROXY}" \
+        -e http_proxy="${HUGGING_FACE_PROXY}" \
+        -e HTTPS_PROXY="${HUGGING_FACE_PROXY}" \
+        -e https_proxy="${HUGGING_FACE_PROXY}" \
+        -e NO_PROXY= -e no_proxy= -e ALL_PROXY= -e all_proxy= \
         -e MODEL_NAME="${MODEL_NAME}" \
-        ${USER_IMAGE} \
+        "${L2_IMAGE}" \
         --model "${MODEL_NAME}"
 else
     echo "Skipping starting apiserver (START_SERVER=${START_SERVER})"

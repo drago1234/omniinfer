@@ -2,9 +2,8 @@ ARG BASE_IMAGE
 ####################### whl BUILD IMAGE ######################
 FROM ${BASE_IMAGE} AS whl_builder
 
-ARG HTTP_PROXY
-ARG PIP_INDEX_URL
-ARG PIP_TRUSTED_HOST
+ARG PIP_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple
+ARG PIP_TRUSTED_HOST=mirrors.huaweicloud.com
 ARG BRANCH
 ARG IS_BRANCH_AFTER_050
 ARG CUSTOM_OPS
@@ -12,7 +11,10 @@ ARG NPU_PLATFORM
 ARG INSTALL_MODULES
 ARG SKIP_PULL
 ARG VLLM_VERSION
-ARG OMNI_BUILD_NETWORK=green
+ARG RUSTUP_DIST_SERVER=https://rsproxy.cn
+ARG RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+ARG RUSTUP_INIT_URL=https://rsproxy.cn/rustup-init.sh
+ARG CARGO_REGISTRY_URL=sparse+https://rsproxy.cn/index/
 
 WORKDIR /workspace
 # If CUSTOM_OPS is provided (a comma-separated list or install script), iterate
@@ -22,71 +24,36 @@ COPY requirements /workspace/dist/requirements
 COPY retry.sh /usr/local/bin/retry.sh
 
 # Install packages for build whl
-RUN export http_proxy=${HTTP_PROXY} && \
-    export https_proxy=${HTTP_PROXY} && \
-    . /usr/local/bin/retry.sh && \
-    retry pip install -i ${PIP_INDEX_URL} --trusted-host ${PIP_TRUSTED_HOST} --no-cache-dir \
+RUN . /usr/local/bin/retry.sh && \
+    retry pip install --no-cache-dir \
         --retries 10 --timeout 120 -r /workspace/dist/requirements/common.txt && \
     retry bash -c 'yum install -y git gcc g++ make cmake zlib-devel pcre-devel openssl-devel wget curl tar zip rpm-build etcd libuuid-devel python3-devel grep ffmpeg cppzmq-devel || (yum clean all; false)'
 
-# Install Rust before building omni-proxy.
-RUN set -eux; \
-    case "${OMNI_BUILD_NETWORK}" in \
-        green) \
-            (printf 'search openstacklocal\nnameserver 7.192.144.229\nnameserver 100.125.243.9\nnameserver 100.125.243.10\n' > /etc/resolv.conf || \
-                echo "Warning: /etc/resolv.conf is read-only; configure Docker build DNS outside the Dockerfile."); \
-            unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; \
-            export RUSTUP_UPDATE_ROOT=http://rust.inhuawei.com/rustup-static/rustup; \
-            export RUSTUP_DIST_SERVER=http://rust.inhuawei.com/rustup-static; \
-            curl -sSf http://rust.inhuawei.com/rustup-static/rustup-init.sh | sh -s -- -y; \
-            . "$HOME/.cargo/env"; \
-            mkdir -p "$HOME/.cargo"; \
-            printf '%s\n' \
-                "[source.crates-io]" \
-                "replace-with = 'mirror'" \
-                "" \
-                "[source.mirror]" \
-                'registry = "sparse+http://mirrors.tools.huawei.com/cargo/"' \
-                "" \
-                "[net]" \
-                "git-fetch-with-cli = true" \
-                "" \
-                "[http]" \
-                "check-revoke = false" \
-                "multiplexing = false" \
-                > "$HOME/.cargo/config.toml"; \
-            ;; \
-        blue) \
-            export RUSTUP_DIST_SERVER=https://rsproxy.cn; \
-            export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup; \
-            curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y; \
-            . "$HOME/.cargo/env"; \
-            mkdir -p "$HOME/.cargo"; \
-            printf '%s\n' \
-                "[source.crates-io]" \
-                "replace-with = 'rsproxy-sparse'" \
-                "" \
-                "[source.rsproxy-sparse]" \
-                'registry = "sparse+https://rsproxy.cn/index/"' \
-                "" \
-                "[net]" \
-                "git-fetch-with-cli = true" \
-                > "$HOME/.cargo/config.toml"; \
-            ;; \
-        *) \
-            echo "Unsupported OMNI_BUILD_NETWORK=${OMNI_BUILD_NETWORK}. Use green or blue." >&2; \
-            exit 1; \
-            ;; \
-    esac; \
+# Install Rust before building omni-proxy. Download URLs are build arguments.
+RUN set -eu; \
+    export RUSTUP_DIST_SERVER RUSTUP_UPDATE_ROOT; \
+    curl --proto '=https' --tlsv1.2 -sSf "${RUSTUP_INIT_URL}" -o /tmp/omni-rustup-init.sh; \
+    sh /tmp/omni-rustup-init.sh -y; \
+    rm -f /tmp/omni-rustup-init.sh; \
+    . "$HOME/.cargo/env"; \
+    mkdir -p "$HOME/.cargo"; \
+    printf '%s\n' \
+        "[source.crates-io]" \
+        "replace-with = 'mirror'" \
+        "" \
+        "[source.mirror]" \
+        "registry = \"${CARGO_REGISTRY_URL}\"" \
+        "" \
+        "[net]" \
+        "git-fetch-with-cli = true" \
+        > "$HOME/.cargo/config.toml"; \
     touch "$HOME/.bashrc"; \
     (grep -qxF '. "$HOME/.cargo/env"' "$HOME/.bashrc" || echo '. "$HOME/.cargo/env"' >> "$HOME/.bashrc"); \
     cargo --version
 
 
 
-RUN export http_proxy=${HTTP_PROXY} && \
-    export https_proxy=${HTTP_PROXY} && \
-    . /usr/local/bin/retry.sh && \
+RUN . /usr/local/bin/retry.sh && \
     if [ -f /workspace/dist/codes/build_info.txt ]; then \
         if [ -f /workspace/build_info.txt ]; then \
             cat /workspace/dist/codes/build_info.txt >> /workspace/build_info.txt; \
@@ -102,7 +69,7 @@ RUN export http_proxy=${HTTP_PROXY} && \
     echo "export HCCL_OP_RETRY_ENABLE=\"L0:0, L1:0, L2:0\"" >> ~/.bashrc; \
     source ~/.bashrc && \
     if [ -n "${CUSTOM_OPS}" ]; then \
-        retry pip install -i ${PIP_INDEX_URL} --trusted-host ${PIP_TRUSTED_HOST} \
+        retry pip install \
             --retries 10 --timeout 120 \
             google==3.0.0 expecttest==0.1.6 hypothesis==6.82.0 psutil==7.0.0 scipy==1.15.3 \
             attrs==25.3.0 numpy==2.2.6 protobuf==4.25.8 PyYAML decorator build && \
@@ -117,7 +84,12 @@ RUN export http_proxy=${HTTP_PROXY} && \
             # Run a matching script from the legacy root or ops_build_images.
             for script in /workspace/dist/codes/"$op".sh /workspace/dist/codes/ops_build_images/"$op".sh; do \
                     if [ -f "$script" ]; then \
-                    found=1; echo "Running $script"; chmod +x "$script" && /bin/bash "$script" --npu-platform "${NPU_PLATFORM}" || { echo "Error: failed to run $script"; exit 1; }; break; \
+                    found=1; echo "Running $script"; chmod +x "$script"; \
+                    if [ "$script" = /workspace/dist/codes/ops_build_images/build_omni-ops_packages.sh ]; then \
+                        /bin/bash "$script" --npu-platform "${NPU_PLATFORM}" --pip-index-url "${PIP_INDEX_URL}" --pip-trusted-host "${PIP_TRUSTED_HOST}" || exit 1; \
+                    else \
+                        /bin/bash "$script" --npu-platform "${NPU_PLATFORM}" || { echo "Error: failed to run $script"; exit 1; }; \
+                    fi; break; \
                 fi; \
             done; \
             # Final fallback: warn user
@@ -173,18 +145,15 @@ FROM whl_builder AS omininfer_openai
 
 USER root
 
-ARG HTTP_PROXY
-ARG PIP_INDEX_URL
-ARG PIP_TRUSTED_HOST
+ARG PIP_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple
+ARG PIP_TRUSTED_HOST=mirrors.huaweicloud.com
 
 # /workspace/dist/codes: optional cann-hixl*.run; optional moxing_framework*.whl (then append MOX_OBS_SIGNATURE to bashrc)
 # Install high version of hf_xet 1.1.10 to solve the problem of downloading the HF model.
-RUN export http_proxy=${HTTP_PROXY} && \
-    export https_proxy=${HTTP_PROXY} && \
-    . /usr/local/bin/retry.sh && \
-    retry pip install -i ${PIP_INDEX_URL} --trusted-host ${PIP_TRUSTED_HOST} --retries 10 --timeout 120 numba && \
-    retry pip install -i ${PIP_INDEX_URL} --trusted-host ${PIP_TRUSTED_HOST} --retries 10 --timeout 120 vllm[audio] && \
-    retry pip install -i ${PIP_INDEX_URL} --trusted-host ${PIP_TRUSTED_HOST} --retries 10 --timeout 120 ffmpeg-python fastapi==0.136.3 xgrammar==0.2.3 pytest-asyncio && \
+RUN . /usr/local/bin/retry.sh && \
+    retry pip install --retries 10 --timeout 120 numba && \
+    retry pip install --retries 10 --timeout 120 vllm[audio] && \
+    retry pip install --retries 10 --timeout 120 ffmpeg-python fastapi==0.136.3 xgrammar==0.2.3 pytest-asyncio && \
     retry pip install --retries 10 --timeout 120 -U hf_xet && \
     cd /workspace/dist/codes && \
     if [ -f ./cann-hixl*.run ]; then \
@@ -194,7 +163,7 @@ RUN export http_proxy=${HTTP_PROXY} && \
     fi && \
     if [ -f ./moxing_framework*.whl ]; then \
         echo "Installing moxing_framework" && \
-        retry pip install -i ${PIP_INDEX_URL} --trusted-host ${PIP_TRUSTED_HOST} \
+        retry pip install \
             --retries 10 --timeout 120 \
             ./moxing_framework*.whl || exit 1; \
         echo 'export MOX_OBS_SIGNATURE=obs' >> ~/.bashrc; \

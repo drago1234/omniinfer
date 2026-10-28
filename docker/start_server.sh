@@ -2,8 +2,9 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 # 代理用于hugging face模型下载
-export http_proxy=${HTTP_PROXY}
-export https_proxy=${HTTP_PROXY}
+set +x
+export http_proxy="${http_proxy:-${HTTP_PROXY:-}}"
+export https_proxy="${https_proxy:-${HTTPS_PROXY:-${http_proxy}}}"
 
 # Defaults previously set in Dockerfile (moved here so runtime overrides work):
 # GLOO_SOCKET_IFNAME, VLLM_* options, HOST, PORT, TZ

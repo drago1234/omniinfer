@@ -1,5 +1,6 @@
 #!/bin/bash
-set -ex
+set +x
+set -e
 script_dir=$(dirname "$(readlink -f "$0")")
 DIR_PATH=$1
 COMPILE_UNIT=$2
@@ -69,8 +70,6 @@ tar -cvf ${pypto_tar_name}.tar pypto/ || true
 zip -r ${pypto_tar_name}.zip pypto/ || true
 tar -czvf ${pypto_tar_name}.tar.gz pypto/ || true
 
-export http_proxy=http://p_llmdevops:4A_dq%21R_@proxy.huawei.com:8080/
-export https_proxy=http://p_llmdevops:4A_dq%21R_@proxy.huawei.com:8080/
 
 # 自定义算子编译
 echo "编译自定义算子"
