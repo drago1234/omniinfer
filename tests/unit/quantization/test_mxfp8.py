@@ -55,6 +55,12 @@ def _mock_npu_grouped_matmul(xs, ws, **kwargs):
     return [torch.zeros(m, n, dtype=out_dtype)]
 
 
+def _mock_fused_gmm_swiglu(x, weights, scales, x_scale, groups, **kwargs):
+    m, n = x.shape[0], weights[0].shape[-1] // 2
+    return (torch.zeros(m, n, dtype=torch.int8),
+            torch.zeros(m, n // 64, 2, dtype=torch.uint8))
+
+
 def _mock_npu_swiglu_mx_quant(
     gate_up,
     group_index=None,
@@ -74,10 +80,12 @@ def _make_mock_torch_npu():
         npu_dynamic_mx_quant=MagicMock(side_effect=_mock_npu_dynamic_mx_quant),
         npu_quant_matmul=MagicMock(side_effect=_mock_npu_quant_matmul),
         npu_grouped_matmul=MagicMock(side_effect=_mock_npu_grouped_matmul),
+        npu_grouped_matmul_swiglu_quant_v2=MagicMock(side_effect=_mock_fused_gmm_swiglu),
         npu_swiglu_mx_quant=MagicMock(side_effect=_mock_npu_swiglu_mx_quant),
         npu_format_cast=MagicMock(side_effect=lambda x, _fmt: x),
-        Format=SimpleNamespace(FRACTAL_NZ=29),
+        Format=SimpleNamespace(FRACTAL_NZ=29, ND=2),
         float8_e8m0fnu=_E8M0_SENTINEL,
+        float8_e4m3fn=292,
     )
 
 
@@ -802,6 +810,24 @@ def moe_method(mxfp8_module, moe_patches):
 
 
 class TestMxfp8MoEMethod:
+    @pytest.mark.parametrize("supported,has_operator", [(True, True), (False, True), (True, False)])
+    def test_fused_gmm_init(
+        self, mxfp8_module, moe_patches, monkeypatch, supported, has_operator,
+    ):
+        monkeypatch.setattr(
+            mxfp8_module.model_extra_config.operator_opt_config,
+            "enable_mxfp8_gmm_swiglu_quant", True,
+        )
+        monkeypatch.setattr(mxfp8_module, "on_ascend950", lambda: supported)
+        if not has_operator:
+            monkeypatch.delattr(mxfp8_module.torch_npu, "npu_grouped_matmul_swiglu_quant_v2")
+        if not supported or not has_operator:
+            with pytest.raises(ValueError, match="requires Ascend950"):
+                mxfp8_module.Mxfp8MoEMethod(mxfp8_module.Mxfp8Config(), _MockMoELayer())
+            return
+        method = mxfp8_module.Mxfp8MoEMethod(mxfp8_module.Mxfp8Config(), _MockMoELayer())
+        assert method.grouped_matmul_swiglu_quant is mxfp8_module._apply_mxfp8_grouped_matmul_swiglu_quant
+
     def test_init_basic_attributes(self, mxfp8_module, moe_method):
         assert isinstance(moe_method.quant_config, mxfp8_module.Mxfp8Config)
         assert moe_method.tp_size == 1
@@ -809,6 +835,18 @@ class TestMxfp8MoEMethod:
         assert moe_method.n_routed_experts == 4
         assert moe_method.prefix == "test_moe"
         assert moe_method.num_of_redundant_experts == 0
+        assert moe_method.grouped_matmul_swiglu_quant is None
+
+    def test_fusion_does_not_enable_for_other_quant_formats(
+        self, mxfp8_module, moe_patches, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            mxfp8_module.model_extra_config.operator_opt_config,
+            "enable_mxfp8_gmm_swiglu_quant", True,
+        )
+        other_config = SimpleNamespace(get_name=lambda: "w4a8_mxfp")
+        method = mxfp8_module.Mxfp8MoEMethod(other_config, _MockMoELayer())
+        assert method.grouped_matmul_swiglu_quant is None
 
     def test_create_weights_registers_all_tensors(self, moe_method):
         layer = torch.nn.Module()
@@ -867,7 +905,13 @@ class TestMxfp8MoEMethod:
         assert cfg._w1.scale is layer.w13_weight_scale
         assert cfg._w2.scale is layer.w2_weight_scale
 
-    def test_process_weights_after_loading_repacks(self, moe_method):
+    @pytest.mark.parametrize("use_nz", [True, False])
+    def test_process_weights_after_loading_repacks(
+        self, moe_method, mxfp8_module, mock_torch_npu, monkeypatch, use_nz
+    ):
+        monkeypatch.setattr(mxfp8_module.model_extra_config.operator_opt_config,
+                            "gmm_nz", use_nz)
+        mock_torch_npu.npu_format_cast.reset_mock()
         layer = torch.nn.Module()
         layer.moe_config = SimpleNamespace()
         moe_method.create_weights(
@@ -885,6 +929,9 @@ class TestMxfp8MoEMethod:
         assert layer.w13_weight_scale.shape == (4, 128 // 64, 128, 2)
         # w2: (E, K, I) -> (E, I, K)
         assert layer.w2_weight.shape == (4, 64, 128)
+        assert layer.w13_weight.is_weight_nz is use_nz
+        assert layer.w2_weight.is_weight_nz is use_nz
+        assert mock_torch_npu.npu_format_cast.call_count == (2 if use_nz else 0)
         layer._ensure_moe_quant_config_init.assert_called_once()
 
 
@@ -1243,6 +1290,38 @@ class TestMxfp8MoEMethodApplyExperts:
         _, kwargs = mock_torch_npu.npu_swiglu_mx_quant.call_args
         assert kwargs["scale_alg"] == 1
 
+    @pytest.mark.parametrize("finalize", [False, True])
+    @pytest.mark.parametrize("use_ep", [False, True])
+    def test_fused_gate_up_feeds_down_scale(
+        self, mock_torch_npu, moe_method, mxfp8_module, finalize, use_ep,
+    ):
+        layer = self._build_layer(moe_method)
+        layer.moe_config.moe_parallel_config.use_ep = use_ep
+        moe_method.grouped_matmul_swiglu_quant = mxfp8_module._apply_mxfp8_grouped_matmul_swiglu_quant
+        pr = self._prepare_permute_result(torch.zeros(8, 4, dtype=torch.uint8))
+        result = moe_method.apply_experts(layer, pr, use_grouped_matmul_finalize_routing=finalize)
+        fused = mock_torch_npu.npu_grouped_matmul_swiglu_quant_v2
+        fused.assert_called_once()
+        assert fused.call_args.args[4] is pr.expert_tokens
+        assert fused.call_args.kwargs["group_list_type"] == int(use_ep)
+        assert fused.call_args.kwargs["dequant_dtype"] == 6
+        assert fused.call_args.kwargs["dequant_mode"] == 2
+        assert fused.call_args.kwargs["quant_mode"] == 2
+        assert fused.call_args.kwargs["quant_dtype"] == mock_torch_npu.float8_e4m3fn
+        assert fused.call_args.kwargs["weight_scale_dtype"] is _E8M0_SENTINEL
+        assert fused.call_args.kwargs["x_scale_dtype"] is _E8M0_SENTINEL
+        mock_torch_npu.npu_swiglu_mx_quant.assert_not_called()
+        if finalize:
+            assert result[0].shape == (8, 64)
+            assert result[1].shape == (8, 1, 2)
+            mock_torch_npu.npu_grouped_matmul.assert_not_called()
+        else:
+            mock_torch_npu.npu_grouped_matmul.assert_called_once()
+            down = mock_torch_npu.npu_grouped_matmul.call_args
+            assert down.args[1][0] is layer.routed_experts.w2_weight
+            assert down.kwargs["per_token_scale"][0].shape == (8, 1, 2)
+            assert result.shape == (8, 128)
+
     def test_apply_experts_reads_weights_from_routed_experts(
         self, mock_torch_npu, moe_method
     ):
@@ -1362,6 +1441,7 @@ def _set_schedule(mxfp8_module, monkeypatch, *, multi_stream, schedule,
         "model_extra_config",
         SimpleNamespace(
             operator_opt_config=SimpleNamespace(
+                gmm_nz=True,
                 shared_expert_multi_stream=multi_stream,
                 shared_expert_parallel_schedule=schedule,
                 router_gating_in_fp32=router_gating_in_fp32,
@@ -1403,6 +1483,8 @@ class TestMxfp8MoEMethodApplyExpertsCV:
             multi_stream=True, schedule="with_routed_experts_cv",
         )
         moe_method.shared_experts_stream = _DummyStream()
+        # Fusion must fall back to preserve shared-down launch ordering.
+        moe_method.grouped_matmul_swiglu_quant = mxfp8_module._apply_mxfp8_grouped_matmul_swiglu_quant
 
         shared_down_out = torch.full((8, 128), 9.0, dtype=torch.bfloat16)
         shared_experts = SimpleNamespace(
@@ -1425,6 +1507,7 @@ class TestMxfp8MoEMethodApplyExpertsCV:
 
         result = moe_method.apply_experts(layer, pr)
 
+        mock_torch_npu.npu_grouped_matmul_swiglu_quant_v2.assert_not_called()
         # Returns (routed, shared) tuple.
         assert isinstance(result, tuple)
         routed_out, shared_out = result

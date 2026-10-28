@@ -130,6 +130,24 @@ def _apply_mxfp8_grouped_matmul(
     )[0]
 
 
+def _apply_mxfp8_grouped_matmul_swiglu_quant(
+    activation, weight, weight_scale, pertoken_scale, expert_tokens,
+    group_list_type,
+):
+    # MX mode requires FP32 dequantization (torch dtype enum 6). Unlike the
+    # unfused path, there is no BF16 rounding before SwiGLU.
+    return torch_npu.npu_grouped_matmul_swiglu_quant_v2(
+        activation, [weight], [weight_scale], pertoken_scale, expert_tokens,
+        dequant_mode=2,
+        dequant_dtype=6,
+        quant_mode=2,
+        quant_dtype=torch_npu.float8_e4m3fn,
+        group_list_type=group_list_type,
+        weight_scale_dtype=torch_npu.float8_e8m0fnu,
+        x_scale_dtype=torch_npu.float8_e8m0fnu,
+    )
+
+
 def apply_mxfp_experts(
     method,
     layer,
@@ -141,6 +159,7 @@ def apply_mxfp_experts(
     *,
     swiglu_scale_alg=None,
     reshape_swiglu_scale=False,
+    grouped_matmul_swiglu_quant=None,
 ):
     """Run the shared MXFP expert pipeline with a format-specific GEMM."""
     experts = layer.routed_experts
@@ -158,7 +177,11 @@ def apply_mxfp_experts(
         quantize,
     )
 
-    gate_up_proj = grouped_matmul(
+    # The CV schedule launches shared down between gate/up and SwiGLU;
+    # retain that schedule rather than moving work across a fused operator.
+    use_fused = grouped_matmul_swiglu_quant is not None and not run_shared
+    gate_up = grouped_matmul_swiglu_quant if use_fused else grouped_matmul
+    gate_up_proj = gate_up(
         hidden_states,
         experts.w13_weight,
         experts.w13_weight_scale,
@@ -180,13 +203,16 @@ def apply_mxfp_experts(
     swiglu_options = {}
     if swiglu_scale_alg is not None:
         swiglu_options["scale_alg"] = swiglu_scale_alg
-    intermediate, pertoken_scale = swiglu_quant(
-        gate_up_proj,
-        group_index=None,
-        activate_left=True,
-        dst_type=torch.float8_e4m3fn,
-        **swiglu_options,
-    )
+    if use_fused:
+        intermediate, pertoken_scale = gate_up_proj
+    else:
+        intermediate, pertoken_scale = swiglu_quant(
+            gate_up_proj,
+            group_index=None,
+            activate_left=True,
+            dst_type=torch.float8_e4m3fn,
+            **swiglu_options,
+        )
     if reshape_swiglu_scale and pertoken_scale.dim() == 2:
         pertoken_scale = _reshape_mxfp_scale_pairs(pertoken_scale)
     if run_shared:
@@ -779,6 +805,24 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         self.on_ascend950 = on_ascend950()
         self.model_prefetch = PrefetchManager()
 
+        self.grouped_matmul_swiglu_quant = None
+        if (
+            quant_config.get_name() == MXFP8
+            and model_extra_config.operator_opt_config.enable_mxfp8_gmm_swiglu_quant
+        ):
+            if not self.on_ascend950 or not hasattr(
+                torch_npu, "npu_grouped_matmul_swiglu_quant_v2"
+            ):
+                raise ValueError(
+                    "enable_mxfp8_gmm_swiglu_quant requires Ascend950 and "
+                    "torch_npu.npu_grouped_matmul_swiglu_quant_v2"
+                )
+            self.grouped_matmul_swiglu_quant = _apply_mxfp8_grouped_matmul_swiglu_quant
+            logger.info_once(
+                "MXFP8 GMM/SwiGLU quant V2 enabled (FP32 intermediate); "
+                "with_routed_experts_cv keeps the unfused path."
+            )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -895,6 +939,10 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         w2_weight, w2_scale = _pack_mxfp8_expert_weight(
             layer.w2_weight.data, layer.w2_weight_scale.data,
         )
+        use_nz = model_extra_config.operator_opt_config.gmm_nz
+        if use_nz:
+            w13_weight = torch_npu.npu_format_cast(w13_weight, torch_npu.Format.FRACTAL_NZ)
+            w2_weight = torch_npu.npu_format_cast(w2_weight, torch_npu.Format.FRACTAL_NZ)
         layer.w13_weight.data = w13_weight
         layer.w2_weight.data = w2_weight
         layer.w13_weight_scale.data = w13_scale
@@ -902,6 +950,7 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
         weight_attrs = {
             "is_weight_transposed": True,
             "is_mxfp8_packed": True,
+            "is_weight_nz": use_nz,
         }
         set_weight_attrs(layer.w13_weight, weight_attrs)
         set_weight_attrs(layer.w2_weight, weight_attrs)
@@ -1172,4 +1221,5 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
             torch_npu.npu_swiglu_mx_quant,
             use_grouped_matmul_finalize_routing,
             swiglu_scale_alg=1,
+            grouped_matmul_swiglu_quant=self.grouped_matmul_swiglu_quant,
         )

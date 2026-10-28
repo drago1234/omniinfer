@@ -33,6 +33,7 @@
         "enable_prefill_cudagraph": true,
         "enable_prefill_graph_token_parallel": true,
         "disable_npu_top_k_top_p_sample": true,
-        "top_k_top_p_sample_backend": "pytorch"
+        "top_k_top_p_sample_backend": "pytorch",
+        "enable_mxfp8_gmm_swiglu_quant": true
     }
 }

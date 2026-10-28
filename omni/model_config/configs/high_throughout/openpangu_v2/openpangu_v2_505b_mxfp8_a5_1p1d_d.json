@@ -26,6 +26,7 @@
         "use_mome_inplace_update": true,
         "use_rope_fusion_op": true,
         "enable_mhc_multistream": true,
-        "enable_mxfp8_comm_quant": true
+        "enable_mxfp8_comm_quant": true,
+        "enable_mxfp8_gmm_swiglu_quant": true
     }
 }

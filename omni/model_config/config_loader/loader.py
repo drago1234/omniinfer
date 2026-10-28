@@ -148,6 +148,8 @@ class ModelOperatorOptConfig:
     enable_dense_mlp_dequant_swiglu_quant: bool = False
     enable_shared_expert_dequant_swiglu_quant: bool = False
     gmm_nz: bool = True
+    # Experimental MXFP8 gate/up GMM + SwiGLU + MX quantization fusion.
+    enable_mxfp8_gmm_swiglu_quant: bool = False
     gmm_autotiling: bool = False
     lmhead_fp32: bool = False
     moe_multi_stream_tune: bool = False
