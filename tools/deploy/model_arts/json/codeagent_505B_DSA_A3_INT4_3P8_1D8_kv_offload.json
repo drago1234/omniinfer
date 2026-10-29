@@ -31,6 +31,8 @@
             "card": 8
           },
           "envs": {
+            "OMNI_PD_ROLE": "prefill",
+            "ENABLE_KV_EVENT": "true",
             "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
             "PREFILL_INSTANCE_NUM": "3",
@@ -91,6 +93,8 @@
             "card": 8
           },
           "envs": {
+            "OMNI_PD_ROLE": "prefill",
+            "ENABLE_KV_EVENT": "true",
             "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
             "PREFILL_INSTANCE_NUM": "3",
@@ -151,6 +155,8 @@
             "card": 8
           },
           "envs": {
+            "OMNI_PD_ROLE": "prefill",
+            "ENABLE_KV_EVENT": "true",
             "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
             "PREFILL_INSTANCE_NUM": "3",
@@ -211,6 +217,7 @@
             "card": 8
           },
           "envs": {
+            "OMNI_PD_ROLE": "decode",
             "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
             "PREFILL_INSTANCE_NUM": "3",

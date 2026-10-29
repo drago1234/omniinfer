@@ -31,6 +31,8 @@
             "card": 8
           },
           "envs": {
+            "OMNI_PD_ROLE": "prefill",
+            "ENABLE_KV_EVENT": "true",
             "VLLM_USE_V2_MODEL_RUNNER": "1",
             "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
@@ -92,6 +94,8 @@
             "card": 8
           },
           "envs": {
+            "OMNI_PD_ROLE": "prefill",
+            "ENABLE_KV_EVENT": "true",
             "VLLM_USE_V2_MODEL_RUNNER": "1",
             "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
@@ -153,6 +157,8 @@
             "card": 8
           },
           "envs": {
+            "OMNI_PD_ROLE": "prefill",
+            "ENABLE_KV_EVENT": "true",
             "VLLM_USE_V2_MODEL_RUNNER": "1",
             "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
@@ -214,6 +220,7 @@
             "card": 8
           },
           "envs": {
+            "OMNI_PD_ROLE": "decode",
             "VLLM_USE_V2_MODEL_RUNNER": "1",
             "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
