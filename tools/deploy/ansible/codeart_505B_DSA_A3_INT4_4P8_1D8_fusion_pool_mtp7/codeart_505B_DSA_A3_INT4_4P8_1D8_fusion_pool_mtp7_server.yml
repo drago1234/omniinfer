@@ -27,7 +27,7 @@
     mtp_variant: "{{ lookup('env', 'MTP_VARIANT') | default('mtp7', true) }}"
     mtp_profiles:
       mtp3:
-        model_path: "/mnt/sfs_turbo_new/bucket-910c-6055/s30033981/models/505B_iter_0015398_llt_modelslim_w4a8"
+        model_path: "/path/to/model"
         num_speculative_tokens: 3
         enable_mdrv2: false
         rejection_sample_method: standard
@@ -40,7 +40,7 @@
           compile_sizes: [4, 16, 32]
         decode_max_num_batched_tokens: 32
       mtp7:
-        model_path: "/mnt/sfs_turbo_new/bucket-910c-6055/s30033981/models/505B_B003_mtp7/iter_0000900/modelslim_w4a8_schemal1_2"
+        model_path: "/path/to/model"
         num_speculative_tokens: 7
         enable_mdrv2: true  # MDRv2 仅适配 mtp7
         rejection_sample_method: block

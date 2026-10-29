@@ -18,10 +18,10 @@
 #                兜底 https://mirrors.tools.huawei.com/pypi/simple
 #
 # 例：
-#   bash /data/zh00942897/code/vllm_0251_ut/from_zz/run_omniinfer_pipeline_ut.sh \
-#     /data/zh00942897/code/vllm_0251_ut/local_code_path/omniinfer \
+#   bash /path/to/ut/from_zz/run_omniinfer_pipeline_ut.sh \
+#     /path/to/ut/local_code_path/omniinfer \
 #     registry-cbu.huawei.com/omniai_omniinfer/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.9.0-ai-infra-op_1.5.0-omni_master-vllm-202609041600:0.0.1 \
-#     HEAD~1 /data/zh00942897/code/vllm_0251_ut/from_zz/result
+#     HEAD~1 /path/to/ut/from_zz/result
 # =============================================================================
 
 # 注意：不用全局 set -e，以保证「三项检查各自独立、任一失败不影响其它、全部如实打印」。

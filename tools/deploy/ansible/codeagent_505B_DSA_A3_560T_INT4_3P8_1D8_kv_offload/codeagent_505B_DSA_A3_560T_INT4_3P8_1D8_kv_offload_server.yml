@@ -18,8 +18,7 @@
 
   vars:
     model: pangu-v2-505b
-    # model_path: "/mnt/sfs_turbo/bucket-910c-6055/rk/ckpt/505B_B005_INT8_open_index_shared"
-    model_path: "/mnt/sfs_turbo/bucket-pangu-green-guiyang/b00938090/models/505b_w4a8"
+    model_path: "/path/to/model"
     enable_prefix_caching: true
 
     run_docker_profile:

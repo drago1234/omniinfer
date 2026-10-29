@@ -31,7 +31,7 @@
             "card": 8
           },
           "envs": {
-            "MODEL_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/y00662080/ckpt/505B_iter_0015398_llt_w8a8",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
             "PREFILL_INSTANCE_NUM": "4",
             "DECODE_INSTANCE_NUM": "1",
@@ -93,7 +93,7 @@
             "card": 8
           },
           "envs": {
-            "MODEL_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/y00662080/ckpt/505B_iter_0015398_llt_w8a8",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
             "PREFILL_INSTANCE_NUM": "4",
             "DECODE_INSTANCE_NUM": "1",
@@ -155,7 +155,7 @@
             "card": 8
           },
           "envs": {
-            "MODEL_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/y00662080/ckpt/505B_iter_0015398_llt_w8a8",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
             "PREFILL_INSTANCE_NUM": "4",
             "DECODE_INSTANCE_NUM": "1",
@@ -217,7 +217,7 @@
             "card": 8
           },
           "envs": {
-            "MODEL_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/y00662080/ckpt/505B_iter_0015398_llt_w8a8",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
             "PREFILL_INSTANCE_NUM": "4",
             "DECODE_INSTANCE_NUM": "1",
@@ -279,7 +279,7 @@
             "card": 8
           },
           "envs": {
-            "MODEL_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/y00662080/ckpt/505B_iter_0015398_llt_w8a8",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
             "PREFILL_INSTANCE_NUM": "4",
             "DECODE_INSTANCE_NUM": "1",

@@ -27,7 +27,7 @@
 
   vars:
     model: pangu2-r-92b-xpyd-bf16
-    model_path: "/mnt/sfs_turbo/bucket-910c-6055/s00562949/models/openPangu_2.0_Flash_BF16/global_step_26/"
+    model_path: "/path/to/model"
 
     run_docker_profile:
       shm_size: 500g

@@ -21,7 +21,7 @@
 
   vars:
     model: pangu-v2-92b
-    model_path: "/mnt/sfs_turbo_new/bucket-910c-6055/f00937498/Pangu92B_bf16_0921/global_step_26"
+    model_path: "/path/to/model"
 
     # Selecting this dedicated playbook enables the M service and P-side pool.
     enable_fusion_pool: true

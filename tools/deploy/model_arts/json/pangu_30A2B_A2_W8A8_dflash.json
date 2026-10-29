@@ -86,8 +86,8 @@
             "OMNI_CUSTOM_MODEL_CONFIG_PATH": "high_throughout/openpangu_v2/openpangu_v2_omni_30b_bf16_a2_hybrid_dflash.json",
             "VLLM_USE_V2_MODEL_RUNNER": "1",
 
-            "SPECULATIVE_CONFIG": "{\"method\":\"dflash\",\"model\":\"/home/ma-user/work/s3-asset-g-wl-infra-infer-exp/l00935240/ckpt/dflash2_30A2_pr/iter_1600\",\"num_speculative_tokens\":7}",
-            "MODEL_PATH": "/home/ma-user/work/s3-asset-g-wl-infra-infer-exp/l00935240/ckpt/pangu_30BA2B_iter_0002430_W8A8_no_quant_vit",
+            "SPECULATIVE_CONFIG": "{\"method\":\"dflash\",\"model\":\"/path/to/model\",\"num_speculative_tokens\":7}",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME":"pangu-omni-30b-dflash",
             "MEDIA_IO_KWARGS": "{\"image\":{\"rgba_background_color\":[128,128,128]},\"video\":{\"num_frames\":256,\"sample_fps\":1}}",
             "HOST": "0.0.0.0",

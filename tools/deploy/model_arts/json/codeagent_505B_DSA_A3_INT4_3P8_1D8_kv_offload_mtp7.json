@@ -32,7 +32,7 @@
           },
           "envs": {
             "VLLM_USE_V2_MODEL_RUNNER": "1",
-            "MODEL_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/h00988481/505B_w4a8_mtp7/modelslim_w4a8_schemal1_2/",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
             "PREFILL_INSTANCE_NUM": "3",
             "DECODE_INSTANCE_NUM": "1",
@@ -93,7 +93,7 @@
           },
           "envs": {
             "VLLM_USE_V2_MODEL_RUNNER": "1",
-            "MODEL_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/h00988481/505B_w4a8_mtp7/modelslim_w4a8_schemal1_2/",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
             "PREFILL_INSTANCE_NUM": "3",
             "DECODE_INSTANCE_NUM": "1",
@@ -154,7 +154,7 @@
           },
           "envs": {
             "VLLM_USE_V2_MODEL_RUNNER": "1",
-            "MODEL_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/h00988481/505B_w4a8_mtp7/modelslim_w4a8_schemal1_2/",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
             "PREFILL_INSTANCE_NUM": "3",
             "DECODE_INSTANCE_NUM": "1",
@@ -215,7 +215,7 @@
           },
           "envs": {
             "VLLM_USE_V2_MODEL_RUNNER": "1",
-            "MODEL_PATH": "/mnt/sfs_turbo/bucket-pangu-green-guiyang/h00988481/505B_w4a8_mtp7/modelslim_w4a8_schemal1_2/",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-505b",
             "PREFILL_INSTANCE_NUM": "3",
             "DECODE_INSTANCE_NUM": "1",

@@ -64,7 +64,7 @@
           },
           "dumps": [],
           "envs": {
-            "MODEL_PATH": "/mnt/bucket-910c-6055/f00937498/Pangu92B_bf16_0921/global_step_26/",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-92b",
             "PREFILL_INSTANCE_NUM": "1",
             "DECODE_INSTANCE_NUM": "1",
@@ -131,7 +131,7 @@
           },
           "dumps": [],
           "envs": {
-            "MODEL_PATH": "/mnt/bucket-910c-6055/f00937498/Pangu92B_bf16_0921/global_step_26/",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-92b",
             "PREFILL_INSTANCE_NUM": "1",
             "DECODE_INSTANCE_NUM": "1",

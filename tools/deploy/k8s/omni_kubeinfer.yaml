@@ -38,7 +38,7 @@ spec:
             spec:
               affinity: {}
               nodeSelector:
-                nodes-name-prefix: devserver-hps-a0f74d4d-g00615224
+                nodes-name-prefix: devserver-hps-a0f74d4d
               containers:
                 - command:
                     - /bin/sh
@@ -134,7 +134,7 @@ spec:
               affinity:
                 podAffinity: {}
               nodeSelector:
-                nodes-name-prefix: devserver-hps-a0f74d4d-g00615224 #label
+                nodes-name-prefix: devserver-hps-a0f74d4d #label
               containers:
                 - command:
                     - /bin/sh
@@ -266,7 +266,7 @@ spec:
               affinity:
                 podAffinity: {}
               nodeSelector:
-                nodes-name-prefix: devserver-hps-a0f74d4d-g00615224
+                nodes-name-prefix: devserver-hps-a0f74d4d
               containers:
                 - command:
                     - /bin/sh
