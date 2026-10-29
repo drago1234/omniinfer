@@ -1,0 +1,7 @@
+{
+  "repository": "https://gitee.com/omniai/Pangu-FusionComm.git",
+  "commit": "76532606528200741647f169cfc21378e3fad010",
+  "license": "MIT",
+  "included": "Pangu-FusionPool/fusion_pool (excluding deploy), Pangu-FusionPool/kv_common, LICENSE",
+  "file_count": 22
+}

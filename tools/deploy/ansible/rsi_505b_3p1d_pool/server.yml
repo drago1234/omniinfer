@@ -25,6 +25,7 @@
     model_path: "{{ rsi_model_path }}"
     enable_prefix_caching: true
     enable_fusion_pool: true
+    rsi_pool_manifest_sha256: "6d27363885ec7bd29d54e8aa6434d3ee1daeb7454867caa2eb093d68a517e91d"
     fusion_pool_repo_root: "{{ playbook_dir }}/assets"
     fusion_pool_enable_load_events: false
     fusion_pool_enable_store_events: false
@@ -41,7 +42,7 @@
         - /home:/home
 
     # host_sync 同步整个 omniinfer 和 vllm/vllm。
-    # 容器里只覆盖 omni、start_server、Pangu-FusionComm、vllm/vllm。
+    # 容器里覆盖 omni、start_server、vllm/vllm 和本部署包的 Pool 依赖。
     sync_code_profile:
       host_sync:
         enabled: true
@@ -59,6 +60,10 @@
 
       container_copy:
         prefill: >-
+          (cd '{{ ansible_env.CODE_PATH }}/omniinfer/tools/deploy/ansible/rsi_505b_3p1d_pool/assets/Pangu-FusionPool' &&
+          printf '%s  %s\n' '{{ rsi_pool_manifest_sha256 }}' SHA256SUMS | sha256sum -c - &&
+          sha256sum -c SHA256SUMS &&
+          diff -u <(awk '/[.]py$/ {print $2}' SHA256SUMS | sort) <(find fusion_pool kv_common -type f -name '*.py' | sort)) &&
           docker exec "$DOCKER_NAME_P" find
           '{{ container_workspace }}/omniinfer/omni/' -type f
           '(' -name '*.py' -o -name '*.pyc' ')' -delete &&
@@ -70,16 +75,24 @@
           docker exec "$DOCKER_NAME_P" mkdir -p
           '{{ container_workspace }}/omniinfer/components' &&
           docker exec "$DOCKER_NAME_P" rm -rf
-          '{{ container_workspace }}/omniinfer/components/Pangu-FusionComm' &&
+          '{{ container_workspace }}/omniinfer/components/rsi-fusion-pool' &&
+          docker exec "$DOCKER_NAME_P" mkdir -p
+          '{{ container_workspace }}/omniinfer/components/rsi-fusion-pool' &&
           docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/omni/.'
           "${DOCKER_NAME_P}:{{ container_workspace }}/omniinfer/omni/" &&
           docker cp '{{ ansible_env.CODE_PATH }}/vllm/vllm/.'
           "${DOCKER_NAME_P}:/opt/vllm/vllm/" &&
           docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/tools/deploy/start_server'
           "${DOCKER_NAME_P}:{{ container_workspace }}/omniinfer/tools/deploy/" &&
-          docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/components/Pangu-FusionComm'
-          "${DOCKER_NAME_P}:{{ container_workspace }}/omniinfer/components/"
+          docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/tools/deploy/ansible/rsi_505b_3p1d_pool/assets/Pangu-FusionPool/.'
+          "${DOCKER_NAME_P}:{{ container_workspace }}/omniinfer/components/rsi-fusion-pool/" &&
+          docker exec "$DOCKER_NAME_P" bash -c
+          'cd "{{ container_workspace }}/omniinfer/components/rsi-fusion-pool" && sha256sum -c SHA256SUMS'
         decode: >-
+          (cd '{{ ansible_env.CODE_PATH }}/omniinfer/tools/deploy/ansible/rsi_505b_3p1d_pool/assets/Pangu-FusionPool' &&
+          printf '%s  %s\n' '{{ rsi_pool_manifest_sha256 }}' SHA256SUMS | sha256sum -c - &&
+          sha256sum -c SHA256SUMS &&
+          diff -u <(awk '/[.]py$/ {print $2}' SHA256SUMS | sort) <(find fusion_pool kv_common -type f -name '*.py' | sort)) &&
           docker exec "$DOCKER_NAME_D" find
           '{{ container_workspace }}/omniinfer/omni/' -type f
           '(' -name '*.py' -o -name '*.pyc' ')' -delete &&
@@ -91,15 +104,19 @@
           docker exec "$DOCKER_NAME_D" mkdir -p
           '{{ container_workspace }}/omniinfer/components' &&
           docker exec "$DOCKER_NAME_D" rm -rf
-          '{{ container_workspace }}/omniinfer/components/Pangu-FusionComm' &&
+          '{{ container_workspace }}/omniinfer/components/rsi-fusion-pool' &&
+          docker exec "$DOCKER_NAME_D" mkdir -p
+          '{{ container_workspace }}/omniinfer/components/rsi-fusion-pool' &&
           docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/omni/.'
           "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/omni/" &&
           docker cp '{{ ansible_env.CODE_PATH }}/vllm/vllm/.'
           "${DOCKER_NAME_D}:/opt/vllm/vllm/" &&
           docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/tools/deploy/start_server'
           "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/tools/deploy/" &&
-          docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/components/Pangu-FusionComm'
-          "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/components/"
+          docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/tools/deploy/ansible/rsi_505b_3p1d_pool/assets/Pangu-FusionPool/.'
+          "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/components/rsi-fusion-pool/" &&
+          docker exec "$DOCKER_NAME_D" bash -c
+          'cd "{{ container_workspace }}/omniinfer/components/rsi-fusion-pool" && sha256sum -c SHA256SUMS'
 
     run_server_prefill_profile:
       # Each Prefill enables a 1 TiB CPU offload pool in this 3P1D scenario.
