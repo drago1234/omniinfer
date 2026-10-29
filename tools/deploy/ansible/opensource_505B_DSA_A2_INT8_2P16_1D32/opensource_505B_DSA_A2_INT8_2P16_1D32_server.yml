@@ -89,7 +89,6 @@
         export ASCEND_PROCESS_LOG_PATH=${LOG_PATH}/plog  # plog目录重定向
         rm -rf ${LOG_PATH}/plog/*
       
-        export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_VLLM_PATCHES_DIR="pangu_v2_hybrid, pangu_v2_moe"
         export OMNI_VLLM_PATCHES="ALL"
@@ -146,7 +145,6 @@
         export ASCEND_PROCESS_LOG_PATH=${LOG_PATH}/plog
         rm -rf ${LOG_PATH}/plog/*
         export VLLM_CACHE_ROOT='./graph_cache'
-        export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_VLLM_PATCHES_DIR="pangu_v2_hybrid, pangu_v2_moe"
         export OMNI_VLLM_PATCHES="ALL"

@@ -70,13 +70,11 @@
         export ASCEND_GLOBAL_LOG_LEVEL=3
         export TASK_QUEUE_ENABLE=2
         export VLLM_MQ_MAX_CHUNK_BYTES_MB=100
-        export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
         export VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models"
         export OMNI_HYBRID_ATTN_GROUP_SIZE=18
         export OMNI_VLLM_PATCHES_DIR="low_latency"
         export OMNI_VLLM_PATCHES="ALL"
         export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
-        export OMNI_PANGU_TOOL_CALL_ENDS_THINKING=1
         export RAY_CGRAPH_get_timeout=7200
         export OMNI_PIGGYBACK_INPUT_IDS=1
         export OMNI_SKIP_DECODE_TOKENIZE=0
