@@ -90,10 +90,15 @@ bash docker_build_run.sh [options]
 | 字段 | 含义 |
 | :--- | :--- |
 | `--arch <arch>` | 目标构建平台架构：`aarch64` 或 `x86_64`。默认：`aarch64` |
-| `--proxy <proxy>` | 构建时 HTTP 代理（拉取外部资源）。示例：`http://user:pass@host:port/` |
-| `--hugging-face-proxy <proxy>` | 运行时容器下载模型用的 HTTP 代理。默认同 `--proxy` |
+| `--proxy <proxy>` | 构建时 HTTP/HTTPS 代理。默认空；示例：`http://proxy.example.com:8080` |
+| `--no-proxy <hosts>` | 构建时不经过代理的主机列表，以逗号分隔。默认空 |
+| `--hugging-face-proxy <proxy>` | 运行时容器下载模型用的 HTTP/HTTPS 代理。默认空，与 `--proxy` 独立 |
 | `--pip-index-url <url>` | Docker 构建中 pip 索引地址。默认：`https://mirrors.huaweicloud.com/repository/pypi/simple` |
-| `--pip-trusted-host <host>` | pip trusted host，避免证书或主机校验失败。默认：`mirrors.huaweicloud.com` |
+| `--pip-trusted-host <host>` | pip 信任的主机，默认：`mirrors.huaweicloud.com`；更换源时同步调整，可传 `""` 清空 |
+| `--rustup-dist-server <url>` | Rust 工具链下载地址，默认：`https://rsproxy.cn` |
+| `--rustup-update-root <url>` | Rustup 更新地址，默认：`https://rsproxy.cn/rustup` |
+| `--rustup-init-url <url>` | Rustup 安装脚本的 HTTPS 地址，默认：`https://rsproxy.cn/rustup-init.sh` |
+| `--cargo-registry-url <url>` | Cargo registry 地址，默认：`sparse+https://rsproxy.cn/index/`；sparse 地址末尾保留 `/` |
 | `--model-name <name>` | 运行时要下载或启动的模型名（例如 `"Qwen/Qwen2.5-0.5B"`），会传给容器。 |
 | `--cann-install-mode <split\|whole>` | L1 构建时 CANN 安装方式：`whole`（整包，默认）或 `split`（分包）。 |
 | `--base-image <image>` | 构建 L1 时使用的系统基础镜像 tag。默认：`test-infer-base:0.1` |
@@ -105,12 +110,24 @@ bash docker_build_run.sh [options]
 | `--python-version <version>` | 构建时使用的 Python 版本。默认：`3.11.12`（对应 wheel 的 `cp311`） |
 | `--start-server <True\|False>` | 构建结束后是否启动容器执行 `start_server.sh`。默认：`True` |
 | `--build-target <L1\|L2\|both\|skip>` | 构建目标：`L1` 只构建 `Dockerfile.base`；`L2` 只构建 `Dockerfile.omniinfer`；`both` 先 L1 再 L2（默认）；`skip` 跳过构建。 |
-| `--build-network <green\|blue>` | L2 构建时 Rust / Cargo 网络环境。默认：`green` |
 | `--vllm-version <version>` | 安装的 vLLM 版本。默认：`v0.14.0` |
 | `--install-modules <modules>` | 要安装的 omniinfer 模块，逗号分隔。默认：`omni-proxy`；`omni-npu` 已由 omniinfer 自身集成，无需再传入。 |
 | `--skip-pull <True\|False>` | 是否向 omniinfer `build/build.sh` 传递 `--skip-pull`。默认：`false` |
 | `--build-for-roma <True\|False>` | 是否继续构建 Roma 镜像。默认：`false` |
 | `--roma-image <image>` | Roma 镜像 tag。默认：`test-infer-ROMA:0.1` |
+
+脚本仅通过命令行参数覆盖配置，不读取同名环境变量作为配置入口。不传参数时使用
+上述默认值；脚本内部会将参数传入 Docker 构建环境。旧的 `--build-network` 参数已移除，
+旧命令应删除该参数，需要自定义 Rust/Cargo 源时使用上面的四个地址参数。
+
+`--proxy` 同时设置构建环境的大小写 HTTP/HTTPS 代理变量，`--no-proxy` 同时设置
+大小写 NO_PROXY；未传入时显式清空代理，包括 ALL_PROXY，以覆盖 Docker 客户端的默认
+代理配置。运行代理仅由 `--hugging-face-proxy` 设置，不会自动继承构建代理。
+代理使用 Docker 预定义构建参数传递，不在 Dockerfile 中声明为 `ARG` 或写入 `ENV`；
+构建脚本也不会主动打印完整代理地址。
+
+这些构建代理参数用于构建步骤中的下载；基础镜像拉取所需的代理由 Docker daemon／
+BuildKit 自身的网络配置管理。
 
 ### 命令执行
 
@@ -161,6 +178,139 @@ bash docker_build_run.sh --build-target L2 \
 训练算子。源码目录结构、预编译 `.run`/`.whl` 命名、HiXL / moxing / 离线 vLLM 等可选文件，见
 **[codes/README.md](./codes/README.md)**。
 
+**示例 4 — 通过代理构建，构建完成后不启动服务**：
+
+```bash
+bash docker_build_run.sh \
+  --base-image new-infer-base:0.1 \
+  --proxy "http://proxy.example.com:8080" \
+  --no-proxy "localhost,127.0.0.1,.example.com" \
+  --start-server False
+```
+
+将示例代理替换成实际可用的代理地址。若构建结束后还要通过代理下载模型，应另行传入
+`--hugging-face-proxy "http://runtime-proxy.example.com:8080"` 并设置 `--start-server True`。
+
+**示例 5 — 更换 pip 源**：
+
+```bash
+bash docker_build_run.sh \
+  --build-target L2 \
+  --L1-image new-infer-meddle:0.1 \
+  --pip-index-url "https://pypi.org/simple" \
+  --pip-trusted-host "" \
+  --start-server False
+```
+
+此例使用 PyPI 并清空 trusted host，使用正常的 HTTPS 证书校验。网络配置会传给内置
+omni-ops 编译入口，L1、L2 和算子编译不会各自切回内网 pip 源。
+
+**示例 6 — 更换 Rust/Cargo 下载地址**：
+
+下面的 `mirror.example.com` 是占位域名，应替换成实际部署的镜像站；四个路径应与该
+站点的 Rustup、工具链和 Cargo 服务对应。一般公网构建无需传入这些参数。
+
+```bash
+bash docker_build_run.sh \
+  --build-target L2 \
+  --L1-image new-infer-meddle:0.1 \
+  --rustup-dist-server "https://mirror.example.com/rustup-static" \
+  --rustup-update-root "https://mirror.example.com/rustup-static/rustup" \
+  --rustup-init-url "https://mirror.example.com/rustup-static/rustup-init.sh" \
+  --cargo-registry-url "sparse+https://mirror.example.com/cargo/" \
+  --start-server False
+```
+
+## 构建环境的 DNS 配置
+
+DNS 用于把下载站域名解析为 IP 地址。镜像构建默认使用构建环境提供的 DNS，Dockerfile
+不修改 `/etc/resolv.conf`，也不包含内部 DNS 地址。网络正常时无需额外设置。
+DNS 与下载源地址是两项配置：更换下载源不会自动更换 DNS。
+
+以下配置均位于构建机器上，不需要在本仓库新增文件。`<DNS_IP_1>`、`<DNS_IP_2>` 和
+`<SEARCH_DOMAIN>` 均为占位符，应用配置前须替换为构建网络中实际可用的值。
+
+### 普通 Docker 构建：默认 docker driver
+
+使用 `docker buildx ls` 查看构建器及其 driver。一键脚本使用 `docker build`，默认走
+Docker 自带的构建器。Linux Docker Engine 的 DNS 可在宿主机 `/etc/docker/daemon.json`
+中配置；将以下字段合并到已有 JSON 中，保留其他配置：
+
+```json
+{
+  "dns": ["<DNS_IP_1>", "<DNS_IP_2>"]
+}
+```
+
+在允许重启 Docker 的时段执行 `sudo systemctl restart docker` 使配置生效；这会影响
+该宿主机上的容器。Docker Desktop 用户可在 Settings → Docker Engine 中合并配置并
+应用重启。Rootless Docker 通常使用 `~/.config/docker/daemon.json`，由对应用户重启其
+Docker 服务。
+
+随后重新执行原来的 `bash docker_build_run.sh ...` 命令，无需传入 DNS 参数。
+参考 [Docker DNS 配置说明](https://docs.docker.com/engine/daemon/troubleshoot/#specify-dns-servers-for-docker)。
+
+### 独立 BuildKit／buildx 构建器
+
+独立运行的 BuildKit 有自己的 DNS 配置，不应只修改宿主机 Docker daemon 配置。
+其配置通常位于 `/etc/buildkit/buildkitd.toml`，rootless 模式通常位于
+`~/.config/buildkit/buildkitd.toml`；也可能由运维启动参数指定其他路径。在该配置中合并：
+
+```toml
+[dns]
+  nameservers = ["<DNS_IP_1>", "<DNS_IP_2>"]
+  # 仅在需要补全内部短域名时设置，否则省略下面一行。
+  searchDomains = ["<SEARCH_DOMAIN>"]
+```
+
+直接运行的 BuildKit 需由运维重启对应实例。使用 buildx 的 `docker-container` driver
+时，在宿主机准备好上述配置，然后创建加载该配置的构建器，例如：
+
+```bash
+docker buildx create \
+  --name omniinfer-builder \
+  --driver docker-container \
+  --buildkitd-config /etc/buildkit/buildkitd.toml \
+  --bootstrap
+```
+
+一键脚本不会自动切换到这个独立构建器。需要使用它时，应显式执行 `docker buildx build`
+并指定 `--builder`。例如，在 `docker/` 目录中使用已有 L1 镜像构建 L2：
+
+```bash
+docker buildx build \
+  --builder omniinfer-builder \
+  --load \
+  --build-arg BASE_IMAGE="<构建器能够获取的L1镜像>" \
+  --build-arg BRANCH=master \
+  --target omininfer_openai \
+  -f Dockerfile.omniinfer \
+  -t new-infer-omniinfer:0.1 .
+```
+
+`docker-container` 构建器有独立的镜像存储，基础镜像应能从它可访问的镜像仓库拉取。
+自定义源通过同名 `--build-arg` 传入，例如 `--build-arg RUSTUP_DIST_SERVER=...`；代理
+可传入 `--build-arg HTTP_PROXY=... --build-arg HTTPS_PROXY=...`，有需要时也传入小写变量
+及 NO_PROXY。参考 [BuildKit 配置方式](https://docs.docker.com/build/buildkit/configure/)
+和 [DNS 配置字段](https://docs.docker.com/build/buildkit/toml-configuration/)。
+
+### 如何检查与排查
+
+先确认宿主机能解析下载站，再确认构建步骤也能解析。使用本地已有、包含 `getent` 的
+L1 镜像，可执行下面的最小构建来检查默认构建器的 DNS，无需创建测试 Dockerfile：
+
+```bash
+printf 'FROM %s\nRUN getent hosts rsproxy.cn\n' "<已存在的L1镜像>" \
+  | docker build --no-cache -
+```
+
+独立构建器检查时，将最后一段替换成
+`docker buildx build --builder omniinfer-builder --no-cache -`，并使用该构建器能获取的
+基础镜像。使用代理时，还需确认代理服务器域名能够解析。
+
+`Could not resolve host` 通常需要检查上述 DNS 配置；连接超时还需检查网络路由和代理。
+`docker run --dns` 只设置启动后的容器，不能修复之前的镜像构建。
+
 ## 容器启动
 
 当前镜像默认将 `ENTRYPOINT` 设置为 `start_server.sh`，因此若只想进 shell，启动容器时需要加 `--entrypoint=bash`。也可以自行覆盖 `ENTRYPOINT`。
@@ -176,6 +326,10 @@ docker run --rm -it --shm-size=500g \
 	-e PORT=8301 \
 	-e ASCEND_RT_VISIBLE_DEVICES=1 \
 	-e HTTP_PROXY="${HUGGING_FACE_PROXY}" \
+	-e http_proxy="${HUGGING_FACE_PROXY}" \
+	-e HTTPS_PROXY="${HUGGING_FACE_PROXY}" \
+	-e https_proxy="${HUGGING_FACE_PROXY}" \
+	-e NO_PROXY= -e no_proxy= -e ALL_PROXY= -e all_proxy= \
 	-e MODEL_NAME="${MODEL_NAME}" \
 	<L2镜像> \
 	--model "${MODEL_NAME}"
@@ -191,3 +345,14 @@ docker run --rm -it --privileged --net=host \
 	--entrypoint=bash \
 	<L2镜像>
 ```
+
+若启动后的容器需要单独指定 DNS，可在手动运行时添加参数：
+
+```bash
+docker run --rm -it \
+  --dns "<DNS_IP_1>" --dns "<DNS_IP_2>" \
+  --entrypoint=bash \
+  "<L2镜像>"
+```
+
+该例只用于进入 shell；运行推理服务时需同时保留上面的 NPU 设备等参数。

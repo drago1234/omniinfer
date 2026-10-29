@@ -103,7 +103,15 @@ Dockerfile 实际执行：
 --project-version <version>  release-* 或 poc-*，默认 poc-0.8.0rc1
 --cann-version <version>     CANN 版本，默认 8.5RC1
 --pta-version <version>      PTA 版本，默认 2.6.0
+--proxy <url>               显式覆盖本次编译的 HTTP/HTTPS 代理
+--no-proxy <hosts>          显式覆盖本次编译的代理绕过列表
+--pip-index-url <url>       默认 https://mirrors.huaweicloud.com/repository/pypi/simple
+--pip-trusted-host <host>   默认 mirrors.huaweicloud.com，可传 "" 清空
 ```
+
+一键构建时，Dockerfile 会将 `--pip-index-url` 和 `--pip-trusted-host` 传给此入口；
+代理从 Docker 构建环境继承，release 脚本不再指定固定代理。手动执行此入口时，也可
+用上面的命令行参数覆盖网络配置。网络参数在脚本内部传给子进程，不需要新增配置文件。
 
 手动只编译推理算子：
 
@@ -120,19 +128,20 @@ bash /workspace/dist/codes/ops_build_images/build_omni-ops_packages.sh \
 ## 4. 在宿主机启动独立编译容器
 
 入口脚本保留了原始位置参数模式。该模式负责清理同名容器、启动编译镜像、挂载工作
-目录、配置内部 pip 源、安装编译依赖，并调用指定 release 脚本。
+目录、传入 pip 源和代理、安装编译依赖，并调用指定 release 脚本。
 
 ### 环境要求
 
 - 已安装 Docker，当前用户具有 Docker 执行权限。
 - 编译镜像包含 CANN Toolkit、Python、PyTorch、torch_npu 和 AscendC 编译工具。
-- 执行机器能够访问 `http://mirrors.tools.huawei.com/pypi/simple/`。
+- 编译容器能够访问公网华为云 PyPI 源，或通过命令行指定的其他软件源。
 - 工作根目录可读写，并同时包含源码和编包脚本。
 
 ### 用法
 
 ```bash
 bash ops_build_images/build_omni-ops_packages.sh \
+  [网络选项] \
   <container_name> \
   <image_name> \
   <DIR_PATH> \
@@ -161,6 +170,23 @@ bash ops_build_images/build_omni-ops_packages.sh \
 10. `pta_version`：默认 `2.6.0`。
 
 `DIR_PATH` 和 `ops_build_images/` 必须都位于 `ops_work_path` 中，否则容器无法访问。
+
+网络选项支持 `--proxy`、`--no-proxy`、`--pip-index-url` 和 `--pip-trusted-host`，
+可放在位置参数前后。宿主机模式默认不使用代理，pip 默认使用公网华为云源及其
+trusted host；仅从命令行覆盖，不读取宿主机同名环境变量作为配置入口。代理和 pip
+配置通过容器环境传递，不会写入全局 pip 配置，也不会嵌入 shell 命令文本。
+
+例如，在下方任一宿主机构建命令的脚本名之后添加：
+
+```text
+--proxy "http://proxy.example.com:8080" \
+--no-proxy "localhost,127.0.0.1,.example.com" \
+--pip-index-url "https://pypi.org/simple" \
+--pip-trusted-host ""
+```
+
+其中的代理域名为占位示例，需替换成实际地址。DNS 由 Docker／构建器配置，具体步骤见
+[docker/README.md](../README.md#构建环境的-dns-配置)。
 
 ### 宿主机工作目录示例
 
@@ -218,7 +244,7 @@ bash ops_build_images/build_omni-ops_packages.sh \
 2. 使用 `--privileged --ipc=host --shm-size=128g` 启动临时容器。
 3. 将 `ops_work_path` 挂载到容器内同名绝对路径。
 4. 加载 `~/.bashrc` 和 `/etc/profile`。
-5. 配置内部 pip 镜像并安装编译依赖。
+5. 使用传入的 pip 源和代理安装编译依赖。
 6. 调用 `ops_build_images/ops_scripts/` 下指定的 release 脚本。
 
 Dockerfile 模式：
@@ -345,9 +371,9 @@ bash build.sh -n "${ops}" --compute-unit "${COMPILE_UNIT}"
 
 ## 10. 注意事项和常见错误
 
-- release 脚本当前包含硬编码代理地址及凭据。应改用环境变量，并轮换已经提交或共享
-  过的凭据。
-- 宿主机模式使用内部 PyPI 镜像；非对应网络环境需要更换软件源。
+- release 脚本继承调用方的代理配置；使用入口脚本的命令行参数配置网络。
+- 宿主机和 Dockerfile 模式均默认使用公网华为云 PyPI 源；更换源时同步调整
+  `--pip-trusted-host`，或传 `""` 清空。
 - `ops_work_path` 必须使用绝对路径，并与容器内路径保持一致。
 - `build_script_file` 只传文件名，不要添加 `ops_scripts/` 前缀。
 - `project_version` 的 `release-` 前缀生成正式包，`poc-` 前缀生成带日期的开发包。
