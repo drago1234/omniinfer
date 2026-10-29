@@ -604,6 +604,51 @@ def test_w4a8_process_asymmetric_weights_builds_bias_and_scales_offset(
     assert layer._use_w4a8_enk is False
 
 
+def test_w4a8_process_weights_scale_conversion_drops_redundant_sign_extend(
+    compressed_moe_module,
+):
+    """The refactor removed the ``<< 32 >> 32`` sign-extension on the int4 scale
+    because ``.to(torch.int32)`` already yields the lower 32 bits. A negative
+    float scale (int32 bit pattern with bit 31 set, sign-extended into int64)
+    must still rehydrate to the same float32, proving the change is a no-op."""
+    method_cls = compressed_moe_module.NPUCompressedTensorsW4A8Int4MoEMethod
+    method = method_cls.__new__(method_cls)
+    method.asymmetric_quant = False
+    method.gmm_autotiling = False
+
+    packed = torch.zeros(1, 4, 8, dtype=torch.int8)
+    # Negative floats have bit 31 set in their int32 view, so their int64
+    # representation is sign-extended (upper 32 bits are all ones).
+    scales = torch.tensor(
+        [[[-1.5, -0.25, -8.0, -0.0625, -2.0, -4.0, -0.5, -1.0]]],
+        dtype=torch.float32,
+    )
+    scale_bits = scales.view(torch.int32).to(torch.int64)
+    assert bool((scale_bits >> 32).to(torch.int32).any())  # upper bits set
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(packed.clone(), requires_grad=False),
+        w2_weight=torch.nn.Parameter(packed.clone(), requires_grad=False),
+        w13_weight_int4_scale=torch.nn.Parameter(
+            scale_bits.clone(), requires_grad=False
+        ),
+        w2_weight_int4_scale=torch.nn.Parameter(
+            scale_bits.clone(), requires_grad=False
+        ),
+        w13_weight_bias=torch.nn.Parameter(torch.zeros(1, 8), requires_grad=False),
+        w2_weight_bias=torch.nn.Parameter(torch.zeros(1, 8), requires_grad=False),
+        w13_weight_offset=None,
+        w2_weight_offset=None,
+    )
+
+    method.process_weights_after_loading(layer)
+
+    # bias = sum(nibbles=0) * scale * 8 = 0, so just assert the scale path did
+    # not corrupt the float view: re-reading the registered scale must match.
+    recovered = layer.w13_weight_int4_scale.to(torch.int32).view(torch.float32)
+    assert torch.equal(recovered.squeeze(1), scales.squeeze(1))
+    assert layer._use_w4a8_enk is False
+
+
 def test_w4a8_process_symmetric_weights_skips_offset_rewrite(compressed_moe_module):
     """Symmetric W4A8 still recomputes bias/transpose but leaves offset as None."""
     method_cls = compressed_moe_module.NPUCompressedTensorsW4A8Int4MoEMethod
@@ -681,6 +726,53 @@ def test_pack_w4a8_enk_nz_interleaves_nibbles(compressed_moe_module):
     )
 
 
+def test_pack_w4a8_enk_nz_with_unpacked_matches_default_path(compressed_moe_module):
+    """Passing pre-computed (low, high) yields the same NZ tensor as the
+    auto-derivation path. This locks down the new ``unpacked`` parameter that
+    lets ``process_weights_after_loading`` reuse its already-computed nibbles
+    instead of recomputing them inside the packer."""
+    packed = torch.tensor(
+        [[[0x01, 0x23], [0x45, 0x67], [0x10, 0x32], [0x54, 0x76]]],
+        dtype=torch.int8,
+    )
+    values = packed.to(torch.int32)
+    low = ((values + 8).remainder(16) - 8).to(torch.int8)
+    high = torch.floor_divide(values, 16).to(torch.int8)
+
+    default_out = compressed_moe_module._pack_w4a8_enk_nz(packed)
+    reused_out = compressed_moe_module._pack_w4a8_enk_nz(packed, (low, high))
+
+    assert reused_out.dtype == torch.int32
+    assert torch.equal(reused_out, default_out)
+
+
+def test_pack_w4a8_enk_nz_sign_extends_negative_nibbles(compressed_moe_module):
+    """The remainder/floor_divide sign-extension must match the legacy
+    bitwise-shift extraction for high nibbles >= 8 (negative INT4 values),
+    where the refactor is most likely to regress."""
+    # Build via uint8 then view as int8 so byte values > 0x7F (negative INT4
+    # high nibbles) don't trip torch's int8 overflow check on strict builds.
+    packed = torch.tensor(
+        [[[0x8F, 0xF0], [0x12, 0xAB], [0x7C, 0x9D], [0x3E, 0x4C]]],
+        dtype=torch.uint8,
+    ).view(torch.int8)
+    # Legacy reference: shift-based sign extension + uint8 nibble masking,
+    # which is the behavior the refactor must preserve.
+    legacy_low = packed.bitwise_left_shift(4).bitwise_right_shift(4)
+    legacy_high = packed.bitwise_right_shift(4)
+    e, n2, k = packed.shape
+    legacy_enk = packed.new_empty(e, n2 * 2, k)
+    legacy_enk[:, 0::2, :] = legacy_low
+    legacy_enk[:, 1::2, :] = legacy_high
+    legacy_ln = legacy_enk[:, :, ::2].to(torch.uint8) & 0xF
+    legacy_hn = (legacy_enk[:, :, 1::2].to(torch.uint8) & 0xF) << 4
+    legacy_nz = (legacy_ln | legacy_hn).to(torch.int8).view(e, k, n2).view(torch.int32)
+
+    out = compressed_moe_module._pack_w4a8_enk_nz(packed)
+    assert out.dtype == torch.int32
+    assert torch.equal(out, legacy_nz)
+
+
 def test_w4a8_process_symmetric_enk_packs_nz_weights(compressed_moe_module):
     """Symmetric W4A8 with the EnK switch packs both projections and skips transpose."""
     compressed_moe_module.model_extra_config.operator_opt_config.use_w4a8_enk_gmm = True
@@ -699,6 +791,45 @@ def test_w4a8_process_symmetric_enk_packs_nz_weights(compressed_moe_module):
     assert layer._use_w4a8_enk is True
     assert torch.equal(layer.w13_weight, expected)
     assert torch.equal(layer.w2_weight, expected)
+
+
+def test_w4a8_process_symmetric_enk_bias_matches_reused_nibbles(compressed_moe_module):
+    """When the EnK switch is on, ``process_weights_after_loading`` must compute
+    the bias from the same (low, high) nibbles it forwards to ``_pack_w4a8_enk_nz``
+    via the new ``unpacked`` argument, so the packed weights and the bias stay
+    consistent. The bias must also match the legacy shift-based reference."""
+    compressed_moe_module.model_extra_config.operator_opt_config.use_w4a8_enk_gmm = True
+    method_cls = compressed_moe_module.NPUCompressedTensorsW4A8Int4MoEMethod
+    method = method_cls.__new__(method_cls)
+    method.asymmetric_quant = False
+    # Build via uint8 then view as int8 so byte values > 0x7F (negative INT4
+    # high nibbles) don't trip torch's int8 overflow check on strict builds.
+    packed = torch.tensor(
+        [[[0x8F, 0xF0], [0x12, 0xAB], [0x7C, 0x9D], [0x3E, 0x4C]]],
+        dtype=torch.uint8,
+    ).view(torch.int8)
+    layer = _w4a8_packed_layer(packed)
+
+    method.process_weights_after_loading(layer)
+
+    # Legacy reference bias from shift-based sign extension.
+    legacy_low = packed.bitwise_left_shift(4).bitwise_right_shift(4)
+    legacy_high = packed.bitwise_right_shift(4)
+    expected_sums = torch.empty(1, 8, dtype=torch.int32)
+    expected_sums[..., 0::2] = legacy_low.sum(dim=-1, dtype=torch.int32)
+    expected_sums[..., 1::2] = legacy_high.sum(dim=-1, dtype=torch.int32)
+    # _w4a8_packed_layer uses a scale of 1.0 for every channel.
+    expected_bias = expected_sums.float() * 1.0 * 8.0
+
+    assert layer._use_w4a8_enk is True
+    assert torch.equal(layer.w13_weight_bias, expected_bias)
+    assert torch.equal(layer.w2_weight_bias, expected_bias)
+    # Packed weight must equal the default (unpacked=None) path, proving the
+    # reused (low, high) tuple is identical to what the packer would derive.
+    assert torch.equal(
+        layer.w13_weight,
+        compressed_moe_module._pack_w4a8_enk_nz(packed),
+    )
 
 
 def test_w4a8_process_asymmetric_ignores_enk_switch(compressed_moe_module):

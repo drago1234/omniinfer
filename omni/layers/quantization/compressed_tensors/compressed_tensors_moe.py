@@ -658,17 +658,21 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
         return True
 
 
-def _pack_w4a8_enk_nz(packed):
+def _pack_w4a8_enk_nz(packed, unpacked=None):
     """Checkpoint (E, N/2, K) int8 -> EnK NZ (E, K, N/8) int32."""
-    low = packed.bitwise_left_shift(4).bitwise_right_shift(4)
-    high = packed.bitwise_right_shift(4)
+    if unpacked is None:
+        values = packed.to(torch.int32)
+        low = ((values + 8).remainder(16) - 8).to(torch.int8)
+        high = torch.floor_divide(values, 16).to(torch.int8)
+    else:
+        low, high = unpacked
     e, n2, k = packed.shape
     w_enk = packed.new_empty(e, n2 * 2, k)
     w_enk[:, 0::2, :] = low
     w_enk[:, 1::2, :] = high
-    w_ln = w_enk[:, :, ::2].to(torch.uint8) & 0xF
-    w_hn = (w_enk[:, :, 1::2].to(torch.uint8) & 0xF) << 4
-    w_nz = torch_npu.npu_format_cast((w_ln | w_hn).to(torch.int8), 29)
+    w_ln = w_enk[:, :, ::2].to(torch.int32).remainder(16)
+    w_hn = w_enk[:, :, 1::2].to(torch.int32).remainder(16) * 16
+    w_nz = torch_npu.npu_format_cast((w_ln + w_hn).to(torch.int8), 29)
     return w_nz.view(e, k, n2).view(torch.int32)
 
 
@@ -789,40 +793,41 @@ class NPUCompressedTensorsW4A8Int4MoEMethod(NPUCompressedTensorsW8A8Int8MoEMetho
             layer.register_parameter("w2_weight_offset", None)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer._use_w4a8_enk = (
+            not self.asymmetric_quant
+            and model_extra_config.operator_opt_config.use_w4a8_enk_gmm
+        )
         for proj in ("w13", "w2"):
             scale_i64 = getattr(layer, f"{proj}_weight_int4_scale").data
-            scale = ((scale_i64 << 32) >> 32).to(torch.int32).view(torch.float32)
+            scale = scale_i64.to(torch.int32).view(torch.float32)
 
             packed = getattr(layer, f"{proj}_weight").data
             bias = getattr(layer, f"{proj}_weight_bias")
-            unpacked = packed.clone()
-            unpacked.bitwise_left_shift_(4).bitwise_right_shift_(4)
-            bias.data[..., 0::2].copy_(
-                unpacked.sum(dim=-1, dtype=torch.int32)
-            )
-            unpacked.copy_(packed).bitwise_right_shift_(4)
-            bias.data[..., 1::2].copy_(
-                unpacked.sum(dim=-1, dtype=torch.int32)
-            )
+            values = packed.to(torch.int32)
+            # Sign-extend each INT4 without NPU bitwise-shift fallbacks.
+            low = ((values + 8).remainder(16) - 8).to(torch.int8)
+            high = torch.floor_divide(values, 16).to(torch.int8)
+            del values
+            bias.data[..., 0::2].copy_(low.sum(dim=-1, dtype=torch.int32))
+            bias.data[..., 1::2].copy_(high.sum(dim=-1, dtype=torch.int32))
             bias.data.mul_(scale.squeeze(-2)).mul_(8.0)
 
             if self.asymmetric_quant:
                 offset = getattr(layer, f"{proj}_weight_offset")
                 offset.data = (-1 * scale * offset.data.float()).contiguous()
 
-        layer._use_w4a8_enk = (
-            not self.asymmetric_quant
-            and model_extra_config.operator_opt_config.use_w4a8_enk_gmm
-        )
-        if layer._use_w4a8_enk:
-            for proj in ("w13", "w2"):
-                packed = getattr(layer, f"{proj}_weight").data
+            if layer._use_w4a8_enk:
                 setattr(
                     layer,
                     f"{proj}_weight",
-                    torch.nn.Parameter(_pack_w4a8_enk_nz(packed), requires_grad=False),
+                    torch.nn.Parameter(
+                        _pack_w4a8_enk_nz(packed, (low, high)),
+                        requires_grad=False,
+                    ),
                 )
-        else:
+            del low, high
+
+        if not layer._use_w4a8_enk:
             layer.w13_weight = torch.nn.Parameter(layer.w13_weight.transpose(1, 2).contiguous(), requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(layer.w2_weight.transpose(1, 2).contiguous(), requires_grad=False)
 
