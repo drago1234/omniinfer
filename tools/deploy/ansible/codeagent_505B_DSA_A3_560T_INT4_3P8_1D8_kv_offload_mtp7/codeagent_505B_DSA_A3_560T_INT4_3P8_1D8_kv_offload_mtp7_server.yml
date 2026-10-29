@@ -156,7 +156,6 @@
         export OMNI_DRAFT_TOP_K=100
         export ENABLE_DP_LB=false
         export TASK_QUEUE_ENABLE=1
-        export LOCAL_WORLD_SIZE=16
         # export VLLM_TORCH_PROFILER_DIR=${LOG_PATH}/{{ inventory_hostname }}/profiling
         # mkdir -p "${VLLM_TORCH_PROFILER_DIR}"
         # export OMNI_PROFILE_TOKEN_THRESHOLD=1

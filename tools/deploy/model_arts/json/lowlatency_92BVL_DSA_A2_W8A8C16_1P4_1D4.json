@@ -174,7 +174,7 @@
             "ENABLE_DP_LB": "false",
             "VLLM_DATA_PARALLEL_EXTERNAL_LB": "false",
             "VLLM_CACHE_ROOT": "/workspace/omniinfer/tools/deploy/start_server/graph_cache",
-            "LOCAL_WORLD_SIZE": "4",
+            "NUM_SERVERS": "4",
             "VLLM_DISABLE_COMPILE_CACHE": "1",
             "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME": "DECODE_SHM_BUFFER",
             "kv_offload": "false",
