@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # SPDX-License-Identifier: MIT
 """端到端 smoke：验证 kv_transfer 方案 B 全链路（worker→KVConnectorStats通道→前端counter→/metrics）。
 

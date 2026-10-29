@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # SPDX-License-Identifier: MIT
 """Unit tests for omni_npu.diagnostics.metrics.worker_mem (采样，走 stats 通道，无 prometheus)."""
 

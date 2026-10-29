@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Unit validation of notification ownership, deduplication and failure relay."""
 from pathlib import Path
 import sys

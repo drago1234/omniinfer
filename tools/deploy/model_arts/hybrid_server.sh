@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # 通用混部 vLLM 服务启动脚本。
 # 模型及部署参数通过部署 JSON 的 envs 传入；cmd 中脚本路径后的命令行参数将原样追加到 vLLM serve 命令末尾。
 

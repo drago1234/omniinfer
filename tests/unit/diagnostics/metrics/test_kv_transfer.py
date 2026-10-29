@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # SPDX-License-Identifier: MIT
 """Unit tests for omni_npu.diagnostics.metrics.kv_transfer（KVConnectorStats 通道，含 worker_mem 合并）。"""
 

@@ -1,4 +1,5 @@
 #!/bin/bash
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 #
 # acs-bench 性能压测脚本（pangu_ultra_moe / OpenAI Chat 后端）
 #
@@ -18,7 +19,7 @@
 #       bash benchmarks/pangu_ultra_moe_acs_bench.sh
 set -e
 
-BASE_URL=${BASE_URL:-http://172.0.0.1:7000/v1}
+BASE_URL=${BASE_URL:-http://127.0.0.1:7000/v1}
 INPUT_PATH=${INPUT_PATH:-/your/datasets/path/claw_all_openai.json}
 
 acs-bench prof \

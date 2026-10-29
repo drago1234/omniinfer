@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """
 ModelArts v2 在线服务创建客户端
 

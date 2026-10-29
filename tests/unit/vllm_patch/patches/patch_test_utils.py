@@ -1,7 +1,6 @@
-"""Shared helpers for VLLM patch tests."""
-
-# SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# SPDX-License-Identifier: MIT
+"""Shared helpers for VLLM patch tests."""
 
 from __future__ import annotations
 

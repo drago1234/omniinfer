@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # FusionPool is opt-in; otherwise retain the existing deployment path.
 if [[ "${ENABLE_FUSION_POOL:-0}" == 1 ]]; then
     set -eo pipefail
@@ -117,7 +118,7 @@ export VLLM_ENABLE_MC2=${VLLM_ENABLE_MC2:-1}
 export VLLM_LLMDATADIST_ZMQ_PORT=${VLLM_LLMDATADIST_ZMQ_PORT:-5568}
 export VLLM_USE_V1=${VLLM_USE_V1:-1}
 export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-fork}
-export HYBRID_ATTN_GROUP_SIZE=${HYBRID_ATTN_GROUP_SIZE:-18}
+export OMNI_HYBRID_ATTN_GROUP_SIZE=${OMNI_HYBRID_ATTN_GROUP_SIZE:-18}
 export ENABLE_OVERWRITE_REQ_IDS=${ENABLE_OVERWRITE_REQ_IDS:-1}
 export VLLM_DP_RANK=${VLLM_DP_RANK:-0}
 export VLLM_DP_MASTER_IP=${HOST_IP}
@@ -277,7 +278,7 @@ if [[ "${ENABLE_OMNI_CACHE:-0}" == "1" ]]; then
     export ROLE=prefill
     export VLLM_PLUGINS="omni-npu,omni_custom_models,omni_pangu_models,omni_npu_patches"
 
-    export KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:=$(( OMNI_CACHE_LAYER_BYTES * HYBRID_ATTN_GROUP_SIZE ))}"
+    export KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:=$(( OMNI_CACHE_LAYER_BYTES * OMNI_HYBRID_ATTN_GROUP_SIZE ))}"
     EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-memory-bytes ${KV_CACHE_MEMORY_BYTES}"
 
     SETUP_HUGETLBFS_SH="/workspace/omniinfer/components/omni-cache/tools/setup/setup_hugetlbfs_2MB.sh"

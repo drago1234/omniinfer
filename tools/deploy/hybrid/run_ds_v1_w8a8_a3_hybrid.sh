@@ -2,8 +2,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 
-
-IP="7.150.12.18"
+IP="${IP:-127.0.0.1}"
 PORT=8000
 LOG_FILE="./server.log"
 MODEL_PATH="/data/models/DeepSeek-V31-Terminus-INT8"

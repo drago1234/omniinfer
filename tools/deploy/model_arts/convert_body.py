@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """
 服务快照 JSON → ModelArts 创建请求体(规范) 转换脚本。
 
