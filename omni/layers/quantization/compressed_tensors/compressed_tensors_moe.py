@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# This file is based on vLLM implementation:
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# https://github.com/vllm-project/vllm/blob/v0.11.2/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
 
 from typing import Optional, Callable, Union, Dict, cast
 import os

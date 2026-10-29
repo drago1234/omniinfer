@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 """MTP configuration isolation, phase dispatch and producer execution policy."""
 from types import SimpleNamespace as NS

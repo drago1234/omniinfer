@@ -1,4 +1,5 @@
 #!/bin/bash
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 # usage
 # bash pipeline_diff_cover_v1.sh ut_test_v1 swr.cn-east-4.myhuaweicloud.com/omni/omni_infer_v1_a3:20260211_970 /data/CI/scripts_diff_cov_v1

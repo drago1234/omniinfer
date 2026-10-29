@@ -1,4 +1,6 @@
 #!/bin/sh
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 
 retry() {
   max="${RETRY_MAX:-5}"

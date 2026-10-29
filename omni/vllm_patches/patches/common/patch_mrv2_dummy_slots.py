@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Backport the slot-kernel half of vLLM PR #56734 for MRV2 NPU.
 Removal criteria: drop the loader patch when upgrading to vLLM >= 0.31.0.

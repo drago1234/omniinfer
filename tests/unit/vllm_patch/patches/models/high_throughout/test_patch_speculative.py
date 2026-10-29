@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """High-throughput draft overrides must not leak into the shared base patch."""
 
 import pickle

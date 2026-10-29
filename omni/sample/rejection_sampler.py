@@ -1,6 +1,10 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# This file is based on vLLM implementation:
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# https://github.com/vllm-project/vllm/blob/main/vllm/v1/sample/rejection_sampler.py
+
 from dataclasses import replace
 from typing import Optional
 import torch

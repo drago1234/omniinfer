@@ -1,4 +1,5 @@
 #!/bin/bash
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # FusionPool is opt-in; otherwise retain the existing deployment path.
 if [[ "${ENABLE_FUSION_POOL:-0}" == 1 ]]; then
     set -eo pipefail

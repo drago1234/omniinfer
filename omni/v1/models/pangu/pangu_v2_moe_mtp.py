@@ -1,4 +1,4 @@
-# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # SPDX-License-Identifier: MIT
 #
 # This file is based on vLLM implementation:

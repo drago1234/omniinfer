@@ -1,4 +1,5 @@
 #!/bin/bash
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # =============================================================================
 #
 #
@@ -14,8 +15,7 @@
 #   MIN_COVER    全量覆盖率阈值(%)，默认 80
 #   MIN_DIFF     增量覆盖率阈值(%)，默认 80
 #   STAGE_BASE   staging 根目录，必须在容器挂载路径下，默认 /tmp/omniinfer_ut_selftest
-#   PIP_INDEX    容器内预装测试依赖用的 pip 源，默认取宿主机 pip 配置，
-#                兜底 https://mirrors.tools.huawei.com/pypi/simple
+#   PIP_INDEX    容器内预装测试依赖用的 pip 源，默认取宿主机 pip 配置
 #
 # 例：
 #   bash /path/to/ut/from_zz/run_omniinfer_pipeline_ut.sh \
@@ -145,7 +145,7 @@ echo "[INFO] 启动 4 个测试容器 ..."
 # 从各容器名取自库配置（source 不算修改库文件）。
 source "${STAGE}/tests/ut_config.sh"
 PIP_INDEX="${PIP_INDEX:-$(pip3 config get global.index-url 2>/dev/null)}"
-PIP_INDEX="${PIP_INDEX:-https://mirrors.tools.huawei.com/pypi/simple}"
+PIP_INDEX="${PIP_INDEX:-https://pypi.org/simple}"
 PIP_HOST="${PIP_INDEX#*://}"; PIP_HOST="${PIP_HOST%%/*}"
 echo "[INFO] 预装测试依赖(pytest-split/pytest-cov) ..."
 # 用宿主机的解析结果补容器 hosts：getent 同时覆盖 /etc/hosts 和 DNS 两条路径，故不硬编码 IP。
