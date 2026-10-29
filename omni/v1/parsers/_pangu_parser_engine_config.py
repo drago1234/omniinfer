@@ -114,16 +114,28 @@ def pangu_tool_arg_converter(raw_args: str, partial: bool) -> str:
     return json.dumps(without_name, ensure_ascii=False) if without_name else "{}"
 
 
-def pangu_parser_engine_config(
-    terminals: PanguTerminals,
-    *,
-    thinking_enabled: bool,
-    implicit_tool_end: bool,
-) -> ParserEngineConfig:
+def _build_terminal_map(
+    terminals: PanguTerminals, thinking_enabled: bool
+) -> dict[str, str]:
+    """构建终结符映射:思考模式开启时额外注册 THINK 起止符。"""
     terminal_map = {
         "TOOL_START": terminals.tool_start,
         "TOOL_END": terminals.tool_end,
     }
+    if thinking_enabled:
+        terminal_map.update(
+            {
+                "THINK_START": terminals.think_start,
+                "THINK_END": terminals.think_end,
+            }
+        )
+    return terminal_map
+
+
+def _build_transitions(
+    thinking_enabled: bool, implicit_tool_end: bool
+) -> dict[tuple[ParserState, str], Transition]:
+    """构建状态转移表:CONTENT/TOOL_ARGS 基础转移 + 思考模式相关转移。"""
     transitions = {
         (ParserState.CONTENT, "TOOL_START"): Transition(
             ParserState.TOOL_ARGS, (EventType.TOOL_CALL_START,)
@@ -134,12 +146,6 @@ def pangu_parser_engine_config(
     }
 
     if thinking_enabled:
-        terminal_map.update(
-            {
-                "THINK_START": terminals.think_start,
-                "THINK_END": terminals.think_end,
-            }
-        )
         transitions.update(
             {
                 (ParserState.REASONING, "THINK_START"): Transition(
@@ -157,6 +163,19 @@ def pangu_parser_engine_config(
                 ParserState.TOOL_ARGS,
                 (EventType.REASONING_END, EventType.TOOL_CALL_START),
             )
+
+    return transitions
+
+
+def pangu_parser_engine_config(
+    terminals: PanguTerminals,
+    *,
+    thinking_enabled: bool,
+    implicit_tool_end: bool,
+) -> ParserEngineConfig:
+    """组装 Pangu 输出的声明式 ParserEngine 配置。"""
+    terminal_map = _build_terminal_map(terminals, thinking_enabled)
+    transitions = _build_transitions(thinking_enabled, implicit_tool_end)
 
     return ParserEngineConfig(
         name="pangu",

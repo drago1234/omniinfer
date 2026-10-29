@@ -26,6 +26,10 @@ def test_cpu_hook_precedes_npu_context_creation(monkeypatch,setting,failed):
     cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='NPUWorker')
     method=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='init_device')
     method.decorator_list=[]
+    # init_device 现在编排 _select_npu_device 实例方法;同步提取它并注入
+    # 合成作用域,使 CPU 亲和绑定逻辑(已搬入该方法)在 exec 执行时可达。
+    select_method=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='_select_npu_device')
+    select_method.decorator_list=[]
     calls=[]
     def boundary(device):
         calls.append('set_device')
@@ -43,7 +47,10 @@ def test_cpu_hook_precedes_npu_context_creation(monkeypatch,setting,failed):
     with patch.dict(sys.modules,{'omni_npu':package,'omni_npu.worker':worker_package,'omni_npu.worker.cpu_affinity':module}):
         exec(ast.unparse(affinity_import),scope)
     exec('from __future__ import annotations\n'+ast.unparse(method),scope)
+    exec('from __future__ import annotations\n'+ast.unparse(select_method),scope)
     instance=NS(device_config=NS(device=NS(type='npu')),parallel_config=NS(data_parallel_size=1,tensor_parallel_size=16,pipeline_parallel_size=1,nnodes_within_dp=1),local_rank=7,rank=7)
+    # 把提取出的 _select_npu_device 以实例方法形式绑定到 mock 实例上
+    instance._select_npu_device=scope['_select_npu_device'].__get__(instance,type(instance))
     if setting is not None:
         monkeypatch.setenv('OMNI_WORKER_CPUSET_MAP',setting)
     else:

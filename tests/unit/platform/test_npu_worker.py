@@ -144,6 +144,24 @@ def test_patch_npu_tma_probe_avoids_cuda_device_capability(monkeypatch):
         assert host_tma_probe.__wrapped__() is False
 
 
+def _bind_worker_helpers(worker):
+    """把 NPUWorker 上真实的初始化子步骤绑定到 mock 实例上。
+
+    init_device 现在按阶段编排 _select_npu_device 等实例方法;SimpleNamespace
+    mock 没有这些方法,直接调用会 AttributeError。绑定真实实现保持被测行为。
+    """
+    for name in (
+        "_select_npu_device",
+        "_load_engram_extra_config",
+        "_init_distributed_environment",
+        "_load_extra_config_and_determinism",
+        "_emit_config_summary_and_validate",
+        "_maybe_init_layer_parallel",
+    ):
+        setattr(worker, name, NPUWorker.__dict__[name].__get__(worker, NPUWorker))
+    return worker
+
+
 def test_init_device_patches_triton_capabilities_after_setting_device(monkeypatch):
     class DtypeCheckReached(Exception):
         pass
@@ -168,13 +186,13 @@ def test_init_device_patches_triton_capabilities_after_setting_device(monkeypatc
         events.append(("check_dtype", dtype))
         raise DtypeCheckReached
 
-    worker = SimpleNamespace(
+    worker = _bind_worker_helpers(SimpleNamespace(
         device_config=SimpleNamespace(device=SimpleNamespace(type="npu")),
         parallel_config=SimpleNamespace(distributed_executor_backend="ray"),
         local_rank=3,
         rank=3,
         model_config=SimpleNamespace(dtype="float16"),
-    )
+    ))
     platform = SimpleNamespace(
         device_type="npu",
         logical_device_id_to_visible_device_id=logical_to_visible,
@@ -223,7 +241,7 @@ def test_init_device_continues_when_cpu_affinity_fails(monkeypatch, setting):
     monkeypatch.setattr("omni_npu.worker.npu_worker.torch.npu.set_device", set_device)
     worker_logger = MagicMock()
     monkeypatch.setattr("omni_npu.worker.npu_worker.logger", worker_logger)
-    worker = SimpleNamespace(
+    worker = _bind_worker_helpers(SimpleNamespace(
         device_config=SimpleNamespace(device=SimpleNamespace(type="npu")),
         parallel_config=SimpleNamespace(
             distributed_executor_backend="ray", data_parallel_size=1,
@@ -231,7 +249,7 @@ def test_init_device_continues_when_cpu_affinity_fails(monkeypatch, setting):
         ),
         rank=0,
         local_rank=0,
-    )
+    ))
 
     init_device = getattr(NPUWorker.init_device, "__wrapped__", NPUWorker.init_device)
     with pytest.raises(DeviceInitReached):
@@ -280,13 +298,13 @@ def test_init_device_dp_offset_respects_assigned_devices(
         pipeline_parallel_size=1,
         tensor_parallel_size=1,
     )
-    worker = SimpleNamespace(
+    worker = _bind_worker_helpers(SimpleNamespace(
         device_config=SimpleNamespace(device=SimpleNamespace(type="npu")),
         parallel_config=parallel_config,
         local_rank=0,
         rank=1,
         model_config=SimpleNamespace(dtype="float16"),
-    )
+    ))
     platform = SimpleNamespace(
         device_type="npu",
         logical_device_id_to_visible_device_id=logical_to_visible,
@@ -364,7 +382,7 @@ def test_init_device_forwards_world_ranks(monkeypatch, world_ranks):
         captured["kwargs"] = kwargs
         raise DistributedInitReached
 
-    worker = SimpleNamespace(
+    worker = _bind_worker_helpers(SimpleNamespace(
         device_config=SimpleNamespace(device=SimpleNamespace(type="npu")),
         # "ray" keeps init_device out of the local-rank remapping branch, so
         # the local_rank asserted below is the one that was passed in.
@@ -377,7 +395,7 @@ def test_init_device_forwards_world_ranks(monkeypatch, world_ranks):
         local_rank=1,
         distributed_init_method="tcp://localhost:12345",
         world_ranks=world_ranks,
-    )
+    ))
     platform = SimpleNamespace(
         device_type="npu",
         dist_backend="hccl",
@@ -659,6 +677,110 @@ class TestNpuWorker:
         assert ensure_called["backend"] == "hccl"
         # Verify load_model_extra_config was called exactly once
         mock_load_config.assert_called_once()
+
+    def test_init_device_completes_all_stages(self, monkeypatch):
+        """全流程走通 init_device:设备选择到 profiler 初始化的所有阶段。
+
+        替代被 skip 的旧 test_init_device:现代 mock 手法下验证编排器依次
+        完成设备绑定、分布式初始化、配置校验、内存快照与 ModelRunner 构造。
+        """
+        worker = self._create_worker(monkeypatch)
+        worker = _bind_worker_helpers(worker)
+        worker.model_config = SimpleNamespace(
+            seed=42,
+            hf_config=SimpleNamespace(engram_layer_ids=None),
+            dtype=torch.bfloat16,
+        )
+        worker.scheduler_config = SimpleNamespace(enable_chunked_prefill=True)
+        worker.cache_config = SimpleNamespace(gpu_memory_utilization=0.9)
+        # _is_auto_profiler_mode 读取 profiler_config;默认关闭以跳过 profiler 段
+        worker.profiler_config = SimpleNamespace(profiler=None)
+        # 父类 __init__ 从 vllm_config 读取;mock 上直接给定
+        worker.use_v2_model_runner = False
+
+        stages = []
+        # _create_worker 的平台 mock 不含设备解析方法;补齐以支持 _select_npu_device
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.current_platform",
+            SimpleNamespace(
+                device_type="npu",
+                logical_device_id_to_visible_device_id=lambda local_rank: local_rank,
+                check_if_supports_dtype=lambda dtype: stages.append("check_dtype"),
+                dist_backend="hccl",
+            ),
+        )
+        # CPU 亲和成功分支:返回非 None placement 覆盖 info 日志路径
+        monkeypatch.setenv("OMNI_WORKER_CPUSET_MAP", "auto")
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.apply_worker_cpu_affinity",
+            lambda rank, config: {"rank": rank},
+        )
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.load_model_extra_config",
+            lambda *a, **k: stages.append("load_config"),
+        )
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker._enable_batch_invariant_determinism",
+            lambda config: stages.append("determinism"),
+        )
+        monkeypatch.setattr(
+            "omni_npu.diagnostics.config_summary.emit_config_summary",
+            lambda **k: stages.append("summary"),
+        )
+        monkeypatch.setattr(
+            "omni_npu.configs.validators.validate_all",
+            lambda ctx: stages.append("validate"),
+        )
+        monkeypatch.setattr(
+            "omni_npu.model_config.config_loader.loader",
+            SimpleNamespace(model_extra_config={}),
+        )
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.set_random_seed",
+            lambda seed: stages.append("seed"),
+        )
+        def mock_request_memory(snapshot, cache_config):
+            stages.append("request_memory")
+            # 返回数值而非 None:后续 format_gib(requested_memory) 会做除法
+            return 8 * (1 << 30)
+
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.request_memory", mock_request_memory
+        )
+        # CI 多容器并发下 NPU allocator 可能未初始化,真实 measure 会
+        # INTERNAL ASSERT;UT 只关心编排顺序,mock 掉内存测量本身。
+        monkeypatch.setattr(
+            MemorySnapshot, "measure", lambda self: None
+        )
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.init_workspace_manager",
+            lambda device, num_ubatches: stages.append("workspace"),
+        )
+        # 真实 report_usage_stats 会解析 model_config.architectures,
+        # mock config 上是 property 对象;UT 只关心编排顺序,mock 掉遥测上报。
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.report_usage_stats",
+            lambda vllm_config: stages.append("usage_stats"),
+        )
+
+        init_device = getattr(
+            NPUWorker.init_device, "__wrapped__", NPUWorker.init_device
+        )
+        init_device(worker)
+
+        # 编排顺序:dtype 检查 -> 配置加载/确定性 -> 摘要 -> 校验 -> 种子
+        #           -> 内存请求 -> workspace
+        assert stages.index("check_dtype") < stages.index("load_config")
+        assert stages.index("load_config") < stages.index("determinism")
+        assert stages.index("determinism") < stages.index("summary")
+        assert stages.index("summary") < stages.index("validate")
+        assert stages.index("validate") < stages.index("seed")
+        assert stages.index("seed") < stages.index("request_memory")
+        assert stages.index("request_memory") < stages.index("workspace")
+        assert stages.index("workspace") < stages.index("usage_stats")
+        assert worker.device == torch.device("npu:0")
+        assert hasattr(worker, "init_snapshot")
+        assert worker.requested_memory == 8 * (1 << 30)
 
     def test_init_device_unsupported_device_type(self, monkeypatch):
         """Test init_device with unsupported device type (covers line 103).

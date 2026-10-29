@@ -98,125 +98,154 @@ class NPUWorker(Worker):
 
     @instrument(span_name="Init device")
     def init_device(self):
-        if self.device_config.device.type == "npu" and current_platform.device_type == "npu":
-            parallel_config = self.parallel_config
-            if _needs_dp_local_rank_offset(parallel_config):
-                # Use local DP rank if available, otherwise use global DP rank.
-                dp_local_rank = self.parallel_config.data_parallel_rank_local
-                if dp_local_rank is None:
-                    dp_local_rank = self.parallel_config.data_parallel_index
-
-                tp_pp_world_size = (
-                    self.parallel_config.pipeline_parallel_size
-                    * self.parallel_config.tensor_parallel_size
-                )
-
-                # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
-                self.local_rank += dp_local_rank * tp_pp_world_size
-
-            visible_device_index = current_platform.logical_device_id_to_visible_device_id(self.local_rank)
-            self.device = torch.device(f"npu:{visible_device_index}")
-            if os.environ.get("OMNI_WORKER_CPUSET_MAP"):
-                placement = apply_worker_cpu_affinity(self.rank, parallel_config)
-                if placement is not None:
-                    logger.info("Early worker CPU placement: %s", placement)
-                else:
-                    logger.warning("CPU affinity binding failed for worker rank %s; continuing worker startup",
-                                   self.rank)
-            torch.npu.set_device(self.device)
-
-            _patch_npu_triton_capabilities()
-
-            current_platform.check_if_supports_dtype(self.model_config.dtype)
-
-            # Engram group topology needs its JSON options before group creation.
-            # Preserve the existing initialization order for other models.
-            engram_layers = getattr(self.model_config.hf_config, "engram_layer_ids", None)
-            if engram_layers:
-                load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
-
-            # Initialize the distributed environment BEFORE taking
-            # memory snapshot
-            # This ensures NCCL buffers are allocated before we measure
-            # available memory
-            # world_ranks is an omni-rl extension carried on init_worker: a
-            # rollout replica's communication world covers only a subset of
-            # the training world's ranks. Dropping it here silently builds
-            # the model-parallel groups on the default full world, so
-            # collectives wait on ranks that belong to another replica.
-            init_worker_distributed_environment(
-                self.vllm_config,
-                self.rank,
-                self.distributed_init_method,
-                self.local_rank,
-                current_platform.dist_backend,
-                world_ranks=self.world_ranks,
-            )
-
-            # Initialize the model best practice configs.
-            if not engram_layers:
-                load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
-            from omni_npu.model_config.config_loader import loader as _omni_loader
-            _enable_batch_invariant_determinism(_omni_loader.model_extra_config)
-
-            # OMNI-CONF worker-scope snapshot (solution doc §3.3): full dump
-            # on local_rank 0, hash-only elsewhere (cross-rank drift signal).
-            # Exception-isolated + once-guarded + OMNI_CONFIG_SUMMARY=0 gated inside.
-            from omni_npu.diagnostics.config_summary import emit_config_summary
-            emit_config_summary(
-                vllm_config=self.vllm_config,
-                scope="worker",
-                rank=self.rank,
-                local_rank=self.local_rank,
-                include_omni=True,
-                hash_only=(self.local_rank != 0),
-            )
-
-            # Run declarative validation after the summary so startup errors
-            # can be compared with the emitted configuration.
-            from omni_npu.configs.validators import (
-                ValidationContext,
-                validate_all,
-            )
-            validate_all(
-                ValidationContext(
-                    model_extra_config=_omni_loader.model_extra_config,
-                    vllm_config=self.vllm_config,
-                ))
-
-            # Only initialize the custom layer-parallel communication domain when
-            # explicitly enabled by the high-performance launcher script.
-            if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
-                # Initialize the model best practice configs.
-                from omni_npu.v1.distributed.parallel_state_ext import (
-                    ensure_layer_parallel_initialized,
-                )
-
-                ensure_layer_parallel_initialized(backend=current_platform.dist_backend)
-
-            if self.use_v2_model_runner:
-                logger.info_once("Using V2 Model Runner")
-
-            # Set random seed
-            set_random_seed(self.model_config.seed)
-
-            # Snapshot available memory after distributed init
-            # NOTE: HCCL buffers are NOT allocated yet (lazy allocation on first use)
-            # NOTE: gc.collect() aligns with GPU worker's init_device() to ensure
-            # accurate memory measurement by releasing cyclic references before snapshot.
-            gc.collect()
-            torch.npu.empty_cache()
-
-            # take current memory snapshot
-            self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
-            self.requested_memory = request_memory(init_snapshot, self.cache_config)
-            logger.debug("worker init memory snapshot: %r", self.init_snapshot)
-            logger.debug(
-                "worker requested memory: %sGiB", format_gib(self.requested_memory)
-            )
-        else:
+        """初始化 NPU 设备:按阶段编排各子步骤,保持原有初始化顺序。"""
+        if self.device_config.device.type != "npu" or current_platform.device_type != "npu":
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
+        self._select_npu_device()
+        _patch_npu_triton_capabilities()
+        current_platform.check_if_supports_dtype(self.model_config.dtype)
+
+        # Engram 模型需在分布式建组前加载其 JSON 选项,其余模型保持原有顺序
+        engram_layers = self._load_engram_extra_config()
+        self._init_distributed_environment()
+        model_extra_config = self._load_extra_config_and_determinism(engram_layers)
+        self._emit_config_summary_and_validate(model_extra_config)
+        self._maybe_init_layer_parallel()
+
+        if self.use_v2_model_runner:
+            logger.info_once("Using V2 Model Runner")
+
+        # Set random seed
+        set_random_seed(self.model_config.seed)
+
+        self._snapshot_init_memory()
+        self._init_workspace_and_model_runner()
+
+        if self.rank == 0:
+            report_usage_stats(self.vllm_config)
+
+        if self._is_auto_profiler_mode():
+            self._init_token_profiler_state()
+            self._init_profiler()
+
+        # NOTE: eplb feature need to adapt vllm 0.25.1
+
+    def _select_npu_device(self) -> None:
+        """计算本 worker 的 NPU 设备号(含 DP 偏移),绑定设备与 CPU 亲和性。"""
+        if _needs_dp_local_rank_offset(self.parallel_config):
+            # Use local DP rank if available, otherwise use global DP rank.
+            dp_local_rank = self.parallel_config.data_parallel_rank_local
+            if dp_local_rank is None:
+                dp_local_rank = self.parallel_config.data_parallel_index
+
+            tp_pp_world_size = (
+                self.parallel_config.pipeline_parallel_size
+                * self.parallel_config.tensor_parallel_size
+            )
+
+            # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
+            self.local_rank += dp_local_rank * tp_pp_world_size
+
+        visible_device_index = current_platform.logical_device_id_to_visible_device_id(self.local_rank)
+        self.device = torch.device(f"npu:{visible_device_index}")
+        if os.environ.get("OMNI_WORKER_CPUSET_MAP"):
+            placement = apply_worker_cpu_affinity(self.rank, self.parallel_config)
+            if placement is not None:
+                logger.info("Early worker CPU placement: %s", placement)
+            else:
+                logger.warning("CPU affinity binding failed for worker rank %s; continuing worker startup",
+                               self.rank)
+        torch.npu.set_device(self.device)
+
+    def _load_engram_extra_config(self) -> bool:
+        """Engram 分组拓扑在建组前就需要其 JSON 选项;返回是否存在 engram 层。"""
+        engram_layers = getattr(self.model_config.hf_config, "engram_layer_ids", None)
+        if engram_layers:
+            load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
+        return bool(engram_layers)
+
+    def _init_distributed_environment(self) -> None:
+        """在内存快照前初始化分布式环境,确保通信缓冲先于显存测量分配。"""
+        # world_ranks is an omni-rl extension carried on init_worker: a
+        # rollout replica's communication world covers only a subset of
+        # the training world's ranks. Dropping it here silently builds
+        # the model-parallel groups on the default full world, so
+        # collectives wait on ranks that belong to another replica.
+        init_worker_distributed_environment(
+            self.vllm_config,
+            self.rank,
+            self.distributed_init_method,
+            self.local_rank,
+            current_platform.dist_backend,
+            world_ranks=self.world_ranks,
+        )
+
+    def _load_extra_config_and_determinism(self, engram_layers: bool):
+        """加载模型最佳实践配置并启用批不变确定性;返回加载后的额外配置。"""
+        # Initialize the model best practice configs.
+        if not engram_layers:
+            load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
+        from omni_npu.model_config.config_loader import loader as _omni_loader
+        _enable_batch_invariant_determinism(_omni_loader.model_extra_config)
+        return _omni_loader.model_extra_config
+
+    def _emit_config_summary_and_validate(self, model_extra_config) -> None:
+        """输出 worker 级配置摘要,随后执行声明式校验(顺序保持先摘要后校验)。"""
+        # OMNI-CONF worker-scope snapshot (solution doc §3.3): full dump
+        # on local_rank 0, hash-only elsewhere (cross-rank drift signal).
+        # Exception-isolated + once-guarded + OMNI_CONFIG_SUMMARY=0 gated inside.
+        from omni_npu.diagnostics.config_summary import emit_config_summary
+        emit_config_summary(
+            vllm_config=self.vllm_config,
+            scope="worker",
+            rank=self.rank,
+            local_rank=self.local_rank,
+            include_omni=True,
+            hash_only=(self.local_rank != 0),
+        )
+
+        # Run declarative validation after the summary so startup errors
+        # can be compared with the emitted configuration.
+        from omni_npu.configs.validators import (
+            ValidationContext,
+            validate_all,
+        )
+        validate_all(
+            ValidationContext(
+                model_extra_config=model_extra_config,
+                vllm_config=self.vllm_config,
+            ))
+
+    def _maybe_init_layer_parallel(self) -> None:
+        """仅在启动脚本显式启用 omni_custom_models 插件时初始化层并行通信域。"""
+        # Only initialize the custom layer-parallel communication domain when
+        # explicitly enabled by the high-performance launcher script.
+        if "omni_custom_models" not in os.environ.get("VLLM_PLUGINS", ""):
+            return
+        from omni_npu.v1.distributed.parallel_state_ext import (
+            ensure_layer_parallel_initialized,
+        )
+        ensure_layer_parallel_initialized(backend=current_platform.dist_backend)
+
+    def _snapshot_init_memory(self) -> None:
+        """在分布式初始化后采集可用内存快照并记录请求内存。"""
+        # NOTE: HCCL buffers are NOT allocated yet (lazy allocation on first use)
+        # NOTE: gc.collect() aligns with GPU worker's init_device() to ensure
+        # accurate memory measurement by releasing cyclic references before snapshot.
+        gc.collect()
+        torch.npu.empty_cache()
+
+        # take current memory snapshot
+        self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+        self.requested_memory = request_memory(init_snapshot, self.cache_config)
+        logger.debug("worker init memory snapshot: %r", self.init_snapshot)
+        logger.debug(
+            "worker requested memory: %sGiB", format_gib(self.requested_memory)
+        )
+
+    def _init_workspace_and_model_runner(self) -> None:
+        """初始化 workspace 管理器并按配置构造对应版本的 ModelRunner。"""
         # Initialize workspace manager
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
@@ -230,15 +259,6 @@ class NPUWorker(Worker):
             from omni_npu.worker.npu_model_runner import NPUModelRunner
 
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
-
-        if self.rank == 0:
-            report_usage_stats(self.vllm_config)
-
-        if self._is_auto_profiler_mode():
-            self._init_token_profiler_state()
-            self._init_profiler()
-
-        # NOTE: eplb feature need to adapt vllm 0.25.1
 
     @torch.inference_mode()
     @determine_memory_decorator

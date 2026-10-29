@@ -212,6 +212,18 @@ def test_json_order_changes_only_for_engram(monkeypatch, engram_layers):
         vllm_config=object(),
         scheduler_config=object(),
     )
+    # init_device 按阶段编排实例方法;把真实的初始化子步骤绑定到 mock 上,
+    # 使 _select_npu_device / _load_engram_extra_config 等在被调用时存在。
+    for _name in (
+        '_select_npu_device',
+        '_load_engram_extra_config',
+        '_init_distributed_environment',
+        '_load_extra_config_and_determinism',
+        '_emit_config_summary_and_validate',
+        '_maybe_init_layer_parallel',
+    ):
+        setattr(worker, _name,
+                worker_module.NPUWorker.__dict__[_name].__get__(worker, worker_module.NPUWorker))
     monkeypatch.setattr(
         worker_module,
         'current_platform',
