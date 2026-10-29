@@ -104,7 +104,7 @@
           }
         },
         {
-          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/deploy/model_arts\n\nexport NUM_SERVERS=8\nexport TASK_QUEUE_ENABLE=1\nexport HCCL_BUFFSIZE=1000\nexport gpu_util=0.9\nexport max_num_seqs=24\nexport ENABLE_DP_LB=false\nexport TORCH_COMPILE_DISABLE=1\nexport VLLM_CACHE_ROOT=\"./graph_cache\"\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_xp1d_d.json\"\nexport kv_transfer_config='{\"kv_buffer_device\":\"npu\",\"kv_connector\":\"LLMDataDistConnector\",\"kv_parallel_size\":1,\"kv_role\":\"kv_consumer\"}'\n\nrm -rf graph_cache/\n\npython3 -c \"import os; from transformers import AutoConfig; AutoConfig.from_pretrained(os.environ['MODEL_PATH'], trust_remote_code=True)\"\n\nbash \"${SCRIPT_PATH}/decode.sh\" \\\n  --max-model-len 16384 \\\n  --block-size 128 \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --enable-expert-parallel \\\n  --no-enable-prefix-caching \\\n  --no-enable-chunked-prefill \\\n  --distributed-executor-backend mp \\\n  --compilation-config '{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[96],\"backend\":\"\",\"compile_sizes\":[96]}' \\\n  --additional-config '{\"enable_low_latency\":true,\"enable_pd_elastic_scaling\":true}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity",
+          "cmd": "SCRIPT_PATH=/workspace/omniinfer/tools/deploy/model_arts\n\nexport NUM_SERVERS=8\nexport LOCAL_WORLD_SIZE=8\nexport TASK_QUEUE_ENABLE=1\nexport HCCL_BUFFSIZE=1000\nexport gpu_util=0.9\nexport max_num_seqs=24\nexport ENABLE_DP_LB=false\nexport TORCH_COMPILE_DISABLE=1\nexport VLLM_CACHE_ROOT=\"./graph_cache\"\nexport OMNI_CUSTOM_MODEL_CONFIG_PATH=\"low_latency/openpangu_v2/pangu_v2_moe_bf16_a3_xp1d_d.json\"\nexport kv_transfer_config='{\"kv_buffer_device\":\"npu\",\"kv_connector\":\"LLMDataDistConnector\",\"kv_parallel_size\":1,\"kv_role\":\"kv_consumer\"}'\n\nrm -rf graph_cache/\n\npython3 -c \"import os; from transformers import AutoConfig; AutoConfig.from_pretrained(os.environ['MODEL_PATH'], trust_remote_code=True)\"\n\nbash \"${SCRIPT_PATH}/decode.sh\" \\\n  --max-model-len 16384 \\\n  --block-size 128 \\\n  --no-disable-hybrid-kv-cache-manager \\\n  --enable-expert-parallel \\\n  --no-enable-prefix-caching \\\n  --no-enable-chunked-prefill \\\n  --distributed-executor-backend mp \\\n  --compilation-config '{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[96],\"backend\":\"\",\"compile_sizes\":[96]}' \\\n  --additional-config '{\"enable_low_latency\":true,\"enable_pd_elastic_scaling\":true}' \\\n  --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' && sleep infinity",
           "codes": [],
           "count": 1,
           "custom_spec": {
@@ -124,6 +124,7 @@
             "DECODE_INSTANCE_NUM": "1",
             "npu": "8",
             "NUM_SERVERS": "8",
+            "LOCAL_WORLD_SIZE": "8",
             "PROXY_PORT": "7710",
             "ENABLE_OMNI_CACHE": "0",
             "dtype": "bfloat16",

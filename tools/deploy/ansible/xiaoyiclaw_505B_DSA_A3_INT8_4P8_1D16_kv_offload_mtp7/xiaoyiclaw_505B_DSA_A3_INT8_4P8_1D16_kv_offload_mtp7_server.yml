@@ -139,6 +139,7 @@
         export OMNI_HYBRID_ATTN_GROUP_SIZE=18
         export ENABLE_DP_LB=false
         export TASK_QUEUE_ENABLE=1
+        export LOCAL_WORLD_SIZE=16
         export OMNI_VLLM_PATCHES_DIR="low_latency"
         EXTRA_ARGS="--no-disable-hybrid-kv-cache-manager"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-expert-parallel --max-num-seqs 3"

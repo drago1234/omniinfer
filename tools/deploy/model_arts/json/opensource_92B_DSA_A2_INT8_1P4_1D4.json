@@ -123,6 +123,7 @@
             "DECODE_INSTANCE_NUM": "1",
             "npu": "4",
             "NUM_SERVERS": "4",
+            "LOCAL_WORLD_SIZE": "4",
             "PROXY_PORT": "7710",
             "ENABLE_OMNI_CACHE": "0",
             "dtype": "bfloat16",

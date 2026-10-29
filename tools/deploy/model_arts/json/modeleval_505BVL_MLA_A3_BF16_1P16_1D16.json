@@ -176,6 +176,7 @@
             "ENABLE_DP_LB": "false",
             "VLLM_DATA_PARALLEL_EXTERNAL_LB": "false",
             "VLLM_CACHE_ROOT": "./graph_cache",
+            "NUM_SERVERS": "16",
             "LOCAL_WORLD_SIZE": "16",
             "VLLM_DISABLE_COMPILE_CACHE": "1",
             "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME": "DECODE_SHM_BUFFER",
