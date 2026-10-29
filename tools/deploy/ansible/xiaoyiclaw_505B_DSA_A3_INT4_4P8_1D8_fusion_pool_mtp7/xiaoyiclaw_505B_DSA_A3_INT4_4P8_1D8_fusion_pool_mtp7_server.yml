@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 ---
-- name: Run PanguV2 505B INT8 4P1D Prefill with KV offload, Decode, and Omni Proxy services.
+- name: Run PanguV2 505B INT8 4P1D Prefill with Fusion Pool, Decode, and Omni Proxy services.
   hosts: all
   any_errors_fatal: true
   max_fail_percentage: 0
   gather_facts: true
   # 当前 Ansible 的配置与使用说明请参见 tools/deploy/ansible/README.md。
-  # 搭配 inventories/omni_infer_inventory_used_for_4P8_1D16.yml 拓扑模板使用。
+  # 搭配同目录的 xiaoyiclaw_505B_DSA_A3_INT4_4P8_1D8_fusion_pool_mtp7_inventory.yml 使用。
   environment:
     LOG_PATH: /data/log_path
     LOG_PATH_IN_EXECUTOR: /data/log_path_in_executor
@@ -21,12 +21,25 @@
 
   vars:
     model: pangu-v2-505b
-    model_path: "/mnt/sfs_turbo/bucket-910c-6055/rk/ckpt/505B_B005_INT4_open/"
+    model_path: "/model_path"
     enable_prefix_caching: true
+    enable_fusion_pool: true
+    # Fusion Pool load/store events are separate from the native P HBM events used by Proxy.
+    fusion_pool_enable_load_events: false
+    fusion_pool_enable_store_events: false
+
+    # Follow the published INT4 Fusion Pool scheduling settings, not the INT8 thresholds.
+    omni_proxy_pool_aware: true
+    omni_proxy_schedule_algo: work_aware
+    omni_proxy_work_aware_short_threshold: 98304
+    omni_proxy_work_aware_service_floor_tokens: 4096
+    omni_proxy_pool_w_hbm: 100
+    omni_proxy_pool_w_local: 90
+    omni_proxy_pool_w_remote: 80
+    mooncake_enable_kv_events: true
 
     run_docker_profile:
-      # Keep the /dev/shm fallback large enough for the 1 TiB Prefill pool
-      # when Prefill kv_offload.hugepage_enabled is turned off.
+      # Retain the upstream container resource settings.
       shm_size: 1800g
       envs:
         - PYTHONHASHSEED=1234
@@ -45,7 +58,13 @@
           -mindepth 1 -maxdepth 1 ! -name components
           -exec rm -rf -- '{}' + &&
           docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/.'
-          "${DOCKER_NAME_P}:{{ container_workspace }}/omniinfer/"
+          "${DOCKER_NAME_P}:{{ container_workspace }}/omniinfer/" &&
+          if [ -d '{{ ansible_env.CODE_PATH }}/Pangu-Fusion' ]; then
+          docker exec "$DOCKER_NAME_P" rm -rf
+          '{{ container_workspace }}/omniinfer/components/Pangu-Fusion' &&
+          docker cp '{{ ansible_env.CODE_PATH }}/Pangu-Fusion'
+          "${DOCKER_NAME_P}:{{ container_workspace }}/omniinfer/components/";
+          fi
         decode: >-
           docker exec "$DOCKER_NAME_D" mkdir -p
           '{{ container_workspace }}/omniinfer/components' &&
@@ -54,23 +73,27 @@
           -mindepth 1 -maxdepth 1 ! -name components
           -exec rm -rf -- '{}' + &&
           docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/.'
-          "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/"
+          "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/" &&
+          if [ -d '{{ ansible_env.CODE_PATH }}/Pangu-Fusion' ]; then
+          docker exec "$DOCKER_NAME_D" rm -rf
+          '{{ container_workspace }}/omniinfer/components/Pangu-Fusion' &&
+          docker cp '{{ ansible_env.CODE_PATH }}/Pangu-Fusion'
+          "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/components/";
+          fi
 
     run_server_prefill_profile:
-      # Each Prefill enables a 1 TiB CPU offload pool in this 4P1D scenario.
-      kv_offload:
-        enable: true
-        hugepage_enabled: true
-        cpu_bytes_to_use: 1288490188800  # 1 TiB 
-        eviction_policy: arc  # arc or lru
-        # 分片 DDR 载入：每卡只从 DDR 读 1/tp，卡间 all-gather 拼齐；不满足条件时各卡一致退回原路径。
-        # 特性默认关，这里只是把开关摆出来；要开改成 true。
-        sharded_load: false
-      # 由 enable_fusion_pool=true 控制（M 组部署 + install_fusion_pool +
-      # fusion_pool_runtime fragment）。
+      # Replace CPU offload with Fusion Pool; do not generate a second connector config.
       fusion_pool:
         global_segment_size_gb: 64
+        local_buffer_size_gb: 8
+        hugepage_enabled: true
       prepare_commands: |-
+        export OMNI_WORKER_CPUSET_MAP=auto
+        export ASCEND_USE_ASYNC_TRANSFER=1
+        export ASCEND_CONNECT_TIMEOUT=180000
+        export ASCEND_TRANSFER_TIMEOUT=180000
+        export VLLM_MOONCAKE_STORE_TIER_LOG=0
+        export VLLM_USE_V2_MODEL_RUNNER=1
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_ALL | replace(' ', '') | trim | quote }}
         export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=36000
         export VLLM_DISABLE_PYNCCL=1
@@ -113,7 +136,11 @@
         export TORCH_COMPILE_DISABLE=1
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
         GPU_UTIL=0.9
+        # Required fragment: fail instead of silently starting without Fusion Pool.
+        test -r "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh" || exit 1
+        . "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh" || exit 1
       args:
+        - --kv-transfer-config "${KV_TRANSFER_CONFIG}"
         - --max-model-len 524288
         - --served-model-name {{ model | quote }}
         - '--additional-config ''{"enable_low_latency": true}'''
@@ -121,17 +148,17 @@
         - --extra-args "${EXTRA_ARGS}"
         - --hccl-buffsize "${HCCL_BUFFSIZE}"
         - --hccl-op-expansion-mode "${HCCL_OP_EXPANSION_MODE}"
-        - --num-speculative-tokens 3
+        - --num-speculative-tokens 7
 
     run_server_decode_profile:
-      # Decode keeps the plain LLMDataDist connector; flipping enable to true
-      # activates the configured per-device 50 GiB CPU offload pool.
-      kv_offload:
-        enable: false
-        hugepage_enabled: false
-        cpu_bytes_to_use: 53687091200  # 50 GiB
-        eviction_policy: arc  # arc or lru
+      # D contributes DDR capacity; no Fusion Pool lookup/save or D event scheduling.
+      enable_kv_events: false
+      fusion_pool:
+        global_segment_size_gb: 64
+        local_buffer_size_gb: 8
+        hugepage_enabled: true
       prepare_commands: |-
+        export VLLM_USE_V2_MODEL_RUNNER=1
         export DECODE_DATA_PARALLEL_SIZE={{ DECODE_SERVER_BY_GROUP | quote }}
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_BY_GROUP | replace(' ', '') | trim | quote }}
         export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=36000
@@ -155,7 +182,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --enable-expert-parallel --max-num-seqs 3"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prompt-tokens-details --enable-chunked-prefill"
         EXTRA_ARGS="${EXTRA_ARGS} --distributed-executor-backend mp --dtype bfloat16"
-        COMPILATION_CONFIG='{"mode": 3, "cudagraph_mode":"FULL", "cudagraph_capture_sizes":[4,12], "backend":"", "compile_sizes":[4,12]}'
+        COMPILATION_CONFIG='{"mode": 3, "cudagraph_mode":"FULL", "cudagraph_capture_sizes":[8,16,24], "backend":"", "compile_sizes":[8,16,24]}'
         EXTRA_ARGS="${EXTRA_ARGS} --compilation-config ${COMPILATION_CONFIG}"
         EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
@@ -173,7 +200,10 @@
         export VLLM_DISABLE_COMPILE_CACHE=1
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
         GPU_UTIL=0.95
+        test -r "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh" || exit 1
+        . "{{ ansible_env.SCRIPTS_PATH }}/fusion_pool_runtime.sh" || exit 1
       args:
+        - --kv-transfer-config "${KV_TRANSFER_CONFIG}"
         - --max-model-len 524288
         - --served-model-name {{ model | quote }}
         - --tp 1
@@ -187,7 +217,9 @@
         - --extra-args "${EXTRA_ARGS}"
         - --hccl-buffsize "${HCCL_BUFFSIZE}"
         - --hccl-op-expansion-mode "${HCCL_OP_EXPANSION_MODE}"
-        - --num-speculative-tokens 3
+        - --num-speculative-tokens 7
+        - --rejection-sample-method block
+        - --draft-sample-method probabilistic
 
     run_server_common_profile:
       restart_proxy: true
@@ -210,10 +242,21 @@
         - --omni-proxy-max-batch-num-token 49152
         - --omni-proxy-prefill-max-num-seqs 4
         - --omni-proxy-decode-max-num-seqs 3
+        - --omni-proxy-tokenizer-wide-affinity on
+        - --omni-proxy-schedule-algo {{ omni_proxy_schedule_algo | quote }}
+        - --omni-proxy-work-aware-short-threshold {{ omni_proxy_work_aware_short_threshold }}
+        - --omni-proxy-work-aware-service-floor-tokens {{ omni_proxy_work_aware_service_floor_tokens }}
+        - --omni-proxy-pool-aware-scheduling on
+        # Existing Master events/admin contracts; ports are controlled in inventory.
+        - --omni-proxy-pool-master-events {{ (hostvars[groups['M'][0]].host_ip ~ ':' ~ hostvars[groups['M'][0]].mooncake_kv_events_port) | quote }}
+        - --omni-proxy-pool-master-admin {{ (hostvars[groups['M'][0]].host_ip ~ ':' ~ ((hostvars[groups['M'][0]].mooncake_metadata_port | int) + 100)) | quote }}
+        - --omni-proxy-pool-w-hbm {{ omni_proxy_pool_w_hbm }}
+        - --omni-proxy-pool-w-local {{ omni_proxy_pool_w_local }}
+        - --omni-proxy-pool-w-remote {{ omni_proxy_pool_w_remote }}
 
     proc_bind_profile:
       enabled: "{{ proc_bind_enabled | default(false) | bool }}"
 
   tasks:
     - ansible.builtin.import_role:
-        name: elastic_server
+        name: fusion_pool

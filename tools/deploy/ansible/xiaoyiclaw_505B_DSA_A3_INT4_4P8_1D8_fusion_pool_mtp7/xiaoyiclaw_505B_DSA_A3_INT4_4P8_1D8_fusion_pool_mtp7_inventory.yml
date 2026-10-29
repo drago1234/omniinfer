@@ -76,3 +76,16 @@ all:
           node_port: "{{ proxy_port + node_rank }}"
           host_ip: "127.0.0.1"
           role: "C"
+
+    M:
+      vars:
+        # Metadata /metadata :8081; RPC :16752; Proxy events :5599;
+        # existing Master admin HTTP = metadata+100 (:8181).
+        mooncake_metadata_port: 8081
+        mooncake_rpc_port: 16752
+        mooncake_kv_events_port: 5599
+      hosts:
+        m0:
+          ansible_host: "127.0.0.1"
+          host_ip: "127.0.0.1"
+          node_rank: 0
