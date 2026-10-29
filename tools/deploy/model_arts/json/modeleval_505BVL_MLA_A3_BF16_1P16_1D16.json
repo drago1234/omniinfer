@@ -35,12 +35,12 @@
       "model": {
         "efs_sub_path": "/",
         "host_cache": false,
-        "mount_path": "/mnt/",
+        "mount_path": "/home/ma-user/work/",
         "os_warm_up": false,
         "read_only": false,
         "source": "EFS",
-        "source_id": "631e010d-948c-11f1-88b7-fa163ee29cb4",
-        "source_name": "efs-asset-g-wh-infra-infer-exp-1"
+        "source_id": "71ad4c97-cdbd-11f1-b999-fa163ee29cb4",
+        "source_name": "efs-asset-g-wh-infra-infer-exp-2"
       },
       "pool_id": "pool-1c07c990-42aa-4ff0-9dbc-04ab4fdcdcab",
       "priority": 3,
@@ -76,7 +76,7 @@
             "DECODE_INSTANCE_NUM": "1",
             "MODEL_NAME": "pangu_ultra_moe",
             "OMNI_LLMDATADIST_LINK_RECYCLE_DELAY": "36000",
-            "MODEL_PATH": "/mnt/bucket-910c-6055/suisiyue/model/505BVL_sft_Prod_512K_1013_gbs64_iter_0007500_hf/",
+            "MODEL_PATH": "/home/ma-user/work/bucket-910c-6055/suisiyue/model/505BVL_sft_Prod_512K_1013_gbs64_iter_0007500_hf/",
             "ENABLE_OMNI_CACHE": "0",
             "LOG_PATH": "/home/ma-user/",
             "HCCL_EXEC_TIMEOUT": "600",
@@ -151,7 +151,7 @@
             "DECODE_INSTANCE_NUM": "1",
             "MODEL_NAME": "pangu_ultra_moe",
             "OMNI_LLMDATADIST_LINK_RECYCLE_DELAY": "36000",
-            "MODEL_PATH": "/mnt/bucket-910c-6055/suisiyue/model/505BVL_sft_Prod_512K_1013_gbs64_iter_0007500_hf/",
+            "MODEL_PATH": "/home/ma-user/work/bucket-910c-6055/suisiyue/model/505BVL_sft_Prod_512K_1013_gbs64_iter_0007500_hf/",
             "ENABLE_OMNI_CACHE": "0",
             "LOG_PATH": "/home/ma-user/",
             "HCCL_EXEC_TIMEOUT": "600",

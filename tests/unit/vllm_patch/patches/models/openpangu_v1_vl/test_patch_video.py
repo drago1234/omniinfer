@@ -173,3 +173,30 @@ def test_load_bytes_joins_actual_sampling_and_frame_decode(video, strategy, fps,
     assert metadata["fps"] == 4 and metadata["do_sample_frames"] is False
     for cap in captures:
         cap.release.assert_called_once()
+
+
+def test_load_bytes_warns_instead_of_raising_when_frames_are_missing(
+        video, monkeypatch, caplog):
+    cap = Mock()
+    cap.isOpened.return_value = True
+    metadata = {7: 9, 5: 4, 3: 1, 4: 1}
+    cap.get.side_effect = metadata.__getitem__
+    video.cv2.VideoCapture.return_value = cap
+
+    def decode_frame(frame_idx, _path, _total_frames):
+        if frame_idx == 4:
+            return None
+        return np.array([[[frame_idx, 20, 30]]], dtype=np.uint8)
+
+    monkeypatch.setattr(video.backend, "decode_single_frame", decode_frame)
+
+    with caplog.at_level("WARNING"):
+        frames, result_metadata = video.backend.load_bytes(
+            b"capture double", num_frames=3, sample_fps=1,
+            frame_sample_strategy="uniform", decode_frame_thread_count=1)
+
+    assert frames.shape == (3, 1, 1, 3)
+    np.testing.assert_array_equal(frames[:2, 0, 0], [[0, 20, 30], [8, 20, 30]])
+    assert result_metadata["frames_indices"] == [0, 4, 8]
+    assert "Expected reading 3 frames, but only loaded 2 frames from video." in caplog.text
+    cap.release.assert_called_once()
