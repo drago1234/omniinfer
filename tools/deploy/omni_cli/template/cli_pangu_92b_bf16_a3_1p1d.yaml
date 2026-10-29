@@ -108,6 +108,7 @@ all:
             CODE_PATH: /workspace/omniinfer
             DECODE_POD_NUM: 1
             DECODE_SERVER_LIST: 0,1,2,3,4,5,6,7
+            LOCAL_WORLD_SIZE: 8
             GLOBAL_DECODE_SERVER_IP_LIST: ${SERVER_IP_LIST}
             GLOO_SOCKET_IFNAME: enp23s0f3
             HCCL_BUFFSIZE: 500

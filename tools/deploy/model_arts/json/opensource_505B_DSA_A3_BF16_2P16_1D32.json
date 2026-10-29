@@ -135,6 +135,7 @@
             "LOG_PATH": "/home/ma-user/",
             "OMNI_HYBRID_ATTN_GROUP_SIZE": "18",
             "NUM_SERVERS": "16",
+            "LOCAL_WORLD_SIZE": "16",
             "kv_offload": "false",
             "PREFILL_INSTANCE_NUM": "2",
             "DECODE_INSTANCE_NUM": "1",

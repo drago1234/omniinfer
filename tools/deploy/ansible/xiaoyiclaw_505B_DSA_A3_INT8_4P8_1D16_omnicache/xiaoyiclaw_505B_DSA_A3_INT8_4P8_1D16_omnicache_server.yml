@@ -238,6 +238,7 @@
         export OMNI_HYBRID_ATTN_GROUP_SIZE=18
         export ENABLE_DP_LB=false
         export TASK_QUEUE_ENABLE=1
+        export LOCAL_WORLD_SIZE={{ ascend_rt_visible_devices.split(",") | length }}
         export HCCL_SOCKET_IFNAME=enp23s0f3
         export OMNI_VLLM_PATCHES_DIR="pangu_v2_hybrid, pangu_v2_moe"
         export OMNI_VLLM_PATCHES="ALL"
