@@ -19,7 +19,7 @@
 
   vars:
     model: pangu-v2-92b
-    model_path: "/mnt/sfs_turbo/bucket-910c-6055/f00937498/global_step_26"
+    model_path: "/path/to/model"
 
     run_docker_profile:
       envs:

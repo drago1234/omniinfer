@@ -21,7 +21,7 @@
 
   vars:
     model: pangu-v2-505b
-    model_path: "/mnt/sfs_turbo_new/bucket-910c-6055/s00623235/models/505b/505b_w4a8"
+    model_path: "/path/to/model"
     enable_prefix_caching: true
 
     # Selecting this dedicated playbook enables the M service and P-side pool.

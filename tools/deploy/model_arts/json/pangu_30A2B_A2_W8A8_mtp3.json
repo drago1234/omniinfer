@@ -50,7 +50,7 @@
       "system_log_dump_enable": false,
       "unit_configs": [
         {
-          "cmd": "source ~/.bashrc && bash /home/ma-user/work/s3-asset-g-wl-infra-infer-exp/z30083002/ma_scripts/hybrid_server.sh && sleep infinity",
+          "cmd": "source ~/.bashrc && bash /path/to/scripts/hybrid_server.sh && sleep infinity",
           "codes": [],
           "count": 1,
           "custom_spec": {
@@ -84,7 +84,7 @@
             "CLEAN_COMPILE_CACHE": "1",
             "LOG_DIR": "/home/ma-user/work/logs/pangu30b_w8a8_mtp3",
 
-            "MODEL_PATH": "/home/ma-user/work/s3-asset-g-wl-infra-infer-exp/z30083002/ckpt/30BA2B_sq24K_attnLora_shared_nextn3_single_mtp_head_iter_0002430_vllm_W8A8_omni_no_vit/",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME":"pangu_omni_30b",
             "ALLOWED_LOCAL_MEDIA_PATH": "/home",
             "MEDIA_IO_KWARGS": "{\"image\":{\"rgba_background_color\":[128,128,128]},\"video\":{\"num_frames\":256,\"sample_fps\":1}}",

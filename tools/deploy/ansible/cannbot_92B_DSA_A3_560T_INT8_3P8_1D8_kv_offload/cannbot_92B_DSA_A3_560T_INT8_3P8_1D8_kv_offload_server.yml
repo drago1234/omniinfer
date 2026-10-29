@@ -22,7 +22,7 @@
 
   vars:
     model: pangu-v2-92b
-    model_path: "/mnt/sfs_turbo/bucket-pangu-green-guiyang/d00827726/models/pangu_92b/global_step_26-iterative-int8-0626/"
+    model_path: "/path/to/model"
     enable_prefix_caching: true
 
     run_docker_profile:

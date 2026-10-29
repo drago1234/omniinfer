@@ -64,7 +64,7 @@
           },
           "dumps": [],
           "envs": {
-            "MODEL_PATH": "/mnt/bucket-910c-6055/s00562949/models/openPangu_2.0_Flash_BF16/global_step_26/",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu_ultra_moe",
             "PREFILL_INSTANCE_NUM": "2",
             "DECODE_INSTANCE_NUM": "1",
@@ -117,7 +117,7 @@
           },
           "dumps": [],
           "envs": {
-            "MODEL_PATH": "/mnt/bucket-910c-6055/s00562949/models/openPangu_2.0_Flash_BF16/global_step_26/",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu_ultra_moe",
             "PREFILL_INSTANCE_NUM": "2",
             "DECODE_INSTANCE_NUM": "1",
@@ -171,7 +171,7 @@
           },
           "dumps": [],
           "envs": {
-            "MODEL_PATH": "/mnt/bucket-910c-6055/s00562949/models/openPangu_2.0_Flash_BF16/global_step_26/",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu_ultra_moe",
             "PREFILL_INSTANCE_NUM": "2",
             "DECODE_INSTANCE_NUM": "1",

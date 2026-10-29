@@ -31,7 +31,7 @@
   vars:
     model: pangu-v2-92b
     # PanguUltraMoEForCausalLM，恒高吞吐
-    model_path: "/mnt/sfs_turbo_new/bucket-910c-6055/f00937498/Pangu92B_bf16_0921/global_step_26"
+    model_path: "/path/to/model"
 
     # 验证时取的长度：最长 prompt 13512 token + 生成。按实际业务需要调大。
     max_len: 16384

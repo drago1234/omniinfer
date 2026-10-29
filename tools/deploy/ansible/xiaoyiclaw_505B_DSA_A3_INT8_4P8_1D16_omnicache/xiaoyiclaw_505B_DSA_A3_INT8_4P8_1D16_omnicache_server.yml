@@ -34,7 +34,7 @@
     pangu_scripts_path: /data/xxx/pangu21/logs_path/scripts_path
 
     model: pangu-v2-505b
-    model_path: "/mnt/sfs_turbo_new/bucket-910c-6055/s30033981/models/505B_iter_0015398_llt_w8a8"
+    model_path: "/path/to/model"
     enable_prefix_caching: true
 
     # Budgets are per physical host; Decode's connector budget spans D0.

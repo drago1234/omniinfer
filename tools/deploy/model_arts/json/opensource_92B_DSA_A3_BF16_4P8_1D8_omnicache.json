@@ -64,7 +64,7 @@
           },
           "dumps": [],
           "envs": {
-            "MODEL_PATH": "/mnt/sfs_turbo_new/bucket-910c-6055/s00562949/models/openPangu_2.0_Flash_INT8/global_step_26-iterative-int8-0626",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-92b",
             "PREFILL_INSTANCE_NUM": "4",
             "DECODE_INSTANCE_NUM": "1",
@@ -143,7 +143,7 @@
           },
           "dumps": [],
           "envs": {
-            "MODEL_PATH": "/mnt/sfs_turbo_new/bucket-910c-6055/s00562949/models/openPangu_2.0_Flash_INT8/global_step_26-iterative-int8-0626",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-92b",
             "PREFILL_INSTANCE_NUM": "4",
             "DECODE_INSTANCE_NUM": "1",
@@ -222,7 +222,7 @@
           },
           "dumps": [],
           "envs": {
-            "MODEL_PATH": "/mnt/sfs_turbo_new/bucket-910c-6055/s00562949/models/openPangu_2.0_Flash_INT8/global_step_26-iterative-int8-0626",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-92b",
             "PREFILL_INSTANCE_NUM": "4",
             "DECODE_INSTANCE_NUM": "1",
@@ -301,7 +301,7 @@
           },
           "dumps": [],
           "envs": {
-            "MODEL_PATH": "/mnt/sfs_turbo_new/bucket-910c-6055/s00562949/models/openPangu_2.0_Flash_INT8/global_step_26-iterative-int8-0626",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-92b",
             "PREFILL_INSTANCE_NUM": "4",
             "DECODE_INSTANCE_NUM": "1",
@@ -380,7 +380,7 @@
           },
           "dumps": [],
           "envs": {
-            "MODEL_PATH": "/mnt/sfs_turbo_new/bucket-910c-6055/s00562949/models/openPangu_2.0_Flash_INT8/global_step_26-iterative-int8-0626",
+            "MODEL_PATH": "/path/to/model",
             "MODEL_NAME": "pangu-v2-92b",
             "PREFILL_INSTANCE_NUM": "4",
             "DECODE_INSTANCE_NUM": "1",
