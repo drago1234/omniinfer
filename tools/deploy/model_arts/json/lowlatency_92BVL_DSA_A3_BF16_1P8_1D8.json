@@ -112,7 +112,7 @@
             "category": "CPU",
             "id": "1ee3ce93-436a-11f1-9299-0255ac10016b",
             "source": "SWR_PRO",
-            "swr_path": "swr-aifm-exp-t3bbun.swr-pro.myhuaweicloud.com/aifm.infra.infer/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.5.0-omni_master-vllm-202609120013:0.0.1"
+            "swr_path": "swr-aifm-exp-t3bbun.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.7.0-omni_develop-vllm-202610252335:0.0.1"
           },
           "models": [],
           "name": "prefill-0",
@@ -188,7 +188,7 @@
             "category": "CPU",
             "id": "1ee3ce93-436a-11f1-9299-0255ac10016b",
             "source": "SWR_PRO",
-            "swr_path": "swr-aifm-exp-t3bbun.swr-pro.myhuaweicloud.com/aifm.infra.infer/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.5.0-omni_master-vllm-202609120013:0.0.1"
+            "swr_path": "swr-aifm-exp-t3bbun.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a3-cann9.1.0-pta_v2.12.0-ai-infra-op_1.7.0-omni_develop-vllm-202610252335:0.0.1"
           },
           "models": [],
           "name": "decode",

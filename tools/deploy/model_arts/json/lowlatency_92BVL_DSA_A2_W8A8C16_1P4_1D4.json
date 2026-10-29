@@ -71,6 +71,7 @@
             "OMNI_VLLM_PATCHES_DIR": "pangu_v2_hybrid,pangu_v2_moe,openpangu_v1_vl",
             "OMNI_VLLM_PATCHES": "ALL",
             "VLLM_VIDEO_LOADER_BACKEND": "npu_opencv_dynamic",
+            "VLLM_MEDIA_CONNECTOR": "omni_lazy_image",
             "TORCH_COMPILE_DISABLE": "1",
             "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
             "PREFILL_INSTANCE_NUM": "1",
@@ -113,7 +114,7 @@
             "category": "CPU",
             "id": "8ee7aa0f-502f-11f1-aca0-0255ac10016a",
             "source": "SWR_PRO",
-            "swr_path": "swr-aifm-exp-z7c82y.swr-pro.myhuaweicloud.com/aifm.infra.infer/ai-infra-infer-1.2.1-arm-openeuler-py311-a2-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_master-vllm-202610112332:0.0.1"
+            "swr_path": "swr-aifm-exp-z7c82y.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a2-cann9.1.0-pta_v2.12.0-ai-infra-op_1.7.0-omni_develop-vllm-202610252337:0.0.1"
           },
           "models": [],
           "name": "prefill-0",
@@ -146,6 +147,7 @@
             "OMNI_VLLM_PATCHES_DIR": "pangu_v2_hybrid,pangu_v2_moe,openpangu_v1_vl",
             "OMNI_VLLM_PATCHES": "ALL",
             "VLLM_VIDEO_LOADER_BACKEND": "npu_opencv_dynamic",
+            "VLLM_MEDIA_CONNECTOR": "omni_lazy_image",
             "TORCH_COMPILE_DISABLE": "1",
             "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
             "PREFILL_INSTANCE_NUM": "1",
@@ -191,7 +193,7 @@
             "category": "CPU",
             "id": "8ee7aa0f-502f-11f1-aca0-0255ac10016a",
             "source": "SWR_PRO",
-            "swr_path": "swr-aifm-exp-z7c82y.swr-pro.myhuaweicloud.com/aifm.infra.infer/ai-infra-infer-1.2.1-arm-openeuler-py311-a2-cann9.1.0-pta_v2.12.0-ai-infra-op_1.6.0-omni_master-vllm-202610112332:0.0.1"
+            "swr_path": "swr-aifm-exp-z7c82y.swr-pro.myhuaweicloud.com/aifm.infra.pipeline.verifying/ai-infra-infer-1.2.1-arm-openeuler-py311-a2-cann9.1.0-pta_v2.12.0-ai-infra-op_1.7.0-omni_develop-vllm-202610252337:0.0.1"
           },
           "models": [],
           "name": "decode",
