@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     OMNI_SKIP_DECODE_TOKENIZE: bool
     OMNI_CONFIG_SUMMARY: bool
     OMNI_LMHEAD_USE_DEVICE_COMM_A2A: bool
+    OMNI_PIN_DUMMY_LOGITS: bool
     OMNI_PIGGYBACK_INPUT_IDS: bool
     OMNI_VALIDATE_PIGGYBACK_INPUT_IDS: bool
     OMNI_HYBRID_ALIGNED_DECODE: bool
@@ -608,6 +609,27 @@ env_variables: Dict[str, Callable[[], Any]] = {
         False,
         _as_bool,
     ),
+
+    # Pins the temporary host index buffer that selects dummy-run sample
+    # hidden states, before its non-blocking H2D copy.
+    #
+    # On NPU, Tensor.to(device, non_blocking=True) still synchronizes the
+    # current stream when the source is unregistered (pageable) host memory.
+    # Dummy-run logit indices are a short-lived CPU tensor built from a numpy
+    # view, so that sync lands on the critical path immediately before
+    # compute_logits. Exact "1" calls pin_memory() first: the pinned allocator
+    # records the DMA event and keeps this temporary buffer alive until the
+    # copy finishes, so the transfer can overlap the dummy forward. The same
+    # staged device tensor is then reused by _dp_sync_main_compute_logits
+    # instead of being built again after the forward. Unset defaults to False
+    # and keeps the previous pageable-host path. Any value other than exact
+    # "1" (including "true", "TRUE", and " 1") is False; nothing is raised.
+    # Opt-in performance switch for DP/local-parallel lm_head dummy runs.
+    # Consumers: worker/npu_model_runner.py:NPUModelRunner._stage_dummy_logits_indices
+    # and NPUModelRunner._dummy_run.
+    "OMNI_PIN_DUMMY_LOGITS":
+    lambda: get_env_with_fallback(
+        "OMNI_PIN_DUMMY_LOGITS", None, False, _as_exact_one),
 
     # Lets a compatible client send pre-tokenized input_ids on the
     # ChatCompletionRequest; the server then skips chat-template expansion

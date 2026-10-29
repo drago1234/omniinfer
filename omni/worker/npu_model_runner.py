@@ -68,6 +68,7 @@ from vllm.v1.worker.cp_utils import (
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
+from omni_npu import envs as omni_envs
 from omni_npu.attention.backends.mome import bind_num_prompt_tokens
 from omni_npu.compilation.acl_graph import (
     ACLGraphWrapper,
@@ -1131,6 +1132,14 @@ class NPUModelRunner(GPUModelRunner):
         else:
             NPUParallelLMHead._dp_pad_n = int(dp_meta.max_tokens_across_dp_cpu)
 
+    def _stage_dummy_logits_indices(self, num_scheduled_tokens):
+        indices = torch.from_numpy(np.cumsum(num_scheduled_tokens) - 1)
+        # See OMNI_PIN_DUMMY_LOGITS in omni_npu.envs: pageable host memory
+        # makes this non_blocking H2D copy synchronize on NPU.
+        if omni_envs.OMNI_PIN_DUMMY_LOGITS:
+            indices = indices.pin_memory()
+        return indices.to(self.device, non_blocking=True)
+
     # --- DP lm_head sync helper -------------------------------------------
     # When dp_parallel_lmhead is on, NPULogitsProcessor._get_logits issues
     # DP collectives (allgather + all_to_all) inside compute_logits. Active
@@ -1144,13 +1153,13 @@ class NPUModelRunner(GPUModelRunner):
         hidden_states: torch.Tensor,
         num_scheduled_tokens: np.ndarray,
         is_profile: bool,
+        logit_indices_device: torch.Tensor | None = None,
     ) -> None:
         if not (self.dp_parallel_lmhead or self.local_parallel_lmhead) or is_profile:
             return
-        logit_indices = torch.from_numpy(
-            np.cumsum(num_scheduled_tokens) - 1
-        ).to(self.device, non_blocking=True)
-        sample_hs = hidden_states[logit_indices]
+        if logit_indices_device is None:
+            logit_indices_device = self._stage_dummy_logits_indices(num_scheduled_tokens)
+        sample_hs = hidden_states[logit_indices_device]
         self.model.compute_logits(sample_hs)
 
     @torch.inference_mode()
@@ -1330,10 +1339,7 @@ class NPUModelRunner(GPUModelRunner):
 
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
 
-        logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        logit_indices_device = torch.from_numpy(logit_indices).to(
-            self.device, non_blocking=True
-        )
+        logit_indices_device = self._stage_dummy_logits_indices(num_scheduled_tokens)
 
         _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
             self._determine_batch_execution_and_padding(
@@ -1549,7 +1555,12 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = outputs
 
             self._dp_sync_main_compute_logits(
-                hidden_states, num_scheduled_tokens, is_profile)
+                hidden_states, num_scheduled_tokens, is_profile,
+                logit_indices_device=(
+                    logit_indices_device
+                    if omni_envs.OMNI_PIN_DUMMY_LOGITS else None
+                ),
+            )
 
             if self.speculative_config and get_pp_group().is_last_rank and self.speculative_config.use_eagle():
                 if not isinstance(self.drafter, EagleProposer):

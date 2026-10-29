@@ -202,8 +202,33 @@ def test_dir_lists_all_registered():
                  "OMNI_DUMP_ENABLE", "OMNI_HEALTH_HANG_SEC",
                  "OMNI_METRICS_WORKER_MEM_EVERY",
                  "OMNI_TRACE_OUTPUT_DIRECTORY",
-                 "OMNI_PANGU_V2_HIGH_THROUGHOUT"}:
+                 "OMNI_PANGU_V2_HIGH_THROUGHOUT",
+                 "OMNI_PIN_DUMMY_LOGITS"}:
         assert must in names
+
+
+def test_pin_dummy_logits_defaults_off():
+    import omni_npu.envs as envs
+
+    assert envs.OMNI_PIN_DUMMY_LOGITS is False
+    assert isinstance(envs.OMNI_PIN_DUMMY_LOGITS, bool)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("1", True),
+        ("0", False),
+        ("true", False),
+        ("TRUE", False),
+        (" 1", False),
+    ],
+)
+def test_pin_dummy_logits_accepts_only_exact_one(monkeypatch, raw, expected):
+    monkeypatch.setenv("OMNI_PIN_DUMMY_LOGITS", raw)
+    import omni_npu.envs as envs
+
+    assert envs.OMNI_PIN_DUMMY_LOGITS is expected
 
 
 def test_source_only_vars_are_not_registered():
