@@ -46,7 +46,7 @@ init_runtime() {
 
 prepare_pool() {
     if [[ "${ENABLE_FUSION_POOL:-1}" != 1 || "${ENABLE_OMNI_CACHE:-0}" != 0 || "${kv_offload:-false}" != false ]]; then
-        echo 'ERROR: this deployment requires KV Pool without Omni Cache/CPU offload' >&2
+        echo 'ERROR: this deployment requires Fusion Pool without Omni Cache/CPU offload' >&2
         return 1
     fi
     if [[ "${MA_DRY_RUN:-0}" == 1 ]]; then
@@ -119,7 +119,8 @@ PY
             --gpu-memory-utilization "${gpu_util:-0.9}"
             --data-parallel-address "$MASTER_IP" --data-parallel-rpc-port "$MASTER_PORT"
             --port "$((API_PORT + rank))" --served-model-name "${MODEL_NAME:-pangu-v2-505b}"
-            --load-format auto --block-size 128 --kv-transfer-config "$KV_TRANSFER_CONFIG")
+            --load-format auto --block-size 128 --enable-expert-parallel
+            --kv-transfer-config "$KV_TRANSFER_CONFIG")
         if [[ "$ROLE" == decode ]]; then
             cmd+=(--data-parallel-size "$VLLM_DP_SIZE" --data-parallel-rank "$VLLM_DP_RANK")
         fi
