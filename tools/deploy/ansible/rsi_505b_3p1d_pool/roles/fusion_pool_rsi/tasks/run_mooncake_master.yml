@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+---
+- name: Start the enabled KV pool master.
+  ansible.builtin.include_tasks:
+    file: "{{ fusion_pool_repo_root }}/Pangu-FusionPool/fusion_pool/deploy/run_mooncake_master.yml"
+  when:
+    - enable_fusion_pool | bool
+    - "'M' in group_names"
+
+- name: Wait for the Mooncake metadata and RPC ports.
+  ansible.builtin.wait_for:
+    host: "{{ host_ip }}"
+    port: "{{ item }}"
+    timeout: 180
+  loop:
+    - "{{ mooncake_metadata_port | default(8081) }}"
+    - "{{ mooncake_rpc_port | default(16752) }}"
+  when: "'M' in group_names and (enable_fusion_pool | bool)"
+  tags: run_mooncake_master

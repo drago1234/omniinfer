@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+---
+# Mirrors roles/common/tasks/run_proxy.yml, but for the dedicated mooncake
+# master container (group M). The master is control-plane only (RPC + HTTP
+# metadata server), needs no NPU, and must be up before any P worker connects.
+# The launch script starts a detached, flock-protected supervisor. Repeated
+# launches do not restart a supervised master; child exits trigger backoff
+# restart. A legacy unsupervised master requires an explicit migration stop.
+- name: Generate the mooncake master docker start command.
+  ansible.builtin.set_fact:
+    resolved_run_mooncake_master_cmd_m: >-
+      {{ docker_exec_cmd }}
+      -d $DOCKER_NAME_M
+      /bin/bash -c $SCRIPTS_PATH/run_mooncake_master.sh
+  when: "'M' in group_names and (enable_fusion_pool | default(false) | bool)"
+  tags: run_mooncake_master
+
+- name: Create the initial shared tenant quota policy.
+  ansible.builtin.copy:
+    content: "{{ {'version': 1, 'tenants': mooncake_tenant_quotas} | to_nice_yaml }}"
+    dest: "{{ ansible_env.SCRIPTS_PATH }}/mooncake_tenant_quotas.yaml"
+    mode: '0640'
+    force: false
+  when:
+    - "'M' in group_names and (enable_fusion_pool | default(false) | bool)"
+    - mooncake_enable_multi_tenants | default(false) | bool
+  tags: run_mooncake_master
+
+- name: Generate the mooncake master launch script.
+  ansible.builtin.template:
+    src: "{{ fusion_pool_repo_root }}/Pangu-FusionPool/fusion_pool/deploy/run_mooncake_master.sh.j2"
+    dest: "$SCRIPTS_PATH/run_mooncake_master.sh"
+    mode: '0750'
+  when: "'M' in group_names and (enable_fusion_pool | default(false) | bool)"
+  tags: run_mooncake_master
+
+- name: Start the mooncake master.
+  ansible.builtin.command:
+    argv:
+      - bash
+      - -c
+      - "{{ resolved_run_mooncake_master_cmd_m }}"
+  environment:
+    DOCKER_NAME_M: "{{ ACTUAL_DOCKER_NAME_M }}"
+  when: "'M' in group_names and (enable_fusion_pool | default(false) | bool)"
+  tags: run_mooncake_master
+
+- name: Synchronize tenant quotas with the running mooncake master.
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ (mooncake_metadata_port | int) + 100 }}/api/v1/tenant_quotas?tenant_id={{ item.name | urlencode }}"
+    method: PUT
+    body_format: json
+    body: "{{ {'requested_quota_bytes': item.quota | string | human_to_bytes | int} }}"
+    status_code: 200
+    timeout: 5
+  loop: "{{ mooncake_tenant_quotas | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: mooncake_tenant_quota_result
+  until: mooncake_tenant_quota_result.status | default(0) == 200
+  retries: 30
+  delay: 2
+  when:
+    - "'M' in group_names and (enable_fusion_pool | default(false) | bool)"
+    - mooncake_enable_multi_tenants | default(false) | bool
+  tags: run_mooncake_master

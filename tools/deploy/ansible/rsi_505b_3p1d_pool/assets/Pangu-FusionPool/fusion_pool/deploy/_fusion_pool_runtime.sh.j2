@@ -1,0 +1,117 @@
+{#- Mooncake KV pool runtime fragment, rendered per host group by
+    omni_vllm_25_npu roles/fusion_pool/tasks/run_server.yml when enable_fusion_pool
+    is true. Mirrors the kv_offload pattern from omni_vllm_25_npu
+    (_kv_offload_runtime.sh.j2): env exports, HugePage reservation via
+    setup_hugetlbfs.sh, and the KV transfer config JSON.
+
+    Role-aware: Prefill hosts resolve the Prefill profile and join the pool
+    as producer (kv_both store connector — unchanged behavior); Decode hosts
+    resolve the Decode profile and join capacity-only (upstream vLLM PR
+    #50498: kv_consumer + enable_lookup false — they contribute their
+    segment to the pool but perform no lookup and no saves). -#}
+{% if 'D' in group_names %}
+{% set profile = resolved_run_server_decode_profile -%}
+{% set pool_role = 'kv_consumer' -%}
+{% set kv_rank_value = '__KV_RANK_D__' -%}
+{% set mooncake_sub_config = {
+  'kv_connector': 'NPUMooncakeStoreConnector',
+  'kv_role': 'kv_consumer',
+  'kv_connector_extra_config': {'enable_lookup': False, 'enable_load_events': False}
+} -%}
+{% else %}
+{% set profile = resolved_run_server_prefill_profile -%}
+{% set pool_role = profile.get('kv_role', 'kv_producer') -%}
+{% set kv_rank_value = kv_rank | int -%}
+{% set mooncake_sub_config = {
+  'kv_connector': 'NPUMooncakeStoreConnector',
+  'kv_role': 'kv_both',
+  'kv_connector_extra_config': {
+    'enable_load_events': fusion_pool_enable_load_events | default(false) | bool,
+    'enable_store_events': fusion_pool_enable_store_events | default(false) | bool
+  }
+} -%}
+{% endif %}
+{% set fusion_pool_config = profile.get('fusion_pool', {}) -%}
+{% set hugepage_enabled = fusion_pool_config.get('hugepage_enabled', true) | bool -%}
+{% set segment_gb = fusion_pool_config.get('global_segment_size_gb', 32) | int -%}
+{% set buffer_gb = fusion_pool_config.get('local_buffer_size_gb', 8) | int -%}
+{% set ssd_enabled = fusion_pool_ssd_offload | default(false) | bool -%}
+{% set tp_num = ascend_rt_visible_devices.split(',') | length -%}
+{% set m_host = groups['M'] | first -%}
+{% set master_ip = hostvars[m_host].host_ip -%}
+{% set metadata_port = hostvars[m_host].mooncake_metadata_port | default(8081) -%}
+{% set rpc_port = hostvars[m_host].mooncake_rpc_port | default(16752) -%}
+# Mooncake engine shared-library paths (libtransfer_engine.so etc.) needed by
+# the vLLM process when the KV pool connector is active.
+export LD_LIBRARY_PATH=/opt/openEuler/gcc-toolset-12/root/usr/lib64:/usr/local/lib/python3.11/site-packages/mooncake:/usr/local/lib:$LD_LIBRARY_PATH
+export MC_STORE_USE_HUGEPAGE={{ hugepage_enabled | ternary('1', '0') }}
+export MC_STORE_HUGEPAGE_SIZE=2MB
+# mooncake.json: master from group M host_ip; ports from M-group inventory vars.
+{% set mooncake_config = {
+  'metadata_server': 'http://' ~ master_ip ~ ':' ~ metadata_port ~ '/metadata',
+  'master_server_address': master_ip ~ ':' ~ rpc_port,
+  'protocol': 'ascend',
+  'device_name': '',
+  'global_segment_size': segment_gb ~ 'GB',
+  'local_buffer_size': buffer_gb ~ 'GB',
+  'tenant_id': fusion_pool_config.get('tenant_id', 'default'),
+  'enable_offload': ssd_enabled,
+  'enable_ssd_offload': ssd_enabled,
+  'ssd_offload_path': fusion_pool_config.get('ssd_offload_path', '/mnt/ssd/fusion_pool')
+} -%}
+printf '%s\n' {{ mooncake_config | to_json | quote }} > /tmp/mooncake.json
+export MOONCAKE_CONFIG_PATH=/tmp/mooncake.json
+{% if ssd_enabled %}
+export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES={{ fusion_pool_config.get('ssd_staging_buffer_bytes', 1342177280) | int }}
+export MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES={{ fusion_pool_config.get('ssd_max_size_bytes', 137438953472) | int }}
+export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=${MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES}
+export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=lru
+{% endif %}
+{% if hugepage_enabled %}
+# HugePage reservation = (global_segment_size + local_buffer_size) * local TP
+# device count: each TP rank mounts one segment plus its transfer buffer.
+# Tune via the profile's fusion_pool.*_size_gb in the playbook.
+FUSION_POOL_SETUP_LOG="${LOG_PATH}/{{ inventory_hostname }}/fusion_pool_setup.log"
+if ! MAP_SIZE_BYTES=$(( ({{ segment_gb }} + {{ buffer_gb }}) * 1024 * 1024 * 1024 * {{ tp_num }} )) \
+  bash "{{ container_workspace }}/omniinfer/tools/deploy/start_server/setup_hugetlbfs.sh" > "${FUSION_POOL_SETUP_LOG}" 2>&1; then
+  echo "[ERROR] KV pool HugePage setup failed; see ${FUSION_POOL_SETUP_LOG}" >&2
+  exit 1
+fi
+{% endif %}
+# KV_TRANSFER_CONFIG mirrors pd_run.sh's MultiConnector branch (LLMDataDist for
+# P->D transfer + NPUMooncakeStore for the shared KV pool). Passing it via
+# --kv-transfer-config hits pd_run.sh's KV_TRANSFER_CONFIG_OVERRIDE so the
+# internally-built config is skipped. Runtime-only values use __TOKEN__s that
+# the shell expands below, same mechanism as _kv_offload_runtime.sh.j2.
+{% set parallel_size_token = '__KV_PARALLEL_SIZE__' -%}
+{% set port_token = '__OMNI_LLMDATADIST_ZMQ_PORT__' -%}
+{% set primary_connector_config = {
+  'kv_connector': 'LLMDataDistConnector',
+  'kv_role': pool_role,
+  'kv_rank': kv_rank_value,
+  'kv_parallel_size': parallel_size_token,
+  'kv_port': port_token
+} -%}
+{% set kv_transfer_config = {
+  'kv_connector': 'MultiConnector',
+  'kv_connector_module_path': 'fusion_pool.connector.pool_event_multi_connector',
+  'kv_role': pool_role,
+  'kv_rank': kv_rank_value,
+  'kv_parallel_size': parallel_size_token,
+  'kv_port': port_token,
+  'kv_connector_extra_config': {
+    'connectors': [
+      primary_connector_config,
+      mooncake_sub_config
+    ]
+  }
+} -%}
+KV_TRANSFER_CONFIG={{ kv_transfer_config | to_json | quote }}
+KV_TRANSFER_CONFIG="${KV_TRANSFER_CONFIG//\"__KV_PARALLEL_SIZE__\"/${KV_PARALLEL_SIZE}}"
+KV_TRANSFER_CONFIG="${KV_TRANSFER_CONFIG//\"__OMNI_LLMDATADIST_ZMQ_PORT__\"/${VLLM_LLMDATADIST_ZMQ_PORT:-${OMNI_LLMDATADIST_ZMQ_PORT:-5568}}}"
+{% if 'D' in group_names %}
+# Decode joins the PD pair with kv_rank = prefill pod count — the same value
+# the bare-flag decode path passes as --kv-rank; expanded at container start
+# (OMNI_PD_PREFILL_POD_NUM is injected via docker -e).
+KV_TRANSFER_CONFIG="${KV_TRANSFER_CONFIG//\"__KV_RANK_D__\"/${OMNI_PD_PREFILL_POD_NUM}}"
+{% endif %}

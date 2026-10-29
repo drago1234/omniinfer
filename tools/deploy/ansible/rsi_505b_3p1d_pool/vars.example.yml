@@ -1,0 +1,7 @@
+---
+rsi_docker_image: "REPLACE_WITH_IMAGE"
+rsi_model_path: "/mnt/REPLACE_WITH_MODEL_PATH"
+rsi_executor_code_path: "/data/REPLACE_WITH_EXECUTOR_CODE_ROOT"
+rsi_remote_code_path: "/data/REPLACE_WITH_REMOTE_CODE_ROOT"
+rsi_log_path: "/data/REPLACE_WITH_REMOTE_LOG_DIR"
+rsi_executor_log_path: "/data/REPLACE_WITH_EXECUTOR_LOG_DIR"

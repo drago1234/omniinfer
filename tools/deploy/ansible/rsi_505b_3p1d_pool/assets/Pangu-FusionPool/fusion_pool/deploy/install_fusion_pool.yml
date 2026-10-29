@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+---
+# Install the fusion_pool shared KV-cache-pool module (Pangu-Fusion) into the
+# Prefill containers. Only needed when the dedicated mooncake master is
+# enabled: the sole importer is the NPUMooncakeStoreConnector branch of the
+# P-side MultiConnector config, and omni registers that connector as a lazy
+# string 鈥?deployments without enable_fusion_pool never import fusion_pool,
+# so this task must stay gated on that switch (see run_server.yml).
+#
+# The install is a real pip install. fusion_pool depends only on the shared pure-
+# Python kv_common package (NPU KV registration-view helpers); the C-building
+# kv_offload is NOT part of the mooncake path and is deliberately not
+# installed here.
+#
+# Editable (-e), not a copying install: the image pre-installs both packages
+# editable against this same path, so sync_code alone picks up source edits.
+# Re-running -e over an existing editable install is idempotent.
+#
+# The target container defaults to the Prefill container; the Decode
+# preparation block passes fusion_pool_install_container to mirror the install
+# there (capacity-only decode needs the same connector package).
+- name: pip install fusion_pool and kv_common into the container.
+  # The git safe.directory call unblocks the image's setuptools, whose
+  # metadata generation runs git introspection against /workspace/omniinfer
+  # (dubious-ownership failure otherwise). Both packages are pure Python.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ fusion_pool_install_container | default(ACTUAL_DOCKER_NAME_P) }}"
+      - bash
+      - -c
+      - >-
+        git config --global --add safe.directory /workspace/omniinfer || true;
+        pip3 install --no-build-isolation --no-deps -e
+        {{ container_workspace }}/omniinfer/components/Pangu-FusionComm/Pangu-FusionPool/kv_common &&
+        pip3 install --no-build-isolation --no-deps -e
+        {{ container_workspace }}/omniinfer/components/Pangu-FusionComm/Pangu-FusionPool/fusion_pool
+  register: fusion_pool_pip_result
+  changed_when: "'Successfully installed' in fusion_pool_pip_result.stdout"
+  tags: run_server
+
+- name: Verify the fusion_pool import chain inside the container.
+  # Gates service start on a working install: this imports vllm + kv_common +
+  # fusion_pool end to end, exactly the chain the P-side connector resolves at
+  # engine init. Failing here is much cheaper to diagnose than a dead engine.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ fusion_pool_install_container | default(ACTUAL_DOCKER_NAME_P) }}"
+      - bash
+      - -c
+      - >-
+        source /usr/local/Ascend/ascend-toolkit/set_env.sh >/dev/null 2>&1 || true;
+        python3 -c "from fusion_pool.connector.npu_mooncake_store_connector import NPUMooncakeStoreConnector"
+  changed_when: false
+  tags: run_server
