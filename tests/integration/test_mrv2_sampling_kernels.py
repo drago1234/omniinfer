@@ -19,6 +19,7 @@ from omni_npu.worker.npu.ops.gumbel import (
 )
 from omni_npu.worker.npu.ops import rejection_sampler_utils as rejection
 from omni_npu.worker.npu.ops.rejection_sampler_utils import tl_rand32
+from omni_npu.worker.npu.rejection_sampler import gather_draft_sampled
 
 
 pytestmark = [pytest.mark.integration, pytest.mark.npu]
@@ -342,3 +343,101 @@ def test_rejection_greedy_matches_target_argmax(block):
     assert counts.tolist() == [k + 1, 1]
     assert sampled[0, :k + 1].tolist() == [2] * (k + 1)
     assert sampled[1, 0].item() == 2
+
+
+# Placeholder regressions for vLLM #50939 and #58784.
+PLACEHOLDER_STEPS, PLACEHOLDER_VOCAB, PLACEHOLDER_TRIALS = 7, 257, 256
+
+
+def _placeholder_inputs(temperature=1.0, full=True):
+    device = "npu"
+    # A nonidentity request-state mapping must survive batch compaction.
+    mapping = torch.arange(PLACEHOLDER_TRIALS - 1, -1, -1, device=device, dtype=torch.int32)
+    local = torch.arange(PLACEHOLDER_STEPS + 1, device=device, dtype=torch.int32).repeat(PLACEHOLDER_TRIALS)
+    target = torch.full((PLACEHOLDER_TRIALS * (PLACEHOLDER_STEPS + 1), PLACEHOLDER_VOCAB), -float('inf'), device=device)
+    target[:, 3] = torch.log(torch.tensor(0.25)).item()
+    target[:, 5] = torch.log(torch.tensor(0.75)).item()
+    return dict(
+        target_logits=target,
+        draft_logits=target[:1].expand(PLACEHOLDER_TRIALS, PLACEHOLDER_STEPS, PLACEHOLDER_VOCAB).contiguous() if full else None,
+        draft_sampled=torch.full((PLACEHOLDER_TRIALS * (PLACEHOLDER_STEPS + 1),), 5, dtype=torch.int64, device=device),
+        cu_num_logits=torch.arange(0, (PLACEHOLDER_TRIALS + 1) * (PLACEHOLDER_STEPS + 1), PLACEHOLDER_STEPS + 1, device=device, dtype=torch.int32),
+        pos=local.to(torch.int64) + 125,
+        idx_mapping=mapping,
+        expanded_idx_mapping=mapping.repeat_interleave(PLACEHOLDER_STEPS + 1),
+        expanded_local_pos=local,
+        temperature=torch.full((PLACEHOLDER_TRIALS,), temperature, device=device),
+        seed=torch.arange(PLACEHOLDER_TRIALS, device=device, dtype=torch.int64) + 1234,
+        num_speculative_steps=PLACEHOLDER_STEPS,
+    )
+
+
+@pytest.mark.parametrize('mode', ['standard', 'block', 'synthetic'])
+@pytest.mark.parametrize('temperature', [0.0, 1.0])
+@pytest.mark.parametrize('full', [False, True])
+def test_placeholder_recovery_uses_target(mode, temperature, full):
+    args = _placeholder_inputs(temperature, full)
+    args['draft_sampled'].view(PLACEHOLDER_TRIALS, PLACEHOLDER_STEPS + 1)[:, 1:] = -1
+    args['use_block_verification'] = mode == 'block'
+    if mode == 'synthetic':
+        args['synthetic_conditional_rates'] = torch.ones(PLACEHOLDER_STEPS, device="npu")
+    sampled, counts = rejection.rejection_sample(**args)
+    assert (counts == 1).all().item()
+    output = sampled[:, 0].cpu()
+    assert ((output == 3) | (output == 5)).all().item()
+    if temperature == 0:
+        assert (output == 5).all().item()
+    else:
+        # q == p above makes residual recovery invalid; true target recovery
+        # must still draw both tokens with the requested distribution.
+        fraction = (output == 5).float().mean().item()
+        assert 0.60 < fraction < 0.88, fraction
+
+
+@pytest.mark.parametrize('full', [False, True])
+def test_placeholder_blocks_later_valid_drafts(full):
+    args = _placeholder_inputs(full=full)
+    args['target_logits'].fill_(-float('inf'))
+    args['target_logits'][:, 5] = 0
+    if full:
+        args['draft_logits'].fill_(-float('inf'))
+        args['draft_logits'][:, :, 5] = 0
+    args['draft_sampled'].view(PLACEHOLDER_TRIALS, PLACEHOLDER_STEPS + 1)[:, 3] = -1
+    sampled, counts = rejection.rejection_sample(**args, use_block_verification=True)
+    assert (counts == 3).all().item()
+    assert (sampled[:, :3] == 5).all().item()
+
+
+def test_verify_rejects_unproposed_zero_drafts():
+    args = _placeholder_inputs(full=True)
+    target = args['target_logits'].view(PLACEHOLDER_TRIALS, PLACEHOLDER_STEPS + 1, PLACEHOLDER_VOCAB)
+    target.fill_(-40)
+    target[:, 0, 5] = 0
+    target[:, 0, 0] = -20
+    target[:, 1:, 0] = 40
+    args['draft_logits'].zero_()
+    args['draft_sampled'].zero_()
+    original = args['draft_sampled'].clone()
+    prefill = torch.full((PLACEHOLDER_TRIALS,), 126, dtype=torch.int32, device="npu")
+    indices = torch.arange(PLACEHOLDER_TRIALS * (PLACEHOLDER_STEPS + 1), device="npu")
+    gathered, pos = gather_draft_sampled(
+        original, args['pos'], indices, args['expanded_idx_mapping'],
+        args['expanded_local_pos'], prefill,
+    )
+    assert (original == 0).all().item()  # execution/cache input is unchanged
+    assert (gathered.view(PLACEHOLDER_TRIALS, PLACEHOLDER_STEPS + 1)[:, 1:] == -1).all().item()
+    args['draft_sampled'] = gathered
+    args['pos'] = pos
+    sampled, counts = rejection.rejection_sample(**args, use_block_verification=True)
+    assert (counts == 1).all().item()
+    assert (sampled[:, 0] == 5).all().item()
+    # Equality is a real speculative round, even when a valid draft is token 0.
+    prefill.fill_(125)
+    gathered, _ = gather_draft_sampled(
+        original, pos, indices, args['expanded_idx_mapping'],
+        args['expanded_local_pos'], prefill,
+    )
+    assert (gathered == 0).all().item()
+    args['draft_sampled'] = gathered
+    _, counts = rejection.rejection_sample(**args, use_block_verification=True)
+    assert (counts == PLACEHOLDER_STEPS + 1).all().item()
