@@ -169,7 +169,7 @@
         EXTRA_ARGS="${EXTRA_ARGS} --max-num-seqs 8"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-prompt-tokens-details --enable-chunked-prefill"
         EXTRA_ARGS="${EXTRA_ARGS} --distributed-executor-backend mp --dtype bfloat16"
-        COMPILATION_CONFIG='{"mode": 3, "cudagraph_mode":"FULL", "cudagraph_capture_sizes":[16,32,64], "backend":"", "compile_sizes":[16,32,64]}'
+        COMPILATION_CONFIG='{"mode": 3, "cudagraph_mode":"FULL_DECODE_ONLY", "cudagraph_capture_sizes":[16,32,64], "backend":"", "compile_sizes":[16,32,64]}'
         EXTRA_ARGS="${EXTRA_ARGS} --compilation-config ${COMPILATION_CONFIG}"
         EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype li_int8_ds_mla"
         EXTRA_ARGS="${EXTRA_ARGS} --enable-logging-iteration-details"
