@@ -18,7 +18,6 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-
 @triton.jit
 def _penalties_kernel(
     logits_ptr,
@@ -128,4 +127,131 @@ def apply_penalties(
         output_bin_counts.stride(0),
         vocab_size,
         BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+
+# Adapted from vllm-ascend PR #15270, commit
+# ef792533de1d4fcd25e458eda701fa105ffafeb4.
+PROMPT_WORDS_PER_BLOCK = 128
+
+
+@triton.jit
+def _bincount_kernel(
+    expanded_idx_mapping_ptr,
+    all_token_ids_ptr,
+    all_token_ids_stride,
+    prompt_len_ptr,
+    prefill_len_ptr,
+    prompt_flag_ptr,
+    prompt_flag_stride,
+    output_bin_counts_ptr,
+    output_bin_counts_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
+
+    prefill_len = tl.load(prefill_len_ptr + req_state_idx)
+    if block_idx * BLOCK_SIZE >= prefill_len:
+        return
+
+    prompt_len = tl.load(prompt_len_ptr + req_state_idx)
+    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    if block_idx * BLOCK_SIZE < prompt_len:
+        mask = block < prompt_len
+        prompt_tokens = tl.load(all_token_ids_ptr + req_state_idx * all_token_ids_stride + block, mask=mask)
+        # One byte per vocabulary entry instead of a packed bit, so colliding
+        # tokens need no read-modify-write: every lane stores the same value.
+        # The packed mask is built by _pack_prompt_bin_mask_kernel below.
+        tl.store(
+            prompt_flag_ptr + token_idx * prompt_flag_stride + prompt_tokens,
+            tl.full((BLOCK_SIZE,), 1, tl.int8),
+            mask=mask,
+        )
+
+    if (block_idx + 1) * BLOCK_SIZE >= prompt_len:
+        mask = block < prefill_len
+        mask &= block >= prompt_len
+        output_tokens = tl.load(all_token_ids_ptr + req_state_idx * all_token_ids_stride + block, mask=mask)
+        tl.atomic_add(
+            output_bin_counts_ptr + req_state_idx * output_bin_counts_stride + output_tokens,
+            1,
+            mask=mask,
+        )
+
+
+@triton.jit
+def _pack_prompt_bin_mask_kernel(
+    expanded_idx_mapping_ptr,
+    prompt_flag_ptr,
+    prompt_flag_stride,
+    prompt_bin_mask_ptr,
+    prompt_bin_mask_stride,
+    num_words,
+    vocab_size,
+    WORDS_PER_BLOCK: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    word_block_idx = tl.program_id(1)
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
+
+    words = word_block_idx * WORDS_PER_BLOCK + tl.arange(0, WORDS_PER_BLOCK)
+    word_mask = words < num_words
+    bits = tl.arange(0, 32)
+    flat = words[:, None] * 32 + bits[None, :]
+    # The final word runs past vocab_size, so mask per element, not per word.
+    elem_mask = word_mask[:, None] & (flat < vocab_size)
+    flags = tl.load(prompt_flag_ptr + token_idx * prompt_flag_stride + flat, mask=elem_mask, other=0).to(tl.int32)
+    # Each bit is contributed by exactly one lane, so the sum equals an OR.
+    packed = tl.sum(flags << bits[None, :], axis=1)
+    tl.store(prompt_bin_mask_ptr + req_state_idx * prompt_bin_mask_stride + words, packed, mask=word_mask)
+
+
+def bincount(
+    expanded_idx_mapping: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    prompt_len: torch.Tensor,
+    prefill_len: torch.Tensor,
+    prompt_bin_mask: torch.Tensor,
+    output_bin_counts: torch.Tensor,
+    max_prefill_len: int,
+) -> None:
+    output_bin_counts[expanded_idx_mapping] = 0
+    num_tokens = expanded_idx_mapping.shape[0]
+    num_words = prompt_bin_mask.shape[1]
+    vocab_size = output_bin_counts.shape[1]
+    BLOCK_SIZE = 1024
+    num_blocks = triton.cdiv(max_prefill_len, BLOCK_SIZE)
+    # Scratch flags for the prompt bitmask, one byte per vocabulary entry per
+    # request being counted. Freed on return; num_tokens is the number of newly
+    # added penalty requests, so this stays small.
+    prompt_flag = torch.zeros(
+        num_tokens,
+        num_words * 32,
+        dtype=torch.int8,
+        device=prompt_bin_mask.device,
+    )
+    _bincount_kernel[(num_tokens, num_blocks)](
+        expanded_idx_mapping,
+        all_token_ids,
+        all_token_ids.stride(0),
+        prompt_len,
+        prefill_len,
+        prompt_flag,
+        prompt_flag.stride(0),
+        output_bin_counts,
+        output_bin_counts.stride(0),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    # Writes every word of each row, so prompt_bin_mask needs no pre-zeroing.
+    _pack_prompt_bin_mask_kernel[(num_tokens, triton.cdiv(num_words, PROMPT_WORDS_PER_BLOCK))](
+        expanded_idx_mapping,
+        prompt_flag,
+        prompt_flag.stride(0),
+        prompt_bin_mask,
+        prompt_bin_mask.stride(0),
+        num_words,
+        vocab_size,
+        WORDS_PER_BLOCK=PROMPT_WORDS_PER_BLOCK,
     )
