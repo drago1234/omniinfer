@@ -7,7 +7,7 @@ all:
           ansible_host: 127.0.0.1
           ansible_ssh_common_args: -o StrictHostKeyChecking=no -o IdentitiesOnly=yes
           ansible_user: root
-          ansible_ssh_pass: Hw123456
+          ansible_ssh_pass: passwd
           args:
             decode-lb-sdk: pd_score_balance
             prefill-lb-sdk: pd_score_balance
@@ -26,7 +26,7 @@ all:
           DOCKER_IMAGE_ID: image-repository:tag
           ansible_host: 127.0.0.3
           ansible_ssh_common_args: -o StrictHostKeyChecking=no -o IdentitiesOnly=yes
-          ansible_ssh_pass: Hw123456
+          ansible_ssh_pass: passwd
           ansible_user: root
           args:
             base-api-port: $API_PORT
@@ -172,7 +172,7 @@ all:
           DOCKER_IMAGE_ID: image-repository:tag
           ansible_host: 127.0.0.2
           ansible_ssh_common_args: -o StrictHostKeyChecking=no -o IdentitiesOnly=yes
-          ansible_ssh_pass: Hw123456
+          ansible_ssh_pass: passwd
           ansible_user: root
           args:
             base-api-port: $API_PORT
@@ -321,7 +321,7 @@ all:
           ansible_host: 127.0.0.1
           ansible_ssh_common_args: -o StrictHostKeyChecking=no -o IdentitiesOnly=yes
           ansible_user: root
-          ansible_ssh_pass: Hw123456
+          ansible_ssh_pass: passwd
           args:
             base-api-port: $API_PORT
             additional-config:
