@@ -107,42 +107,46 @@ class SQLiteMetadataStore(MMFeatureMetadataStore):
             self._closed = True
 
     def add_feature(self, mm_hash: str, size: int) -> None:
-        self._run_with_retry(lambda: self._execute(
+        self._run_with_retry(lambda: self.conn.execute(
             "INSERT INTO features (mm_hash, size, refcount, last_used) VALUES (?, ?, 0, ?)",
             (mm_hash, size, self._now())
-        ), write=True)
+        ))
+        self._run_with_retry(self.conn.commit)
 
     def inc_refcount(self, mm_hash: str) -> None:
-        self._run_with_retry(lambda: self._execute(
+        self._run_with_retry(lambda: self.conn.execute(
             "UPDATE features SET refcount = refcount + 1, last_used = ? WHERE mm_hash = ?",
             (self._now(), mm_hash)
-        ), write=True)
+        ))
+        self._run_with_retry(self.conn.commit)
 
     def dec_refcount(self, mm_hash: str) -> None:
-        self._run_with_retry(lambda: self._execute(
+        self._run_with_retry(lambda: self.conn.execute(
             "UPDATE features SET refcount = refcount - 1, last_used = ? WHERE mm_hash = ? AND refcount > 0",
             (self._now(), mm_hash)
-        ), write=True)
+        ))
+        self._run_with_retry(self.conn.commit)
 
     def get_refcount(self, mm_hash: str) -> int | None:
-        rows = self._run_with_retry(
-            lambda: self._execute("SELECT refcount FROM features WHERE mm_hash = ?", (mm_hash,), fetch="one")
+        cur = self._run_with_retry(
+            lambda: self.conn.execute("SELECT refcount FROM features WHERE mm_hash = ?", (mm_hash,))
         )
-        return rows[0][0] if rows else None
+        row = self._run_with_retry(cur.fetchone)
+        return row[0] if row else None
 
     def get_total_used(self) -> int:
-        return self._run_with_retry(
-            lambda: self._execute("SELECT COALESCE(SUM(size), 0) FROM features", fetch="one")
-        )[0][0]
+        cur = self._run_with_retry(
+            lambda: self.conn.execute("SELECT COALESCE(SUM(size), 0) FROM features")
+        )
+        return self._run_with_retry(cur.fetchone)[0]
 
     def get_eviction_candidates(self, required_bytes: int) -> List[Tuple[str, int]]:
         candidates = []
-        rows = self._run_with_retry(lambda: self._execute(
-            "SELECT mm_hash, size FROM features WHERE refcount = 0 ORDER BY last_used ASC",
-            fetch="all",
+        cur = self._run_with_retry(lambda: self.conn.execute(
+            "SELECT mm_hash, size FROM features WHERE refcount = 0 ORDER BY last_used ASC"
         ))
         total = 0
-        for mm_hash, size in rows:
+        for mm_hash, size in self._run_with_retry(cur.fetchall):
             candidates.append((mm_hash, size))
             total += size
             if total >= required_bytes:
@@ -150,28 +154,30 @@ class SQLiteMetadataStore(MMFeatureMetadataStore):
         return candidates
 
     def delete_feature(self, mm_hash: str) -> None:
-        self._run_with_retry(lambda: self._execute(
+        self._run_with_retry(lambda: self.conn.execute(
             "DELETE FROM features WHERE mm_hash = ?", (mm_hash,)
-        ), write=True)
+        ))
+        self._run_with_retry(self.conn.commit)
 
     def delete_old_features(self, older_than: int) -> List[str]:
-        def _delete_old_features():
-            rows = self._execute(
-                "SELECT mm_hash FROM features WHERE refcount = 0 AND last_used < ?",
-                (older_than,), fetch="all",
-            )
-            if rows:
-                self._execute(
-                    "DELETE FROM features WHERE refcount = 0 AND last_used < ?",
-                    (older_than,),
-                )
-            return [row[0] for row in rows]
-
-        return self._run_with_retry(_delete_old_features, write=True)
+        cur = self._run_with_retry(lambda: self.conn.execute(
+            "SELECT mm_hash FROM features WHERE refcount = 0 AND last_used < ?",
+            (older_than,)
+        ))
+        hashes = [row[0] for row in self._run_with_retry(cur.fetchall)]
+        if hashes:
+            self._run_with_retry(lambda: self.conn.execute(
+                "DELETE FROM features WHERE refcount = 0 AND last_used < ?",
+                (older_than,)
+            ))
+            self._run_with_retry(self.conn.commit)
+        return hashes
 
     def _init_tables(self):
         def _execute_init_logic():
-            self._execute("""
+            cursor = self.conn.cursor()
+            
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS features (
                     mm_hash TEXT PRIMARY KEY,
                     size INTEGER NOT NULL,
@@ -179,76 +185,36 @@ class SQLiteMetadataStore(MMFeatureMetadataStore):
                     last_used INTEGER NOT NULL
                 )
             """)
-            self._execute(
+            cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_evict ON features(refcount, last_used)"
             )
-            self._execute("DELETE FROM features")
-        self._run_with_retry(_execute_init_logic, write=True)
+            cursor.execute("DELETE FROM features")
+        self._run_with_retry(lambda: self.conn.execute("BEGIN IMMEDIATE TRANSACTION;"))
+        self._run_with_retry(_execute_init_logic)
+        self._run_with_retry(self.conn.commit)
 
     def _current_mode(self) -> str:
-        return self._run_with_retry(
-            lambda: self._execute("PRAGMA journal_mode", fetch="one")
-        )[0][0]
+        cursor = self._run_with_retry(self.conn.cursor)
+        self._run_with_retry(lambda: cursor.execute("PRAGMA journal_mode"))
+        current_mode = self._run_with_retry(cursor.fetchone)[0]
+        return current_mode
 
     def _ensure_wal_mode(self) -> None:
         mode = self._current_mode().lower()
         if mode == "wal":
             return
-        self._run_with_retry(lambda: self._execute("PRAGMA journal_mode=WAL", fetch="one"))
+        self._run_with_retry(lambda: self.conn.execute("PRAGMA journal_mode=WAL"))
 
-    def _execute(
-        self, sql: str, parameters: tuple = (), *, fetch: str | None = None
-    ) -> List[Tuple[Any, ...]]:
-        """Return rows as a list, including for a single row or no results."""
-        # Called inside _run_with_retry: no cursor or read snapshot may escape
-        # the connection lock, including when fetching or executing raises.
-        cursor = self.conn.cursor()
-        rows = []
-        try:
-            cursor.execute(sql, parameters)
-            if fetch == "one":
-                rows = cursor.fetchmany(1)
-            elif fetch == "all":
-                rows = cursor.fetchall()
-        finally:
-            cursor.close()
-        return rows
-
-    def _run_with_retry(self, func: Callable[[], T], *, write: bool = False) -> T:
-        """Retry a complete operation, never a statement in a failed transaction."""
+    def _run_with_retry(self, func: Callable[[], T]) -> T:  # pylint: disable=inconsistent-return-statements
         start = time.monotonic()
         for attempt in range(self._max_retry_attempts):
             try:
                 with self._db_lock:
-                    try:
-                        if write:
-                            # Reserve the writer before reading to avoid upgrading
-                            # a stale WAL read snapshot (SQLITE_BUSY_SNAPSHOT).
-                            self._execute("BEGIN IMMEDIATE")
-                        result = func()
-                        if write:
-                            self.conn.commit()
-                        return result
-                    except Exception:
-                        # Also handles IntegrityError: callers may catch duplicate
-                        # inserts, but must not inherit an open write transaction.
-                        self.conn.rollback()
-                        raise
+                    return func()
             except sqlite3.OperationalError as e:
                 message = str(e).lower()
-                code = getattr(e, "sqlite_errorcode", None)
-                name = getattr(e, "sqlite_errorname", None)
-                retryable = (
-                    (code & 0xff) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_IOERR)
-                    if code is not None else
-                    any(text in message for text in ("locked", "busy", "disk i/o error"))
-                )
-                if not retryable:
+                if "locked" not in message and "busy" not in message and "disk i/o error" not in message:
                     raise
-                logger.warning(
-                    "SQLite operation failed: code=%s name=%s attempt=%d/%d: %s",
-                    code, name, attempt + 1, self._max_retry_attempts, e,
-                )
                 if attempt == self._max_retry_attempts - 1:
                     raise
                 if time.monotonic() - start >= self._max_retry_total_seconds:
@@ -554,3 +520,4 @@ class DiskMMFeatureConnector(BaseMMFeatureConnector):
                         os.remove(entry_path)
                     except OSError:
                         pass
+
