@@ -33,7 +33,8 @@
     pangu_scripts_path: /data/xxx/pangu21/logs_path/scripts_path
 
     model: pangu-v2-92b
-    model_path: "/path/to/model"
+    # model_path: "/mnt/sfs_turbo/bucket-910c-6055/zhuqi/ckpt/pangu92b/0620_v21_new/output_ckpts/hf/global_step_26-iterative-int8-0626"
+    model_path: "/mnt/sfs_turbo_new/bucket-910c-6055/s00562949/models/openPangu_2.0_Flash_INT8/global_step_26-iterative-int8-0626"
 
     # Keep the D-side local OX ports distinct because this inventory runs P and
     # D containers on one host with --net=host. Only P binds the completion port.
@@ -237,6 +238,7 @@
         export TORCH_COMPILE_DISABLE=0
         export VLLM_CACHE_ROOT='./graph_cache'
         export TASK_QUEUE_ENABLE=1
+        export LOCAL_WORLD_SIZE=16
         export HCCL_SOCKET_IFNAME=enp23s0f3
         # export OMNI_CACHE_V2_DIAGNOSTICS=3
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True

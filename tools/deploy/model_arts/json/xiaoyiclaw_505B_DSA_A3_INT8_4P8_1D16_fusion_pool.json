@@ -463,6 +463,7 @@
             "MODEL_PATH": "/path/to/model",
             "npu": "16",
             "NUM_SERVERS": "16",
+            "LOCAL_WORLD_SIZE": "16",
             "SOCKET_IFNAME": "eth0",
             "ENABLE_OMNI_CACHE": "0",
             "LOG_PATH": "/home/ma-user/",

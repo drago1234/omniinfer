@@ -184,6 +184,7 @@
             "cpu_bytes_to_use": "53687091200",
             "npu": "4",
             "NUM_SERVERS": "4",
+            "LOCAL_WORLD_SIZE": "4",
             "OMNI_LMHEAD_USE_DEVICE_COMM_A2A": "1",
             "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True"
           },

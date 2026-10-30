@@ -165,6 +165,7 @@
         export TORCH_COMPILE_DISABLE=0
         export VLLM_CACHE_ROOT='./graph_cache'
         export TASK_QUEUE_ENABLE=1
+        export LOCAL_WORLD_SIZE=16
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
         rm -rf {{ container_workspace }}/omniinfer/tools/deploy/start_server/static_kernel_compile_outputs
         rm -rf /usr/local/Ascend/cann/opp/static_kernel

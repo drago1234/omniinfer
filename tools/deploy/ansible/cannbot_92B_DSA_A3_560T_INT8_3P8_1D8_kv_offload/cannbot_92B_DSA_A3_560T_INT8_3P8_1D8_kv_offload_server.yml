@@ -107,7 +107,7 @@
 
     # --- Decode：最大图档位 [32] + GPU_UTIL 0.85 + kv_offload ---
     # max-model-len 524288, seqs 8 (=32/(1+MTP3)), batched 2048,
-    # cudagraph FULL [32], npugraph_ex, MTP 3
+    # cudagraph FULL [32], npugraph_ex, MTP 3；A3 保持 LOCAL_WORLD_SIZE=16
     run_server_decode_profile:
       runner: pd_run.sh
       workdir: "{{ container_workspace }}/omniinfer/tools/deploy/start_server"
@@ -143,6 +143,7 @@
         export VLLM_DATA_PARALLEL_EXTERNAL_LB=false
         export VLLM_CACHE_ROOT='./graph_cache'
         export TASK_QUEUE_ENABLE=1
+        export LOCAL_WORLD_SIZE=16
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
         rm -rf ./graph_cache /workspace/omniinfer/tools/deploy/start_server/static_kernel_compile_outputs 2>/dev/null || true
         EXTRA_ARGS="${EXTRA_ARGS} --no-disable-hybrid-kv-cache-manager --enable-expert-parallel"

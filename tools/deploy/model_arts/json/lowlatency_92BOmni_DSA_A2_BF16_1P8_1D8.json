@@ -182,6 +182,7 @@
             "cpu_bytes_to_use": "53687091200",
             "npu": "8",
             "NUM_SERVERS": "8",
+            "LOCAL_WORLD_SIZE": "8",
             "OMNI_LMHEAD_USE_DEVICE_COMM_A2A": "1",
             "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
             "HYBRID_ATTN_GROUP_SIZE": "17"

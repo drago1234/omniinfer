@@ -261,7 +261,8 @@
             "OMNI_PIGGYBACK_INPUT_IDS": "1",
             "DISABLE_GATHER_SELECTION": "0",
             "CPU_AFFINITY_CONF": "0",
-            "NUM_SERVERS": "16"
+            "NUM_SERVERS": "16",
+            "LOCAL_WORLD_SIZE": "16"
           },
           "termination_grace": {
             "termination_grace_period_seconds": 30

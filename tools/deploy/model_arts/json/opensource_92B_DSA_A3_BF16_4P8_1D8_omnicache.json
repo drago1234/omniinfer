@@ -414,6 +414,7 @@
             "VLLM_CACHE_ROOT": "./graph_cache",
             "TASK_QUEUE_ENABLE": "1",
             "NUM_SERVERS": "16",
+            "LOCAL_WORLD_SIZE": "16",
             "HCCL_SOCKET_IFNAME": "enp23s0f3",
             "tp": "1",
             "gpu_util": "0.82",
