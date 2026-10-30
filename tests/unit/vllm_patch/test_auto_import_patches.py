@@ -160,6 +160,7 @@ def test_legacy_vl_group_contains_expected_multimodal_patches():
         "patch_mm_feature_transfer_args.py",
         "patch_multimodal_embeddings.py",
         "patch_multimodal_prompt_updates.py",
+        "patch_output_token_budget.py",
         "patch_shm_reference_counting.py",
         "patch_video.py",
     ]
