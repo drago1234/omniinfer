@@ -13,6 +13,27 @@ from omni_npu.worker.npu_model_runner import NPUModelRunner, GPUModelRunner
 pytestmark = pytest.mark.unit
 
 
+@pytest.mark.parametrize("rank,has_table", [(1, True), (5, True), (5, False)])
+def test_worker_reports_actual_engram_group_and_local_parameters(monkeypatch, rank, has_table):
+    from omni_npu.v1.distributed import parallel_state_ext
+    from omni_npu.worker.npu_worker import NPUWorker
+
+    model = torch.nn.Module()
+    if has_table:
+        model.table = torch.nn.Parameter(torch.zeros(3, 4), requires_grad=False)
+        model.table.engram_shared_ptr = model.table.data_ptr()
+    group = SimpleNamespace(ranks=[1, 5], rank_in_group=[1, 5].index(rank))
+    monkeypatch.setattr(parallel_state_ext, "_ENGRAM_SHARED", group)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
+    worker = SimpleNamespace(rank=99, model_runner=SimpleNamespace(get_model=lambda: model))
+    layout = NPUWorker.get_engram_weight_layout(worker)
+    assert layout == dict(global_rank=rank, shared_ranks=[1, 5], writer_global_rank=1,
+                          is_writer=rank == 1, table_names=["table"] if has_table else [])
+    if not has_table:
+        monkeypatch.setattr(parallel_state_ext, "_ENGRAM_SHARED", None)
+        assert NPUWorker.get_engram_weight_layout(worker)["table_names"] == []
+
+
 @pytest.mark.parametrize("kv_transfer,noncontiguous", [(True, True), (False, False), (False, True)])
 def test_kv_allocation_delegates_when_alignment_is_not_required(monkeypatch, kv_transfer, noncontiguous):
     import omni_npu.worker.npu_model_runner as module

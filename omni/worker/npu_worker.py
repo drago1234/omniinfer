@@ -6,7 +6,7 @@ import gc
 import os
 import sys
 from contextlib import AbstractContextManager, nullcontext
-from typing import Optional, Union, List
+from typing import Optional, Union
 from types import NoneType
 
 import torch
@@ -59,6 +59,7 @@ from omni_npu.diagnostics.metrics import stage_metrics
 from omni_npu.worker.collective_features import collective_feature
 import omni_npu.diagnostics.nan_inf.collective  # noqa: F401
 from omni_npu.worker.cpu_affinity import apply_worker_cpu_affinity
+from omni_npu.worker.kv_storage import snapshot_kv_storages, resize_kv_storages
 
 logger = init_logger(__name__)
 
@@ -424,6 +425,22 @@ class NPUWorker(Worker):
                 self.model_runner.get_model(),
             )
 
+    def get_engram_weight_layout(self) -> dict:
+        """Query actual sharing roles and local tables after the model is loaded."""
+        from omni_npu.v1.distributed.parallel_state_ext import get_engram_shared_group
+
+        model = self.model_runner.get_model()
+        names = sorted(name for name, param in model.named_parameters() if hasattr(param, "engram_shared_ptr"))
+        try:
+            group = get_engram_shared_group()
+        except RuntimeError:
+            if names:
+                raise
+            return dict(global_rank=torch.distributed.get_rank(), shared_ranks=[],
+                        writer_global_rank=None, is_writer=False, table_names=[])
+        return dict(global_rank=torch.distributed.get_rank(), shared_ranks=list(group.ranks),
+                    writer_global_rank=group.ranks[0], is_writer=group.rank_in_group == 0, table_names=names)
+
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True, force_attention=True)
@@ -581,14 +598,9 @@ class NPUWorker(Worker):
                 cast_module_to_nd(self.model_runner.get_drafter_model(), tag="drafter_model")
             self.model_runner.get_drafter_model().to("cpu")
 
-        self.kv_nbytes: List[List[int]] = [
-            [t.untyped_storage().nbytes() for t in row]
-            for row in self.model_runner.kv_caches
-        ]
-
-        for kv_caches_i in self.model_runner.kv_caches:
-            for kv_caches_i_j in kv_caches_i:
-                kv_caches_i_j.untyped_storage().resize_(0)
+        self._kv_storage_snapshot = snapshot_kv_storages(self.model_runner.kv_caches)
+        logger.info("Release %d unique KV storages", len(self._kv_storage_snapshot))
+        resize_kv_storages(self._kv_storage_snapshot, release=True)
 
         gc.collect()
         torch.npu.empty_cache()
@@ -625,9 +637,8 @@ class NPUWorker(Worker):
                 self.model_runner.get_drafter_model().to("npu")
 
         if (tags == ["kv_cache"]):
-            for i, kv_caches_i in enumerate(self.model_runner.kv_caches):
-                for j, kv_caches_i_j in enumerate(kv_caches_i):
-                    kv_caches_i_j.untyped_storage().resize_(self.kv_nbytes[i][j])
+            logger.info("Restore %d unique KV storages", len(self._kv_storage_snapshot))
+            resize_kv_storages(self._kv_storage_snapshot, release=False)
 
             logger.info(f"re-register kv caches now")
             self.model_runner.reregister_kv_caches()

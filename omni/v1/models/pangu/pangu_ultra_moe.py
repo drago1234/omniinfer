@@ -1024,7 +1024,7 @@ class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
         logits = self.logits_processor(self.lm_head, hidden_states.to(dtype))
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor | None]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
@@ -1082,7 +1082,7 @@ class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):
                 moe.n_redundant_experts = self.num_redundant_experts
                 moe.experts.update_expert_map()
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor | None]]) -> set[str]:
         stacked_params_mapping: list[tuple[str, str, int]] = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
@@ -1176,6 +1176,10 @@ class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):
 
         record_conv_name = []
         for name, loaded_weight in weights:
+            if loaded_weight is None and not name.endswith((
+                ".engram.embed.weight", ".engram.embed_tokens.weight"
+            )):
+                raise ValueError(f"None is only valid for an online Engram table notification: {name}")
             if _skip_weight(name):
                 continue
 

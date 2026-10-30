@@ -336,15 +336,49 @@ class DPSharedEngramStorage:
     def synchronize(self) -> None:
         torch.distributed.barrier(group=self.group.cpu_group)
 
-    def load_weight(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        """Only the writer loads; every peer waits before using shared rows."""
-        if self.is_writer:
-            source = loaded_weight.detach().narrow(0, param.engram_vocab_start, param.shape[0])
-            rows_per_chunk = max(1, (256 << 20) // (param.shape[1] * max(source.element_size(), param.element_size())))
-            for begin in range(0, param.shape[0], rows_per_chunk):
-                end = min(begin + rows_per_chunk, param.shape[0])
-                param.data[begin:end].copy_(source[begin:end].to(device=param.device, dtype=param.dtype))
-        self.synchronize()
+    def _exchange_load_errors(self, error: str | None) -> None:
+        """Wait for all peers to finish loading and propagate any failure."""
+        errors = [None] * self.group.world_size
+        torch.distributed.all_gather_object(errors, error, group=self.group.cpu_group)
+        failures = [f"member {rank}: {value}" for rank, value in enumerate(errors) if value is not None]
+        if failures:
+            raise RuntimeError("Engram weight load failed: " + "; ".join(failures))
+
+    def load_weight(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor | None,
+        num_embeddings: int,
+    ) -> None:
+        """Accept notifications on non-writers; keep checkpoint Tensor loading."""
+        error = None
+        try:
+            if self.is_writer and loaded_weight is None:
+                raise ValueError("Engram writer requires a full table Tensor")
+            if param.data_ptr() != param.engram_shared_ptr:
+                raise RuntimeError("Engram parameter storage must not be replaced")
+            if self.is_writer:
+                # Only writers consume a full logical table; allow tail padding.
+                if (
+                    loaded_weight.ndim != 2
+                    or loaded_weight.shape[0] < num_embeddings
+                    or loaded_weight.shape[1] != param.shape[1]
+                ):
+                    raise ValueError(
+                        f"Engram table weight shape {tuple(loaded_weight.shape)} requires at least "
+                        f"{num_embeddings} rows and {param.shape[1]} columns"
+                    )
+                source = loaded_weight.detach().narrow(0, param.engram_vocab_start, param.shape[0])
+                rows_per_chunk = max(
+                    1, (256 << 20) // (param.shape[1] * max(source.element_size(), param.element_size()))
+                )
+                for begin in range(0, param.shape[0], rows_per_chunk):
+                    end = min(begin + rows_per_chunk, param.shape[0])
+                    param.data[begin:end].copy_(source[begin:end].to(device=param.device, dtype=param.dtype))
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        # A peer failure may follow a write; the caller must keep inference paused.
+        self._exchange_load_errors(error)
 
     @staticmethod
     def _check_shm_free_space(required_bytes: int) -> None:
@@ -445,20 +479,8 @@ class ParallelEngramEmbedding(nn.Module):
         # Preserve the chosen storage and its registration when model.to() visits.
         return self
 
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        # As in vLLM, load logical head rows and ignore any checkpoint tail padding.
-        if (
-            loaded_weight.ndim != 2
-            or loaded_weight.shape[0] < self.num_embeddings
-            or loaded_weight.shape[1] != self.dim
-        ):
-            raise ValueError(
-                f"Engram table weight shape {tuple(loaded_weight.shape)} requires at least "
-                f"{self.num_embeddings} rows and {self.dim} columns"
-            )
-        if param.data_ptr() != param.engram_shared_ptr:
-            raise RuntimeError("Engram parameter storage must not be replaced")
-        self.storage.load_weight(param, loaded_weight)
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor | None) -> None:
+        self.storage.load_weight(param, loaded_weight, self.num_embeddings)
 
     def process_weights_after_loading(self) -> None:
         if self.dummy_weights:
@@ -479,8 +501,10 @@ class ParallelEngramEmbedding(nn.Module):
         if not rows:
             return
         grid = min(triton.cdiv(rows, 16), max(1, self._num_cores))
+        # The retained view owns a valid CANN registration. Pass its device
+        # address explicitly because Triton misclassifies mapped-host Tensors.
         _engram_lookup_kernel[(grid,)](
-            self._mapped_weight,
+            self._mapped_weight.data_ptr(),
             indices,
             output,
             rows,
@@ -489,6 +513,7 @@ class ParallelEngramEmbedding(nn.Module):
             indices.stride(0),
             indices.stride(1),
             grid,
+            WEIGHT_DTYPE=getattr(tl, str(self._mapped_weight.dtype).removeprefix("torch.")),
             HEAD_START=self.head_start,
             LOCAL_HEADS=self.part_n_hash_cols,
             TOTAL_HEADS=self.n_hash_cols,
@@ -517,7 +542,7 @@ class ParallelEngramEmbedding(nn.Module):
 
 @triton.jit(do_not_specialize=["num_rows", "vocab_start", "vocab_end"])
 def _engram_lookup_kernel(
-    weight,
+    weight: tl.uint64,
     ids,
     output,
     num_rows,
@@ -526,6 +551,7 @@ def _engram_lookup_kernel(
     stride_t,
     stride_h,
     grid,
+    WEIGHT_DTYPE: tl.constexpr,
     HEAD_START: tl.constexpr,
     LOCAL_HEADS: tl.constexpr,
     TOTAL_HEADS: tl.constexpr,
@@ -535,12 +561,13 @@ def _engram_lookup_kernel(
 ):
     """Gather this rank's head embeddings from the shared host table on the NPU.
 
-    Inputs: the registered host table view, absolute hash IDs [token, head],
+    Inputs: the registered host table's device address, absolute hash IDs [token, head],
     and this rank's head and vocabulary ranges.
     Output: write embeddings [token, local head, DIM] into the NPU output buffer.
     Steps: map each output row to a token/head, read its hash ID, subtract
     vocab_start, and copy the table row. Invalid IDs and padded heads write zeros.
     """
+    weight = tl.cast(weight, tl.pointer_type(WEIGHT_DTYPE))
     # vLLM's persistent gather, with BF16 loads instead of FP8 dequantization.
     # All constexpr arguments remain last (Ascend launcher compatibility).
     cols = tl.arange(0, BLOCK_D)

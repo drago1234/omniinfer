@@ -58,11 +58,17 @@ def cpu_kernels(monkeypatch):
             monkeypatch.setattr(torch.npu, "get_device_properties", lambda device: SimpleNamespace(vector_core_num=16))
             monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
 
-            def storage(shape, dtype, group):
-                table = torch.zeros(shape, dtype=dtype)
-                return SimpleNamespace(tensor=table, device_view=lambda: table, load_weight=Mock())
+            def allocate(self, shape, dtype):
+                return torch.zeros(shape, dtype=dtype)
 
-            monkeypatch.setattr(engram, "DPSharedEngramStorage", storage)
+            def gather(errors, error, group):
+                errors[:] = [error] + [None] * (len(errors) - 1)
+
+            # Keep the real loader and its validation; only replace shared-memory
+            # allocation, device registration and collectives for CPU execution.
+            monkeypatch.setattr(engram.DPSharedEngramStorage, "_allocate", allocate)
+            monkeypatch.setattr(engram.DPSharedEngramStorage, "device_view", lambda self: self.tensor)
+            monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
             yield
         finally:
             for obj, snapshot in reversed(snapshots):
@@ -105,7 +111,7 @@ class TestEngramCpuKernels:
     def test_shared_model_preparation_compiles_and_reads_new_inputs(cpu_kernels, monkeypatch, model_type):
         from omni_npu.v1.models.pangu import pangu_ultra_moe, pangu_v2_moe
 
-        group = SimpleNamespace(world_size=1, rank_in_group=0, ranks=[0])
+        group = SimpleNamespace(world_size=1, rank_in_group=0, ranks=[0], cpu_group=None)
         monkeypatch.setattr(engram, "get_tp_group", lambda: group)
 
         def linear(size, width, **kwargs):
@@ -157,7 +163,7 @@ class TestEngramCpuKernels:
         layout = engram.EngramLayout(_config(
             num_heads_per_ngram=7, embedding_dim_per_ngram=14, shard_heads=shard_heads
         ))
-        group = SimpleNamespace(world_size=4, rank_in_group=3, ranks=[0, 1, 2, 3])
+        group = SimpleNamespace(world_size=4, rank_in_group=3, ranks=[0, 1, 2, 3], cpu_group=None)
         monkeypatch.setattr(engram, "get_tp_group", lambda: group)
         embedding = engram.ParallelEngramEmbedding(layout, 2, group)
         full = torch.arange(embedding.num_embeddings * 2, dtype=torch.float32).reshape(-1, 2)
@@ -200,7 +206,7 @@ class TestEngramCpuKernels:
         from omni_npu.model_config.config_loader.loader import model_extra_config
 
         group = SimpleNamespace(world_size=4 if sequence_parallel else 1, rank_in_group=1 if sequence_parallel else 0,
-                                ranks=[0, 1, 2, 3])
+                                ranks=[0, 1, 2, 3], cpu_group=None)
         monkeypatch.setattr(engram, "get_tp_group", lambda: group)
 
         def linear(size, width, **kwargs):

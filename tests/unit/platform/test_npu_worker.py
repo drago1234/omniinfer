@@ -1662,8 +1662,9 @@ class TestNpuWorker:
             "omni_npu.worker.npu_worker.set_aclgraph_recapture",
             mock_recapture)
 
-        worker.kv_nbytes = [[256]]
         stor = MagicMock()
+        stor.nbytes.return_value = 0
+        worker._kv_storage_snapshot = [(stor, 256)]
         kv_tensor = MagicMock()
         kv_tensor.untyped_storage.return_value = stor
         worker.model_runner.kv_caches = [[kv_tensor]]
@@ -1685,8 +1686,9 @@ class TestNpuWorker:
             "omni_npu.worker.npu_worker.set_aclgraph_recapture",
             mock_recapture)
 
-        worker.kv_nbytes = [[128]]
         stor = MagicMock()
+        stor.nbytes.return_value = 0
+        worker._kv_storage_snapshot = [(stor, 128)]
         kv_tensor = MagicMock()
         kv_tensor.untyped_storage.return_value = stor
         worker.model_runner.kv_caches = [[kv_tensor]]

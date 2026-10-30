@@ -978,6 +978,19 @@ class TestPanguUltraV3Engram(unittest.TestCase):
         table_loader.assert_called_once()
         self.assertIs(table_loader.call_args.args[0], engram.embed_tokens.weight)
 
+        # Notifications must reach the table loader without Tensor operations.
+        table = engram.embed_tokens.weight
+        table_loader.reset_mock(side_effect=True)
+        table_name = "model.layers.1.engram.embed.weight"
+        with patch.object(ultra_mod, "fused_moe_make_expert_params_mapping", return_value=[]), patch.object(
+            ultra_mod, "mark_split_q_up_params_loaded"
+        ):
+            loaded = owner.load_weights([(table_name, None)])
+            self.assertEqual(loaded, {table_name.replace("embed.weight", "embed_tokens.weight")})
+            table_loader.assert_called_once_with(table, None)
+            with self.assertRaisesRegex(ValueError, "only valid for an online Engram"):
+                owner.load_weights([("model.layers.1.engram.wkv.weight", None)])
+
     def test_engram_selects_layer_hashes_before_mhc_pre(self):
         layer = ultra_mod.OpenPanguDecoderLayer.__new__(ultra_mod.OpenPanguDecoderLayer)
         nn.Module.__init__(layer)

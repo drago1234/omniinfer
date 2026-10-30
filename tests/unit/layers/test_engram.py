@@ -410,17 +410,18 @@ def test_shared_weight_loading_writes_once_and_fences_peers(monkeypatch, writer,
 
     storage = engram.DPSharedEngramStorage.__new__(engram.DPSharedEngramStorage)
     storage.is_writer = writer
-    storage.group = SimpleNamespace(cpu_group=object())
+    storage.group = SimpleNamespace(cpu_group=object(), world_size=2)
     weight = torch.nn.Parameter(torch.zeros(3, 4, dtype=torch.bfloat16), requires_grad=False)
     weight.engram_vocab_start = 2
     full = torch.arange((7 + padding) * 4, dtype=torch.float32).reshape(7 + padding, 4)
     snapshots = []
 
-    def barrier(*, group):
+    def gather(errors, error, *, group):
         assert group is storage.group.cpu_group
+        errors[:] = [error, None]
         snapshots.append(weight.detach().clone())
 
-    monkeypatch.setattr(engram.torch.distributed, "barrier", barrier)
+    monkeypatch.setattr(engram.torch.distributed, "all_gather_object", gather)
     pointer = weight.data_ptr()
     weight.engram_shared_ptr = pointer
     embedding = engram.ParallelEngramEmbedding.__new__(engram.ParallelEngramEmbedding)
@@ -429,11 +430,89 @@ def test_shared_weight_loading_writes_once_and_fences_peers(monkeypatch, writer,
     embedding.weight_loader(weight, full)
     assert weight.data_ptr() == pointer
     assert len(snapshots) == 1
-    torch.testing.assert_close(snapshots[0], full[2:5].bfloat16() if writer else torch.zeros_like(weight))
+    torch.testing.assert_close(snapshots[-1], full[2:5].bfloat16() if writer else torch.zeros_like(weight))
     for invalid in (full[:6], full[:, :3], full.flatten()):
-        with pytest.raises(ValueError, match="requires at least"):
+        if writer:
+            with pytest.raises(RuntimeError, match="requires at least"):
+                embedding.weight_loader(weight, invalid)
+        else:
+            # Checkpoint peers do not consume or validate their source Tensor.
             embedding.weight_loader(weight, invalid)
-    assert len(snapshots) == 1
+            torch.testing.assert_close(weight, torch.zeros_like(weight))
+    assert len(snapshots) == 4
+
+
+@pytest.mark.parametrize("writer", [True, False])
+def test_none_notification_requires_non_writer(monkeypatch, writer):
+    from omni_npu.layers import engram
+
+    storage = engram.DPSharedEngramStorage.__new__(engram.DPSharedEngramStorage)
+    storage.is_writer = writer
+    storage.group = SimpleNamespace(cpu_group=object(), world_size=2)
+    weight = torch.nn.Parameter(torch.ones(3, 4), requires_grad=False)
+    weight.engram_shared_ptr = weight.data_ptr()
+    calls = []
+
+    def gather(errors, error, group):
+        errors[:] = [error, None]
+        calls.append(error)
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    if writer:
+        with pytest.raises(RuntimeError, match="full table Tensor"):
+            storage.load_weight(weight, None, 7)
+        assert len(calls) == 1
+    else:
+        storage.load_weight(weight, None, 7)
+        assert calls == [None]
+    torch.testing.assert_close(weight, torch.ones_like(weight))
+
+
+def test_peer_table_failure_reaches_non_writer(monkeypatch):
+    from omni_npu.layers import engram
+
+    storage = engram.DPSharedEngramStorage.__new__(engram.DPSharedEngramStorage)
+    storage.is_writer = False
+    storage.group = SimpleNamespace(cpu_group=object(), world_size=2)
+    calls = []
+
+    def gather(errors, error, group):
+        calls.append(error)
+        errors[:] = ["writer failure", error]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    weight = torch.nn.Parameter(torch.ones(3, 4))
+    weight.engram_shared_ptr = weight.data_ptr()
+    with pytest.raises(RuntimeError, match="load failed.*writer failure"):
+        storage.load_weight(weight, None, 7)
+    assert calls == [None]
+
+
+@pytest.mark.parametrize("failure", ["pointer", "copy"])
+def test_writer_failure_is_exchanged_before_raising(monkeypatch, failure):
+    from omni_npu.layers import engram
+
+    storage = engram.DPSharedEngramStorage.__new__(engram.DPSharedEngramStorage)
+    storage.is_writer = True
+    storage.group = SimpleNamespace(cpu_group=object(), world_size=2)
+    weight = torch.nn.Parameter(torch.zeros(3, 4), requires_grad=False)
+    weight.engram_shared_ptr = weight.data_ptr() + (1 if failure == "pointer" else 0)
+    weight.engram_vocab_start = 0
+    calls = []
+
+    def gather(errors, error, group):
+        calls.append(error)
+        errors[:] = [error, None]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    if failure == "copy":
+        def fail_copy(*args, **kwargs):
+            raise OSError("injected copy failure")
+        monkeypatch.setattr(torch.Tensor, "copy_", fail_copy)
+    with pytest.raises(RuntimeError, match="storage must not be replaced|injected copy failure"):
+        storage.load_weight(weight, torch.ones(7, 4), 7)
+    assert len(calls) == 1
+    assert calls[-1] is not None
 
 
 def test_hidden_stream_layouts_preserve_shape_validation():
@@ -701,7 +780,8 @@ def test_shared_mapping_lifetime_cleanup_and_writer_load(monkeypatch, tmp_path, 
         extension.register_mapped_cpu_tensor.assert_called_once_with(storage.tensor, 0)
         weight = torch.nn.Parameter(storage.tensor, requires_grad=False)
         weight.engram_vocab_start = 0
+        weight.engram_shared_ptr = weight.data_ptr()
         source = torch.arange(12, dtype=torch.float32).reshape(3, 4)
-        storage.load_weight(weight, source)
+        storage.load_weight(weight, source, 3)
         torch.testing.assert_close(storage.tensor, source.bfloat16())
-        barrier.assert_called_once_with(group=group.cpu_group)
+        barrier.assert_not_called()
