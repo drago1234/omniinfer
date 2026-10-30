@@ -13,11 +13,14 @@ import itertools
 # OpenCVVideoBackendMixin)` as its base. Mirror that here so our NPU dynamic
 # backend stays compatible. This backend fully overrides `load_bytes`, so it
 # does not depend on the removed class's sampling orchestration.
+from vllm.logger import init_logger
 from vllm.multimodal.video import (
     VIDEO_LOADER_REGISTRY,
     VideoLoader,
     OpenCVVideoBackendMixin,
 )
+
+logger = init_logger(__name__)
 
 
 def get_extracted_frame_indices(total_frames: int, original_fps: float, target_fps: float):
@@ -227,7 +230,7 @@ class NPUOpenCVDynamicVideoBackend(VideoLoader, OpenCVVideoBackendMixin):
                         valid_count += 1
 
             if valid_count != len(frames_indices):
-                raise ValueError(
+                logger.warning(
                     f"Expected reading {len(frames_indices)} frames, "
                     f"but only loaded {valid_count} frames from video."
                 )

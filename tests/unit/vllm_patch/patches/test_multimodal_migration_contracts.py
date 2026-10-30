@@ -405,8 +405,10 @@ def test_multimodal_embedding_merge_preserves_values_and_empty_input(monkeypatch
 
 
 @pytest.mark.parametrize("scenario", ["valid", "open_failed", "bad_fps", "bad_frame", "constructor_failed"])
-def test_video_preserves_valid_frames_and_cleans_up_failures(monkeypatch, scenario):
+def test_video_preserves_valid_frames_and_cleans_up_failures(
+        monkeypatch, scenario):
     paths = []
+    logger = MagicMock()
     cap = SimpleNamespace(
         isOpened=lambda: scenario != "open_failed",
         get=lambda key: {1: 3, 2: 0 if scenario == "bad_fps" else 2, 3: 2, 4: 2}[key],
@@ -423,6 +425,7 @@ def test_video_preserves_valid_frames_and_cleans_up_failures(monkeypatch, scenar
           CAP_PROP_FPS=2, CAP_PROP_FRAME_WIDTH=3, CAP_PROP_FRAME_HEIGHT=4)
     _stub(monkeypatch, "numpy", ndarray=torch.Tensor, uint8=torch.uint8, empty=torch.empty)
     _stub(monkeypatch, "numpy.typing", NDArray=torch.Tensor)
+    _stub(monkeypatch, "vllm.logger", init_logger=lambda _name: logger)
     _stub(monkeypatch, "vllm.multimodal.video",
           VIDEO_LOADER_REGISTRY=SimpleNamespace(register=lambda name: lambda cls: cls),
           VideoLoader=type("VideoLoader", (), {}),
@@ -437,11 +440,16 @@ def test_video_preserves_valid_frames_and_cleans_up_failures(monkeypatch, scenar
         return torch.full((2, 2, 3), index, dtype=torch.uint8)
     monkeypatch.setattr(backend, "decode_single_frame", decode)
 
-    if scenario == "valid":
+    if scenario in ("valid", "bad_frame"):
         frames, metadata = backend.load_bytes(b"test-video")
         assert frames.shape == (2, 2, 2, 3)
         assert torch.equal(frames[0], torch.zeros(2, 2, 3, dtype=torch.uint8))
-        assert torch.equal(frames[1], torch.full((2, 2, 3), 2, dtype=torch.uint8))
+        if scenario == "valid":
+            assert torch.equal(frames[1], torch.full((2, 2, 3), 2, dtype=torch.uint8))
+            logger.warning.assert_not_called()
+        else:
+            logger.warning.assert_called_once_with(
+                "Expected reading 2 frames, but only loaded 1 frames from video.")
         assert metadata["frames_indices"] == [0, 2]
         assert metadata["sample_frame_timestamps"] == [0.0, 1.0]
     else:
