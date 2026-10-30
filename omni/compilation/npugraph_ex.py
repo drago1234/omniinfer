@@ -456,23 +456,135 @@ def _install_py_code_save_hook(
     return restore, state
 
 
-#: npugraph_ex sync ops whose second argument is a runtime-assigned stream
-#: ordinal; only their relative identity is semantic (see _ordinals_normalized).
-_TAGGED_STREAM_OPS = (
-    "tagged_event_record_on_stream",
-    "tagged_event_wait_on_stream",
-    "record_tagged_on_stream",
-)
+def _pool_blocks_of(example_inputs):
+    """(args index, block count) of the KV pool tensor among the inputs.
+
+    The pool tensor dominates every other input by numel (~N*5*1024 vs the
+    4-8k of hidden states); its largest dim is the KV block count N. Units
+    that never touch the pool return (None, None): their digests contain no
+    N anywhere, so nothing needs the treatment.
+    """
+    best_idx, best_numel = None, 0
+    for idx, item in enumerate(example_inputs):
+        numel_fn = getattr(item, "numel", None)
+        if numel_fn is None or not callable(numel_fn):
+            continue
+        try:
+            numel = int(numel_fn())
+        except Exception:  # noqa: BLE001
+            continue
+        if numel >= (1 << 20) and numel > best_numel:
+            best_idx, best_numel = idx, numel
+    if best_idx is None:
+        return None, None
+    try:
+        blocks = max(int(d) for d in example_inputs[best_idx].shape)
+    except Exception:  # noqa: BLE001
+        return best_idx, None
+    return best_idx, blocks
 
 
-def _load_pooled_unit(pool, cache_dir, name):
+def _pool_input_indices(example_inputs):
+    """Indices of every input whose shape carries the KV block count N.
+
+    N comes from the dominant pool tensor (K/V, ~N*5*1024 elements); every
+    input whose shape CONTAINS that value participates -- including 1-D
+    block-table arrays of length N whose numel falls far below any size
+    heuristic. v45b evidence: a 920-site rewrite over the pool-sized
+    inputs still left one such small guard stale (length-N array, numel
+    6633 << 2^20) and the engine asserted at capture -- "expected size
+    6632==6633". Units with no pool tensor return an empty list.
+    """
+    _, blocks = _pool_blocks_of(example_inputs)
+    if blocks is None:
+        return []
+    indices = []
+    for idx, item in enumerate(example_inputs):
+        shape = getattr(item, "shape", None)
+        if shape is None:
+            continue
+        try:
+            if any(int(d) == blocks for d in shape):
+                indices.append(idx)
+        except Exception:  # noqa: BLE001 — symbolic dims
+            continue
+    return indices
+
+
+def _rewrite_pool_guards(py_code, example_inputs, indices):
+    """Rewrite every pool guard's shape/stride literals to the live input's.
+
+    N reaches the artifact only through the first-run assert_size_stride
+    guards (the op sequence is N-free); cross-N reuse rewrites them from
+    the CURRENT tensors -- exact for any layout. Every occurrence for
+    every pool index is rewritten, and two fail-open checks keep a stale
+    guard from ever loading: v44's count=1 rewrite left the second pool
+    tensor's guard stale and the engine asserted at capture time
+    ("expected size 6633==6632") -- loud, but boot-breaking.
+    """
+    for pos, idx in enumerate(indices):
+        tensor = example_inputs[idx]
+        try:
+            shape = tuple(int(d) for d in tensor.shape)
+            stride = tuple(int(d) for d in tensor.stride())
+        except Exception:  # noqa: BLE001 — symbolic dims: cannot pin literals
+            return None
+        literal = f"{shape}, {stride}"
+        pattern = re.compile(
+            r"(assert_size_stride\(args\[" + str(idx) + r"\], )\([^)]*\), \([^)]*\)"
+        )
+        first_match = pattern.search(py_code)
+        py_code, count = pattern.subn(r"\g<1>" + literal, py_code)
+        if not count and pos == 0:
+            return None  # the primary pool input has no guard: unexpected shape
+        # Cross-check with a whitespace-tolerant count: a guard whose format
+        # drifted out of the strict pattern is invisible to BOTH the rewrite
+        # and the residual check below -- the counts must agree or the whole
+        # artifact is a miss (fail-open, never a stale guard).
+        tolerant = re.findall(
+            r"assert_size_stride\s*\(\s*args\[" + str(idx) + r"\]", py_code
+        )
+        if len(tolerant) != count:
+            return None
+        if first_match is not None:
+            old_shape = first_match.group(0).split("(", 2)[2].split(")")[0]
+            if old_shape != ", ".join(str(d) for d in shape):
+                logger.info(
+                    "npugraph_cache: pool guard rewritten args[%d] (%s) -> %s"
+                    " (%d site(s))",
+                    idx,
+                    old_shape,
+                    shape,
+                    count,
+                )
+    # Residual: every pool guard must now carry the live shape literal --
+    # anything left stale would assert at capture time.
+    for idx in indices:
+        shape = tuple(int(d) for d in example_inputs[idx].shape)
+        for match in re.finditer(
+            r"assert_size_stride\(args\[" + str(idx) + r"\], \(([^)]*)\)", py_code
+        ):
+            try:
+                found = tuple(
+                    int(x) for x in match.group(1).split(",") if x.strip()
+                )
+            except ValueError:
+                return None
+            if found != shape:
+                return None
+    return py_code
+
+
+def _load_pooled_unit(pool, cache_dir, name, example_inputs):
     """Serve one unit from the pool, or None for a miss.
 
     The single pool-hit path shared by compile() and load(). The local file
     is never consulted (the pool is sole-source). Every failure degrades to
-    a miss the caller turns into a recompile; only bytes that provably fail
-    to rebuild schedule a heal, because only proven-bad bytes justify
-    overwriting the object.
+    a miss the caller turns into a recompile: a fetch error, a pool guard
+    this boot cannot adapt (never load a stale guard -- it would assert at
+    capture time) and bytes that do not rebuild. Only the last one schedules
+    a heal, because only proven-bad bytes justify overwriting the object;
+    an un-adaptable guard is a generation mismatch, not a poison marker.
     """
     try:
         py_code = pool.fetch(cache_dir, name)
@@ -482,6 +594,28 @@ def _load_pooled_unit(pool, cache_dir, name):
     if py_code is None:
         return None
     try:
+        pool_indices = _pool_input_indices(example_inputs)
+        if pool_indices:
+            rewritten = _rewrite_pool_guards(py_code, example_inputs, pool_indices)
+            if rewritten is None:
+                logger.warning(
+                    "npugraph_cache: pool guard not adaptable for %s "
+                    "(pool args=%s); recompiling",
+                    name,
+                    pool_indices,
+                )
+                return None
+            py_code = rewritten
+        elif _pool_blocks_of(example_inputs)[0] is not None:
+            # A pool-sized input exists but its N is underivable (symbolic
+            # dims): the guards cannot be adapted, and a stale guard asserts
+            # at capture time -- never load one (v47 round B).
+            logger.warning(
+                "npugraph_cache: pool tensor present but N is symbolic for "
+                "%s; recompiling",
+                name,
+            )
+            return None
         from npugraph_ex.npu_fx_compiler import (
             _CompiledFxArtifacts,
             _CompiledFxGraph,
@@ -503,6 +637,15 @@ def _load_pooled_unit(pool, cache_dir, name):
     except Exception as exc:  # noqa: BLE001 - pool never blocks compile
         logger.warning("npugraph_cache: pooled unit failed for %s: %s", name, exc)
         return None
+
+
+#: npugraph_ex sync ops whose second argument is a runtime-assigned stream
+#: ordinal; only their relative identity is semantic (see _ordinals_normalized).
+_TAGGED_STREAM_OPS = (
+    "tagged_event_record_on_stream",
+    "tagged_event_wait_on_stream",
+    "record_tagged_on_stream",
+)
 
 
 def _npugraph_digest(
@@ -549,6 +692,11 @@ def _npugraph_digest(
     {pid}.txt — a cross-boot diff of these files pinpoints any remaining
     nondeterminism line by line instead of hiding it inside the hash.
     """
+    # KV block count N is capacity, not computation: it reaches the digest
+    # only through the pool tensor's shape. Normalizing that one value lets
+    # artifacts be shared across N generations; the load side rewrites the
+    # first-run guards to the current shapes (_rewrite_pool_guards).
+    _kv_blocks = _pool_blocks_of(example_inputs)[1]
     sym_letters: dict[str, str] = {}
 
     def _sym_letter(sym: Any) -> str:
@@ -562,7 +710,11 @@ def _npugraph_digest(
             dims = []
             for dim in value.shape:
                 try:
-                    dims.append(str(int(dim)))
+                    dim_int = int(dim)
+                    dims.append(
+                        "N" if _kv_blocks is not None and dim_int == _kv_blocks
+                        else str(dim_int)
+                    )
                 except Exception:  # noqa: BLE001 — unbacked symint dim
                     dims.append(_sym_letter(dim))
             return f"tensor:{value.dtype}:{','.join(dims)}"
@@ -846,7 +998,9 @@ class NpuGraphExAdaptor(CompilerInterface):
             # pool or a fresh compile.
             if pool is not None:
                 name = os.path.basename(cache_path)
-                compiled_fn = _load_pooled_unit(pool, self.cache_dir, name)
+                compiled_fn = _load_pooled_unit(
+                    pool, self.cache_dir, name, example_inputs
+                )
                 if compiled_fn is not None:
                     return compiled_fn, (key, cache_path)
 
@@ -1039,7 +1193,9 @@ class NpuGraphExAdaptor(CompilerInterface):
             # Sole source: the local file is never consulted; a pool miss
             # falls straight through to compile().
             name = os.path.basename(path)
-            compiled_fn = _load_pooled_unit(pool, self.cache_dir, name)
+            compiled_fn = _load_pooled_unit(
+                pool, self.cache_dir, name, example_inputs
+            )
             if compiled_fn is None:
                 # A miss (or a fetch failure) still resolves this unit: the
                 # summary counts units, not hits.

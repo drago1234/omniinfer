@@ -154,7 +154,12 @@ def _set_config(monkeypatch, cfg):
 
 
 class _Pool:
-    """Programmable double for the npugraph_cache bridge."""
+    """Programmable double for the npugraph_cache bridge.
+
+    Payloads are the decoded py_code TEXT: the bridge decodes the object
+    bytes before returning them, and only text can carry the source rewrite
+    the load path applies.
+    """
 
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
@@ -1409,7 +1414,7 @@ class TestCompileWithPyCodeCache:
         self, npu_env, monkeypatch, cache_ready, pool
     ):
         adaptor, cache_dir, setup = cache_ready
-        pool.objects[f"artifact_0.dddddddddddddddd{_SUFFIX}"] = b"pooled = 1\n"
+        pool.objects[f"artifact_0.dddddddddddddddd{_SUFFIX}"] = "pooled = 1\n"
         monkeypatch.setattr(
             nx, "_npugraph_digest", lambda *a, **k: "dddddddddddddddd"
         )
@@ -1418,7 +1423,7 @@ class TestCompileWithPyCodeCache:
 
         assert compiled is npu_env.loaded
         # the adaptor hands the bridge payload over verbatim (bytes as stored)
-        assert npu_env.loaded_py_codes == [b"pooled = 1\n"]
+        assert npu_env.loaded_py_codes == ["pooled = 1\n"]
         assert npu_env.backend_calls == []  # a hit never recompiles
         assert pool.fetches == [
             (cache_dir, f"artifact_0.dddddddddddddddd{_SUFFIX}")
@@ -1435,7 +1440,7 @@ class TestCompileWithPyCodeCache:
     ):
         adaptor, cache_dir, _ = cache_ready
         name = f"artifact_0.dddddddddddddddd{_SUFFIX}"
-        pool.objects[name] = b"torn = 1\n"
+        pool.objects[name] = "torn = 1\n"
         npu_env.load_error = ValueError("cannot execute")
         monkeypatch.setattr(
             nx, "_npugraph_digest", lambda *a, **k: "dddddddddddddddd"
@@ -1623,7 +1628,7 @@ class TestCompileWithPyCodeCache:
         self, npu_env, monkeypatch, cache_ready, pool
     ):
         adaptor, _, setup = cache_ready
-        pool.objects[f"artifact_0.dddddddddddddddd{_SUFFIX}"] = b"pooled = 1\n"
+        pool.objects[f"artifact_0.dddddddddddddddd{_SUFFIX}"] = "pooled = 1\n"
         monkeypatch.setattr(
             nx, "_npugraph_digest", lambda *a, **k: "dddddddddddddddd"
         )
@@ -1689,7 +1694,7 @@ class TestLoadFromPyCodeCache:
             nx, "_get_npugraph_ex_config", lambda: {"enable": True}
         )
         name = f"artifact_0.dddddddddddddddd{_SUFFIX}"
-        pool.objects[name] = b"pooled = 1\n"
+        pool.objects[name] = "pooled = 1\n"
         monkeypatch.setattr(
             nx, "_npugraph_digest", lambda *a, **k: "dddddddddddddddd"
         )
@@ -1706,7 +1711,7 @@ class TestLoadFromPyCodeCache:
         adaptor, cache_dir, _ = cache_ready
         name = f"artifact_0.dddddddddddddddd{_SUFFIX}"
         self._write_artifact(cache_dir, name, "local = 1\n")
-        pool.objects[name] = b"pooled = 1\n"
+        pool.objects[name] = "pooled = 1\n"
         monkeypatch.setattr(
             nx, "_npugraph_digest", lambda *a, **k: "dddddddddddddddd"
         )
@@ -1717,7 +1722,7 @@ class TestLoadFromPyCodeCache:
 
         assert loaded is npu_env.loaded
         # the local file at the same name is never even read
-        assert npu_env.loaded_py_codes == [b"pooled = 1\n"]
+        assert npu_env.loaded_py_codes == ["pooled = 1\n"]
         assert pool.resolved == 1
 
     def test_canon_digest_names_the_lookup(
@@ -1725,7 +1730,7 @@ class TestLoadFromPyCodeCache:
     ):
         adaptor, cache_dir, _ = cache_ready
         name = f"artifact_0.canoncanoncanon1{_SUFFIX}"
-        pool.objects[name] = b"pooled = 1\n"
+        pool.objects[name] = "pooled = 1\n"
         monkeypatch.setattr(nx, "_get_npugraph_ex_config", lambda: {"enable": True})
         monkeypatch.setattr(nx, "_npugraph_digest", lambda *a, **k: "rawrawrawrawrawr")
         monkeypatch.setattr(nx, "_log_canon", lambda *a, **k: "canoncanoncanon1")
@@ -1758,7 +1763,7 @@ class TestLoadFromPyCodeCache:
     ):
         adaptor, cache_dir, _ = cache_ready
         name = f"artifact_0.dddddddddddddddd{_SUFFIX}"
-        pool.objects[name] = b"torn = 1\n"
+        pool.objects[name] = "torn = 1\n"
         npu_env.load_error = ValueError("cannot execute")
         monkeypatch.setattr(
             nx, "_npugraph_digest", lambda *a, **k: "dddddddddddddddd"
@@ -1831,6 +1836,192 @@ class TestLoadFromPyCodeCache:
         saved = open(handle[1]).read()
         assert npu_env.loaded_py_codes == [saved]
         assert "'gfx" in saved  # the persisted bytes are the namespaced ones
+
+
+def _pool_input(blocks, dtype=torch.uint8):
+    """A KV-pool-shaped input: dominates by numel, largest dim is N."""
+    return torch.empty(blocks, 1024, dtype=dtype)
+
+
+_GUARD_TEMPLATE = (
+    "def call(args):\n"
+    "    assert_size_stride(args[{idx}], ({blocks}, 5, 1024), (5120, 1024, 1))\n"
+)
+
+
+class TestPoolGuardAdaptation:
+    """The KV block count N is capacity, not computation: one guard literal
+    carries it into the artifact, so the digest normalizes it and the load
+    path rewrites it to the boot's own value."""
+
+    def test_pool_blocks_of_finds_the_dominant_input(self):
+        assert nx._pool_blocks_of([torch.empty(2, 3), _pool_input(2048)]) == (
+            1,
+            2048,
+        )
+
+    def test_pool_blocks_of_picks_the_largest_and_skips_non_tensors(self):
+        assert nx._pool_blocks_of(
+            [None, 4, _pool_input(4096), _pool_input(8192)]
+        ) == (3, 8192)
+
+    def test_pool_blocks_of_skips_unmeasurable_and_symbolic_inputs(self):
+        class _Broken:
+            def numel(self):
+                raise RuntimeError("symbolic")
+
+        class _SymbolicPool:
+            shape = (_sym_env().create_unbacked_symint(),)
+
+            def numel(self):
+                return 1 << 20
+
+        assert nx._pool_blocks_of([]) == (None, None)
+        assert nx._pool_blocks_of([_Broken()]) == (None, None)
+        assert nx._pool_blocks_of([_SymbolicPool()]) == (0, None)
+
+    def test_rewrite_pool_guards_rewrites_every_site(self):
+        code = _GUARD_TEMPLATE.format(idx=2, blocks=1234) * 2
+
+        rewritten = nx._rewrite_pool_guards(
+            code, [None, None, torch.empty(2048, 5, 1024)], [2]
+        )
+
+        assert rewritten.count("(2048, 5, 1024)") == 2  # every site, not just the first (v44)
+
+    def test_rewrite_pool_guards_misses_without_the_guard_line(self):
+        inputs = [None, None, torch.empty(2048, 5, 1024)]
+        assert nx._rewrite_pool_guards("x = 1\n", inputs, [2]) is None
+        # a guard for another argument is not the pool guard
+        other_arg = _GUARD_TEMPLATE.format(idx=0, blocks=1)
+        assert nx._rewrite_pool_guards(other_arg, inputs, [2]) is None
+
+    def test_rewrite_pool_guards_covers_small_n_dims(self):
+        # v45b: a 1-D block array of length N sits far below any size
+        # heuristic; N-membership detection must still catch its guard.
+        code = (
+            _GUARD_TEMPLATE.format(idx=2, blocks=4096)
+            + "    assert_size_stride(args[3], (4096,), (1,))\n"
+        )
+        inputs = [None, None, torch.empty(4096, 5, 1024), torch.empty(4096)]
+        rewritten = nx._rewrite_pool_guards(code, inputs, [2, 3])
+        assert "(4096,)" in rewritten
+
+    def test_rewrite_pool_guards_is_silent_when_shapes_match(self, logger):
+        code = _GUARD_TEMPLATE.format(idx=2, blocks=2048)
+
+        rewritten = nx._rewrite_pool_guards(
+            code, [None, None, torch.empty(2048, 5, 1024)], [2]
+        )
+
+        assert rewritten == code
+        logger.info.assert_not_called()
+
+    def test_block_count_is_normalized_out_of_the_digest(self):
+        graph = _add_graph()
+        small = nx._npugraph_digest(graph, [torch.empty(2, 3), _pool_input(2048)])
+        large = nx._npugraph_digest(graph, [torch.empty(2, 3), _pool_input(4096)])
+
+        assert small == large
+
+    def test_non_pool_shape_drift_still_misses(self):
+        graph = _add_graph()
+        first = nx._npugraph_digest(graph, [_pool_input(2048), torch.empty(2, 3)])
+        second = nx._npugraph_digest(graph, [_pool_input(2048), torch.empty(3, 3)])
+
+        assert first != second
+
+    def test_compile_adapts_the_guard_before_loading(
+        self, npu_env, monkeypatch, cache_ready, pool
+    ):
+        adaptor, cache_dir, _ = cache_ready
+        name = f"artifact_0.dddddddddddddddd{_SUFFIX}"
+        pool.objects[name] = _GUARD_TEMPLATE.format(idx=1, blocks=1234)
+        monkeypatch.setattr(nx, "_npugraph_digest", lambda *a, **k: "dddddddddddddddd")
+        inputs = [torch.empty(2, 3), _pool_input(2048)]
+
+        compiled, _ = adaptor.compile(_add_graph(), inputs, {}, key="artifact_0")
+
+        assert compiled is npu_env.loaded
+        loaded_code = npu_env.loaded_py_codes[0]
+        # whole-tuple rewrite: the guard carries the LIVE tensor's exact
+        # shape and stride (the 2-D test pool input), not the stale 3-D one
+        assert "(2048, 1024), (1024, 1)" in loaded_code
+        assert "(1234, 5, 1024)" not in loaded_code
+
+    def test_compile_treats_an_unadaptable_guard_as_a_miss(
+        self, npu_env, monkeypatch, cache_ready, pool
+    ):
+        adaptor, cache_dir, _ = cache_ready
+        name = f"artifact_0.dddddddddddddddd{_SUFFIX}"
+        pool.objects[name] = "def call(args):\n    pass\n"
+        monkeypatch.setattr(nx, "_npugraph_digest", lambda *a, **k: "dddddddddddddddd")
+
+        compiled, handle = adaptor.compile(
+            _add_graph(), [torch.empty(2, 3), _pool_input(2048)], {}, key="artifact_0"
+        )
+
+        assert npu_env.loaded_py_codes == []  # nothing loaded
+        assert npu_env.backend_calls  # recompiled instead
+        # an un-adaptable guard is a generation mismatch, not poison: no heal
+        assert pool.load_failed == []
+        assert compiled == "compiled" and handle is not None
+
+    def test_a_symbolic_pool_tensor_is_a_miss_not_a_broken_artifact(
+        self, npu_env, monkeypatch, cache_ready, pool
+    ):
+        adaptor, cache_dir, _ = cache_ready
+        name = f"artifact_0.dddddddddddddddd{_SUFFIX}"
+        pool.objects[name] = _GUARD_TEMPLATE.format(idx=0, blocks=1234)
+        monkeypatch.setattr(nx, "_npugraph_digest", lambda *a, **k: "dddddddddddddddd")
+
+        class _SymbolicPool:
+            shape = (_sym_env().create_unbacked_symint(),)
+
+            def numel(self):
+                return 1 << 20
+
+        assert (
+            adaptor.load(
+                ("artifact_0", "stale"), _add_graph(), [_SymbolicPool()], 0, None
+            )
+            is None
+        )
+        assert npu_env.loaded_py_codes == []
+        assert pool.load_failed == []
+
+    def test_load_adapts_the_guard_too(self, npu_env, monkeypatch, cache_ready, pool):
+        adaptor, cache_dir, _ = cache_ready
+        name = f"artifact_0.dddddddddddddddd{_SUFFIX}"
+        pool.objects[name] = _GUARD_TEMPLATE.format(idx=1, blocks=1234)
+        monkeypatch.setattr(nx, "_npugraph_digest", lambda *a, **k: "dddddddddddddddd")
+
+        loaded = adaptor.load(
+            ("artifact_0", "stale"),
+            _add_graph(),
+            [torch.empty(2, 3), _pool_input(2048)],
+            0,
+            None,
+        )
+
+        assert loaded is npu_env.loaded
+        assert "(2048, 1024), (1024, 1)" in npu_env.loaded_py_codes[0]
+
+    def test_a_pool_helper_accident_never_blocks_the_compile(
+        self, npu_env, monkeypatch, cache_ready, pool
+    ):
+        adaptor, cache_dir, _ = cache_ready
+        pool.objects[f"artifact_0.dddddddddddddddd{_SUFFIX}"] = "pooled = 1\n"
+        monkeypatch.setattr(nx, "_npugraph_digest", lambda *a, **k: "dddddddddddddddd")
+        monkeypatch.setattr(
+            nx, "_pool_input_indices", MagicMock(side_effect=RuntimeError("boom"))
+        )
+
+        compiled, handle = adaptor.compile(_add_graph(), _inputs(), {}, key="artifact_0")
+
+        assert compiled == "compiled"  # fell through to a fresh compile
+        assert handle is not None
+        assert npu_env.loaded_py_codes == []
 
 
 if __name__ == "__main__":  # pragma: no cover
