@@ -218,9 +218,12 @@ class TestConfigLoaderUnit(unittest.TestCase):
         from omni_npu.model_config.config_loader import loader
 
         config_dir = os.path.join(loader.default_config_path, "low_latency", "openpangu_v3")
-        for role, strategy in (("p", "allgather_reducescatter"), ("d", "dispatch_combine")):
+        for role, model_size, strategy in (
+            ("p", "50B", "allgather_reducescatter"),
+            ("d", "xxB", "dispatch_combine"),
+        ):
             with self.subTest(role=role):
-                filename = f"pangu_v3_moe_bf16_a3_xxB_xp1d_{role}_open.json"
+                filename = f"pangu_v3_moe_bf16_a3_{model_size}_xp1d_{role}_open.json"
                 data = loader._loader_configs_data(os.path.join(config_dir, filename))
                 parallel = loader.ModelParallelConfig(**data["model_parallel_config"])
                 operator = loader.ModelOperatorOptConfig(**data["operator_optimization_config"])

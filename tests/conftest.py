@@ -31,7 +31,6 @@ collect_ignore = [
     # Sampling kernels require a supported torch/CANN/Triton NPU environment.
     # Run these files explicitly for single-device validation.
     "integration/test_mrv2_sampling_kernels.py",
-    "integration/test_mrv2_penalties_npu.py",
     "integration/test_mrv2_topk_topp_npu.py",
     "integration/test_mrv2_position_rng_npu.py",
     "unit/worker/npu/test_mtp_dummy_slots.py",

@@ -18,7 +18,7 @@ from vllm.logger import init_logger
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 from omni_npu.worker.npu.ops.gumbel import gumbel_sample
-from omni_npu.worker.npu.ops.penalties import apply_penalties
+from omni_npu.worker.npu.ops.penalties import apply_penalties, bincount
 from omni_npu.worker.npu.sampler import apply_top_k_top_p
 
 logger = init_logger(__name__)
@@ -125,6 +125,7 @@ else:
 
 @register_patch("MRv2PenaltiesPatch", up_penalties)
 class MRv2PenaltiesPatch(VLLMPatch):
-    _attr_names_to_apply = ["apply_penalties"]
+    _attr_names_to_apply = ["apply_penalties", "bincount"]
 
     apply_penalties = apply_penalties
+    bincount = bincount
