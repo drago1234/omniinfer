@@ -24,6 +24,46 @@ def _disable_worker_cpu_affinity(monkeypatch):
     monkeypatch.delenv("OMNI_WORKER_CPUSET_MAP", raising=False)
 
 
+@pytest.mark.parametrize("enforce_eager", [False, True])
+@pytest.mark.parametrize("use_fusion", [False, True])
+def test_engram_warmup_precedes_capture_including_eager(monkeypatch, enforce_eager, use_fusion):
+    import sys
+    from types import ModuleType
+    from omni_npu.model_config.config_loader.loader import model_extra_config
+
+    monkeypatch.setattr(model_extra_config.operator_opt_config, "use_engram_proj_gate_fusion_op", use_fusion)
+
+    worker = NPUWorker.__new__(NPUWorker)
+    worker.model_config = SimpleNamespace(enforce_eager=enforce_eager, seed=42)
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(compilation_time=1.0, encoder_compilation_time=2.0)
+    )
+    worker.model_runner = SimpleNamespace(
+        max_num_tokens=20480,
+        get_model=MagicMock(),
+        capture_model=MagicMock(),
+    )
+    order = []
+    warmup = MagicMock(side_effect=lambda *args: order.append("warmup"))
+    op = ModuleType("omni_npu.layers.ops.ai_infra_pypto_engram_proj_gate")
+    op.warmup_engram = warmup
+    monkeypatch.setitem(sys.modules, op.__name__, op)
+    worker.model_runner.capture_model.side_effect = lambda: order.append("capture")
+    seed = MagicMock(side_effect=lambda value: order.append("seed"))
+    monkeypatch.setattr("omni_npu.worker.npu_worker.set_random_seed", seed)
+
+    times = worker.compile_or_warm_up_model()
+
+    assert order == (["warmup"] if use_fusion else []) + (["capture"] if not enforce_eager else []) + ["seed"]
+    if use_fusion:
+        warmup.assert_called_once_with(worker.model_runner.get_model.return_value, 20480)
+    else:
+        warmup.assert_not_called()
+        worker.model_runner.get_model.assert_not_called()
+    seed.assert_called_once_with(42)
+    assert (times.language_model, times.encoder) == (1.0, 2.0)
+
+
 @pytest.mark.parametrize(
     ("has_triton_package", "available_device", "expected"),
     [

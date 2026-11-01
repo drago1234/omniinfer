@@ -45,7 +45,7 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.workspace import init_workspace_manager
 
-from omni_npu.model_config.config_loader.loader import load_model_extra_config
+from omni_npu.model_config.config_loader.loader import load_model_extra_config, model_extra_config
 from omni_npu.configs import OmniAdditionalConfig
 from omni_npu.plugin_decorators import load_model_decorator, determine_memory_decorator
 from omni_npu.compilation.acl_graph import (
@@ -110,8 +110,8 @@ class NPUWorker(Worker):
         # Engram 模型需在分布式建组前加载其 JSON 选项,其余模型保持原有顺序
         engram_layers = self._load_engram_extra_config()
         self._init_distributed_environment()
-        model_extra_config = self._load_extra_config_and_determinism(engram_layers)
-        self._emit_config_summary_and_validate(model_extra_config)
+        model_extra_config_ = self._load_extra_config_and_determinism(engram_layers)
+        self._emit_config_summary_and_validate(model_extra_config_)
         self._maybe_init_layer_parallel()
 
         if self.use_v2_model_runner:
@@ -191,7 +191,7 @@ class NPUWorker(Worker):
         _enable_batch_invariant_determinism(_omni_loader.model_extra_config)
         return _omni_loader.model_extra_config
 
-    def _emit_config_summary_and_validate(self, model_extra_config) -> None:
+    def _emit_config_summary_and_validate(self, model_extra_config_) -> None:
         """输出 worker 级配置摘要,随后执行声明式校验(顺序保持先摘要后校验)。"""
         # OMNI-CONF worker-scope snapshot (solution doc §3.3): full dump
         # on local_rank 0, hash-only elsewhere (cross-rank drift signal).
@@ -214,7 +214,7 @@ class NPUWorker(Worker):
         )
         validate_all(
             ValidationContext(
-                model_extra_config=model_extra_config,
+                model_extra_config=model_extra_config_,
                 vllm_config=self.vllm_config,
             ))
 
@@ -392,6 +392,10 @@ class NPUWorker(Worker):
             self.profiler.stop()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        if model_extra_config.operator_opt_config.use_engram_proj_gate_fusion_op:
+            from omni_npu.layers.ops.ai_infra_pypto_engram_proj_gate import warmup_engram
+
+            warmup_engram(self.model_runner.get_model(), self.model_runner.max_num_tokens)
         if not self.model_config.enforce_eager:
             self.model_runner.capture_model()
         set_random_seed(self.model_config.seed)

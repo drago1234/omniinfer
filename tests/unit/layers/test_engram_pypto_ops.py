@@ -23,8 +23,11 @@ def wrapper(monkeypatch):
     pypto.DYNAMIC, pypto.DT_BF16, pypto.DT_FP32 = -1, "bf16", "fp32"
     monkeypatch.setitem(sys.modules, "pypto", pypto)
     path = Path(__file__).resolve().parents[3] / "omni/layers/ops/ai_infra_pypto_engram_proj_gate.py"
-    spec = importlib.util.spec_from_file_location("engram_pypto_wrapper_test", path)
+    # Keep the package name so --cov=omni_npu traces this dynamically loaded code.
+    name = "omni_npu.layers.ops.ai_infra_pypto_engram_proj_gate"
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
     return module
 
@@ -48,7 +51,13 @@ def test_inference_uses_minimal_placeholders_and_preserves_kernel_output(wrapper
         assert args[-1] is False
         for placeholder in args[6:10]:
             assert placeholder.shape == (1,)
-        args[10].copy_(expected.reshape(6, 2, 4))
+        assert args[0].shape == (8, 2, 4)
+        torch.testing.assert_close(args[0][:6], inputs()[0].reshape(6, 2, 4))
+        torch.testing.assert_close(args[1][:6], inputs()[1].reshape(6, 8))
+        assert torch.count_nonzero(args[0][6:]) == 0
+        assert torch.count_nonzero(args[1][6:]) == 0
+        args[10].fill_(1234)
+        args[10][:6].copy_(expected.reshape(6, 2, 4))
 
     compiled = Mock(side_effect=kernel)
     monkeypatch.setattr(wrapper, "ai_infra_engram_proj_gate_kernel", compiled)
@@ -57,6 +66,91 @@ def test_inference_uses_minimal_placeholders_and_preserves_kernel_output(wrapper
     compiled.assert_called_once()
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     assert caches == [None] * 4
+
+
+@pytest.mark.parametrize("tokens,expected", [
+    (1, 1), (3, 4), (1024, 1024),
+    (1025, 1536), (1536, 1536), (1537, 2048), (2048, 2048),
+    (2049, 3072),
+])
+def test_inference_bucket_bounds_padding(wrapper, tokens, expected):
+    assert wrapper.inference_token_bucket(tokens) == expected
+
+
+def test_warmup_covers_bucket_range_and_reuses_plans_for_another_layer(wrapper, monkeypatch):
+    calls = []
+    monkeypatch.setattr(wrapper, "ai_infra_engram_proj_gate", lambda *args, **kwargs: calls.append(args[0].shape[1]))
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(synchronize=Mock()), raising=False)
+    key = torch.zeros(2, 8, 4, dtype=torch.bfloat16)
+    value = torch.zeros(8, 4, dtype=torch.bfloat16)
+    gamma = torch.ones(2, 4, dtype=torch.bfloat16)
+    wrapper.warmup_engram_proj_gate(key, value, gamma, gamma, 3)
+    assert calls == [1, 2, 4]
+    wrapper.warmup_engram_proj_gate(key, value, gamma, gamma, 2560)
+    assert calls == [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 3072]
+    assert set(calls) == {wrapper.inference_token_bucket(n) for n in range(1, 2561)}
+    wrapper.warmup_engram_proj_gate(key.clone(), value.clone(), gamma, gamma, 2560)
+    assert len(calls) == 14
+    wrapper.warmup_engram_proj_gate(key, value, gamma, gamma, 4096)
+    assert calls[-1] == 4096 and len(calls) == 15
+
+
+@pytest.mark.parametrize("failure", ["launch", "completion"])
+def test_warmup_retries_all_buckets_after_failure(wrapper, monkeypatch, failure):
+    calls = []
+
+    def run(query, *args, **kwargs):
+        calls.append(query.shape[1])
+        if failure == "launch" and len(calls) == 2:
+            raise RuntimeError("warmup failed")
+
+    synchronize = Mock(side_effect=[RuntimeError("warmup failed"), None]) if failure == "completion" else Mock()
+    monkeypatch.setattr(wrapper, "ai_infra_engram_proj_gate", run)
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(synchronize=synchronize), raising=False)
+    _, _, key, value, gamma_key, gamma_query = inputs()
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        wrapper.warmup_engram_proj_gate(key, value, gamma_key, gamma_query, 3)
+    failed_calls = len(calls)
+
+    wrapper.warmup_engram_proj_gate(key, value, gamma_key, gamma_query, 3)
+
+    assert calls[failed_calls:] == [1, 2, 4]
+
+
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_warmup_finds_nested_fused_engram_and_uses_local_token_limit(wrapper, monkeypatch, sequence_parallel):
+    from unittest.mock import Mock, call
+    from omni_npu.layers import engram
+
+    warmup = Mock()
+    monkeypatch.setattr(wrapper, "warmup_engram_proj_gate", warmup)
+
+    def fusion(enabled):
+        layer = engram.PanGuEngramFusion.__new__(engram.PanGuEngramFusion)
+        torch.nn.Module.__init__(layer)
+        layer.use_engram_proj_gate_fusion_op = enabled
+        layer.use_sequence_parallel = sequence_parallel
+        layer.embed_tokens = SimpleNamespace(model_tp_size=8)
+        for name in ("proj_weights_key", "proj_weights_value", "k_weight", "q_weight"):
+            setattr(layer, name, object())
+        layer.clamp_value, layer.eps = 1e-6, 1e-5
+        return layer
+
+    first, second, unfused = fusion(True), fusion(True), fusion(False)
+    model = torch.nn.Module()
+    model.language_model = torch.nn.Sequential(
+        torch.nn.Linear(2, 2), first, torch.nn.Sequential(second, unfused)
+    )
+    # Shared module aliases must not cause duplicate warmup.
+    model.shared_alias = first
+    wrapper.warmup_engram(model, 20481)
+
+    local_tokens = 2561 if sequence_parallel else 20481
+    assert warmup.call_args_list == [
+        call(layer.proj_weights_key, layer.proj_weights_value, layer.k_weight, layer.q_weight,
+             local_tokens, clamp_value=1e-6, eps=1e-5)
+        for layer in (first, second)
+    ]
 
 
 def test_training_preserves_cache_shapes_dtypes_and_return_order(wrapper, monkeypatch):
@@ -91,7 +185,9 @@ def test_wrapper_rejects_invalid_inputs_before_launch(wrapper, monkeypatch, inva
     kernel.assert_not_called()
 
 
-@pytest.mark.parametrize("tokens,width,return_cache", [(129, 32, False), (3, 1600, True)])
+@pytest.mark.parametrize("tokens,width,return_cache", [
+    (1, 32, False), (129, 32, False), (3, 1600, True),
+])
 def test_kernel_math_and_tile_tails_match_independent_reference(wrapper, tokens, width, return_cache):
     # Execute the original DSL function with CPU tensor primitives. This checks
     # its math and loop tails; it does not validate PyPTO lowering or NPU execution.

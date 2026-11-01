@@ -31,6 +31,54 @@ import math
 import torch
 import pypto
 
+_WARMED_INFERENCE_BUCKETS = {}
+
+
+def inference_token_bucket(tokens: int) -> int:
+    """Bound the concrete shapes used by PyPTO's runtime control-flow cache."""
+    if tokens <= 1024:
+        return 1 << (tokens - 1).bit_length()
+    if tokens <= 1536:
+        return 1536
+    return ((tokens + 1023) // 1024) * 1024
+
+
+@torch.no_grad()
+def warmup_engram_proj_gate(key, value, gamma_key, gamma_query, max_tokens, clamp_value=1e-6, eps=1e-6):
+    """Prepare every inference bucket before serving, without changing weights."""
+    streams, embedding, hidden = key.shape
+    signature = (key.device, key.dtype, streams, embedding, hidden, clamp_value, eps)
+    warmed = _WARMED_INFERENCE_BUCKETS.setdefault(signature, set())
+    maximum = inference_token_bucket(max_tokens)
+    buckets = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1536]
+    buckets.extend(range(2048, maximum + 1, 1024))
+    prepared = set()
+    for tokens in buckets:
+        if tokens > maximum or tokens in warmed:
+            continue
+        query = torch.zeros((1, tokens, streams, hidden), dtype=key.dtype, device=key.device)
+        memory = torch.zeros((1, tokens, embedding), dtype=key.dtype, device=key.device)
+        ai_infra_engram_proj_gate(query, memory, key, value, gamma_key, gamma_query,
+                                 clamp_value=clamp_value, eps=eps, return_cache=False)
+        prepared.add(tokens)
+    torch.npu.synchronize(key.device)
+    warmed.update(prepared)
+
+
+def warmup_engram(model: torch.nn.Module, max_tokens: int) -> None:
+    """Warm fused Engram projections before graph capture and eager serving."""
+    from omni_npu.layers.engram import PanGuEngramFusion
+
+    for layer in model.modules():
+        if not isinstance(layer, PanGuEngramFusion) or not layer.use_engram_proj_gate_fusion_op:
+            continue
+        warmup_engram_proj_gate(
+            layer.proj_weights_key, layer.proj_weights_value,
+            layer.k_weight, layer.q_weight,
+            layer._lookup_num_tokens(max_tokens),
+            clamp_value=layer.clamp_value, eps=layer.eps,
+        )
+
 
 def sign_sqrt_clamp(tensor, clamp_value):
     """gate 预激活: |tensor|.clamp_min.sqrt * sign, 全程 FP32"""
@@ -169,6 +217,14 @@ def ai_infra_engram_proj_gate(
     b, s, m, h = hidden_states.shape
     de = embeddings.shape[-1]
     device = hidden_states.device
+    tokens = b * s
+    kernel_tokens = tokens if return_cache else inference_token_bucket(tokens)
+    hidden_input = hidden_states.view(tokens, m, h)
+    embedding_input = embeddings.view(tokens, de)
+    if kernel_tokens != tokens:
+        padding = kernel_tokens - tokens
+        hidden_input = torch.nn.functional.pad(hidden_input, (0, 0, 0, 0, 0, padding))
+        embedding_input = torch.nn.functional.pad(embedding_input, (0, 0, 0, padding))
     if return_cache:
         key_cache = torch.zeros([b * s, m, h], dtype=torch.bfloat16, device=device)
         value_cache = torch.zeros([b * s, h], dtype=torch.bfloat16, device=device)
@@ -176,15 +232,15 @@ def ai_infra_engram_proj_gate(
         score_cache = torch.zeros([b * s, m], dtype=torch.float32, device=device)
     else:
         # 推理场景: 不分配 cache, 传最小 dummy 占位 (kernel 不生成 cache 写出代码)
-        key_cache = torch.zeros([1], dtype=torch.bfloat16, device=device)
-        value_cache = torch.zeros([1], dtype=torch.bfloat16, device=device)
-        gate_cache = torch.zeros([1], dtype=torch.float32, device=device)
-        score_cache = torch.zeros([1], dtype=torch.float32, device=device)
-    output = torch.zeros([b * s, m, h], dtype=torch.bfloat16, device=device)
+        key_cache = torch.empty([1], dtype=torch.bfloat16, device=device)
+        value_cache = torch.empty([1], dtype=torch.bfloat16, device=device)
+        gate_cache = torch.empty([1], dtype=torch.float32, device=device)
+        score_cache = torch.empty([1], dtype=torch.float32, device=device)
+    output = torch.empty([kernel_tokens, m, h], dtype=torch.bfloat16, device=device)
 
     ai_infra_engram_proj_gate_kernel(
-        hidden_states.view(b * s, m, h),
-        embeddings.view(b * s, de),
+        hidden_input,
+        embedding_input,
         proj_weights_key,
         proj_weights_value,
         gamma_key,
@@ -199,7 +255,7 @@ def ai_infra_engram_proj_gate(
         return_cache,
     )
 
-    output = output.view(b, s, m, h)
+    output = output[:tokens].view(b, s, m, h)
     if not return_cache:
         # 推理场景: 返回签名与训练一致, 4 个 cache 以 None 占位
         return output, None, None, None, None

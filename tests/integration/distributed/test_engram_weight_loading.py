@@ -56,6 +56,8 @@ def _worker(rank, rendezvous, shard_heads):
             with pytest.raises(RuntimeError, match="load failed.*requires at least"):
                 embedding.weight_loader(embedding.weight, invalid)
             torch.testing.assert_close(embedding.weight, expected, rtol=0, atol=0)
+            # Finish reading this version before the writer starts the next update.
+            embedding.storage.synchronize()
     finally:
         torch.distributed.destroy_process_group()
 
