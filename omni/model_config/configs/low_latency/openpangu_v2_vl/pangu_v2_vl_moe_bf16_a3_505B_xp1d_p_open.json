@@ -19,6 +19,7 @@
         "num_extra_reserved_blocks": 0,
         "disable_npu_top_k_top_p_sample": false,
         "optimize_first_chunk": false,
-        "moe_seq_split_length": 524288
+        "moe_seq_split_length": 524288,
+        "defer_mhc_repeat": true
     }
 }
