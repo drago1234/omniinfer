@@ -19,7 +19,7 @@
         "enable_kv_rmsnorm_rope_cache": true,
         "decode_moe_dispatch_combine": false,
         "enable_moe_agrs": true,
-        "enable_omni_agb": true,
+        "enable_omni_agb": false,
         "enable_agrs_finalize_metadata_overlap": true,
         "shared_expert_multi_stream": true,
         "enable_mome_sp": true,
