@@ -71,7 +71,7 @@ def test_inference_uses_minimal_placeholders_and_preserves_kernel_output(wrapper
 @pytest.mark.parametrize("tokens,expected", [
     (1, 1), (3, 4), (1024, 1024),
     (1025, 1536), (1536, 1536), (1537, 2048), (2048, 2048),
-    (2049, 3072),
+    (2049, 2560), (2561, 3072), (3073, 3584),
 ])
 def test_inference_bucket_bounds_padding(wrapper, tokens, expected):
     assert wrapper.inference_token_bucket(tokens) == expected
@@ -87,12 +87,12 @@ def test_warmup_covers_bucket_range_and_reuses_plans_for_another_layer(wrapper, 
     wrapper.warmup_engram_proj_gate(key, value, gamma, gamma, 3)
     assert calls == [1, 2, 4]
     wrapper.warmup_engram_proj_gate(key, value, gamma, gamma, 2560)
-    assert calls == [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 3072]
+    assert calls == [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 2560]
     assert set(calls) == {wrapper.inference_token_bucket(n) for n in range(1, 2561)}
     wrapper.warmup_engram_proj_gate(key.clone(), value.clone(), gamma, gamma, 2560)
     assert len(calls) == 14
     wrapper.warmup_engram_proj_gate(key, value, gamma, gamma, 4096)
-    assert calls[-1] == 4096 and len(calls) == 15
+    assert calls[-3:] == [3072, 3584, 4096] and len(calls) == 17
 
 
 @pytest.mark.parametrize("failure", ["launch", "completion"])
@@ -156,7 +156,11 @@ def test_warmup_finds_nested_fused_engram_and_uses_local_token_limit(wrapper, mo
 def test_training_preserves_cache_shapes_dtypes_and_return_order(wrapper, monkeypatch):
     def kernel(*args):
         assert args[-1] is True
+        assert args[0].shape == (8, 2, 4)
+        assert torch.count_nonzero(args[0][6:]) == 0
+        assert torch.count_nonzero(args[1][6:]) == 0
         for index, tensor in enumerate(args[6:11], start=1):
+            assert tensor.shape[0] == 8
             tensor.fill_(index)
 
     monkeypatch.setattr(wrapper, "ai_infra_engram_proj_gate_kernel", kernel)
@@ -201,7 +205,7 @@ def test_kernel_math_and_tile_tails_match_independent_reference(wrapper, tokens,
     )
     pypto.loop = range
     pypto.cast = lambda value, dtype: value.to({"bf16": torch.bfloat16, "fp32": torch.float32}[dtype])
-    pypto.matmul = lambda left, right, dtype: left.float() @ right.float()
+    pypto.matmul = lambda left, right, dtype: pypto.cast(left.float() @ right.float(), dtype)
     pypto.maximum = torch.clamp_min
     pypto.abs, pypto.sqrt, pypto.sign, pypto.sum = torch.abs, torch.sqrt, torch.sign, torch.sum
     pypto.div = lambda left, right, *args: left / right
@@ -209,8 +213,9 @@ def test_kernel_math_and_tile_tails_match_independent_reference(wrapper, tokens,
     shapes = [(1, tokens, 2, width), (1, tokens, 8), (2, 8, width), (8, width), (2, width), (2, width)]
     args = [torch.randn(shape, generator=generator).bfloat16() for shape in shapes]
     hidden, memory, key, value, gamma_key, gamma_query = [x.float() for x in args]
-    keys = torch.einsum("bnd,mdh->bnmh", memory, key)
-    values = memory @ value
+    # Projection outputs are rounded to BF16 before FP32 normalization/gating.
+    keys = torch.einsum("bnd,mdh->bnmh", memory, key).bfloat16().float()
+    values = (memory @ value).bfloat16().float()
     normalized_keys = torch.nn.functional.rms_norm(keys, (width,), eps=1e-5) * gamma_key
     queries = torch.nn.functional.rms_norm(hidden, (width,), eps=1e-5) * gamma_query
     scores = (normalized_keys * queries).sum(-1) / width ** 0.5

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # coding: utf-8
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -38,9 +38,7 @@ def inference_token_bucket(tokens: int) -> int:
     """Bound the concrete shapes used by PyPTO's runtime control-flow cache."""
     if tokens <= 1024:
         return 1 << (tokens - 1).bit_length()
-    if tokens <= 1536:
-        return 1536
-    return ((tokens + 1023) // 1024) * 1024
+    return ((tokens + 511) // 512) * 512
 
 
 @torch.no_grad()
@@ -50,8 +48,8 @@ def warmup_engram_proj_gate(key, value, gamma_key, gamma_query, max_tokens, clam
     signature = (key.device, key.dtype, streams, embedding, hidden, clamp_value, eps)
     warmed = _WARMED_INFERENCE_BUCKETS.setdefault(signature, set())
     maximum = inference_token_bucket(max_tokens)
-    buckets = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1536]
-    buckets.extend(range(2048, maximum + 1, 1024))
+    buckets = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+    buckets.extend(range(1024, maximum + 1, 512))
     prepared = set()
     for tokens in buckets:
         if tokens > maximum or tokens in warmed:
@@ -139,14 +137,15 @@ def ai_infra_engram_proj_gate_kernel(
             pypto.set_semantic_label("key_proj")
             pypto.set_cube_tile_shapes([128, 128], [128, 256], [128, 128])
             embeddings = embeddings_in[offset:offset + tile]
-            key_proj = pypto.matmul(embeddings, proj_weights_key_in[m_idx], pypto.DT_BF16)
+            key_proj = pypto.matmul(embeddings, proj_weights_key_in[m_idx], pypto.DT_FP32)
+            pypto.set_vec_tile_shapes(first_axis, h)
+            key_proj_bf16 = pypto.cast(key_proj, pypto.DT_BF16)
             if return_cache:
-                pypto.set_vec_tile_shapes(first_axis, h)
-                key_cache_out[offset:offset + tile, m_idx] = key_proj
+                key_cache_out[offset:offset + tile, m_idx] = key_proj_bf16
 
             pypto.set_semantic_label("score")
             pypto.set_vec_tile_shapes(first_axis, h)
-            key_proj_fp32 = pypto.cast(key_proj, pypto.DT_FP32)
+            key_proj_fp32 = pypto.cast(key_proj_bf16, pypto.DT_FP32)
             query = hidden_states_in[offset:offset + tile, m_idx]
             query_fp32 = pypto.cast(query, pypto.DT_FP32)
             rms_k = pypto.sqrt(pypto.sum(key_proj_fp32 * key_proj_fp32, dim=-1) * (1.0 / h) + eps)
@@ -218,7 +217,8 @@ def ai_infra_engram_proj_gate(
     de = embeddings.shape[-1]
     device = hidden_states.device
     tokens = b * s
-    kernel_tokens = tokens if return_cache else inference_token_bucket(tokens)
+    # bs 归一化到固定 bucket, 复用 PyPTO runtime control-flow cache, 消除 bs 变化引入的前处理空泡
+    kernel_tokens = inference_token_bucket(tokens)
     hidden_input = hidden_states.view(tokens, m, h)
     embedding_input = embeddings.view(tokens, de)
     if kernel_tokens != tokens:
@@ -226,10 +226,11 @@ def ai_infra_engram_proj_gate(
         hidden_input = torch.nn.functional.pad(hidden_input, (0, 0, 0, 0, 0, padding))
         embedding_input = torch.nn.functional.pad(embedding_input, (0, 0, 0, padding))
     if return_cache:
-        key_cache = torch.zeros([b * s, m, h], dtype=torch.bfloat16, device=device)
-        value_cache = torch.zeros([b * s, h], dtype=torch.bfloat16, device=device)
-        gate_cache = torch.zeros([b * s, m], dtype=torch.float32, device=device)
-        score_cache = torch.zeros([b * s, m], dtype=torch.float32, device=device)
+        # cache 按 bucket 尺寸分配 (kernel 全行写出, 含 pad 区), 返回前截断到真实 tokens
+        key_cache = torch.empty([kernel_tokens, m, h], dtype=torch.bfloat16, device=device)
+        value_cache = torch.empty([kernel_tokens, h], dtype=torch.bfloat16, device=device)
+        gate_cache = torch.empty([kernel_tokens, m], dtype=torch.float32, device=device)
+        score_cache = torch.empty([kernel_tokens, m], dtype=torch.float32, device=device)
     else:
         # 推理场景: 不分配 cache, 传最小 dummy 占位 (kernel 不生成 cache 写出代码)
         key_cache = torch.empty([1], dtype=torch.bfloat16, device=device)
@@ -259,8 +260,8 @@ def ai_infra_engram_proj_gate(
     if not return_cache:
         # 推理场景: 返回签名与训练一致, 4 个 cache 以 None 占位
         return output, None, None, None, None
-    score_cache = score_cache.view(b, s, m)
-    key_cache = key_cache.view(b, s, m, h)
-    value_cache = value_cache.view(b, s, h)
-    gate_cache = gate_cache.view(b, s, m)
+    score_cache = score_cache[:tokens].view(b, s, m)
+    key_cache = key_cache[:tokens].view(b, s, m, h)
+    value_cache = value_cache[:tokens].view(b, s, h)
+    gate_cache = gate_cache[:tokens].view(b, s, m)
     return output, score_cache, key_cache, value_cache, gate_cache
