@@ -22,6 +22,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import set_weight_attrs
 from omni_npu.layers.fused_moe.config import FusedMoEQuantConfig, FusedMoEQuantDesc, _quant_flags_to_group_shape
+from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import _uses_mxfp_activation
 from omni_npu.layers.quantization.moe_apply import shared_expert_mlp
 from omni_npu.layers.fused_moe.fused_moe_method_base import NPUFusedMoEMethodBase
 from omni_npu.layers.fused_moe.layer import NPUFusedMoE
@@ -774,8 +775,9 @@ class Mxfp8MlpMethod(FusedMLPMethodBase):
         return output
 
     def apply(self, layer, x, stream_label=None):
-        x_fp8, x_scale = self.apply_quant(x, stream_label=stream_label)
-        x = {'x_mxfp8': x_fp8, 'pertoken_scale': x_scale}
+        if not isinstance(x, dict):
+            x_fp8, x_scale = self.apply_quant(x, stream_label=stream_label)
+            x = {'x_mxfp8': x_fp8, 'pertoken_scale': x_scale}
         gate_up = self.apply_part1_gate_up_on_stream(layer, x, stream_label)
         x = self.apply_part2_activation_on_stream(layer, gate_up, stream_label)
         output = self.apply_part3_down_on_stream(layer, x, stream_label)
@@ -1056,16 +1058,27 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
             if self.on_ascend950:
                 if multi_stream or enable_prefetch:
                     cur_stream.wait_stream(self.shared_experts_stream)
+                routed_input = x_slice
+                input_scale = None
+                shared_input = x_slice
+                opt_config = model_extra_config.operator_opt_config
+                if shared_experts is not None and opt_config.enable_moe_init_routing_v3:
+                    if _uses_mxfp_activation(layer.routed_experts.quant_method.moe_quant_config):
+                        routed_input, input_scale = torch_npu.npu_dynamic_mx_quant(
+                            x_slice, dst_type=torch.float8_e4m3fn, scale_alg=1,
+                        )
+                        shared_input = {"x_mxfp8": routed_input, "pertoken_scale": input_scale}
                 routed_output = fused_experts_tp(
                     layer=layer,
-                    x=x_slice,
+                    x=routed_input,
                     topk_ids=topk_ids,
                     topk_weights=topk_weights,
+                    input_scale=input_scale,
                 )
                 if self.tp_size > 1:
                     routed_output = tensor_model_parallel_all_reduce(routed_output)
                 if shared_experts is not None:
-                    shared_output = shared_experts(x_slice)
+                    shared_output = shared_experts(shared_input)
                     return shared_output, routed_output + shared_output
                 return routed_output
             return fused_experts_tp(
@@ -1076,6 +1089,13 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
             )
 
         prepare_permute_result = self.apply_prepare_permute(strategy_impl, layer, x_slice, topk_ids)
+
+        shared_input = x_slice
+        if strategy == "agrs" and prepare_permute_result.shared_expert_input is not None:
+            shared_input = {
+                "x_mxfp8": prepare_permute_result.shared_expert_input,
+                "pertoken_scale": prepare_permute_result.shared_expert_input_scale,
+            }
 
         use_grouped_matmul_finalize_routing = (strategy == "agrs" and prepare_permute_result.row_idx_type == 1)
         finalize_metadata = None
@@ -1121,7 +1141,7 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
                             if shared_experts.gate_up_proj.tp_size > 1:
                                 shared_output = shared_experts(hidden_states)
                             else:
-                                shared_output = shared_experts(x_slice)
+                                shared_output = shared_experts(shared_input)
             else:
                 # Multi-stream disabled — run shared experts synchronously on the
                 # main stream. Schedule is ignored.
@@ -1129,7 +1149,7 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
                     if shared_experts.gate_up_proj.tp_size > 1:
                         shared_output = shared_experts(hidden_states)
                     else:
-                        shared_output = shared_experts(x_slice)
+                        shared_output = shared_experts(shared_input)
 
             if enable_prefetch:
                 self.shared_experts_stream.wait_stream(cur_stream)
@@ -1146,7 +1166,7 @@ class Mxfp8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
                     if shared_experts.gate_up_proj.tp_size > 1:
                         shared_output = shared_experts(hidden_states)
                     else:
-                        shared_output = shared_experts(x_slice)
+                        shared_output = shared_experts(shared_input)
                     if enable_prefetch:
                         self.model_prefetch.prefetch(
                             "next_attn", shared_output, layer=layer

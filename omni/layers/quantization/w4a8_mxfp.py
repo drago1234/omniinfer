@@ -153,6 +153,126 @@ def _pack_w4a8_mxfp_expert_weight(
     return weight, scales
 
 
+def _pad_w4a8_mxfp_expert_tensor(
+    data: torch.Tensor,
+    logical_size: int,
+    padded_size: int,
+    shard: str,
+    is_scale: bool,
+    group_size: int,
+) -> torch.Tensor:
+    """Pad an expert tensor to the paired-scale alignment.
+
+    Gate and up are padded independently. Down-projection weights are already
+    packed two MXFP4 values per byte, while scales keep one value per group.
+    """
+    fill = 127 if is_scale else 0
+    if shard == "w13":
+        shape = list(data.shape)
+        shape[1] = 2 * padded_size
+        result = data.new_full(shape, fill)
+        result[:, :logical_size].copy_(data[:, :logical_size])
+        result[:, padded_size:padded_size + logical_size].copy_(
+            data[:, logical_size:2 * logical_size]
+        )
+    else:
+        padded_width = (
+            padded_size // group_size if is_scale else padded_size // 2
+        )
+        shape = list(data.shape)
+        shape[-1] = padded_width
+        result = data.new_full(shape, fill)
+        result[..., :data.shape[-1]].copy_(data)
+    return result
+
+
+def _w4a8_mxfp_padded_expert_loader(
+    original_loader,
+    param,
+    loaded_weight,
+    *args,
+    shard=None,
+    is_scale=None,
+    **kwargs,
+):
+    """Reload through the checkpoint's logical TP shape, then restore padding."""
+    logical_size = getattr(param, "_w4a8_mxfp_logical_intermediate", None)
+    if logical_size is None:
+        return original_loader(param, loaded_weight, *args, **kwargs)
+
+    storage = param.data
+    padded_size = param._w4a8_mxfp_padded_intermediate
+    shard = param._w4a8_mxfp_expert_shard if shard is None else shard
+    is_scale = param._w4a8_mxfp_is_scale if is_scale is None else is_scale
+    group_size = param._w4a8_mxfp_group_size
+
+    if shard == "w2" and is_scale:
+        local_blocks = logical_size // group_size
+        if loaded_weight.shape[-1] != local_blocks:
+            tp_rank = param._w4a8_mxfp_tp_rank
+            tp_size = param._w4a8_mxfp_tp_size
+            if loaded_weight.shape[-1] != local_blocks * tp_size:
+                raise ValueError(
+                    "W4A8 MXFP w2 scale TP shape mismatch: "
+                    f"loaded={tuple(loaded_weight.shape)}, "
+                    f"local_blocks={local_blocks}, tp_size={tp_size}"
+                )
+            loaded_weight = loaded_weight.narrow(
+                -1,
+                tp_rank * local_blocks,
+                local_blocks,
+            )
+
+    if shard == "w13":
+        logical = torch.cat(
+            (
+                storage[:, :logical_size],
+                storage[:, padded_size:padded_size + logical_size],
+            ),
+            dim=1,
+        )
+    else:
+        logical_width = (
+            logical_size // group_size if is_scale else logical_size // 2
+        )
+        logical = storage[..., :logical_width].contiguous()
+
+    param.data = logical
+    try:
+        result = original_loader(param, loaded_weight, *args, **kwargs)
+        padded = _pad_w4a8_mxfp_expert_tensor(
+            param.data,
+            logical_size,
+            padded_size,
+            shard,
+            is_scale,
+            group_size,
+        )
+        storage.copy_(padded)
+        return result
+    finally:
+        param.data = storage
+
+
+def _set_w4a8_mxfp_padding_attrs(
+    param: torch.nn.Parameter,
+    logical_size: int,
+    padded_size: int,
+    shard: str,
+    is_scale: bool,
+    group_size: int,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+) -> None:
+    param._w4a8_mxfp_logical_intermediate = logical_size
+    param._w4a8_mxfp_padded_intermediate = padded_size
+    param._w4a8_mxfp_expert_shard = shard
+    param._w4a8_mxfp_is_scale = is_scale
+    param._w4a8_mxfp_group_size = group_size
+    param._w4a8_mxfp_tp_rank = tp_rank
+    param._w4a8_mxfp_tp_size = tp_size
+
+
 def w4a8_mxfp_moe_quant_config(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
@@ -588,7 +708,7 @@ class W4A8MXFPMlpMethod(FusedMLPMethodBase):
 
 
 class W4A8MXFPMoEMethod(Mxfp8MoEMethod):
-    """W4A8 MXFP grouped-expert implementation."""
+    """W4A8 MXFP grouped experts sharing MXFP8 activation quantization."""
 
     def __init__(self, quant_config: W4A8MXFPConfig, layer):
         _require_w4a8_mxfp_runtime()
@@ -605,17 +725,25 @@ class W4A8MXFPMoEMethod(Mxfp8MoEMethod):
         **extra_weight_attrs,
     ):
         _validate_group_size(hidden_size, self.group_size)
-        _validate_group_size(
-            intermediate_size_per_partition,
-            self.group_size,
-        )
+        logical_intermediate_size = intermediate_size_per_partition
+        alignment = self.group_size * _MX_SCALE_PAIR
+        padded_intermediate_size = (
+            (logical_intermediate_size + alignment - 1) // alignment
+        ) * alignment
+        _validate_group_size(padded_intermediate_size, self.group_size)
+        layer._w4a8_mxfp_logical_intermediate = logical_intermediate_size
+        layer._w4a8_mxfp_padded_intermediate = padded_intermediate_size
         num_experts += self.num_of_redundant_experts
-        gate_up_size = 2 * intermediate_size_per_partition
+        gate_up_size = 2 * padded_intermediate_size
         hidden_blocks = hidden_size // self.group_size
-        intermediate_blocks = intermediate_size_per_partition // self.group_size
+        intermediate_blocks = padded_intermediate_size // self.group_size
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        moe_config = getattr(layer, "moe_config", None)
+        tp_rank = getattr(moe_config, "tp_rank", self.tp_rank)
+        tp_size = getattr(moe_config, "tp_size", self.tp_size)
 
         w13_weight = torch.nn.Parameter(
-            torch.empty(
+            torch.zeros(
                 num_experts,
                 gate_up_size,
                 hidden_size // 2,
@@ -624,43 +752,90 @@ class W4A8MXFPMoEMethod(Mxfp8MoEMethod):
             requires_grad=False,
         )
         layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
+        w13_attrs = dict(extra_weight_attrs)
+        if weight_loader is not None:
+            w13_attrs["weight_loader"] = partial(
+                _w4a8_mxfp_padded_expert_loader,
+                weight_loader,
+                shard="w13",
+                is_scale=False,
+            )
+        set_weight_attrs(w13_weight, w13_attrs)
+        _set_w4a8_mxfp_padding_attrs(
+            w13_weight, logical_intermediate_size, padded_intermediate_size,
+            "w13", False, self.group_size, tp_rank, tp_size,
+        )
 
         w2_weight = torch.nn.Parameter(
-            torch.empty(
+            torch.zeros(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition // 2,
+                padded_intermediate_size // 2,
                 dtype=torch.uint8,
             ),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
+        w2_attrs = dict(extra_weight_attrs)
+        if weight_loader is not None:
+            w2_attrs["weight_loader"] = partial(
+                _w4a8_mxfp_padded_expert_loader,
+                weight_loader,
+                shard="w2",
+                is_scale=False,
+            )
+        set_weight_attrs(w2_weight, w2_attrs)
+        _set_w4a8_mxfp_padding_attrs(
+            w2_weight, logical_intermediate_size, padded_intermediate_size,
+            "w2", False, self.group_size, tp_rank, tp_size,
+        )
 
         w13_weight_scale = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                gate_up_size,
-                hidden_blocks,
+            torch.full(
+                (num_experts, gate_up_size, hidden_blocks),
+                127,
                 dtype=torch.uint8,
             ),
             requires_grad=False,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         w2_weight_scale = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                intermediate_blocks,
+            torch.full(
+                (num_experts, hidden_size, intermediate_blocks),
+                127,
                 dtype=torch.uint8,
             ),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        extra_weight_attrs.update({"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value})
-        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        scale_attrs = dict(extra_weight_attrs)
+        scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.CHANNEL.value
+        if weight_loader is not None:
+            scale_attrs["weight_loader"] = partial(
+                _w4a8_mxfp_padded_expert_loader,
+                weight_loader,
+                shard="w13",
+                is_scale=True,
+            )
+        set_weight_attrs(w13_weight_scale, scale_attrs)
+        _set_w4a8_mxfp_padding_attrs(
+            w13_weight_scale, logical_intermediate_size, padded_intermediate_size,
+            "w13", True, self.group_size, tp_rank, tp_size,
+        )
+        w2_scale_attrs = dict(extra_weight_attrs)
+        w2_scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.CHANNEL.value
+        if weight_loader is not None:
+            w2_scale_attrs["weight_loader"] = partial(
+                _w4a8_mxfp_padded_expert_loader,
+                weight_loader,
+                shard="w2",
+                is_scale=True,
+            )
+        set_weight_attrs(w2_weight_scale, w2_scale_attrs)
+        _set_w4a8_mxfp_padding_attrs(
+            w2_weight_scale, logical_intermediate_size, padded_intermediate_size,
+            "w2", True, self.group_size, tp_rank, tp_size,
+        )
 
         # Activations are dynamically quantized each forward.
         layer.w13_input_scale = None

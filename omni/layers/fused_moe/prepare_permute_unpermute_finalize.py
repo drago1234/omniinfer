@@ -96,6 +96,8 @@ class AGRSPreparePermuteResult(PreparePermuteResult):
     shared_expert_gate_up: Optional[torch.Tensor] = None
     shared_expert_finished_event: Optional[torch.npu.Event] = None
     gathered_topk_weights: Optional[torch.Tensor] = None
+    shared_expert_input: Optional[torch.Tensor] = None
+    shared_expert_input_scale: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -337,6 +339,8 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
         shared_output = None
         shared_expert_gate_up = None
         shared_expert_finished_event = None
+        shared_expert_input = None
+        shared_expert_input_scale = None
         if layer.routed_experts.quant_config is None:
             gathered_x = get_ep_group().all_gather(x, dim=0)
             gathered_topk_ids = get_ep_group().all_gather(topk_ids, dim=0)
@@ -383,6 +387,9 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                 x_quant = x_int8
             x_quant_local = x_quant
             x_scale_local = x_scale
+            if use_mxfp:
+                shared_expert_input = x_quant_local
+                shared_expert_input_scale = x_scale_local
             if (model_extra_config.operator_opt_config.shared_expert_multi_stream
                     and model_extra_config.operator_opt_config.shared_expert_parallel_schedule == "with_all_gather"):
                 ready_to_dispatch_event = torch.npu.Event()
@@ -538,6 +545,8 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
             shared_output=shared_output,
             shared_expert_gate_up=shared_expert_gate_up,
             shared_expert_finished_event=shared_expert_finished_event,
+            shared_expert_input=shared_expert_input,
+            shared_expert_input_scale=shared_expert_input_scale,
         )
 
     @staticmethod

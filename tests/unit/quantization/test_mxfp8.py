@@ -742,6 +742,16 @@ class TestMxfp8MlpMethod:
         assert out.shape == (4, 128)
         mock_torch_npu.npu_dynamic_mx_quant.assert_called_once()
 
+    def test_apply_reuses_quantized_input(self, mock_torch_npu, mlp_method):
+        layer = _MockMLPLayer(hidden=128, inter=256)
+        x = {
+            "x_mxfp8": torch.zeros(4, 128, dtype=torch.int8),
+            "pertoken_scale": torch.ones(4, 4, dtype=torch.uint8),
+        }
+        out = mlp_method.apply(layer, x)
+        assert out.shape == (4, 128)
+        mock_torch_npu.npu_dynamic_mx_quant.assert_not_called()
+
     def test_apply_forwards_stream_label_by_keyword(self, mlp_method):
         stream = object()
         x = torch.zeros(2, 4)
@@ -1445,6 +1455,7 @@ def _set_schedule(mxfp8_module, monkeypatch, *, multi_stream, schedule,
                 shared_expert_multi_stream=multi_stream,
                 shared_expert_parallel_schedule=schedule,
                 router_gating_in_fp32=router_gating_in_fp32,
+                enable_moe_init_routing_v3=False,
             ),
         ),
     )
@@ -1572,7 +1583,10 @@ def _build_apply_method(mxfp8_module, moe_method, monkeypatch):
         return_value=("agrs", SimpleNamespace())
     )
     moe_method.apply_prepare_permute = MagicMock(
-        return_value=SimpleNamespace(row_idx_type=0)
+        return_value=SimpleNamespace(
+            row_idx_type=0, shared_expert_input=None,
+            shared_expert_input_scale=None,
+        )
     )
     moe_method.apply_unpermute_finalize = MagicMock(
         return_value=torch.zeros(2, 128, dtype=torch.bfloat16)
@@ -2426,3 +2440,87 @@ def test_pure_tp_keeps_tokens_and_reduces_before_shared(
     assert torch.equal(shared_out, hidden * 3)
     assert torch.equal(total, hidden * 19)
     method.apply_prepare_permute.assert_not_called()
+
+
+@pytest.mark.parametrize("routing_v3", [False, True])
+@pytest.mark.parametrize("with_shared", [False, True])
+def test_tp_shared_quantization_is_reused_only_with_routing_v3(
+    mxfp8_module, moe_method, mock_torch_npu, monkeypatch,
+    routing_v3, with_shared,
+):
+    _patch_npu_streams(monkeypatch)
+    _set_schedule(mxfp8_module, monkeypatch, multi_stream=False,
+                  schedule="with_finalize")
+    opts = mxfp8_module.model_extra_config.operator_opt_config
+    opts.enable_moe_init_routing_v3 = routing_v3
+    mxfp8_module.model_extra_config.parall_config = SimpleNamespace(
+        ena_seq_parallel=False,
+    )
+    method = _build_apply_method(mxfp8_module, moe_method, monkeypatch)
+    method.on_ascend950 = True
+    method.tp_size = 8
+    hidden = torch.ones(2, 128, dtype=torch.bfloat16)
+    shared = MagicMock(return_value=hidden * 3)
+    layer = as_moe_runner(
+        SimpleNamespace(gate=None, shared_experts=shared if with_shared else None),
+        use_ep=False,
+    )
+    layer.routed_experts.quant_method = SimpleNamespace(
+        moe_quant_config=SimpleNamespace(
+            use_mxfp8_w8a8=True, use_mxfp4_w4a8=False,
+            use_hifloat8_w8a8=False,
+        ),
+    )
+    fused = MagicMock(return_value=hidden * 2)
+    monkeypatch.setattr(mxfp8_module, "fused_experts_tp", fused)
+    monkeypatch.setattr(mxfp8_module, "tensor_model_parallel_all_reduce",
+                        lambda value: value * 8)
+    result = method.apply(layer, hidden, torch.ones(2, 4), 1, False)
+    args = fused.call_args.kwargs
+    if routing_v3 and with_shared:
+        mock_torch_npu.npu_dynamic_mx_quant.assert_called_once_with(
+            hidden, dst_type=torch.float8_e4m3fn, scale_alg=1,
+        )
+        shared_input = shared.call_args.args[0]
+        assert args["x"] is shared_input["x_mxfp8"]
+        assert args["input_scale"] is shared_input["pertoken_scale"]
+    else:
+        mock_torch_npu.npu_dynamic_mx_quant.assert_not_called()
+        assert args["x"] is hidden
+        assert args["input_scale"] is None
+        if with_shared:
+            assert shared.call_args.args[0] is hidden
+    if with_shared:
+        shared.assert_called_once()
+        torch.testing.assert_close(result[1], hidden * 19)
+    else:
+        shared.assert_not_called()
+        torch.testing.assert_close(result, hidden * 16)
+    method.apply_prepare_permute.assert_not_called()
+
+
+def test_agrs_shared_reuses_local_quantization(
+    mxfp8_module, moe_method, mock_torch_npu, monkeypatch,
+):
+    _patch_npu_streams(monkeypatch)
+    _set_schedule(mxfp8_module, monkeypatch, multi_stream=False,
+                  schedule="with_finalize")
+    method = _build_apply_method(mxfp8_module, moe_method, monkeypatch)
+    hidden = torch.ones(2, 128, dtype=torch.bfloat16)
+    quantized = torch.zeros(2, 128, dtype=torch.int8)
+    scale = torch.ones(2, 4, dtype=torch.uint8)
+    method.apply_prepare_permute.return_value = SimpleNamespace(
+        row_idx_type=0, shared_expert_input=quantized,
+        shared_expert_input_scale=scale,
+    )
+    method.apply_experts = MagicMock(return_value=hidden * 2)
+    shared = MagicMock(return_value=hidden * 3)
+    shared.gate_up_proj = SimpleNamespace(tp_size=1)
+    layer = as_moe_runner(SimpleNamespace(gate=None, shared_experts=shared),
+                          use_ep=True)
+    method.apply(layer, hidden, torch.ones(2, 4), 1, False)
+    shared.assert_called_once()
+    shared_input = shared.call_args.args[0]
+    assert shared_input["x_mxfp8"] is quantized
+    assert shared_input["pertoken_scale"] is scale
+    mock_torch_npu.npu_dynamic_mx_quant.assert_not_called()

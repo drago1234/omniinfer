@@ -323,8 +323,9 @@ def test_fused_experts_tp_uses_routing_v2(fused_module, monkeypatch):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("prequantized", [False, True])
 def test_fused_experts_tp_routing_v3_quantizes_before_routing_once(
-    fused_module, monkeypatch
+    fused_module, monkeypatch, prequantized
 ):
     module, stubs = fused_module
     config = module.model_extra_config.operator_opt_config
@@ -371,12 +372,16 @@ def test_fused_experts_tp_routing_v3_quantizes_before_routing_once(
 
     module.fused_experts_tp(
         layer=layer,
-        x=x,
+        x=quantized_x if prequantized else x,
         topk_ids=torch.zeros(3, 1, dtype=torch.int64),
         topk_weights=torch.ones(3, 1),
+        input_scale=input_scale if prequantized else None,
     )
 
-    stubs.torch_npu.npu_dynamic_quant.assert_called_once_with(x)
+    if prequantized:
+        stubs.torch_npu.npu_dynamic_quant.assert_not_called()
+    else:
+        stubs.torch_npu.npu_dynamic_quant.assert_called_once_with(x)
     init_call = stubs.torch_npu.npu_moe_init_routing_v2.call_args
     assert torch.equal(init_call.args[0], quantized_x)
     assert torch.equal(init_call.kwargs["scale"], input_scale)

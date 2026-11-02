@@ -95,6 +95,7 @@ def fused_experts_tp(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
 ):
     experts = layer.routed_experts
     n_routed_experts = experts.global_num_experts
@@ -104,8 +105,7 @@ def fused_experts_tp(
     if use_routing_v2 or use_routing_v3:
         topk_ids = topk_ids.int()
         routing_input = x
-        input_scale = None
-        if use_routing_v3:
+        if use_routing_v3 and input_scale is None:
             routing_input, input_scale = torch_npu.npu_dynamic_quant(x)
         (
             sorted_tokens,

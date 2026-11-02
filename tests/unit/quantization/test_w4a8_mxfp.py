@@ -849,7 +849,10 @@ def test_moe_apply_inherits_force_load_balance(
     )
     moe_method.enable_agrs_finalize_metadata_overlap = False
     moe_method.apply_prepare_permute = MagicMock(
-        return_value=SimpleNamespace(row_idx_type=0)
+        return_value=SimpleNamespace(
+            row_idx_type=0, shared_expert_input=None,
+            shared_expert_input_scale=None,
+        )
     )
     moe_method.apply_experts = MagicMock(return_value=torch.zeros(2, 4))
     moe_method.apply_unpermute_finalize = MagicMock(return_value=torch.zeros(2, 4))
@@ -876,3 +879,90 @@ def test_moe_apply_inherits_force_load_balance(
     else:
         assert fused_tp.call_args.kwargs["topk_ids"] is ids
         assert fused_tp.call_args.kwargs["topk_weights"] is weights
+
+
+@pytest.mark.parametrize("shard,is_scale", [
+    ("w13", False), ("w13", True), ("w2", False), ("w2", True),
+])
+def test_expert_padding_preserves_packed_weights_and_scales(
+    w4_module, shard, is_scale,
+):
+    module, _ = w4_module
+    logical, padded, hidden, group = 224, 256, 128, 32
+    if shard == "w13":
+        shape = (2, logical * 2, hidden // group if is_scale else hidden // 2)
+    else:
+        shape = (2, hidden, logical // group if is_scale else logical // 2)
+    data = torch.arange(torch.Size(shape).numel()).remainder(251).to(torch.uint8).reshape(shape)
+    result = module._pad_w4a8_mxfp_expert_tensor(
+        data, logical, padded, shard, is_scale, group,
+    )
+    fill = 127 if is_scale else 0
+    if shard == "w13":
+        assert result.shape[1] == padded * 2
+        assert torch.equal(result[:, :logical], data[:, :logical])
+        assert torch.equal(result[:, padded:padded + logical], data[:, logical:])
+        assert torch.all(result[:, logical:padded] == fill)
+        assert torch.all(result[:, padded + logical:] == fill)
+    else:
+        width = logical // group if is_scale else logical // 2
+        assert result.shape[-1] == (padded // group if is_scale else padded // 2)
+        assert torch.equal(result[..., :width], data)
+        assert torch.all(result[..., width:] == fill)
+
+
+@pytest.mark.parametrize("tp_rank", [0, 7])
+@pytest.mark.parametrize("already_sharded", [False, True])
+def test_padded_w2_scale_loader_tp_slice_and_repeat_load(
+    w4_module, tp_rank, already_sharded,
+):
+    module, _ = w4_module
+    param = torch.nn.Parameter(torch.full((2, 128, 8), 127, dtype=torch.uint8),
+                               requires_grad=False)
+    module._set_w4a8_mxfp_padding_attrs(
+        param, 224, 256, "w2", True, 32, tp_rank, 8,
+    )
+    pointer = param.data_ptr()
+
+    def loader(param, value, expert_id):
+        assert param.shape == (2, 128, 7)
+        param.data[expert_id].copy_(value)
+        return True
+
+    for offset in (3, 47):
+        full = (torch.arange(128 * 56).reshape(128, 56) + offset).remainder(251).to(torch.uint8)
+        expected = full[:, tp_rank * 7:(tp_rank + 1) * 7]
+        result = module._w4a8_mxfp_padded_expert_loader(
+            loader, param, expected if already_sharded else full, expert_id=1,
+        )
+        assert result is True
+        assert param.data_ptr() == pointer
+        assert torch.equal(param[1, :, :7], expected)
+        assert torch.all(param[..., 7] == 127)
+        assert torch.all(param[0] == 127)
+
+
+def test_moe_224_padding_produces_paired_scale_gmm_layout(
+    w4_module, moe_method,
+):
+    module, _ = w4_module
+    layer = torch.nn.Module()
+    layer.moe_config = SimpleNamespace(tp_rank=7, tp_size=8)
+    moe_method.create_weights(layer, num_experts=2, hidden_size=128,
+                             intermediate_size_per_partition=224,
+                             params_dtype=torch.bfloat16)
+    assert layer.w13_weight.shape == (2, 512, 64)
+    assert layer.w2_weight.shape == (2, 128, 128)
+    assert torch.all(layer.w13_weight[:, 224:256] == 0)
+    assert torch.all(layer.w13_weight[:, 480:] == 0)
+    assert torch.all(layer.w2_weight[..., 112:] == 0)
+    assert torch.all(layer.w2_weight_scale[..., 7:] == 127)
+    layer._ensure_moe_quant_config_init = MagicMock()
+    moe_method.process_weights_after_loading(layer)
+    assert layer.w13_weight.shape == (2, 64, 512)
+    assert layer.w2_weight.shape == (2, 128, 128)
+    assert layer.w13_weight_scale.shape == (2, 2, 512, 2)
+    assert layer.w2_weight_scale.shape == (2, 4, 128, 2)
+    assert getattr(layer.w13_weight, module._W4A8_MXFP_PACKED_ATTR)
+    moe_method.process_weights_after_loading(layer)
+    layer._ensure_moe_quant_config_init.assert_called_once()

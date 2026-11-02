@@ -62,7 +62,11 @@ def config_module(monkeypatch):
     fused_moe_pkg.__path__ = [str(base_path / "omni" / "layers" / "fused_moe")]
     monkeypatch.setitem(sys.modules, "omni_npu.layers.fused_moe", fused_moe_pkg)
 
-    sys.modules.pop("omni_npu.layers.fused_moe.config", None)
+    # Restore the previous production module after this fixture. Otherwise its
+    # cached functions retain the fake vLLM config class in later quant tests.
+    module_name = "omni_npu.layers.fused_moe.config"
+    monkeypatch.setitem(sys.modules, module_name, None)
+    sys.modules.pop(module_name)
     module = importlib.import_module("omni_npu.layers.fused_moe.config")
     importlib.reload(module)
     return module
