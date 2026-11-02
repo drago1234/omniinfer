@@ -9,6 +9,7 @@ import and use it. We can iterate later with true MLA specialization.
 """
 
 import math
+import weakref
 from dataclasses import dataclass
 from typing import ClassVar, Optional, Tuple, TYPE_CHECKING
 
@@ -618,6 +619,9 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         return metadata
 
     def _lazy_slot_mapping_2d(self, metadata):
+        slot_mapping = metadata.slot_mapping
+        block_size = self.kv_cache_spec.block_size
+        metadata_ref = weakref.ref(metadata)
         # Static-kernel compilation runs the model once before graph capture.
         # Rebuild when the capture state changes so capture records conversion
         # from the live slot_mapping input, while still sharing it across layers.
@@ -631,13 +635,13 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
 
             capturing = get_forward_context().capturing
             if slot_mapping_2d is None or cached_during_capture != capturing:
-                block_size = self.kv_cache_spec.block_size
+                current_metadata = metadata_ref()
+                slots = (
+                    current_metadata.slot_mapping
+                    if current_metadata is not None else slot_mapping
+                )
                 slot_mapping_2d = torch.stack(
-                    [
-                        metadata.slot_mapping // block_size,
-                        metadata.slot_mapping % block_size,
-                    ],
-                    dim=-1,
+                    [slots // block_size, slots % block_size], dim=-1
                 )
                 cached_during_capture = capturing
             return slot_mapping_2d

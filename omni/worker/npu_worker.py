@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.worker_base import CompilationTimes
 from vllm.utils.torch_utils import set_random_seed
+from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -399,6 +400,8 @@ class NPUWorker(Worker):
         if not self.model_config.enforce_eager:
             self.model_runner.capture_model()
         set_random_seed(self.model_config.seed)
+        # Match GPU Worker: keep initialized model/graph objects out of cyclic GC.
+        freeze_gc_heap()
         return CompilationTimes(
             language_model=self.vllm_config.compilation_config.compilation_time,
             encoder=self.vllm_config.compilation_config.encoder_compilation_time,

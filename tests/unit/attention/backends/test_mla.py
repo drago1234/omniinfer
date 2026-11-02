@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+import gc
 import types
 import unittest
 from unittest.mock import MagicMock, patch
@@ -169,7 +170,13 @@ class TestNPUAttentionBackendMLAUtilsFunc(unittest.TestCase):
         builder_cls = self.mla_setup["builder"]
         builder = builder_cls.__new__(builder_cls)
         builder.kv_cache_spec = types.SimpleNamespace(block_size=16)
-        metadata = types.SimpleNamespace(
+        # SimpleNamespace has no __weakref__; the builder holds metadata weakly.
+        class _Metadata:
+            def __init__(self, slot_mapping, slot_mapping_2d):
+                self.slot_mapping = slot_mapping
+                self.slot_mapping_2d = slot_mapping_2d
+
+        metadata = _Metadata(
             slot_mapping=torch.tensor([-1, -1, -1], dtype=torch.long),
             slot_mapping_2d=None,
         )
@@ -205,6 +212,33 @@ class TestNPUAttentionBackendMLAUtilsFunc(unittest.TestCase):
         )
         self.assertTrue(torch.equal(eager_after_capture, captured))
         self.assertEqual(stack_mock.call_count, 3)
+
+    def test_lazy_slot_mapping_2d_falls_back_when_metadata_is_collected(self):
+        builder_cls = self.mla_setup["builder"]
+        builder = builder_cls.__new__(builder_cls)
+        builder.kv_cache_spec = types.SimpleNamespace(block_size=16)
+
+        class _Metadata:
+            def __init__(self, slot_mapping):
+                self.slot_mapping = slot_mapping
+
+        slots = torch.tensor([0, 17, 34], dtype=torch.long)
+        metadata = _Metadata(slot_mapping=slots)
+        callback = builder._lazy_slot_mapping_2d(metadata)
+
+        # Drop the only strong reference: the closure must use its own snapshot.
+        del metadata
+        gc.collect()
+
+        with patch(
+            "omni_npu.attention.backends.mla.get_forward_context",
+            return_value=types.SimpleNamespace(capturing=False),
+        ):
+            result = callback()
+
+        self.assertTrue(
+            torch.equal(result, torch.tensor([[0, 0], [1, 1], [2, 2]]))
+        )
 
     def test_metadata_default_slot_mapping_2d_can_be_overridden(self):
         metadata = self.mla_setup["metadata"](

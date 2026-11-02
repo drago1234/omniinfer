@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from omni_npu.profiler.wrapper import _to_bool
+import omni_npu.worker.npu_worker as worker_module
 from omni_npu.worker.npu_worker import (
     NPUWorker,
     _kv_offload_reserved_bytes,
@@ -1153,6 +1154,17 @@ class TestNpuWorker:
 
         worker.model_runner.capture_model.assert_called_once()
         # Verify set_random_seed is called (verified through monkeypatch)
+
+    def test_compile_or_warm_up_model_freezes_gc_heap(self, monkeypatch):
+        """Warmup must freeze the GC heap so cyclic GC skips static objects."""
+        worker = self._create_worker(monkeypatch)
+        worker.model_config = SimpleNamespace(enforce_eager=True, seed=42)
+        freeze = MagicMock()
+        monkeypatch.setattr(worker_module, "freeze_gc_heap", freeze)
+
+        worker.compile_or_warm_up_model()
+
+        freeze.assert_called_once_with()
 
     def test_load_model(self, monkeypatch):
         """Test load_model method.
