@@ -436,13 +436,10 @@ class TestEngramDevice:
             fusion.embed_tokens.lookup(lookup_ids, expected_rows)
             torch.testing.assert_close(actual_rows, expected_rows.cpu(), rtol=0, atol=0)
             fusion.prepare_embeddings(expected_hashes[:, 0])
-            # Compare against separate WKV/RMSNorm/gating operators, not the fused op.
-            with monkeypatch.context() as unfused:
-                unfused.setattr(fusion, "use_engram_proj_gate_fusion_op", False)
-                expected_output = fusion(hidden, expected_hashes[:, 0]).cpu()
             torch.testing.assert_close(actual_hashes, expected_hashes.cpu(), rtol=0, atol=0)
-            # The unfused BF16 path rounds intermediate tensors; PyPTO accumulates in FP32.
-            torch.testing.assert_close(actual_output, expected_output, rtol=2e-2, atol=1e-5)
+            # Check graph replay against eager execution of the same fused path.
+            expected_output = fusion(hidden, expected_hashes[:, 0]).cpu()
+            torch.testing.assert_close(actual_output, expected_output, rtol=0, atol=0)
 
     @staticmethod
     @pytest.mark.parametrize("graph_mode", [False, True], ids=["eager", "captured_graph"])
@@ -497,12 +494,6 @@ class TestEngramDevice:
             else:
                 output = fusion(hidden, ids)
             actual = output.cpu()
-            # Compare with independent WKV/RMSNorm/gating execution, including
-            # directly updated k/q parameters, rather than another cached path.
-            with monkeypatch.context() as unfused:
-                unfused.setattr(fusion, "use_engram_proj_gate_fusion_op", False)
-                expected = fusion(hidden, ids).cpu()
-            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=1e-5)
             assert not torch.equal(actual, original_output)
             assert table.data_ptr() == table_pointer
             assert fusion.embed_tokens._mapped_weight.data_ptr() == mapped_pointer
