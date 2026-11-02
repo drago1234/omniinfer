@@ -5,6 +5,7 @@
 from contextlib import contextmanager
 import ast
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -164,6 +165,7 @@ def test_dsa_full_conv_and_kv_calls_unchanged_before_local_projection(monkeypatc
         calls.append(("project", out.size(0)))
         return out * 3
 
+    normalize_q = MagicMock(side_effect=lambda q, *, allow_fusion: q)
     indexer = SimpleNamespace(
         _li_prolog_ext=lambda local_x, local_q, x, *args: (local_x, local_q, x),
         _li_prolog=lambda x, *args: (x, x, x),
@@ -174,7 +176,7 @@ def test_dsa_full_conv_and_kv_calls_unchanged_before_local_projection(monkeypatc
         sharded_o_proj=False, ena_kvsp=False, noncontiguous_kv=True, ena_sp=False,
         use_mome=True, q_b_proj=SimpleNamespace(tp_size=1), skip_topk=reuse_topk,
         _get_li_caches=lambda cache: (None, None),
-        q_a_proj=lambda x: (x, None), q_a_layernorm=lambda x: x,
+        q_a_proj=lambda x: (x, None), _normalize_q_maybe_quant=normalize_q,
         _maybe_mome_q=lambda q, args: q, _q_absorb=lambda q, *args: (q, q),
         kv_a_proj_with_mqa=lambda x: (x, None), _maybe_mome_kv=lambda kv, args: kv,
         _kv_norm_rope_cache=lambda kv, *args: calls.append(("kv_cache", kv.size(0))),
@@ -191,6 +193,7 @@ def test_dsa_full_conv_and_kv_calls_unchanged_before_local_projection(monkeypatc
     )
     expected = (full + 1) * 3
     torch.testing.assert_close(result, expected[rows] if project_local else expected)
+    normalize_q.assert_called_once_with(full, allow_fusion=not query_parallel)
     assert indices.shape == topk.shape
     assert ("kv_cache", 256) in calls
     assert ("conv", 256) in calls

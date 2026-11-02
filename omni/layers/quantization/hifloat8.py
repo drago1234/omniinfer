@@ -177,6 +177,8 @@ class Hifloat8LinearMethod(LinearMethodBase):
 
 
 class Hifloat8FCLinearMethod(FlashCommLinearMethodBase):
+    input_quant_format = HIFLOAT8
+
     def __init__(self, quant_config: Hifloat8Config):
         self.quant_config = quant_config
 

@@ -202,6 +202,8 @@ class ModelOperatorOptConfig:
     use_omni_cache: bool = False
 
     omni_disable_npu_add_rms_norm: bool = False
+    # Q RMSNorm fusion for MXFP8 and HiFloat8 projections.
+    enable_rmsnorm_quant_fusion: bool = True
     use_noncontiguous_kv: bool = False
     use_aicpu_fa_tiling: bool = False
     use_quant_lightning_indexer_v2: bool = False

@@ -713,6 +713,11 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 prefix=f"{prefix}.q_a_proj",
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.register_buffer(
+                "_q_norm_quant_scale",
+                torch.ones(1, dtype=torch.float32, device=self.q_a_layernorm.weight.device),
+                persistent=False,
+            )
             self.q_b_proj = ColumnParallelFlashCommLinear(
                 self.q_lora_rank,
                 self.num_heads * self.qk_head_dim,
@@ -1015,7 +1020,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
 
     def _q_project(
         self,
-        q_lora: torch.Tensor,  # TD
+        q_lora: torch.Tensor | dict[str, torch.Tensor],  # TD
         cos: torch.Tensor,  # BNSD
         sin: torch.Tensor,  # BNSD
     ) -> tuple[torch.Tensor, torch.Tensor]:  # TND
@@ -1036,7 +1041,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
 
     def _q_absorb(
         self,
-        q_lora: torch.Tensor,  # TD
+        q_lora: torch.Tensor | dict[str, torch.Tensor],  # TD
         cos: torch.Tensor, sin: torch.Tensor,  # BNSD
     ) -> tuple[torch.Tensor, torch.Tensor]:  # TND
         q_nope, q_pe = self._q_project(q_lora, cos, sin)
@@ -1162,16 +1167,39 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         valid_cache = None not in [kv_cache, slots]
         if latent_kv.size(0) == 0:  # no local_kv
             return cos.new_zeros(0, 1, L), cos.new_zeros(0, 1, R)
-        # Quantized packed (C8) caches always take the explicit per-tile packing
-        # path below, so the fused-op switch does not apply to them.
+        # Fuse FP8/HiF8 packed caches only for the supported PA layout.
+        # Ascend950 FP8/HiF8 support was validated for PA, L=512 and R=64.
+        is_float8_c8 = (
+            is_c8_cache
+            and getattr(self, "cache_dtype", None) in ("fp8_ds_mla", "hif8_ds_mla")
+            and self.on_ascend950
+        )
         use_fused_op = (
             model_extra_config.operator_opt_config.enable_kv_rmsnorm_rope_cache
-            and not is_c8_cache
+            and (is_float8_c8 or not is_c8_cache)
         )
 
         if valid_cache and use_fused_op and packed_kv:
             # Packed layout: one cache tensor holds latent (L) + RoPE (R).
-            assert kv_cache[0].size(-1) == L + R
+            cache_mode = (
+                "PA_NZ" if (self.kv_nz and self.dtype != torch.float16) else "PA"
+            )
+            if not is_float8_c8:
+                assert kv_cache[0].size(-1) == L + R
+            ckv_cache = cache_fit_shape(kv_cache[0], "4D")
+            dtype_kwargs = {}
+            if is_float8_c8:
+                if self.cache_dtype == "fp8_ds_mla":
+                    # FP8 needs a typed view of the packed bytes (no copy).
+                    ckv_cache = ckv_cache.view(torch.float8_e4m3fn)
+                    dtype_kwargs["ckv_cache_dtype"] = torch.float8_e4m3fn
+                else:
+                    # HiF8 uses uint8 storage with an explicit logical dtype.
+                    dtype_kwargs["ckv_cache_dtype"] = torch_npu.hifloat8
+                rotary_mode = "half" if not self.rope_interleaved else "interleave-half"
+            else:
+                rotary_mode = "half" if not self.rope_interleaved else "interleave"
+            quant_mode = "pertile128" if is_float8_c8 else "none"
             k_pe, k_nope = torch.ops.custom.npu_ai_infra_kv_rmsnorm_rope_cache_v2(
                 latent_kv.view(-1, 1, 1, L + R),  # BNSD
                 kv_a_layernorm.weight,
@@ -1179,14 +1207,15 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
                 sin,  # BNSD
                 slots,
                 k_cache=None,
-                ckv_cache=cache_fit_shape(kv_cache[0], "4D"),
+                ckv_cache=ckv_cache,
                 k_rope_scale=None,
                 k_rope_offset=None,
                 epsilon=kv_a_layernorm.variance_epsilon,
-                cache_mode="PA_NZ" if (self.kv_nz and self.dtype != torch.float16) else "PA",
-                rotary_mode="half" if not self.rope_interleaved else "interleave",
-                quant_mode="none",
+                cache_mode=cache_mode,
+                rotary_mode=rotary_mode,
+                quant_mode=quant_mode,
                 is_output_kv=True,
+                **dtype_kwargs,
             )
         elif valid_cache and use_fused_op and self.rope_interleaved:
             # Dense layout: kv_cache[0] = nope (L), kv_cache[1] = rope (R).
@@ -1730,7 +1759,10 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         q = self.q_a_proj(x)[0]  # TD
         q = sp_manager.ag_tokens(q) if self.ena_sp and self.use_mome else q
         q = self._maybe_mome_q(q, get_mome_args)  # TD
-        q = self.q_a_layernorm(q)  # TD
+        # Token gathering and local-query slicing require a plain tensor.
+        q = self._normalize_q_maybe_quant(
+            q, allow_fusion=not (self.ena_sp or use_local_query)
+        )  # TD
         q_lora = sp_manager.ag_tokens(q) if self.ena_sp and not self.use_mome else q
 
         if use_local_query:
@@ -1999,7 +2031,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         sp_x: torch.Tensor,  # TD, sp
         sp_manager: SPManager,
         get_mome_args: Callable | None,
-    ) -> torch.Tensor:  # TD, cp
+    ) -> torch.Tensor | dict[str, torch.Tensor]:  # TD, cp
         """Down-project this rank's SP tokens and move them to the zigzag CP layout."""
         q_lora = self.q_a_proj(sp_x)[0]  # TD, sp
 
@@ -2013,7 +2045,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         else:
             q_lora = sp_manager.sp_to_cp(q_lora)  # TD, cp
 
-        return self.q_a_layernorm(q_lora)  # TD, cp
+        return self._normalize_q_maybe_quant(q_lora)  # TD, cp
 
     def _cp_o_proj(self, cp_out: torch.Tensor, sp_manager: SPManager) -> torch.Tensor:  # TD, sp
         """Project a full-head CP-layout output and hand back this rank's SP tokens."""
@@ -2088,7 +2120,7 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         else:
             q_lora = self.q_a_proj(x)[0]  # TD
             q_lora = self._maybe_mome_q(q_lora, get_mome_args)  # TD
-            q_lora = self.q_a_layernorm(q_lora)  # TD
+            q_lora = self._normalize_q_maybe_quant(q_lora)  # TD
             q_nope, q_pe = self._q_absorb(q_lora, cos, sin)  # TND
 
             kv = self.kv_a_proj_with_mqa(x)[0]  # TD
@@ -2194,10 +2226,10 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         with torch.npu.npugraph_ex.scope.limit_core_num(*_MULTISTREAM_PROLOG_CORE_NUM):
             q_lora = self.q_a_proj(x)[0]
             q_lora = self._maybe_mome_q(q_lora, get_mome_args)
-            q_lora = self.q_a_layernorm(q_lora)
+            q_lora = self._normalize_q_maybe_quant(q_lora)
             q_lora_ready = torch.npu.Event()
             q_lora_ready.record()  # main -> side
-            q_lora.record_stream(side_stream)
+            self._record_q_stream(q_lora, side_stream)
 
             indexer_k = self.indexer.wk(x)[0]
             indexer_k = self.indexer.k_norm(indexer_k).view(-1, 1, self.indexer.head_dim)
@@ -2359,11 +2391,11 @@ class NPUDeepseekSparseAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.M
         q_a_cube_done.record()
         with torch.npu.npugraph_ex.scope.limit_core_num(8, 32):
             q_lora = self._maybe_mome_q(q_lora, get_mome_args)
-            q_lora = self.q_a_layernorm(q_lora)
+            q_lora = self._normalize_q_maybe_quant(q_lora)
 
         if self.split_q_up_in_multistream:
             q_side_ready.record()
-            q_lora.record_stream(li_stream)
+            self._record_q_stream(q_lora, li_stream)
         with torch.npu.npugraph_ex.scope.limit_core_num(24, 48):
             indexer_q = self.indexer.wq_b(q_lora)[0].view(
                 -1, self.indexer.n_head, self.indexer.head_dim

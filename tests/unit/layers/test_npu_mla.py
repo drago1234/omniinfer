@@ -48,6 +48,7 @@ def _make_prefill_attention(attention_cls, sink_count=0):
     token_count, num_heads = 3, 2
     rope_dim, nope_dim, kv_rank, value_dim = 1, 4, 5, 3
     fake = attention_cls.__new__(attention_cls)
+    fake.on_ascend950 = False
     fake.num_local_heads = num_heads
     fake.qk_rope_head_dim = rope_dim
     fake.v_head_dim = value_dim
@@ -164,8 +165,16 @@ def test_forward_decode_routes_to_a5_multistream_when_stream_is_enabled():
 @pytest.mark.unit
 @pytest.mark.parametrize("split_q_up_in_multistream", [True, False])
 @pytest.mark.parametrize("quantized_input", [False, True])
+@pytest.mark.parametrize(
+    "enable_norm_quant, q_quant_format",
+    [(False, "mxfp8"), (True, "mxfp8"), (True, None),
+     (False, "hifloat8"), (True, "hifloat8")],
+    ids=["fusion_disabled", "fusion_enabled", "incompatible_q_projection",
+         "hifloat8_disabled", "hifloat8_enabled"],
+)
 def test_forward_decode_a5_multistream_submits_three_stream_pipeline(
-    monkeypatch, split_q_up_in_multistream, quantized_input
+    monkeypatch, split_q_up_in_multistream, quantized_input,
+    enable_norm_quant, q_quant_format,
 ):
     from omni_npu.v1.layers.attention import npu_mla as mla_mod
     from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
@@ -182,10 +191,35 @@ def test_forward_decode_a5_multistream_submits_three_stream_pipeline(
         "get_forward_context",
         lambda: SimpleNamespace(virtual_engine=0),
     )
+    monkeypatch.setattr(
+        mla_mod.model_extra_config.operator_opt_config,
+        "enable_rmsnorm_quant_fusion",
+        enable_norm_quant,
+    )
 
     def mark(name, result):
         submitted.append(name)
         return result
+
+    q_lora = torch.zeros(2, 64, **cfg_bf16)
+    is_hif8 = q_quant_format == "hifloat8"
+    q_fp8 = torch.zeros(
+        2, 64, device="cpu", dtype=torch.uint8 if is_hif8 else torch.float8_e4m3fn
+    )
+    q_scale = torch.ones(2, 2, device="cpu", dtype=torch.uint8)
+    fused_norm_quant = MagicMock(
+        side_effect=make_marked_constant(
+            mark, "q_norm_quant", (q_fp8, None) if is_hif8 else (q_fp8, q_scale, None)
+        )
+    )
+    monkeypatch.setattr(
+        mla_mod.torch_npu,
+        "npu_rms_norm_quant_v2" if is_hif8 else "npu_rms_norm_dynamic_mx_quant",
+        fused_norm_quant, raising=False,
+    )
+    monkeypatch.setattr(
+        mla_mod.torch_npu, "float8_e4m3fn", torch.float8_e4m3fn, raising=False,
+    )
 
     fake = NPUDeepseekMLAAttention.__new__(NPUDeepseekMLAAttention)
     fake.on_ascend950 = True
@@ -199,19 +233,29 @@ def test_forward_decode_a5_multistream_submits_three_stream_pipeline(
     fake.qk_rope_head_dim = 2
     fake.attn = SimpleNamespace(kv_cache=[(object(), object())])
     fake._maybe_quant = _identity
-    fake.q_a_proj = make_marked_constant(mark, "q_a", (torch.zeros(2, 3),))
+    fake.q_a_proj = make_marked_constant(mark, "q_a", (q_lora,))
     fake.kv_a_proj_with_mqa = make_marked_constant(
         mark, "kv_a", (torch.zeros(2, 5),)
     )
     fake._maybe_mome_q = make_marked_input(mark, "q_conv")
-    fake.q_a_layernorm = make_marked_input(mark, "q_norm")
-    fake.q_b_pe_proj = make_marked_constant(
-        mark, "q_b_pe", (torch.zeros(2, 2),)
+    fake.q_a_layernorm = MagicMock(
+        side_effect=make_marked_input(mark, "q_norm"),
+        weight=torch.ones(64, **cfg_bf16),
+        variance_epsilon=1e-6,
     )
-    fake.q_b_nope_proj = make_marked_constant(
-        mark, "q_b_nope", (torch.zeros(2, 4),)
+    fake._q_norm_quant_scale = torch.ones(1, dtype=torch.float32)
+    fake.q_b_pe_proj = MagicMock(
+        side_effect=make_marked_constant(mark, "q_b_pe", (torch.zeros(2, 2),)),
+        quant_method=SimpleNamespace(input_quant_format=q_quant_format),
     )
-    fake.q_b_proj = make_marked_constant(mark, "q_b", (torch.zeros(2, 6),))
+    fake.q_b_nope_proj = MagicMock(
+        side_effect=make_marked_constant(mark, "q_b_nope", (torch.zeros(2, 4),)),
+        quant_method=SimpleNamespace(input_quant_format="hifloat8" if is_hif8 else "mxfp8"),
+    )
+    fake.q_b_proj = MagicMock(
+        side_effect=make_marked_constant(mark, "q_b", (torch.zeros(2, 6),)),
+        quant_method=SimpleNamespace(input_quant_format=q_quant_format),
+    )
     fake.qk_head_dim = 6
     fake._maybe_mome_kv = make_marked_input(mark, "kv_conv")
     fake._kv_norm_rope_cache = make_marked_constant(
@@ -245,6 +289,39 @@ def test_forward_decode_a5_multistream_submits_three_stream_pipeline(
     inputs = [v for v in x.values() if isinstance(v, torch.Tensor)] if quantized_input else [x]
     assert all(any(t is value and s is side_stream for t, s in recorded) for value in inputs)
     assert torch.equal(output, torch.ones(1))
+    fused = enable_norm_quant and q_quant_format in ("mxfp8", "hifloat8")
+    q_consumers = (
+        [fake.q_b_nope_proj, fake.q_b_pe_proj]
+        if split_q_up_in_multistream else [fake.q_b_proj]
+    )
+    if fused:
+        fake.q_a_layernorm.assert_not_called()
+        quantized_q = q_consumers[0].call_args.args[0]
+        if is_hif8:
+            fused_norm_quant.assert_called_once_with(
+                q_lora, fake.q_a_layernorm.weight, fake._q_norm_quant_scale,
+                epsilon=1e-6, div_mode=False, dst_dtype=mla_mod.torch_npu.hifloat8,
+            )
+            assert set(quantized_q) == {"x_hif8"}
+            assert quantized_q["x_hif8"] is q_fp8
+            q_tensors = [q_fp8]
+        else:
+            fused_norm_quant.assert_called_once_with(
+                q_lora, fake.q_a_layernorm.weight,
+                epsilon=1e-6, scale_alg=1, round_mode="rint",
+                dst_type=torch.float8_e4m3fn,
+            )
+            assert quantized_q["x_mxfp8"] is q_fp8
+            assert quantized_q["pertoken_scale"] is q_scale
+            q_tensors = [q_fp8, q_scale]
+        assert all(proj.call_args.args[0] is quantized_q for proj in q_consumers)
+    else:
+        fused_norm_quant.assert_not_called()
+        fake.q_a_layernorm.assert_called_once_with(q_lora)
+        assert all(proj.call_args.args[0] is q_lora for proj in q_consumers)
+        q_tensors = [q_lora]
+    for value in q_tensors:
+        assert any(t is value and s is side_stream for t, s in recorded) == split_q_up_in_multistream
     q_up_ops = (
         ["record", "q_b_nope"]
         if split_q_up_in_multistream
@@ -259,7 +336,7 @@ def test_forward_decode_a5_multistream_submits_three_stream_pipeline(
         "record",
         "q_a",
         "q_conv",
-        "q_norm",
+        "q_norm_quant" if fused else "q_norm",
         *q_up_ops,
         "q_absorb",
         "kv_a",

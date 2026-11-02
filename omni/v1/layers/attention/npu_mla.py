@@ -245,6 +245,74 @@ class NPUMLAAttention(MLAAttention):
 
 
 class MomeAttentionMixin:
+    def _normalize_q_maybe_quant(
+        self, x: torch.Tensor, *, allow_fusion: bool = True,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        """Normalize Q, optionally fusing MXFP8 or HiF8 quantization.
+
+        Return a quantized input mapping when fusion is enabled and all consumers
+        accept the same format; otherwise return a normalized floating-point tensor.
+        Callers that still need token-layout communication can disable fusion.
+        """
+        if not self._can_fuse_q_norm_quant(allow_fusion=allow_fusion):
+            return self.q_a_layernorm(x)
+        q_proj = self.q_b_nope_proj if self.split_q_up_in_multistream else self.q_b_proj
+        if q_proj.quant_method.input_quant_format == "hifloat8":
+            # The PyTorch v2 API dispatches to CANN RmsNormQuantV3. HiFloat8
+            # projections use a direct cast, so the quantization scale is one.
+            q_hif8, _ = torch_npu.npu_rms_norm_quant_v2(
+                x, self.q_a_layernorm.weight, self._q_norm_quant_scale,
+                epsilon=self.q_a_layernorm.variance_epsilon,
+                div_mode=False, dst_dtype=torch_npu.hifloat8,
+            )
+            return {"x_hif8": q_hif8}
+        q_fp8, q_scale, _ = torch_npu.npu_rms_norm_dynamic_mx_quant(
+            x, self.q_a_layernorm.weight,
+            epsilon=self.q_a_layernorm.variance_epsilon,
+            scale_alg=1, round_mode="rint", dst_type=torch_npu.float8_e4m3fn,
+        )
+        return {"x_mxfp8": q_fp8, "pertoken_scale": q_scale}
+
+    def _can_fuse_q_norm_quant(self, *, allow_fusion: bool = True) -> bool:
+        config = model_extra_config.operator_opt_config
+        if (
+            not allow_fusion
+            or not getattr(config, "enable_rmsnorm_quant_fusion", False)
+            or not self.on_ascend950
+        ):
+            return False
+        if self.split_q_up_in_multistream:
+            consumers = [self.q_b_nope_proj, self.q_b_pe_proj]
+        else:
+            consumers = [self.q_b_proj]
+        if not getattr(self, "skip_topk", True):
+            consumers.append(self.indexer.wq_b)
+        quant_format = getattr(
+            getattr(consumers[0], "quant_method", None), "input_quant_format", None
+        )
+        if quant_format not in ("mxfp8", "hifloat8"):
+            return False
+        return all(
+            getattr(getattr(layer, "quant_method", None), "input_quant_format", None)
+            == quant_format for layer in consumers
+        )
+
+    def _normalize_q_after_gather(self, q: torch.Tensor, sp_manager) -> torch.Tensor | dict[str, torch.Tensor]:
+        """Preserve local norm before gather whenever fusion is unavailable."""
+        if self._can_fuse_q_norm_quant():
+            return self._normalize_q_maybe_quant(sp_manager.ag_tokens(q))
+        return sp_manager.ag_tokens(self.q_a_layernorm(q))
+
+    @staticmethod
+    def _record_q_stream(
+        q: torch.Tensor | dict[str, torch.Tensor], stream: torch.npu.Stream,
+    ) -> None:
+        if isinstance(q, dict):
+            for value in q.values():
+                value.record_stream(stream)
+        else:
+            q.record_stream(stream)
+
     def _build_mome_conv(
         self,
         fake_num_spec_tokens: int,
@@ -532,11 +600,11 @@ class MomeAttentionMixin:
         with torch.npu.npugraph_ex.scope.limit_core_num(24, 32):
             q_lora = self.q_a_proj(x)[0]
             q_lora = self._maybe_mome_q(q_lora, get_mome_args)
-            q_lora = self.q_a_layernorm(q_lora)
+            q_lora = self._normalize_q_maybe_quant(q_lora)
 
         if self.split_q_up_in_multistream:
             q_side_ready.record()
-            q_lora.record_stream(side_stream)
+            self._record_q_stream(q_lora, side_stream)
             with torch.npu.npugraph_ex.scope.limit_core_num(24, 16):
                 q_nope = self.q_b_nope_proj(q_lora)[0].view(
                     -1, self.num_local_heads, self.qk_nope_head_dim
@@ -664,6 +732,11 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             prefix=f"{prefix}.q_a_proj",
         )
         self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+        self.register_buffer(
+            "_q_norm_quant_scale",
+            torch.ones(1, dtype=torch.float32, device=self.q_a_layernorm.weight.device),
+            persistent=False,
+        )
         self.q_b_proj = ColumnParallelFlashCommLinear(
             self.q_lora_rank,
             self.num_heads * self.qk_head_dim,
@@ -1100,26 +1173,28 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
 
     def _q_project(
         self,
-        q_lora: torch.Tensor,  # TD
+        q_lora: torch.Tensor | dict[str, torch.Tensor],  # TD
         cos: torch.Tensor,  # BNSD
         sin: torch.Tensor,  # BNSD
     ) -> tuple[torch.Tensor, torch.Tensor]:
         Q, R = self.qk_nope_head_dim, self.qk_rope_head_dim
-        tok = q_lora.size(0)
         if self.split_q_up_in_multistream:
             # The full q_b_proj storage is released after loading in this
             # mode; the split projections are numerically identical per row.
-            q_nope = self.q_b_nope_proj(q_lora)[0].view(tok, -1, Q)  # TND
-            q_pe = self.q_b_pe_proj(q_lora)[0].view(tok, -1, R)  # TND
+            q_nope = self.q_b_nope_proj(q_lora)[0]
+            q_nope = q_nope.view(q_nope.size(0), -1, Q)  # TND
+            q_pe = self.q_b_pe_proj(q_lora)[0]
+            q_pe = q_pe.view(q_pe.size(0), -1, R)  # TND
         else:
-            q = self.q_b_proj(q_lora)[0].view(tok, -1, Q + R)  # TND
+            q = self.q_b_proj(q_lora)[0]
+            q = q.view(q.size(0), -1, Q + R)  # TND
             q_nope, q_pe = torch.split(q, [Q, R], dim=-1)  # TND
         q_pe = self._apply_rope(q_pe, cos, sin)  # TND
         return q_nope, q_pe  # TND, q_nope not yet absorbed
 
     def _q_absorb(
         self,
-        q_lora: torch.Tensor,  # TD
+        q_lora: torch.Tensor | dict[str, torch.Tensor],  # TD
         cos: torch.Tensor,  # BNSD
         sin: torch.Tensor,  # BNSD
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2418,7 +2493,7 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
 
         q_lora = self.q_a_proj(x)[0]  # TD
         q_lora = self._maybe_mome_q(q_lora, get_mome_args)  # TD
-        q_lora = self.q_a_layernorm(q_lora)  # TD
+        q_lora = self._normalize_q_maybe_quant(q_lora)  # TD
         q_nope, q_pe = self._q_absorb(q_lora, cos, sin)  # TND
 
         kv = self.kv_a_proj_with_mqa(x)[0]  # TD
@@ -2584,9 +2659,10 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             if self.ena_sp:
                 q = sp_manager.ag_tokens(q)
             q = self._maybe_mome_q(q, get_mome_args)  # TD
-        q = self.q_a_layernorm(q)  # TD
         if self.ena_sp and mome_sp_q_applied:
-            q = sp_manager.ag_tokens(q)  # TD
+            q = self._normalize_q_after_gather(q, sp_manager)
+        else:
+            q = self._normalize_q_maybe_quant(q)
         q_nope, q_pe = self._q_absorb(q, cos, sin)  # TND
 
         kv = self.kv_a_proj_with_mqa(x)[0]  # TD
@@ -2687,9 +2763,10 @@ class NPUDeepseekMLAAttention(MomeAttentionMixin, GptOssSinkMixin, torch.nn.Modu
             q = sp_manager.ag_tokens(q)  # TD
         if not mome_sp_q_applied:
             q = self._maybe_mome_q(q, get_mome_args)  # TD
-        q = self.q_a_layernorm(q)  # TD
         if self.ena_sp and not self.use_mome:
-            q = sp_manager.ag_tokens(q)  # TD
+            q = self._normalize_q_after_gather(q, sp_manager)
+        else:
+            q = self._normalize_q_maybe_quant(q)
 
         if self.split_q_up_in_multistream:
             # The full q_b_proj storage is released after loading in this

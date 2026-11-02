@@ -376,6 +376,7 @@ def test_forward_decode_multistream_runs_two_stream_pipeline(
 
     fake = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
     fake.split_q_up_in_multistream = split_q_up_in_multistream
+    fake.on_ascend950 = False
     fake.noncontiguous_kv = False
     fake.side_stream = side_stream
     fake.num_local_heads = 1
@@ -2445,6 +2446,7 @@ def _cp_helper_host(use_mome=False, partition=False):
 
     calls = []
     host = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    host.on_ascend950 = False
     host.use_mome = use_mome
     host.q_a_proj = lambda x: (calls.append("q_a_proj") or x,)
     host._maybe_mome_q = lambda q, args: calls.append(("mome_q", args)) or q
@@ -3055,6 +3057,7 @@ def test_sparse_kv_norm_rope_cache_c8_delegates_to_scatter(monkeypatch):
     from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
 
     fake = NPUDeepseekSparseAttention.__new__(NPUDeepseekSparseAttention)
+    fake.on_ascend950 = True
     fake.qk_rope_head_dim = 64
     fake.kv_lora_rank = 512
     fake.is_sfa_c8 = True
