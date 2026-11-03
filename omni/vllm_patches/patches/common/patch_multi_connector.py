@@ -58,3 +58,18 @@ class MultiConnectorGetFinishedCountPatch(VLLMPatch):
         return _aggregate_child_counts(
             self._connectors, "get_finished_send_count", reduce_min=True
         )
+
+
+@register_patch("MultiConnectorUnregisterKVCachesPatch", MultiConnector)
+class MultiConnectorUnregisterKVCachesPatch(VLLMPatch):
+    # Drop this patch once the deployed vLLM ships its own
+    # MultiConnector.unregister_kv_caches (upstream main; 0.32+ images).
+    # 0.25 has neither that loop nor a no-op default on KVConnectorBase_V1,
+    # hence the getattr guard below.
+    _attr_names_to_apply = ["unregister_kv_caches"]
+
+    def unregister_kv_caches(self) -> None:
+        for c in self._connectors:
+            unregister = getattr(c, "unregister_kv_caches", None)
+            if unregister is not None:
+                unregister()

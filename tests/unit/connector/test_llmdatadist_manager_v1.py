@@ -522,6 +522,34 @@ class TestDatadistEngine:
             core._manual_init(f"{ip}:0")
             log.compare_and_clear()
 
+    def test_sleep_clears_state_and_finalizes(self):
+        import threading
+
+        engine = DatadistEngine.__new__(DatadistEngine)
+        engine.inited = True
+        engine.links = {7: time.time()}  # links must be unlinked on sleep
+        engine.ip = "127.0.0.1"
+        engine.caches = {1: SimpleNamespace(cache_id=1)}
+        engine.data_lock = threading.Lock()
+        engine.engine = MagicMock()
+        engine.sleep()
+        engine.engine.cache_manager.unregister_cache.assert_called_once_with(1)
+        engine.engine.finalize.assert_called_once()
+        assert engine.inited is False
+        assert engine.caches == {}
+        assert engine.links == {}  # released by sleep itself
+        assert engine.engine.unlink_clusters.called
+
+    def test_sleep_skips_when_not_inited(self):
+        import threading
+
+        engine = DatadistEngine.__new__(DatadistEngine)
+        engine.inited = False
+        engine.data_lock = threading.Lock()
+        engine.engine = MagicMock()
+        engine.sleep()
+        engine.engine.finalize.assert_not_called()
+
     def test_pull_and_recycle(self, port=10000, cnt=16):
         buf1 = [torch.zeros(10, 100, dtype=torch.uint8)] * cnt
         buf2 = [torch.zeros(20, 200, dtype=torch.uint8)] * cnt

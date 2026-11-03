@@ -2765,53 +2765,8 @@ class TestNPUModelRunner:
 class TestUnregisterAndReregisterKVCaches:
     """Tests for unregister_kv_caches and reregister_kv_caches methods."""
 
-    def test_unregister_kv_caches_with_llmdatadist_connector(self, monkeypatch):
-        """Test unregister_kv_caches with LLMDataDistConnector config."""
-        from types import SimpleNamespace
-
-        # Create a mock runner without initializing the full NPUModelRunner
-        runner = SimpleNamespace()
-        runner.vllm_config = SimpleNamespace()
-        runner.vllm_config.kv_transfer_config = SimpleNamespace()
-        runner.vllm_config.kv_transfer_config.kv_connector = "LLMDataDistConnector"
-
-        # Import the method and bind it to the mock runner
-        from omni_npu.worker.npu_model_runner import NPUModelRunner
-        runner.unregister_kv_caches = NPUModelRunner.unregister_kv_caches.__get__(runner, type(runner))
-
-        # Mock has_kv_transfer_group and get_kv_transfer_group
-        mock_kv_group = MagicMock()
-        mock_kv_group.unregister_kv_caches = MagicMock()
-
-        monkeypatch.setattr(
-            "omni_npu.worker.npu_model_runner.has_kv_transfer_group",
-            lambda: True
-        )
-        monkeypatch.setattr(
-            "omni_npu.worker.npu_model_runner.get_kv_transfer_group",
-            lambda: mock_kv_group
-        )
-
-        runner.unregister_kv_caches()
-
-        mock_kv_group.unregister_kv_caches.assert_called_once()
-
-    def test_unregister_kv_caches_without_kv_transfer_config(self, monkeypatch):
-        """Test unregister_kv_caches when kv_transfer_config is None."""
-        from types import SimpleNamespace
-
-        runner = SimpleNamespace()
-        runner.vllm_config = SimpleNamespace()
-        runner.vllm_config.kv_transfer_config = None
-
-        from omni_npu.worker.npu_model_runner import NPUModelRunner
-        runner.unregister_kv_caches = NPUModelRunner.unregister_kv_caches.__get__(runner, type(runner))
-
-        # Should not raise and should return early
-        runner.unregister_kv_caches()
-
     def test_unregister_kv_caches_with_different_connector(self, monkeypatch):
-        """Test unregister_kv_caches with different connector type."""
+        """Duck-type: connector without unregister_kv_caches is skipped."""
         from types import SimpleNamespace
 
         runner = SimpleNamespace()
@@ -2822,8 +2777,44 @@ class TestUnregisterAndReregisterKVCaches:
         from omni_npu.worker.npu_model_runner import NPUModelRunner
         runner.unregister_kv_caches = NPUModelRunner.unregister_kv_caches.__get__(runner, type(runner))
 
-        # Should not call unregister
+        mock_kv_group = MagicMock(spec=[])
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.has_kv_transfer_group",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.get_kv_transfer_group",
+            lambda: mock_kv_group,
+        )
+
         runner.unregister_kv_caches()
+
+    def test_unregister_kv_caches_multi_connector_group_method(self, monkeypatch):
+        """Patched MultiConnector: call group once, do not also walk children."""
+        from types import SimpleNamespace
+
+        runner = SimpleNamespace()
+        from omni_npu.worker.npu_model_runner import NPUModelRunner
+        runner.unregister_kv_caches = NPUModelRunner.unregister_kv_caches.__get__(
+            runner, type(runner)
+        )
+
+        child = MagicMock()
+        group = MagicMock()
+        group._connectors = [child]
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.has_kv_transfer_group",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.get_kv_transfer_group",
+            lambda: group,
+        )
+
+        runner.unregister_kv_caches()
+
+        group.unregister_kv_caches.assert_called_once()
+        child.unregister_kv_caches.assert_not_called()
 
     def test_unregister_kv_caches_without_kv_transfer_group(self, monkeypatch):
         """Test unregister_kv_caches when has_kv_transfer_group returns False."""
@@ -3039,7 +3030,7 @@ class TestUnregisterAndReregisterKVCaches:
         mock_kv_group.register_kv_caches.assert_called_once_with(runner.kv_caches_dict)
 
     def test_reregister_kv_caches_without_kv_transfer_config(self, monkeypatch):
-        """Test reregister_kv_caches when kv_transfer_config is None."""
+        """Test reregister_kv_caches when no kv transfer group is present."""
         from types import SimpleNamespace
 
         runner = SimpleNamespace()
@@ -3049,8 +3040,47 @@ class TestUnregisterAndReregisterKVCaches:
         from omni_npu.worker.npu_model_runner import NPUModelRunner
         runner.reregister_kv_caches = NPUModelRunner.reregister_kv_caches.__get__(runner, type(runner))
 
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.has_kv_transfer_group",
+            lambda: False,
+        )
+
         # Should not raise and should return early
         runner.reregister_kv_caches()
+
+    def test_reregister_kv_caches_with_mooncake_connector(self, monkeypatch):
+        """reregister forwards register_kv_caches for any connector."""
+        from types import SimpleNamespace
+
+        runner = SimpleNamespace()
+        runner.vllm_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config.kv_connector = (
+            "NPUMooncakeStoreConnector"
+        )
+        runner.kv_caches_dict = {"layer.0": torch.zeros(2, 3)}
+
+        from omni_npu.worker.npu_model_runner import NPUModelRunner
+        runner.reregister_kv_caches = NPUModelRunner.reregister_kv_caches.__get__(
+            runner, type(runner)
+        )
+
+        mock_kv_group = MagicMock()
+        mock_kv_group.register_kv_caches = MagicMock()
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.has_kv_transfer_group",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.get_kv_transfer_group",
+            lambda: mock_kv_group,
+        )
+
+        runner.reregister_kv_caches()
+
+        mock_kv_group.register_kv_caches.assert_called_once_with(
+            runner.kv_caches_dict
+        )
 
     def test_reregister_kv_caches_without_kv_transfer_group(self, monkeypatch):
         """Test reregister_kv_caches when has_kv_transfer_group returns False."""

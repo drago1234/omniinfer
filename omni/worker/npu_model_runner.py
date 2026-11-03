@@ -1744,26 +1744,18 @@ class NPUModelRunner(GPUModelRunner):
                         attn_builder.reinit_block_table_with_sink()
 
     def unregister_kv_caches(self):
-        kv_transfer_config = self.vllm_config.kv_transfer_config
-        is_llmdatadist = (
-            kv_transfer_config is not None
-            and kv_transfer_config.kv_connector == "LLMDataDistConnector"
-        )
-        if is_llmdatadist:
-            if has_kv_transfer_group():
-                logger.info("unregister_kv_caches")
-                get_kv_transfer_group().unregister_kv_caches()
+        if not has_kv_transfer_group():
+            return
+        logger.info("unregister_kv_caches")
+        unregister = getattr(get_kv_transfer_group(), "unregister_kv_caches", None)
+        if unregister is not None:
+            unregister()
 
     def reregister_kv_caches(self):
-        kv_transfer_config = self.vllm_config.kv_transfer_config
-        is_llmdatadist = (
-            kv_transfer_config is not None
-            and kv_transfer_config.kv_connector == "LLMDataDistConnector"
-        )
-        if is_llmdatadist:
-            if has_kv_transfer_group():
-                logger.info(f"reregister_kv_caches")
-                get_kv_transfer_group().register_kv_caches(self.kv_caches_dict)
+        if not has_kv_transfer_group():
+            return
+        logger.info("reregister_kv_caches")
+        get_kv_transfer_group().register_kv_caches(self.kv_caches_dict)
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:

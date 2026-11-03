@@ -79,6 +79,7 @@
         export NPU_TOP_K_TOP_P_SAMPLE_NOT_SUPPORT_FLOAT=1
         export OMNI_PANGU_V2_HIGH_THROUGHOUT=1
         export VLLM_SERVER_DEV_MODE=1
+        export ASCEND_LOCAL_COMM_RES='{"version":"1.3"}'
 
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_ALL | replace(' ', '') | trim | quote }}
         export OMNI_LLMDATADIST_LINK_RECYCLE_DELAY=36000
@@ -141,6 +142,7 @@
         export NPU_TOP_K_TOP_P_SAMPLE_NOT_SUPPORT_FLOAT=1
         export OMNI_PANGU_V2_HIGH_THROUGHOUT=1
         export VLLM_SERVER_DEV_MODE=1
+        export ASCEND_LOCAL_COMM_RES='{"version":"1.3"}'
         
         export DECODE_DATA_PARALLEL_SIZE={{ DECODE_SERVER_BY_GROUP | quote }}
         export SERVER_IP_LIST={{ DECODE_SERVER_IP_LIST_BY_GROUP | replace(' ', '') | trim | quote }}
