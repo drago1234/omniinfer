@@ -89,7 +89,7 @@ PY
 }
 
 run_vllm() {
-    local rank start devices pid status=0
+    local rank start devices pid server_log status=0
     local -a pids=() cmd
     if [[ "${MA_DRY_RUN:-0}" != 1 ]]; then
         python3 - "$API_PORT" "$num_servers" <<'PY'
@@ -134,7 +134,11 @@ PY
             cat "$LOG_PATH/command_${rank}.txt"
             continue
         fi
-        ASCEND_RT_VISIBLE_DEVICES="$devices" "${cmd[@]}" > "$LOG_PATH/server_${rank}.log" 2>&1 &
+        server_log="$LOG_PATH/server_${rank}.log"
+        if [[ "$ROLE" == prefill ]]; then
+            server_log="$LOG_PATH/server.log"
+        fi
+        ASCEND_RT_VISIBLE_DEVICES="$devices" "${cmd[@]}" > "$server_log" 2>&1 &
         pids+=("$!")
     done
     if [[ "${MA_DRY_RUN:-0}" == 1 ]]; then return 0; fi
