@@ -13,6 +13,7 @@ from omni_npu.attention.backends.dsa import NPUDSAMetadataBuilder
 from omni_npu.compilation.utils import OP_FIA_SINK
 from omni_npu.v1.layers.attention import npu_pangu_custom_ops as custom_ops_mod
 from omni_npu.v1.layers.attention.npu_pangu import (
+    MlaPrologOutput,
     NPUPanguSparseAttention,
     PanguAttentionOutputGate,
     _get_slot_mapping_2d,
@@ -416,7 +417,7 @@ class TestPanguIndexShare(unittest.TestCase):
             )
 
         self.assertIs(metadata.prefill.topk_indices_buffer, topk_indices)
-        self.assertIs(full_output[-1], topk_indices)
+        self.assertIs(full_output.topk_indices, topk_indices)
 
         attention.skip_topk = True
         attention.indexer.reset_mock()
@@ -429,7 +430,7 @@ class TestPanguIndexShare(unittest.TestCase):
             )
 
         attention.indexer.assert_not_called()
-        self.assertIs(shared_output[-1], topk_indices)
+        self.assertIs(shared_output.topk_indices, topk_indices)
 
     def test_mixed_batch_slices_inputs_with_phase(self):
         attention = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
@@ -2562,7 +2563,9 @@ class TestPanguDSADecodeCustomOp(unittest.TestCase):
         latent = torch.ones(4, 2, 8)
         expected = torch.ones(4, 8)
         attention._mla_prolog = MagicMock(
-            return_value=(q_nope, q_pe, kv_cache, topk_indices)
+            return_value=MlaPrologOutput(
+                q_nope, q_pe, kv_cache=kv_cache, topk_indices=topk_indices,
+            )
         )
         attention._mla_epilog = MagicMock(return_value=expected)
         attention.pre_epilog_callback = None

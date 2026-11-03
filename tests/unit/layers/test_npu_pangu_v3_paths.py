@@ -269,7 +269,11 @@ def test_prefill_dispatch_and_cla_decode(case, monkeypatch, mode):
     mocks = {name: Mock(return_value=output) for name in callees}
     for name, mock in mocks.items():
         monkeypatch.setattr(a, name, mock)
-    prolog = (case.q, case.pe, case.cache, None) if mode != "direct" else (case.q,) * 5
+    prolog = (
+        mod.MlaPrologOutput(case.q, case.q, k_up_nope=case.q, k_pe=case.q, v_up=case.q)
+        if mode == "direct"
+        else mod.MlaPrologOutput(case.q, case.pe, kv_cache=case.cache)
+    )
     monkeypatch.setattr(a, "_mla_prolog", Mock(return_value=prolog))
     monkeypatch.setattr(a, "_mla_epilog", lambda value, *_args: value)
     assert a._forward_prefill(case.q, case.pe, case.pe, metadata, metadata) is output
@@ -486,3 +490,247 @@ def test_cp_kv_projection_preserves_optional_mome(case, monkeypatch, mome, inpla
     expected_kv[:, :3] += int(mome)
     torch.testing.assert_close(cache_update.call_args.kwargs["kv"], expected_kv)
     torch.testing.assert_close(output, torch.full((3, 4), 1.0 + int(mome)))
+
+
+def _install_custom_op(monkeypatch, name, fn):
+    targets = [torch.ops]
+    npu_torch = getattr(mod.torch_npu, "torch", None)
+    if npu_torch is not None and getattr(npu_torch, "ops", None) is not torch.ops:
+        targets.append(npu_torch.ops)
+    for ops in targets:
+        monkeypatch.setattr(ops.custom, name, fn, raising=False)
+
+
+def test_cache_dtype_groups_keep_indexer_and_kv_apart(case, monkeypatch):
+    """li_int8 quantizes the indexer only; KV C8 stays on int8/hif8/fp8."""
+    assert "li_int8_ds_mla" in mod.INDEXER_QUANT_CACHE_DTYPES
+    assert "li_int8_ds_mla" not in mod.KV_QUANT_CACHE_DTYPES
+    assert mod.KV_QUANT_CACHE_DTYPES == mod.HIF8_FP8_DTYPES | mod.INT8_C8_DTYPES
+
+    quant = Mock(return_value="quant")
+    plain = Mock(return_value="plain")
+    indexer = mod.NPUPanguIndexer.__new__(mod.NPUPanguIndexer)
+    indexer.cache_config = SimpleNamespace(cache_dtype="li_int8_ds_mla")
+    indexer._apply_lightning_indexer_quant = quant
+    indexer._apply_lightning_indexer_unquant = plain
+    indexer._apply_lightning_indexer_cp_quant = quant
+    indexer._apply_lightning_indexer_cp_unquant = plain
+    assert indexer._apply_lightning_indexer() == "quant"
+    assert indexer._apply_lightning_indexer_cp() == "quant"
+    indexer.cache_config.cache_dtype = "auto"
+    assert indexer._apply_lightning_indexer() == "plain"
+    assert indexer._apply_lightning_indexer_cp() == "plain"
+
+    monkeypatch.setattr(
+        mod.torch_npu, "npu_dynamic_quant",
+        lambda tensor, **kwargs: (tensor, torch.ones(tensor.shape[0])),
+    )
+    monkeypatch.setattr(mod.torch_npu, "hifloat8", torch.int8, raising=False)
+    monkeypatch.setattr(mod.torch_npu, "npu_quant_lightning_indexer", lambda **kwargs: torch.zeros(1))
+    _install_custom_op(
+        monkeypatch, "npu_ai_infra_quant_lightning_indexer", lambda **kwargs: torch.ones(1),
+    )
+    _install_custom_op(
+        monkeypatch, "npu_ai_infra_scatter_block_update_", lambda *args, **kwargs: None,
+    )
+    phase = SimpleNamespace(
+        query_cumlens=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+    )
+    metadata = SimpleNamespace(
+        prefill=phase, decode=None,
+        get_slot_mapping_2d=lambda *args, **kwargs: torch.zeros(1, 2, dtype=torch.int32),
+    )
+    query = torch.zeros(1, 2, 4)
+    weights = torch.zeros(1, 2)
+    kv_cache = (torch.zeros(1, 4, 8), torch.zeros(1, 4, 8), torch.ones(1, 4, 1))
+    indexer.on_ascend950 = True
+    indexer.index_topk = 4
+    indexer.layer_idx = 0
+    indexer.cache_config.cache_dtype = "hif8_ds_mla"
+    assert mod.NPUPanguIndexer._apply_lightning_indexer_quant(
+        indexer, query, weights, metadata, kv_cache,
+    ).shape == (1,)
+    indexer.on_ascend950 = False
+    indexer.cache_config.cache_dtype = "int8_ds_mla"
+    assert mod.NPUPanguIndexer._apply_lightning_indexer_quant(
+        indexer, query, weights, metadata, kv_cache,
+    ).shape == (1,)
+    manager = SimpleNamespace(cp_attn_meta=lambda: (
+        torch.tensor([1]), torch.tensor([1]), None, torch.zeros(1, 1, dtype=torch.int32),
+    ))
+    assert mod.NPUPanguIndexer._apply_lightning_indexer_cp_quant(
+        indexer, query, weights, manager, kv_cache,
+    ).shape == (1,)
+    assert mod.NPUPanguIndexer._update_indexer_cache_quant(
+        indexer, torch.zeros(2, 4), metadata, kv_cache,
+    ) is True
+
+    attention = case.attention
+    attention.is_dsa_layer = True
+    attention.skip_topk = True
+    attention.is_cla_reuse_layer = False
+    attention.kv_b_proj = None
+    attention.quant_config = None
+    attention.cache_config = SimpleNamespace()
+    attention.vllm_config = None
+    attention.hf_config = None
+    attention.index_head_dim = 4
+    attention.page_size_padded = 8
+    attention.block_size_c8 = 128
+    attention.cache_dtype_str = "int8_ds_mla"
+    built = {}
+
+    def fake_dsa(**kwargs):
+        built.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(mod, "DSAAttention", fake_dsa)
+    attention._init_attention_layers()
+    assert built["block_size"] == 128
+    built.clear()
+    attention.cache_dtype_str = "li_int8_ds_mla"
+    attention._init_attention_layers()
+    assert "block_size" not in built
+
+    page_layer = mod.NPUPanguSparseAttention.__new__(mod.NPUPanguSparseAttention)
+    page_layer.kv_lora_rank = 8
+    page_layer.qk_rope_head_dim = 4
+    page_layer.use_mome = False
+    page_layer.block_size_c8 = 8
+    page = page_layer._calculate_page_size_padded(
+        SimpleNamespace(block_size=16),
+        "hif8_ds_mla",
+        SimpleNamespace(index_topk=2048, index_head_dim=8),
+    )
+    assert page == 8 * 788
+
+    attention.use_gpt_oss_sink = False
+    attention.param_sink_number = 0
+    attention.on_ascend950 = True
+    attention.cache_config = SimpleNamespace(cache_dtype="hif8_ds_mla")
+    attention.dummy_value_cache_hif8_fp8 = torch.zeros(1, 4, 8)
+    attention.dummy_value_cache = torch.zeros(1, 4, 8)
+    kernel = Mock(return_value=torch.zeros(2, 3))
+    _install_custom_op(monkeypatch, "npu_ai_infra_kv_quant_sparse_flash_attention", kernel)
+    topk = torch.zeros(3, 1, dtype=torch.int32)
+    hif8_out = attention._apply_DSA_attention(
+        case.q, case.pe, case.cache, topk, case.metadata,
+    )
+    assert hif8_out.shape[-1] == attention.num_local_heads * attention.v_head_dim
+    attention.on_ascend950 = False
+    attention.cache_config.cache_dtype = "int8_ds_mla"
+    int8_out = attention._apply_DSA_attention(
+        case.q, case.pe, case.cache, topk, case.metadata,
+    )
+    assert int8_out.shape == hif8_out.shape
+    cp_manager = SimpleNamespace(cp_attn_meta=lambda: (
+        torch.tensor([3]), torch.tensor([3]), None, torch.zeros(1, 1, dtype=torch.int32),
+    ))
+    cp_out = attention._apply_DSA_attention_cp(
+        case.q, case.pe, case.cache, topk, cp_manager, case.metadata,
+    )
+    assert cp_out.shape == hif8_out.shape
+
+    attention.is_dsa_layer = True
+    attention.on_ascend950 = False
+    attention.cache_config.cache_dtype = "int8_ds_mla"
+    attention._kv_rmsnorm_rope_cache_v2_kwargs = lambda *args, **kwargs: {"kv": torch.zeros(1)}
+    _install_custom_op(
+        monkeypatch, "npu_ai_infra_kv_rmsnorm_rope_cache_v2",
+        lambda **kwargs: (torch.zeros(1), torch.zeros(1)),
+    )
+    rope_meta = SimpleNamespace(slot_mapping=torch.zeros(2, dtype=torch.int32))
+    kv_cache, indices = attention._npu_kvrmsnorm_rope_cache(
+        torch.zeros(2, 4), case.cache, torch.zeros(2, 1), torch.zeros(2, 1), rope_meta, topk,
+    )
+    assert kv_cache is case.cache
+    assert indices is topk
+
+
+def test_mla_prolog_output_is_a_named_tuple(case, monkeypatch):
+    """Decode, prefill, and the sequential prolog read fields, not tuple slots."""
+    from contextlib import nullcontext
+
+    attention = case.attention
+    attention.is_cla_reuse_layer = False
+    attention.is_dsa_layer = True
+    attention.sharded_o_proj = False
+    attention.layer_idx = 1
+    attention.prefix = "layer"
+    attention.pre_epilog_callback = None
+    topk = torch.zeros(3, 1, dtype=torch.int32)
+    prolog = mod.MlaPrologOutput(
+        case.q, case.pe, kv_cache=case.cache, topk_indices=topk,
+    )
+    monkeypatch.setattr(attention, "_mla_prolog", Mock(return_value=prolog))
+    monkeypatch.setattr(attention, "_mla_epilog", lambda value, *args, **kwargs: value)
+    monkeypatch.setattr(mod, "sk_scope", lambda *args, **kwargs: nullcontext())
+    seen = {}
+
+    def dsa_decode(q_nope, q_pe, key, indices, prefix):
+        seen["topk"] = indices
+        seen["q_nope"] = q_nope
+        return torch.ones(3, 4)
+
+    monkeypatch.setattr(torch.ops.vllm, "npu_pangu_dsa_decode", dsa_decode, raising=False)
+    decoded = attention._forward_decode(case.q, case.pe, case.pe, case.metadata)
+    assert seen["topk"] is topk
+    assert seen["q_nope"] is case.q
+    assert decoded.shape == (3, 4)
+
+    monkeypatch.setattr(attention, "_apply_DSA_attention", lambda *args, **kwargs: torch.ones(3, 4))
+    assert attention._forward_prefill(case.q, case.pe, case.pe, case.metadata).shape == (3, 4)
+
+    attention.is_dsa_layer = False
+    attention._use_swa_prefill_pa = lambda metadata: False
+    monkeypatch.setattr(
+        attention, "_apply_SWA_attention_prefill", lambda *args, **kwargs: torch.ones(3, 4),
+    )
+    swa = mod.MlaPrologOutput(
+        case.q, case.pe, k_up_nope=case.q, k_pe=case.pe, v_up=case.q,
+    )
+    attention._mla_prolog.return_value = swa
+    assert attention._forward_prefill(case.q, case.pe, case.pe, case.metadata).shape == (3, 4)
+
+    decode_only = SimpleNamespace(num_decodes=1, num_prefills=0, decode=object(), prefill=None)
+    attention.cache_config = SimpleNamespace(cache_dtype="hif8_ds_mla")
+    del attention._mla_prolog
+    attention._mla_prolog_hif8_fp8_decode_multistream = Mock(return_value=prolog)
+    assert attention._mla_prolog(case.q, case.pe, case.pe, decode_only) is prolog
+
+    attention.use_mome = False
+    attention.is_dsa_layer = False
+    attention.prefix = "layer"
+    hidden = torch.zeros(3, 4)
+    attention.q_a_proj = Mock(return_value=hidden)
+    attention.q_a_layernorm = Mock(side_effect=lambda value: value)
+    attention.q_b_proj = Mock(return_value=torch.zeros(3, 8))
+    attention._w_uk_t_absorb = Mock(side_effect=lambda value: value)
+    attention._q_rope = Mock(side_effect=lambda value, cos, sin: value)
+    attention._run_indexer = Mock(return_value=topk)
+    attention._kv_down_mome = Mock(return_value=torch.zeros(3, 4))
+    attention._use_swa_prefill_pa = Mock(return_value=True)
+    monkeypatch.setattr(
+        torch.ops.vllm, "npu_pangu_kv_cache_update", lambda *args, **kwargs: case.cache,
+        raising=False,
+    )
+    cos = torch.ones(3, 1)
+    absorbed = attention._mla_prolog_sequential(
+        hidden, cos, cos, case.cache, case.metadata, None,
+    )
+    assert absorbed.kv_cache is case.cache
+    assert absorbed.topk_indices is topk
+    assert absorbed.v_up is None
+
+    k_up, k_pe, v_up = torch.ones(3, 2, 3), torch.ones(3, 2, 1), torch.ones(3, 2, 2)
+    attention._use_swa_prefill_pa.return_value = False
+    attention._npu_kvrmsnorm_rope_cache = Mock(return_value=(k_up, k_pe, v_up))
+    plain = attention._mla_prolog_sequential(
+        hidden, cos, cos, case.cache, case.metadata, None,
+    )
+    assert plain.k_up_nope is k_up
+    assert plain.k_pe is k_pe
+    assert plain.v_up is v_up
+    assert plain.kv_cache is None

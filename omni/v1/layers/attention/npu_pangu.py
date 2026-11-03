@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-from typing import Callable, Optional, Union, Tuple
+from typing import Callable, NamedTuple, Optional, Union, Tuple
 from itertools import accumulate
 
 import torch
@@ -65,6 +65,30 @@ from omni_npu.layers.utils import named_stream
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+# Cache-dtype groups. Membership differs by path: li_int8 quantizes the
+# indexer cache only, and does not use the C8 KV layout.
+HIF8_FP8_DTYPES = frozenset({"hif8_ds_mla", "fp8_ds_mla"})
+INT8_DTYPES = frozenset({"int8_ds_mla", "li_int8_ds_mla"})
+INT8_C8_DTYPES = frozenset({"int8_ds_mla"})
+INDEXER_QUANT_CACHE_DTYPES = HIF8_FP8_DTYPES | INT8_DTYPES
+KV_QUANT_CACHE_DTYPES = HIF8_FP8_DTYPES | INT8_C8_DTYPES
+
+
+class MlaPrologOutput(NamedTuple):
+    """Q/KV outputs of an MLA prolog. Unused fields stay None.
+
+    Absorb and DSA paths fill kv_cache and topk_indices. The SWA non-absorb
+    path fills k_up_nope, k_pe, and v_up instead.
+    """
+
+    q_nope: torch.Tensor
+    q_pe: torch.Tensor
+    kv_cache: tuple | None = None
+    topk_indices: torch.Tensor | None = None
+    k_up_nope: torch.Tensor | None = None
+    k_pe: torch.Tensor | None = None
+    v_up: torch.Tensor | None = None
 
 try:
     import omni_custom_ops
@@ -224,7 +248,6 @@ class NPUPanguIndexer(torch.nn.Module):
         self.block_size_c8 = 2 * self.block_size
         self.on_ascend950 = on_ascend950()
         self._init_indexer_weights()
-        self.quant_cache_dtype = ["hif8_ds_mla", "fp8_ds_mla", "int8_ds_mla", "li_int8_ds_mla"]
         self.use_rope_fusion_op = model_extra_config.operator_opt_config.use_rope_fusion_op
 
     def _init_indexer_weights(self):
@@ -258,7 +281,7 @@ class NPUPanguIndexer(torch.nn.Module):
         )
 
     def _apply_lightning_indexer(self, *args, **kwargs):
-        if self.cache_config.cache_dtype in self.quant_cache_dtype:
+        if self.cache_config.cache_dtype in INDEXER_QUANT_CACHE_DTYPES:
             quant_output = self._apply_lightning_indexer_quant(*args, **kwargs)
             return quant_output
         else:
@@ -266,7 +289,7 @@ class NPUPanguIndexer(torch.nn.Module):
             return unquant_output
 
     def _apply_lightning_indexer_cp(self, *args, **kwargs):
-        if self.cache_config.cache_dtype in self.quant_cache_dtype:
+        if self.cache_config.cache_dtype in INDEXER_QUANT_CACHE_DTYPES:
             quant_output = self._apply_lightning_indexer_cp_quant(*args, **kwargs)
             return quant_output
         else:
@@ -319,7 +342,7 @@ class NPUPanguIndexer(torch.nn.Module):
         else:
             metadata = attn_metadata.decode
 
-        if self.on_ascend950 and self.cache_config.cache_dtype in ["hif8_ds_mla", "fp8_ds_mla"]:
+        if self.on_ascend950 and self.cache_config.cache_dtype in HIF8_FP8_DTYPES:
             if self.cache_config.cache_dtype == "hif8_ds_mla":
                 q_quant, q_scale = torch_npu.npu_dynamic_quant(
                     q, dst_type=torch_npu.hifloat8,
@@ -352,7 +375,7 @@ class NPUPanguIndexer(torch.nn.Module):
                 query_dtype=query_dtype,
                 key_dtype=key_dtype
             )
-        elif self.cache_config.cache_dtype in ["int8_ds_mla", "li_int8_ds_mla"]:
+        elif self.cache_config.cache_dtype in INT8_DTYPES:
             q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
             return torch_npu.torch.ops.custom.npu_ai_infra_quant_lightning_indexer(
                 query=q_int8,
@@ -409,7 +432,7 @@ class NPUPanguIndexer(torch.nn.Module):
     ) -> torch.Tensor:
         actual_seq_lengths_query, actual_seq_lengths_kv, _, block_table = sp_manager.cp_attn_meta()
 
-        if self.cache_config.cache_dtype in ["int8_ds_mla", "li_int8_ds_mla"]:
+        if self.cache_config.cache_dtype in INT8_DTYPES:
             q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
             return torch_npu.torch.ops.custom.npu_ai_infra_quant_lightning_indexer(
                 query=q_int8,
@@ -494,7 +517,7 @@ class NPUPanguIndexer(torch.nn.Module):
             )
             return True
 
-        elif self.cache_config.cache_dtype in ["int8_ds_mla", "li_int8_ds_mla"]:
+        elif self.cache_config.cache_dtype in INT8_DTYPES:
             k_int8, k_scale = torch_npu.npu_dynamic_quant(k)
             k_scale_fp16 = k_scale.to(torch.float16).view(-1, 1)
 
@@ -850,7 +873,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
         else:
             self.num_computed_for_cp = None
 
-        self.quant_cache_dtype = ["hif8_ds_mla", "fp8_ds_mla", "int8_ds_mla"]
         self.block_size = self.cache_config.block_size
         self.block_size_c8 = 2 * self.block_size
 
@@ -1436,7 +1458,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 "cache_dtype_str": self.cache_dtype_str,
                 "page_size_padded": self.page_size_padded,
             })
-            if self.cache_dtype_str in ["fp8_ds_mla", "hif8_ds_mla", "int8_ds_mla"]:
+            if self.cache_dtype_str in KV_QUANT_CACHE_DTYPES:
                 attn_kwargs.update({
                     "block_size": self.block_size_c8,
                 })
@@ -1607,7 +1629,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         dsa_page_size = None
         if (getattr(config, "index_topk", None) or 0) > 0:
             index_head_dim = getattr(config, "index_head_dim", 0)
-            if cache_dtype_str in ["fp8_ds_mla", "hif8_ds_mla"]:
+            if cache_dtype_str in HIF8_FP8_DTYPES:
                 # Quant case: 512 fp8 + 64 bf16 + 4 fp32 + 128 int8 + 1 fp32
                 # See DeepseekV3 quantized DSA format
                 dsa_page_size = self.block_size_c8 * (512 * 1 + 64 * 2 + 4 * 4 + 128 * 1 + 1 * 4)
@@ -2298,13 +2320,15 @@ class NPUPanguSparseAttention(torch.nn.Module):
         if self.is_cla_reuse_layer:
             return self._forward_cla(hidden_states, cos, sin, attn_metadata, attn_metadata_cla_swa, mome_metadata)
 
-        q_nope, q_pe, kv_cache, topk_indices = self._mla_prolog(
+        prolog = self._mla_prolog(
             hidden_states,
             cos,
             sin,
             attn_metadata,
             mome_metadata,
         )
+        q_nope, q_pe = prolog.q_nope, prolog.q_pe
+        kv_cache, topk_indices = prolog.kv_cache, prolog.topk_indices
 
         if self.is_dsa_layer:
             # Decode FA only (cat + SparseFA). Prefill W_UV absorb is inside
@@ -2631,7 +2655,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 q_nope, q_pe, kv_cache, topk_indices, actual_seq_lengths_query,
                 actual_seq_lengths_kv, block_table,
             )
-        elif self.cache_config.cache_dtype in ["int8_ds_mla"]:
+        elif self.cache_config.cache_dtype in INT8_C8_DTYPES:
             attn_output = torch.ops.custom.npu_ai_infra_kv_quant_sparse_flash_attention(
                 query=q,
                 key=kv_cache[0].unsqueeze(2),
@@ -2799,7 +2823,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             ckv_cache=kv_cache[0].unsqueeze(2),
         )
 
-        if self.cache_config.cache_dtype in ["int8_ds_mla"]:
+        if self.cache_config.cache_dtype in INT8_C8_DTYPES:
             kwargs.update({
                 "quant_mode": "pertile128",
             })
@@ -2874,7 +2898,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                                      attn_metadata_cla_swa, mome_metadata)
 
         if self.is_dsa_layer:
-            q_nope, q_pe, kv_cache, topk_indices = self._mla_prolog(
+            prolog = self._mla_prolog(
                 hidden_states,
                 cos,
                 sin,
@@ -2882,14 +2906,14 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 mome_metadata,
             )
             attn_output = self._apply_DSA_attention(
-                q_nope,
-                q_pe,
-                kv_cache,
-                topk_indices,
+                prolog.q_nope,
+                prolog.q_pe,
+                prolog.kv_cache,
+                prolog.topk_indices,
                 attn_metadata=attn_metadata,
             )
         else:
-            mla_output = self._mla_prolog(
+            prolog = self._mla_prolog(
                 hidden_states,
                 cos,
                 sin,
@@ -2897,21 +2921,19 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 mome_metadata,
             )
             if self._use_swa_prefill_pa(attn_metadata):
-                q_nope, q_pe, kv_cache, _ = mla_output
                 attn_output = self._apply_SWA_attention_prefill_absorb(
-                    q_nope,
-                    q_pe,
-                    kv_cache,
+                    prolog.q_nope,
+                    prolog.q_pe,
+                    prolog.kv_cache,
                     attn_metadata=attn_metadata,
                 )
             else:
-                q_nope, q_pe, k_up_nope, k_pe, v_up = mla_output
                 attn_output = self._apply_SWA_attention_prefill(
-                    q_nope,
-                    q_pe,
-                    k_up_nope,
-                    k_pe,
-                    v_up,
+                    prolog.q_nope,
+                    prolog.q_pe,
+                    prolog.k_up_nope,
+                    prolog.k_pe,
+                    prolog.v_up,
                     attn_metadata=attn_metadata,
                     recompute_metadata=self.is_fa_metadata_producer,
                 )
@@ -3755,7 +3777,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 q_nope, q_pe, kv_cache, topk_indices, metadata.query_cumlens,
                 metadata.seq_lens, metadata.block_table,
             )
-        elif self.on_ascend950 and self.cache_config.cache_dtype in ["hif8_ds_mla", "fp8_ds_mla"]:
+        elif self.on_ascend950 and self.cache_config.cache_dtype in HIF8_FP8_DTYPES:
             if self.cache_config.cache_dtype == "hif8_ds_mla":
                 key_dtype = torch_npu.hifloat8
                 value_dtype = torch_npu.hifloat8
@@ -3791,7 +3813,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 value_dtype=value_dtype,
                 **sink_kwargs,
             )
-        elif self.cache_config.cache_dtype in ["int8_ds_mla"]:
+        elif self.cache_config.cache_dtype in INT8_C8_DTYPES:
             attn_output = torch.ops.custom.npu_ai_infra_kv_quant_sparse_flash_attention(
                 query=q,
                 key=kv_cache[0].unsqueeze(2),
@@ -3850,8 +3872,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         sin: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata] = None,
         mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
-    ) -> Union[Tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor], # DSA/MLA/SWA absorb
-               Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]: # MLA/SWA non-absorb
+    ) -> MlaPrologOutput:
         # get KV cache for this layer
         kv_cache = self.attn.kv_cache
 
@@ -4004,10 +4025,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
         if self.is_dsa_layer:
             q_lora.record_stream(torch.npu.current_stream())
 
-        ret = (kv_cache, topk_indices)
-
-        output = (q_nope, q_pe, *ret)
-        return output
+        return MlaPrologOutput(
+            q_nope, q_pe, kv_cache=kv_cache, topk_indices=topk_indices,
+        )
 
     def _mla_prolog(
         self,
@@ -4016,13 +4036,12 @@ class NPUPanguSparseAttention(torch.nn.Module):
         sin: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata] = None,
         mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
-    ) -> Union[Tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor], # DSA/MLA/SWA absorb
-               Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]: # MLA/SWA non-absorb
+    ) -> MlaPrologOutput:
 
         # mla prolog multistream override for hif8 decode only specific case
         has_decode = attn_metadata.num_decodes > 0
         has_prefill = attn_metadata.num_prefills > 0
-        if self.cache_config.cache_dtype in ["hif8_ds_mla", "fp8_ds_mla"] and decode_only(attn_metadata):
+        if self.cache_config.cache_dtype in HIF8_FP8_DTYPES and decode_only(attn_metadata):
             return self._mla_prolog_hif8_fp8_decode_multistream(
                 hidden_states,
                 cos, sin,
@@ -4197,20 +4216,22 @@ class NPUPanguSparseAttention(torch.nn.Module):
             new_kv_cache = torch.ops.vllm.npu_pangu_kv_cache_update(
                 kv, kv_cache[0], kv_cache[1], cos, sin, self.prefix,
             )
-            ret = (new_kv_cache, topk_indices)
-        else:
-            ret = self._npu_kvrmsnorm_rope_cache(
-                kv,
-                kv_cache,
-                cos,
-                sin,
-                attn_metadata,
-                topk_indices,
+            return MlaPrologOutput(
+                q_nope, q_pe, kv_cache=new_kv_cache, topk_indices=topk_indices,
             )
+        k_up_nope, k_pe, v_up = self._npu_kvrmsnorm_rope_cache(
+            kv,
+            kv_cache,
+            cos,
+            sin,
+            attn_metadata,
+            topk_indices,
+        )
         ### KV stream ends ###
 
-        output = (q_nope, q_pe, *ret)
-        return output
+        return MlaPrologOutput(
+            q_nope, q_pe, k_up_nope=k_up_nope, k_pe=k_pe, v_up=v_up,
+        )
 
     def _mla_prolog_swa_multistream(
         self, hidden_states, cos, sin, kv_cache, attn_metadata, mome_metadata,
@@ -4308,7 +4329,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         new_kv_cache[0].record_stream(main_stream)
         new_kv_cache[1].record_stream(main_stream)
 
-        return (q_nope, q_pe, new_kv_cache, None)
+        return MlaPrologOutput(q_nope, q_pe, kv_cache=new_kv_cache)
 
     def _mla_prolog_dsa_multistream(
         self, hidden_states, cos, sin, kv_cache, attn_metadata, mome_metadata,
@@ -4488,7 +4509,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
         if not self.skip_topk:
             topk_indices.record_stream(main_stream)
 
-        return (q_nope, q_pe, new_kv_cache, topk_indices)
+        return MlaPrologOutput(
+            q_nope, q_pe, kv_cache=new_kv_cache, topk_indices=topk_indices,
+        )
 
     def _kv_rmsnorm_rope_cache_v2_kwargs(
         self,
@@ -4522,7 +4545,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         Non-absorb MLA/SWA prefill returns (k_up_nope, k_pe, v_up) and
         must call this method directly, not npu_pangu_kv_cache_update.
         """
-        if self.is_dsa_layer and self.cache_config.cache_dtype in self.quant_cache_dtype:
+        if self.is_dsa_layer and self.cache_config.cache_dtype in KV_QUANT_CACHE_DTYPES:
             return self._npu_kvrmsnorm_rope_cache_quant(*args, **kwargs)
         else:
             return self._npu_kvrmsnorm_rope_cache_unquant(*args, **kwargs)
@@ -4538,7 +4561,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
         """Return the DSA cache pair and optional top-k indices."""
         # DSA layer c8 shape
-        if self.on_ascend950 and self.cache_config.cache_dtype in ["hif8_ds_mla", "fp8_ds_mla"]:
+        if self.on_ascend950 and self.cache_config.cache_dtype in HIF8_FP8_DTYPES:
             actual_seq_kvlen = attn_metadata.slot_mapping.shape[0]
             cos = cos[:actual_seq_kvlen, ...]
             sin = sin[:actual_seq_kvlen, ...]
@@ -4601,7 +4624,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             )
 
             return kv_cache, topk_indices
-        elif self.cache_config.cache_dtype in ["int8_ds_mla"]:
+        elif self.cache_config.cache_dtype in INT8_C8_DTYPES:
             actual_seq_kvlen = attn_metadata.slot_mapping.shape[0]
             cos = cos[:actual_seq_kvlen, ...]
             sin = sin[:actual_seq_kvlen, ...]

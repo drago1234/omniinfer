@@ -2295,3 +2295,73 @@ def test_enable_batch_invariant_determinism_only_on_a5(
     worker_mod._enable_batch_invariant_determinism(extra)
 
     assert calls == expected_calls
+
+
+def test_init_device_initializes_profiler_state_when_not_auto(monkeypatch):
+    """Manual profiling must still have token-profiler state after init_device."""
+    import omni_npu.configs.validators as validators
+    import omni_npu.diagnostics.config_summary as summary
+    import omni_npu.worker.npu_model_runner as runner_mod
+    from omni_npu.worker import npu_worker as worker_mod
+
+    monkeypatch.setenv("VLLM_PLUGINS", "")
+    monkeypatch.setattr(worker_mod, "current_platform", SimpleNamespace(
+        device_type="npu",
+        dist_backend="hccl",
+        logical_device_id_to_visible_device_id=lambda local_rank: local_rank,
+        check_if_supports_dtype=lambda dtype: None,
+    ))
+    monkeypatch.setattr(worker_mod.torch, "device", lambda spec: spec)
+    monkeypatch.setattr(worker_mod.torch.npu, "set_device", lambda device: None)
+    monkeypatch.setattr(worker_mod, "_patch_npu_triton_capabilities", lambda: None)
+    monkeypatch.setattr(worker_mod, "init_worker_distributed_environment", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_mod, "load_model_extra_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_mod, "_enable_batch_invariant_determinism", lambda extra: None)
+    monkeypatch.setattr(worker_mod, "set_random_seed", lambda seed: None)
+    monkeypatch.setattr(worker_mod.gc, "collect", lambda: None)
+    monkeypatch.setattr(worker_mod.torch.npu, "empty_cache", lambda: None)
+    monkeypatch.setattr(worker_mod, "MemorySnapshot", lambda device: SimpleNamespace())
+    monkeypatch.setattr(worker_mod, "request_memory", lambda snapshot, cache: 0)
+    monkeypatch.setattr(worker_mod, "init_workspace_manager", lambda device, num_ubatches: None)
+    monkeypatch.setattr(worker_mod, "report_usage_stats", lambda config: None)
+    monkeypatch.setattr(summary, "emit_config_summary", lambda **kwargs: None)
+    monkeypatch.setattr(validators, "validate_all", lambda context: None)
+    monkeypatch.setattr(runner_mod, "NPUModelRunner", lambda config, device: SimpleNamespace())
+
+    parallel = SimpleNamespace(distributed_executor_backend="ray", enable_dbo=False)
+    worker = SimpleNamespace(
+        device_config=SimpleNamespace(device=SimpleNamespace(type="npu")),
+        parallel_config=parallel,
+        model_config=SimpleNamespace(dtype="float16", seed=0),
+        vllm_config=SimpleNamespace(parallel_config=parallel),
+        scheduler_config=SimpleNamespace(),
+        cache_config=SimpleNamespace(),
+        rank=0,
+        local_rank=0,
+        distributed_init_method="tcp://127.0.0.1:1",
+        world_ranks=None,
+        use_v2_model_runner=False,
+        profiler_config=SimpleNamespace(profiler=None),
+    )
+    worker._init_token_profiler_state = NPUWorker._init_token_profiler_state.__get__(worker, NPUWorker)
+    worker._is_auto_profiler_mode = NPUWorker._is_auto_profiler_mode.__get__(worker, NPUWorker)
+    # init_device now delegates device setup. This test only covers profiler state.
+    for name in (
+        "_select_npu_device",
+        "_load_engram_extra_config",
+        "_init_distributed_environment",
+        "_load_extra_config_and_determinism",
+        "_emit_config_summary_and_validate",
+        "_maybe_init_layer_parallel",
+        "_snapshot_init_memory",
+        "_init_workspace_and_model_runner",
+    ):
+        setattr(worker, name, lambda *args, **kwargs: None)
+
+    init_device = getattr(NPUWorker.init_device, "__wrapped__", NPUWorker.init_device)
+    init_device(worker)
+
+    assert worker.profile_already_start is False
+    assert worker.profile_step == 0
+    assert worker.profile_finished is False
+    assert worker.profiler_token_threshold >= 1

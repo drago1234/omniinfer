@@ -127,8 +127,10 @@ class NPUWorker(Worker):
         if self.rank == 0:
             report_usage_stats(self.vllm_config)
 
+        # Always initialize token-profiler state. _init_profiler only runs
+        # in auto mode, but execute_model still reads these attributes.
+        self._init_token_profiler_state()
         if self._is_auto_profiler_mode():
-            self._init_token_profiler_state()
             self._init_profiler()
 
         # NOTE: eplb feature need to adapt vllm 0.25.1
