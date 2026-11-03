@@ -420,6 +420,7 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
             # Verify attributes set by __init__
             self.assertEqual(builder.prefill_metadata_cls, mla_mod.NPUDSAPrefillMetadata)
             self.assertEqual(builder.uniform_decode_query_len, 1)
+            # No speculative decoding or graph padding: capacity is max_num_seqs.
             self.assertEqual(builder.mc2_mask.shape, (16,))
             self.assertEqual(builder.mc2_mask.dtype, torch.bool)
             self.assertEqual(builder.sink_len, 128)
@@ -484,26 +485,14 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
         b.reorder_batch_threshold = getattr(b, "reorder_batch_threshold", 1)
         if not hasattr(b, "model_config"):
             b.model_config = b.vllm_config.model_config
+        if not hasattr(cm, "query_start_loc"):
+            cm.query_start_loc = torch.tensor([0, fake_meta.num_actual_tokens], dtype=torch.int32)
         self._fill_common_for_build(cm)
         with patch(
             "omni_npu.attention.backends.dsa.split_decodes_and_prefills",
             return_value=(0, 0, 0, 0),
         ), patch.object(b, "metadata_cls", return_value=fake_meta, create=True):
             yield
-
-    def test_generate_activate_mask_sets_prefix_true(self):
-        b = self._new_builder_minimal()
-        mask = b._generate_activate_mask(5)
-        self.assertEqual(mask.dtype, torch.bool)
-        self.assertTrue(torch.all(mask[:5]))
-        self.assertTrue(torch.all(~mask[5:]))
-
-    def test_generate_activate_mask_reuses_builder_buffer(self):
-        b = self._new_builder_minimal()
-        mask = b._generate_activate_mask(3)
-        self.assertIs(mask, b.mc2_mask)
-        self.assertTrue(torch.equal(mask[:3], torch.tensor([True, True, True])))
-        self.assertTrue(torch.equal(mask[3:8], torch.tensor([False, False, False, False, False])))
 
     def test_build_prefill_populates_seq_lens_and_query_cumlens(self):
         b = self._new_builder_minimal()
@@ -747,8 +736,8 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
         )
         with self._metadata_from(b, fake_meta, fake_common_attn_metadata), \
             patch.object(
-                b,
-                "_generate_activate_mask",
+                mla_mod,
+                "generate_mc2_active_mask",
                 return_value=fake_mask,
             ) as mock_gen_mask:
 
@@ -759,7 +748,9 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
             )       
 
         self.assertIs(out, fake_meta)
-        mock_gen_mask.assert_called_once_with(12)
+        mock_gen_mask.assert_called_once()
+        self.assertIs(mock_gen_mask.call_args.args[0], b)
+        self.assertEqual(int(mock_gen_mask.call_args.args[1]), 12)
 
         self.assertIs(fake_meta.decode.mc2_mask, fake_mask)
         self.assertTrue(torch.equal(fake_meta.slot_mapping, orig_slot_mapping))
@@ -768,8 +759,8 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
         )
         self.assertTrue(torch.equal(fake_meta.get_slot_mapping_2d(), expect_2d))
 
-    def test_build_decode_no_mc2_mask_when_kv_role_is_producer(self):
-        """mc2_mask should NOT be set when kv_role is kv_producer (pd-mixed uses TP)."""
+    def test_build_decode_sets_mc2_mask_when_kv_role_is_producer(self):
+        """The communication mask is independent of KV transfer role."""
         b = self._new_builder_minimal()
         mock_kv_transfer_config = MagicMock()
         mock_kv_transfer_config.kv_role = "kv_producer"
@@ -798,8 +789,8 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
         )
 
         with self._metadata_from(b, fake_meta, fake_common_attn_metadata), patch.object(
-            b,
-            "_generate_activate_mask",
+            mla_mod,
+            "generate_mc2_active_mask",
         ) as mock_gen_mask:
             out = b.build(
                 common_prefix_len=0,
@@ -808,11 +799,10 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
             )
 
         # mc2_mask should remain None since kv_role is kv_producer
-        self.assertIsNone(out.decode.mc2_mask)
-        # _generate_activate_mask should NOT be called
-        mock_gen_mask.assert_not_called()
-    def test_build_decode_mc2_mask_uses_decode_num_actual_tokens(self):
-        """mc2_mask should use metadata.num_actual_tokens (not decode.num_actual_tokens)."""
+        self.assertIs(out.decode.mc2_mask, mock_gen_mask.return_value)
+        mock_gen_mask.assert_called_once()
+    def test_build_decode_mc2_mask_uses_query_tail(self):
+        """Use the real query tail, falling back when input width exceeds capacity."""
         b = self._new_builder_minimal()
         mock_kv_transfer_config = MagicMock()
         mock_kv_transfer_config.kv_role = "kv_consumer"
@@ -828,7 +818,7 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
             def __init__(self):
                 self.decode = _Decode()
                 self.prefill = None
-                self.num_actual_tokens = 12  # this is the value that should be used
+                self.num_actual_tokens = 12  # padded input width
                 self.num_reqs = 4
                 self.num_prefills = 0
                 self.num_decodes = 3
@@ -837,30 +827,45 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
 
         fake_meta = _Meta()
         fake_common_attn_metadata = SimpleNamespace(
-            seq_lens=torch.tensor([], dtype=torch.long)
+            seq_lens=torch.tensor([], dtype=torch.long),
+            query_start_loc=torch.tensor([0, 7], dtype=torch.int32),
         )
 
         fake_mask = torch.tensor(
             [True] * 12 + [False] * 4,
             dtype=torch.bool,
         )
-        with self._metadata_from(b, fake_meta, fake_common_attn_metadata), patch.object(
-            b,
-            "_generate_activate_mask",
-            return_value=fake_mask,
-        ) as mock_gen_mask:
-            out = b.build(
-                common_prefix_len=0,
-                common_attn_metadata=fake_common_attn_metadata,
-                fast_build=False,
-            )
-        # _generate_activate_mask should be called with metadata.num_actual_tokens (12),
-        # NOT with decode.num_actual_tokens (5)
-        mock_gen_mask.assert_called_once_with(5)
-        self.assertIs(out.decode.mc2_mask, fake_mask)
+        for capacity in (12, 11):
+            with self.subTest(capacity=capacity):
+                b.mc2_mask = torch.ones(capacity, dtype=torch.bool)
+                persistent_mask = b.mc2_mask
+                with self._metadata_from(b, fake_meta, fake_common_attn_metadata), patch.object(
+                    mla_mod,
+                    "generate_mc2_active_mask",
+                    return_value=fake_mask,
+                ) as mock_gen_mask:
+                    fake_common_attn_metadata.num_actual_tokens = 12
+                    mla_mod.split_decodes_and_prefills.return_value = (0, 0, 12, 0)
+                    out = b.build(
+                        common_prefix_len=0,
+                        common_attn_metadata=fake_common_attn_metadata,
+                        fast_build=False,
+                    )
+                if capacity < 12:
+                    mock_gen_mask.assert_not_called()
+                    self.assertIsNone(out.mc2_mask)
+                    self.assertIsNone(out.decode.mc2_mask)
+                    self.assertIs(b.mc2_mask, persistent_mask)
+                    self.assertTrue(persistent_mask.all())
+                    continue
+                # The query tail is authoritative, rather than decode.num_actual_tokens.
+                mock_gen_mask.assert_called_once()
+                self.assertIs(mock_gen_mask.call_args.args[0], b)
+                self.assertEqual(int(mock_gen_mask.call_args.args[1]), 7)
+                self.assertIs(out.decode.mc2_mask, fake_mask)
 
-    def test_build_decode_no_mc2_mask_when_kv_transfer_config_is_none(self):
-        """mc2_mask should NOT be set when kv_transfer_config is None."""
+    def test_build_decode_sets_mc2_mask_without_kv_transfer(self):
+        """Hybrid serving must also populate the communication mask."""
         b = self._new_builder_minimal()
         b.vllm_config.kv_transfer_config = None
 
@@ -886,8 +891,8 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
         )
 
         with self._metadata_from(b, fake_meta, fake_common_attn_metadata), patch.object(
-            b,
-            "_generate_activate_mask",
+            mla_mod,
+            "generate_mc2_active_mask",
         ) as mock_gen_mask:
             out = b.build(
                 common_prefix_len=0,
@@ -895,8 +900,8 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
                 fast_build=False,
             )
 
-        self.assertIsNone(out.decode.mc2_mask)
-        mock_gen_mask.assert_not_called()
+        self.assertIs(out.decode.mc2_mask, mock_gen_mask.return_value)
+        mock_gen_mask.assert_called_once()
 
     def test_init_clamps_decode_cudagraph_max_bs_when_max_capture_size_set(self):
         """Covers min(decode_cudagraph_max_bs, max_cudagraph_capture_size) in dsa __init__."""

@@ -1461,7 +1461,7 @@ class TestOpenPanguModelEmbeds(unittest.TestCase):
         inputs_embeds = torch.zeros(6, 8)
         sliced = torch.zeros(2, 8)
         sp_manager = MagicMock(slice_tokens=MagicMock(return_value=sliced))
-        gathered = object()
+        gathered = torch.arange(8 * 8).reshape(8, 8)
         pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
 
         with patch.object(
@@ -1483,7 +1483,44 @@ class TestOpenPanguModelEmbeds(unittest.TestCase):
         sp_manager.slice_tokens.assert_called_once_with(inputs_embeds)
         self.assertIs(captured["hidden"], sliced)
         ag.assert_called_once_with(sliced, dim=0)
-        self.assertIs(result, gathered)
+        torch.testing.assert_close(result, gathered[:6])
+        self.assertEqual(result.data_ptr(), gathered.data_ptr())
+
+    def test_sp_output_preserves_input_width_on_first_and_last_pp_ranks(self):
+        # Includes an unaligned request, an aligned request and a graph-padded
+        # input: remove only the additional SP rows, preserving runner padding.
+        for first_rank in (True, False):
+            for width in (5, 8, 64):
+                with self.subTest(first_rank=first_rank, width=width):
+                    model = ultra_mod.OpenPanguModel.__new__(ultra_mod.OpenPanguModel)
+                    nn.Module.__init__(model)
+                    layer = _layer_with_rotary()
+                    layer.forward = lambda h, c, s, r, t, e=None: (h, r, t)
+                    _bind_single_decoder_layer(
+                        model, layer, use_mhc=False, use_mhc_fusion_op=False,
+                        config=SimpleNamespace(index_topk=0),
+                    )
+                    shard = torch.zeros((width + 7) // 8, 4)
+                    model.embed_tokens = MagicMock(return_value=shard)
+                    model.norm = MagicMock(side_effect=_passthrough_norm)
+                    gathered = torch.arange(shard.shape[0] * 8 * 4).reshape(-1, 4)
+                    intermediate = ultra_mod.IntermediateTensors(
+                        {"hidden_states": shard, "residual": None}
+                    )
+                    with patch.object(ultra_mod, "get_pp_group", return_value=SimpleNamespace(
+                        is_first_rank=first_rank, is_last_rank=True,
+                    )), patch.object(
+                        ultra_mod.model_extra_config.parall_config, "ena_seq_parallel", True,
+                    ), patch.object(
+                        ultra_mod, "tensor_model_parallel_all_gather", return_value=gathered,
+                    ):
+                        result = model.forward(
+                            input_ids=torch.arange(width) if first_rank else None,
+                            positions=torch.arange(width),
+                            intermediate_tensors=None if first_rank else intermediate,
+                        )
+                    torch.testing.assert_close(result, gathered[:width])
+                    self.assertEqual(result.data_ptr(), gathered.data_ptr())
 
 
 class TestPanguUltraMoeV3Wiring(unittest.TestCase):
@@ -1560,6 +1597,11 @@ class TestPanguUltraMoeV3Wiring(unittest.TestCase):
         assert ultra_mod.PanguUltraMoEForCausalLM.is_hybrid is True  # v2 keeps MoME state
         assert ultra_mod.PanguUltraMoEV3ForCausalLM.is_hybrid is False
         assert ultra_mod.PanguUltraMoEV3ForCausalLM.get_model_state_cls() is DefaultModelState
+
+    def test_v2_causal_lm_registers_mome_state_for_mrv2(self):
+        from omni_npu.worker.npu.mome_model_state import MomeModelState
+
+        assert ultra_mod.PanguUltraMoEForCausalLM.get_model_state_cls() is MomeModelState
 
     def test_an_unmatched_checkpoint_weight_is_skipped(self):
         """A CLA reuse layer builds no global KV projection, so its weight has

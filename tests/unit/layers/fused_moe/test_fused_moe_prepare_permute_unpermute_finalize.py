@@ -1054,7 +1054,7 @@ def test_dispatch_prepare_permute_passes_quant_mode_and_mask(prepare_module):
         quant_method=SimpleNamespace(moe_quant_config=None),
     )
     stubs.context_holder.attn_metadata = {
-        0: SimpleNamespace(decode=SimpleNamespace(mc2_mask=torch.tensor([1, 0, 1], dtype=torch.bool)))
+        0: SimpleNamespace(mc2_mask=torch.tensor([1, 0, 1], dtype=torch.bool))
     }
     dispatch_out = (
         torch.ones(2, 3),
@@ -1106,7 +1106,7 @@ def test_dispatch_prepare_permute_mxfp_disables_dispatch_quant(
         ),
     )
     stubs.context_holder.attn_metadata = {
-        0: SimpleNamespace(decode=SimpleNamespace(mc2_mask=torch.tensor([1, 1], dtype=torch.bool)))
+        0: SimpleNamespace(mc2_mask=torch.tensor([1, 1], dtype=torch.bool))
     }
     expand_x = torch.ones(2, 3)
     dirty_dynamic_scale = torch.ones(2)
@@ -1147,7 +1147,7 @@ def test_dispatch_prepare_permute_hifloat8_casts_and_clears_scale(prepare_module
         ),
     )
     stubs.context_holder.attn_metadata = {
-        0: SimpleNamespace(decode=SimpleNamespace(mc2_mask=torch.tensor([1, 1], dtype=torch.bool)))
+        0: SimpleNamespace(mc2_mask=torch.tensor([1, 1], dtype=torch.bool))
     }
     expand_x = torch.ones(2, 3)
     cast_x = torch.zeros(2, 3, dtype=torch.int8)
@@ -1203,7 +1203,7 @@ def test_dispatch_prepare_permute_mxfp_communication_quant(
         ),
     )
     stubs.context_holder.attn_metadata = {
-        0: SimpleNamespace(decode=SimpleNamespace(mc2_mask=torch.tensor([1, 1], dtype=torch.bool)))
+        0: SimpleNamespace(mc2_mask=torch.tensor([1, 1], dtype=torch.bool))
     }
     expand_x = torch.ones(2, 3)
     dynamic_scale = torch.ones(2, 1, dtype=torch.uint8)
@@ -1265,7 +1265,7 @@ def test_dispatch_unpermute_finalize_passes_counts_and_mask(prepare_module):
         quant_config=None,
     )
     stubs.context_holder.attn_metadata = SimpleNamespace(
-        decode=SimpleNamespace(mc2_mask=torch.tensor([1, 1], dtype=torch.bool))
+        mc2_mask=torch.tensor([1, 1], dtype=torch.bool)
     )
     stubs.torch_npu.npu_moe_distribute_combine_v2.return_value = torch.full((2, 2), 7.0)
     handler = module.DispatchCombinePrepPmtAndUnpmtFinal(layer)
@@ -2454,3 +2454,36 @@ def test_agrs_prepare_permute_with_all_gather_feeds_shared_mlp_quantized_input(
     assert set(x_dict) == {key, "pertoken_scale"}
     assert x_dict[key] is local_x
     assert x_dict["pertoken_scale"] is local_scale
+
+
+@pytest.mark.parametrize(
+    "is_a5,mode,num_prefills,num_tokens,expected",
+    [
+        (True, CUDAGraphMode.FULL, 1, 256, "dispatch_combine"),
+        (True, CUDAGraphMode.FULL, 1, 128, "dispatch_combine"),
+        (True, CUDAGraphMode.FULL, 1, 512, "dispatch_combine"),
+        (True, CUDAGraphMode.FULL, 1, 513, "agrs"),
+        (True, CUDAGraphMode.FULL, 0, 256, "agrs"),
+        (True, CUDAGraphMode.NONE, 1, 256, "agrs"),
+        (True, CUDAGraphMode.PIECEWISE, 1, 256, "agrs"),
+        (False, CUDAGraphMode.FULL, 1, 256, "agrs"),
+    ],
+)
+def test_a5_full_prefill_overrides_agrs_within_threshold(
+    prepare_module, is_a5, mode, num_prefills, num_tokens, expected
+):
+    module, stubs = prepare_module
+    selector = _a5_dispatch_selector(module, stubs, _moe_layer(global_num_experts=4))
+    selector.is_a5_device = is_a5
+    selector.tp_size = 8
+    selector.max_dispatch_combine_threshold = 512
+    module.model_extra_config.parall_config.ena_seq_parallel = True
+    module.model_extra_config.operator_opt_config.enable_moe_agrs = True
+    module.model_extra_config.operator_opt_config.decode_moe_dispatch_combine = False
+    module.get_forward_context = lambda: SimpleNamespace(
+        attn_metadata={0: SimpleNamespace(num_prefills=num_prefills)},
+        cudagraph_runtime_mode=mode,
+    )
+    selector._get_strategy_impl = lambda strategy: strategy
+    strategy, _ = selector.select_communication_strategy(num_tokens)
+    assert strategy == expected

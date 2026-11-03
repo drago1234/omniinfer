@@ -908,8 +908,8 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             torch.tensor([64, 1])
         ))
 
-    def test_build_decode_no_mc2_mask_when_kv_role_is_producer(self):
-        """mc2_mask should NOT be set when kv_role is kv_producer (pd-mixed uses TP)."""
+    def test_build_decode_sets_mc2_mask_when_kv_role_is_producer(self):
+        """The communication mask is independent of KV transfer role."""
         mock_kv_transfer_config = MagicMock()
         mock_kv_transfer_config.kv_role = "kv_producer"
         builder, mla_mod = self._new_builder_for_current_build(
@@ -926,8 +926,8 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             "split_decodes_and_prefills",
             return_value=(1, 0, 1, 0),
         ), patch.object(
-            builder,
-            "generate_activate_mask",
+            mla_mod,
+            "generate_mc2_active_mask",
         ) as mock_gen_mask:
             result = builder.build(
                 common_prefix_len=0,
@@ -935,13 +935,13 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
                 fast_build=False,
             )
 
-        # mc2_mask should remain None since kv_role is kv_producer
-        self.assertIsNone(result.decode.mc2_mask)
-        # generate_activate_mask should NOT be called
-        mock_gen_mask.assert_not_called()
+        self.assertIs(result.decode.mc2_mask, mock_gen_mask.return_value)
+        mock_gen_mask.assert_called_once()
+        self.assertIs(mock_gen_mask.call_args.args[0], builder)
+        self.assertEqual(int(mock_gen_mask.call_args.args[1]), 1)
 
     def test_build_decode_mc2_mask_uses_query_cumlens_last(self):
-        """mc2_mask should use decode.query_cumlens[-1] as the token count."""
+        """Use the real query tail when capacity covers the padded input width."""
         mock_kv_transfer_config = MagicMock()
         mock_kv_transfer_config.kv_role = "kv_consumer"
         builder, mla_mod = self._new_builder_for_current_build(
@@ -953,27 +953,43 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             block_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
         )
 
-        with patch.object(
-            mla_mod,
-            "split_decodes_and_prefills",
-            return_value=(2, 0, 3, 0),
-        ), patch.object(
-            builder,
-            "generate_activate_mask",
-            wraps=builder.generate_activate_mask,
-        ) as mock_gen_mask:
-            result = builder.build(
-                common_prefix_len=0,
-                common_attn_metadata=common_attn_metadata,
-                fast_build=False,
-            )
+        common_attn_metadata.num_actual_tokens = 8  # padded width; real query tail is 3
+        for capacity in (8, 7):
+            with self.subTest(capacity=capacity):
+                builder.mc2_mask = torch.ones(capacity, dtype=torch.bool)
+                persistent_mask = builder.mc2_mask
+                with patch.object(
+                    mla_mod,
+                    "split_decodes_and_prefills",
+                    return_value=(2, 0, 8, 0),
+                ), patch.object(
+                    mla_mod,
+                    "generate_mc2_active_mask",
+                    wraps=mla_mod.generate_mc2_active_mask,
+                ) as mock_gen_mask:
+                    result = builder.build(
+                        common_prefix_len=0,
+                        common_attn_metadata=common_attn_metadata,
+                        fast_build=False,
+                    )
 
-        # generate_activate_mask should be called with query_cumlens[-1] (=3)
-        mock_gen_mask.assert_called_once_with(3)
-        self.assertIsNotNone(result.decode.mc2_mask)
+                if capacity < 8:
+                    mock_gen_mask.assert_not_called()
+                    self.assertIsNone(result.mc2_mask)
+                    self.assertIsNone(result.decode.mc2_mask)
+                    self.assertIs(builder.mc2_mask, persistent_mask)
+                    self.assertTrue(persistent_mask.all())
+                    continue
+                # The shared generator must use the query tail (=3), excluding graph padding.
+                mock_gen_mask.assert_called_once()
+                self.assertIs(mock_gen_mask.call_args.args[0], builder)
+                self.assertEqual(int(mock_gen_mask.call_args.args[1]), 3)
+                self.assertIs(result.mc2_mask, result.decode.mc2_mask)
+                self.assertEqual(int(result.mc2_mask.sum()), 3)
+                self.assertEqual(result.num_actual_tokens, 8)
 
-    def test_build_decode_no_mc2_mask_when_kv_transfer_config_is_none(self):
-        """mc2_mask should NOT be set when kv_transfer_config is None."""
+    def test_build_decode_sets_mc2_mask_without_kv_transfer(self):
+        """Hybrid serving must also populate the communication mask."""
         builder, mla_mod = self._new_builder_for_current_build(
             kv_transfer_config=None,
         )
@@ -988,8 +1004,8 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             "split_decodes_and_prefills",
             return_value=(1, 0, 1, 0),
         ), patch.object(
-            builder,
-            "generate_activate_mask",
+            mla_mod,
+            "generate_mc2_active_mask",
         ) as mock_gen_mask:
             result = builder.build(
                 common_prefix_len=0,
@@ -997,6 +1013,7 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
                 fast_build=False,
             )
 
-        # mc2_mask should remain None since kv_transfer_config is None
-        self.assertIsNone(result.decode.mc2_mask)
-        mock_gen_mask.assert_not_called()
+        self.assertIs(result.decode.mc2_mask, mock_gen_mask.return_value)
+        mock_gen_mask.assert_called_once()
+        self.assertIs(mock_gen_mask.call_args.args[0], builder)
+        self.assertEqual(int(mock_gen_mask.call_args.args[1]), 1)

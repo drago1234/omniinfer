@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import (
+    PAD_SLOT_ID,
     split_decodes_and_prefills as _vllm_split_decodes_and_prefills,
 )
 
@@ -27,6 +28,24 @@ from omni_npu.v1.utils import on_ascend950
 
 logger = init_logger(__name__)
 NPU_ATTENTION_BACKEND = {}
+
+
+def generate_mc2_active_mask(
+    builder, num_actual_tokens: int | torch.Tensor, slot_mapping: torch.Tensor,
+) -> torch.Tensor:
+    """Update the persistent prefix mask, disabling batches with only PAD slots.
+
+    All updates stay on device and retain the tensor address for graph replay.
+    Mixed valid/PAD mappings retain the original token-prefix mask.
+    """
+    mc2_mask = builder.mc2_mask
+    if isinstance(num_actual_tokens, int) and not 0 <= num_actual_tokens <= mc2_mask.numel():
+        raise ValueError("MC2 active token count is outside mask capacity")
+    if not hasattr(builder, "mc2_mask_positions"):
+        builder.mc2_mask_positions = torch.arange(mc2_mask.numel(), device=mc2_mask.device)
+    torch.lt(builder.mc2_mask_positions, num_actual_tokens, out=mc2_mask)
+    mc2_mask.logical_and_(torch.any(slot_mapping != PAD_SLOT_ID))
+    return mc2_mask
 
 
 def split_decodes_and_prefills(

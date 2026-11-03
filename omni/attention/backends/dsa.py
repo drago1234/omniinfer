@@ -42,6 +42,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from omni_npu.attention.backends.utils import (
+    generate_mc2_active_mask,
     _maybe_padded_raw_tensor_to_strided_caches,
     graph_prefill_width,
     paged_cache,
@@ -200,6 +201,7 @@ class NPUDSADecodeMetadata(MLACommonDecodeMetadata):
 
 @dataclass
 class NPUDSAMetadata(MLACommonMetadata[NPUDSADecodeMetadata]):
+    mc2_mask: torch.Tensor | None = None
     slot_mapping_cache = None
     first_layer_idx = -1
     # Capture width a FULL graph would serve this batch at; None keeps a
@@ -244,7 +246,12 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
             else 1 + self.vllm_config.speculative_config.num_speculative_tokens
         )
         max_decode_tokens = self.vllm_config.scheduler_config.max_num_seqs * self.uniform_decode_query_len
-        self.mc2_mask = torch.zeros(max_decode_tokens, dtype=torch.bool, device=current_platform.device_type)
+        mask_capacity = max(
+            max_decode_tokens,
+            int(self.compilation_config.max_cudagraph_capture_size or 0),
+        )
+        self.mc2_mask = torch.zeros(mask_capacity, dtype=torch.bool, device=device)
+        self.mc2_mask_positions = torch.arange(mask_capacity, device=device)
         self.sink_len = getattr(self.vllm_config.model_config.hf_config, "param_sink_number", 0)
 
         self.decode_cudagraph_max_bs = max_decode_tokens
@@ -549,10 +556,15 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
             prefill=prefill_metadata,
             decode=decode_metadata,
         )
+        if num_tokens > self.mc2_mask.numel():
+            metadata.mc2_mask = None
+        else:
+            metadata.mc2_mask = generate_mc2_active_mask(
+                self, query_start_loc[-1], slot_mapping
+            )
+        if metadata.decode is not None:
+            metadata.decode.mc2_mask = metadata.mc2_mask
         if metadata.decode is not None and self.vllm_config.kv_transfer_config is not None:
-            # for pd-mixed, TP is used, no need to use mc2_mask
-            if self.vllm_config.kv_transfer_config.kv_role == "kv_consumer":
-                metadata.decode.mc2_mask = self._generate_activate_mask(metadata.decode.num_actual_tokens)
             metadata.decode.seq_lens = common_attn_metadata.seq_lens[:metadata.num_decodes].to(torch.int32)
 
             # DSA-KVSP is designed for prefill only on pd-disagg
@@ -652,11 +664,6 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
             return slot_mapping_cache
 
         return inner_get_slot_mapping_2d
-
-    def _generate_activate_mask(self, num_actual_tokens):
-        self.mc2_mask.fill_(False)
-        self.mc2_mask[:num_actual_tokens].fill_(True)
-        return self.mc2_mask
 
 
 class NPUDSAImpl(SparseMLAAttentionImpl[NPUDSAMetadata]):

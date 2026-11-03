@@ -41,6 +41,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from omni_npu.connector.utils import TP_Convertor
 from omni_npu.attention.backends.utils import (
+    generate_mc2_active_mask,
     SPManager,
     register_attention_backend,
     split_decodes_and_prefills,
@@ -163,6 +164,7 @@ class NPUMLADecodeMetadata(MLACommonDecodeMetadata):
 @dataclass
 class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
     causal: bool = True
+    mc2_mask: torch.Tensor | None = None
     decode_threshold: int = 1
     slot_mapping_2d: torch.Tensor = None
     # Capture width a FULL graph would serve this batch at; None keeps a
@@ -192,9 +194,13 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         if self.aot_schedule:
             raise ValueError("AOT schedule should be enabled.")
 
-        # FIXME (zhao): since current the max length of input of mc2_mask only support 256, so we clamp it to 256
-        max_decode_tokens = min(256, self.vllm_config.scheduler_config.max_num_seqs * self.reorder_batch_threshold)
-        self.mc2_mask = torch.zeros(max_decode_tokens, dtype=torch.bool, device=current_platform.device_type)
+        # Mixed batches and graph padding can be wider than the decode batch.
+        mask_capacity = max(
+            self.vllm_config.scheduler_config.max_num_seqs * max(1, self.reorder_batch_threshold),
+            int(self.vllm_config.compilation_config.max_cudagraph_capture_size or 0),
+        )
+        self.mc2_mask = torch.zeros(mask_capacity, dtype=torch.bool, device=device)
+        self.mc2_mask_positions = torch.arange(mask_capacity, device=device)
 
     def _build_decode(
         self,
@@ -537,14 +543,14 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         #     super().build() in the old override) ===
         metadata.decode_threshold = self.reorder_batch_threshold
 
-        # update decode_metadata
+        if num_tokens > self.mc2_mask.numel():
+            metadata.mc2_mask = None
+        else:
+            metadata.mc2_mask = generate_mc2_active_mask(
+                self, query_start_loc[-1], slot_mapping
+            )
         if metadata.decode is not None:
-            if self.vllm_config.kv_transfer_config is not None:
-                # for pd-mixed, TP is used, no need to use mc2_mask
-                if self.vllm_config.kv_transfer_config.kv_role == "kv_consumer":
-                    metadata.decode.mc2_mask = self.generate_activate_mask(
-                        metadata.decode.num_actual_tokens,
-                    )
+            metadata.decode.mc2_mask = metadata.mc2_mask
 
             if hasattr(self, "sink_len") and self.sink_len > 0:
                 # for static sink attention, we need to add the sink length to the seq_lens
@@ -647,11 +653,6 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
             return slot_mapping_2d
 
         return get_slot_mapping_2d
-
-    def generate_activate_mask(self, num_actual_tokens):
-        self.mc2_mask.fill_(False)
-        self.mc2_mask[:num_actual_tokens].fill_(True)
-        return self.mc2_mask
 
     def prepare_dcp_slots(self, metadata):
         slots = metadata.slot_mapping

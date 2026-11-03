@@ -41,9 +41,13 @@ def run_isolated_pytest(target, tmp_path, timeout=300, *, interpreter=False):
         # Keep spawned-rank coverage as well as the child pytest process.
         source = Path(__file__).resolve().parents[3] / "omni"
         config = tmp_path / "engram.coveragerc"
+        # Child data is merged directly into the parent, so it must not
+        # reintroduce files excluded from the parent's measurement.
+        omit = parent_coverage.get_option("run:omit") or []
         config.write_text(
             "[run]\nbranch = " + str(parent_coverage.config.branch)
             + "\nparallel = True\nconcurrency = multiprocessing,thread\ninclude =\n    " + str(source / "*") + "\n"
+            + "omit =\n" + "".join("    " + pattern + "\n" for pattern in omit)
         )
         child_data = tmp_path / ".coverage.engram"
         env["COVERAGE_FILE"] = str(child_data)

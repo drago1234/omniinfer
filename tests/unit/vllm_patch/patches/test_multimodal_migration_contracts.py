@@ -439,7 +439,9 @@ def test_video_preserves_valid_frames_and_cleans_up_failures(
     monkeypatch.setattr(backend, "decode_single_frame", decode)
 
     if scenario in ("valid", "bad_frame"):
-        frames, metadata = backend.load_bytes(b"test-video")
+        # API server imports can raise the root logger's level to ERROR.
+        with caplog.at_level(logging.WARNING):
+            frames, metadata = backend.load_bytes(b"test-video")
         assert frames.shape == (2, 2, 2, 3)
         assert torch.equal(frames[0], torch.zeros(2, 2, 3, dtype=torch.uint8))
         if scenario == "valid":

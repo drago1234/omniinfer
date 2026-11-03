@@ -13,6 +13,45 @@ import pytest
 from tests.integration.layers import engram_test_utils as runner
 
 
+@pytest.mark.parametrize("exclude_patches", [False, True])
+@pytest.mark.parametrize("branch", [False, True])
+def test_child_coverage_merge_preserves_parent_omit(tmp_path, monkeypatch, exclude_patches, branch):
+    import coverage
+
+    # A tiny source tree exercises real child collection/merge without NPU code.
+    repo = tmp_path / "repo"
+    source = repo / "omni"
+    patch = source / "vllm_patches" / "example.py"
+    patch.parent.mkdir(parents=True)
+    kept = source / "example.py"
+    kept.write_text("VALUE = 7\n")
+    patch.write_text("VALUE = 11\n")
+    child_test = tmp_path / "test_child.py"
+    child_test.write_text(
+        "import runpy\n"
+        "def test_source_files():\n"
+        f"    assert runpy.run_path({str(kept)!r})['VALUE'] == 7\n"
+        f"    assert runpy.run_path({str(patch)!r})['VALUE'] == 11\n"
+    )
+    monkeypatch.setattr(runner, "__file__", str(repo / "tests/integration/layers/engram_test_utils.py"))
+    omit = ["*/omni/vllm_patches/*", "*/unused/*"] if exclude_patches else []
+    parent = coverage.Coverage(
+        data_file=str(tmp_path / ".coverage.parent"), config_file=False,
+        source=[str(source)], omit=omit, branch=branch,
+    )
+    child_dir = tmp_path / "child"
+    child_dir.mkdir()
+    with parent.collect():
+        runner.run_isolated_pytest(str(child_test), child_dir, timeout=30)
+    data = parent.get_data()
+    assert data.lines(str(kept)) == [1]  # Only the child executed this file.
+    assert data.has_arcs() == branch
+    if exclude_patches:
+        assert str(patch) not in data.measured_files()
+    else:
+        assert data.lines(str(patch)) == [1]
+
+
 @pytest.mark.parametrize("mode,interpreter", [
     ("success", False), ("failure", False), ("timeout", False), ("success", True),
 ])

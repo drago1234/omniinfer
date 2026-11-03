@@ -777,14 +777,30 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
 
     def _get_mc2_mask(self, num_tokens: int) -> torch.Tensor | None:
         attn_metadata = get_forward_context().attn_metadata
-        if isinstance(attn_metadata, dict):
-            attn_metadata = next(iter(attn_metadata.values()), None) if attn_metadata else None
-        if hasattr(attn_metadata, "decode") and attn_metadata.decode is not None:
-            mc2_mask = getattr(attn_metadata.decode, "mc2_mask", None)
+        metadata_values = attn_metadata.values() if isinstance(attn_metadata, dict) else (attn_metadata,)
+        for metadata in metadata_values:
+            # Batch-level masks include prefill and decode rows, with graph
+            # padding excluded.
+            mc2_mask = getattr(metadata, "mc2_mask", None)
             if mc2_mask is not None:
-                mc2_mask = mc2_mask[:num_tokens]
-            return mc2_mask
-        return None
+                break
+        else:
+            return None
+
+        if mc2_mask.dtype != torch.bool or mc2_mask.ndim != 1:
+            logger.warning_once(
+                "MC2 active mask must be a one-dimensional bool tensor; "
+                "falling back to unmasked dispatch."
+            )
+            return None
+        if mc2_mask.numel() < num_tokens:
+            logger.warning_once(
+                "MC2 mask has %d rows for %d input tokens; "
+                "falling back to unmasked dispatch.",
+                mc2_mask.numel(), num_tokens,
+            )
+            return None
+        return mc2_mask[:num_tokens]
 
     def prepare_permute(
         self,
@@ -815,6 +831,9 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
         else:
             quant_mode = 2 if layer.routed_experts.quant_config is not None else 0
 
+        mc2_mask = self._get_mc2_mask(topk_ids.shape[0])
+        if mc2_mask is not None and mc2_mask.device != x.device:
+            raise ValueError("MC2 active mask and input must be on the same device")
         output = torch_npu.npu_moe_distribute_dispatch_v2(
             x=x,
             expert_ids=topk_ids,
@@ -827,7 +846,7 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
             group_ep=self.moe_all_to_all_group_name,
             ep_world_size=self.ep_size,
             ep_rank_id=self.ep_rank,
-            x_active_mask=self._get_mc2_mask(topk_ids.shape[0]),
+            x_active_mask=mc2_mask,
             expert_scales=options.topk_weights.float() if layer.use_swiglu_group_fusion else None,
             **dispatch_quant_kwargs,
         )
@@ -938,7 +957,16 @@ class CommunicationStrategySelector:
             # tokens per rank
             local_num_tokens = cdiv(num_tokens, self.tp_size)
 
-        if model_extra_config.operator_opt_config.enable_moe_agrs:
+        is_a5_full_graph = (
+            self.is_a5_device
+            and forward_ctx.cudagraph_runtime_mode == CUDAGraphMode.FULL
+        )
+        is_a5_prefill_graph = (
+            is_a5_full_graph and getattr(attn_metadata, "num_prefills", 0) > 0
+        )
+        if is_a5_prefill_graph and local_num_tokens <= self.max_dispatch_combine_threshold:
+            strategy = "dispatch_combine"
+        elif model_extra_config.operator_opt_config.enable_moe_agrs:
             strategy = "agrs"
         elif self.is_a2_device:
             if model_extra_config.operator_opt_config.decode_moe_dispatch_combine:

@@ -847,6 +847,14 @@ class OpenPanguModel(PanGuEngramModelMixin, nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        if model_extra_config.parall_config.ena_seq_parallel:
+            # Preserve the runner's input width, including any graph padding.
+            # Embedding/SP may add further rows to make it divisible by TP.
+            original_num_tokens = (
+                inputs_embeds.shape[0]
+                if inputs_embeds is not None
+                else positions.shape[-1]
+            )
         if self.engram_hash is not None and input_ids is None:
             raise ValueError("PanGu Engram requires raw token IDs")
         engram_hash_ids = (
@@ -950,6 +958,7 @@ class OpenPanguModel(PanGuEngramModelMixin, nn.Module):
 
         if model_extra_config.parall_config.ena_seq_parallel:
             hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
+            hidden_states = hidden_states[:original_num_tokens]
         return hidden_states
 
 
@@ -1275,6 +1284,13 @@ class PanguUltraMoEForCausalLM(OpenPanguMoEModel, IsHybrid):
 
     # Allow vLLM to keep APC enabled for this MOME-based model.
     supports_mamba_prefix_caching = True
+
+    @classmethod
+    def get_model_state_cls(cls):
+        """Publish prompt lengths to the MoME builders under MRv2."""
+        from omni_npu.worker.npu.mome_model_state import MomeModelState
+
+        return MomeModelState
 
     @classmethod
     def get_mamba_state_dtype_from_config(
