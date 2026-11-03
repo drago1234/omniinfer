@@ -83,10 +83,18 @@ class NPUOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         Same role as SimpleCPUOffload ``_in_flight_store_gpu_blocks``
         (vLLM #42903): skip SWA reuse and prefix-share duplicates so the
         same GPU block is not stored (or touched) twice.
+
+        Exclude jobs in ``_current_batch_jobs_to_flush``: the worker waits
+        for them before overwriting reused blocks, so they must not
+        suppress stores of the new KV contents.
         """
-        in_flight = set(self._block_id_to_pending_jobs)
-        for job_status in self._jobs.values():
-            if not job_status.is_store:
+        in_flight = {
+            block_id
+            for block_id, pending_jobs in self._block_id_to_pending_jobs.items()
+            if pending_jobs - self._current_batch_jobs_to_flush
+        }
+        for job_id, job_status in self._jobs.items():
+            if not job_status.is_store or job_id in self._current_batch_jobs_to_flush:
                 continue
             in_flight.update(job_status.non_sliding_window_block_ids or ())
             in_flight.update(job_status.sliding_window_block_ids or ())

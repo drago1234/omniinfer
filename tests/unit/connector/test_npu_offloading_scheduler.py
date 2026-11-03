@@ -123,6 +123,7 @@ def _make_scheduler(config, req_status, recorded, store_everything=True):
     scheduler._generate_job_id = _next_job_id
     scheduler._jobs = {}
     scheduler._block_id_to_pending_jobs = {}
+    scheduler._current_batch_jobs_to_flush = set()
     return scheduler
 
 
@@ -1010,3 +1011,39 @@ def test_store_rejects_when_a_load_job_is_pending():
 
     with pytest.raises(RuntimeError, match="cannot issue store job"):
         _run_step(scheduler, 0, CHUNK_TOKENS)
+
+
+def test_reallocated_block_is_stored_after_old_store_is_fenced():
+    config = _scheduler_config(_group_config(0, is_eagle=False))
+    req_status = _make_req_status(config)
+    recorded = []
+    scheduler = _make_scheduler(config, req_status, recorded)
+    scheduler._jobs[99] = TransferJobStatus(
+        req_id="old-req", pending_count=1, keys={"old-key"},
+        is_store=True, non_sliding_window_block_ids=None,
+        sliding_window_block_ids=[1],
+    )
+    scheduler._block_id_to_pending_jobs = {1: {99}}
+    scheduler._current_batch_jobs_to_flush = {99}
+    jobs = _run_step(scheduler, 0, CHUNK_TOKENS)
+    assert 1 in _src_block_ids(jobs)
+    assert recorded == list(range(BLOCKS_PER_CHUNK))
+
+
+def test_non_sliding_store_is_excluded_when_fenced():
+    config = _scheduler_config(_group_config(0, is_eagle=False))
+    scheduler = _make_scheduler(config, _make_req_status(config), [])
+    scheduler._jobs[99] = TransferJobStatus(
+        req_id="old-req", pending_count=1, keys=set(), is_store=True,
+        non_sliding_window_block_ids=[1], sliding_window_block_ids=None,
+    )
+    scheduler._current_batch_jobs_to_flush = {99}
+    assert scheduler._in_flight_store_gpu_ids() == set()
+
+
+def test_block_stays_protected_if_another_pending_job_is_not_fenced():
+    config = _scheduler_config(_group_config(0, is_eagle=False))
+    scheduler = _make_scheduler(config, _make_req_status(config), [])
+    scheduler._block_id_to_pending_jobs = {1: {99, 100}, 2: {99}}
+    scheduler._current_batch_jobs_to_flush = {99}
+    assert scheduler._in_flight_store_gpu_ids() == {1}
