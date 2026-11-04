@@ -202,7 +202,6 @@ class TestMomeContextOps(unittest.TestCase):
             )
             torch.nn.Module.__init__(attention)
             attention.layer_name = "layer"
-            attention.on_ascend950 = False
             attention.mome_attn = SimpleNamespace(kv_cache=[states])
             conv = SimpleNamespace(mome_cache_index=0, weight=weight)
             attn_metadata = SimpleNamespace(prefill=None)
@@ -264,7 +263,6 @@ class TestMomeContextCallSites(unittest.TestCase):
         )
         torch.nn.Module.__init__(self.attention)
         self.attention.layer_name = "layer"
-        self.attention.on_ascend950 = False
         self.attention.mome_attn = SimpleNamespace(
             kv_cache=[torch.zeros(16, 8) for _ in range(3)]
         )
@@ -296,19 +294,10 @@ class TestMomeContextCallSites(unittest.TestCase):
                         phase=phase,
                     )
 
-    def test_warmup_and_ascend950_keep_original_paths(self):
+    def test_warmup_returns_input(self):
         x = torch.zeros(4, 8)
-        conv = SimpleNamespace(
-            mome_cache_index=0, forward=MagicMock(return_value=x + 1)
-        )
+        conv = SimpleNamespace(mome_cache_index=0)
         self.assertIs(self.attention._apply_MOME(x, conv, None, None), x)
-        self.attention.on_ascend950 = True
-        metadata = object()
-        result = self.attention._apply_MOME(x, conv, object(), metadata)
-        self.assertIs(result, conv.forward.return_value)
-        conv.forward.assert_called_once_with(
-            x, self.attention.mome_attn.kv_cache[0], metadata, inplace=False
-        )
 
     def test_prefill_inplace_keeps_legacy_view_contract(self):
         x = torch.zeros(4, 12)[:, :8]

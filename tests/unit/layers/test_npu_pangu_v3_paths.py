@@ -19,7 +19,7 @@ def case(monkeypatch):
         qk_nope_head_dim=3, qk_rope_head_dim=1, qk_head_dim=4, v_head_dim=2,
         block_size=16, sliding_window=32, scaling=0.5, param_sink_number=0,
         use_gpt_oss_sink=False, use_gpt_oss_sink_rescale=False, use_aicpu_fa_tiling=False,
-        on_ascend950=False, is_fa_metadata_producer=True, _fa_meta_suffix="_mla",
+        is_fa_metadata_producer=True, _fa_meta_suffix="_mla",
         is_cla_fa_metadata_producer=True, cla_swa_gate_window=8, use_mome=False,
         is_cla_reuse_layer=True, is_dsa_layer=False, first_chunk_pa=True,
         sharded_o_proj=False, _fia_aic_core_num=24, _fia_aiv_core_num=48,
@@ -120,20 +120,16 @@ def test_v3_absorb_uses_phase_or_sp_metadata(case, monkeypatch, sp_tokens):
 @pytest.mark.parametrize("backend,capturing,aicpu,sinks,padded", [
     ("sink", False, False, 1, True), ("sink", True, False, 1, False),
     ("sink", False, False, 0, False), ("sink", False, True, 0, False),
-    ("pioneer", False, False, 1, False), ("pioneer", True, False, 1, False),
-    ("pioneer", False, True, 0, False),
     ("gpt", False, False, 0, False), ("gpt", True, False, 0, False),
 ])
 def test_swa_pa_backends_capture_and_padding(case, monkeypatch, backend, capturing, aicpu, sinks, padded):
     a = case.attention
-    a.on_ascend950, a.use_gpt_oss_sink = backend == "pioneer", backend == "gpt"
+    a.use_gpt_oss_sink = backend == "gpt"
     a.use_aicpu_fa_tiling, a.param_sink_number = aicpu, sinks
     case.context.capturing = capturing
     count = 2 if padded else 3
     op = Mock(return_value=(case.q[:count].transpose(0, 1).contiguous(), torch.empty(0)))
     monkeypatch.setattr(torch.ops.custom, "npu_fused_infer_attention_sink", op)
-    monkeypatch.setattr(torch.ops.custom, "npu_ai_infra_attention_pioneer", op)
-    monkeypatch.setattr(mod.torch_npu, "_npu_attention_pioneer", op, raising=False)
     native_fia = Mock(return_value=(op.return_value[0], torch.empty(0), torch.empty(0), torch.empty(0)))
     monkeypatch.setattr(torch.ops.custom, "npu_ai_infra_flash_attention", native_fia, raising=False)
     opaque_fia = Mock(return_value=op.return_value[0])
@@ -142,10 +138,9 @@ def test_swa_pa_backends_capture_and_padding(case, monkeypatch, backend, capturi
     monkeypatch.setattr(mod, "npu_ai_infra_flash_attention_metadata", native_metadata)
     tiling = Mock(return_value=torch.empty(1, dtype=torch.int32))
     monkeypatch.setattr(mod, "npu_fused_infer_attention_sink_metadata", tiling)
-    monkeypatch.setattr(mod, "npu_ai_infra_attention_pioneer_metadata", tiling)
     capture = Mock()
     monkeypatch.setattr(mod, "capture_graph_task", capture)
-    caller = "decode_mla" if a.on_ascend950 and aicpu else "cla_prefill_absorb"
+    caller = "cla_prefill_absorb"
     if backend == "gpt":
         case.metadata.decode, case.metadata.prefill = case.metadata.prefill, None
         output = a._apply_SWA_attention_decode(case.q, case.pe, case.cache, attn_metadata=case.metadata)
@@ -158,8 +153,7 @@ def test_swa_pa_backends_capture_and_padding(case, monkeypatch, backend, capturi
         torch.testing.assert_close(output, torch.zeros_like(case.q))
         op.assert_not_called()
         kwargs = capture.call_args.kwargs["op_kwargs"]
-        expected_op = {"sink": mod.OP_FIA_SINK, "pioneer": mod.OP_FIA_PIONEER}[backend]
-        assert capture.call_args.kwargs["op_desc"] == expected_op
+        assert capture.call_args.kwargs["op_desc"] == mod.OP_FIA_SINK
     else:
         torch.testing.assert_close(output[:count], case.q[:count])
         torch.testing.assert_close(output[count:], torch.zeros_like(output[count:]))
@@ -181,7 +175,7 @@ def test_swa_pa_backends_capture_and_padding(case, monkeypatch, backend, capturi
         assert kwargs["meta_data"] is native_metadata.return_value
         assert native_metadata.call_args.args[-1] == "decode_mla"
     if aicpu:
-        assert kwargs["metaData" if a.on_ascend950 else "meta_data"] is tiling.return_value
+        assert kwargs["meta_data"] is tiling.return_value
         args, recompute, actual_caller = tiling.call_args.args
         assert args["block_size"] == a.block_size and recompute is True
         assert actual_caller == caller
@@ -189,12 +183,12 @@ def test_swa_pa_backends_capture_and_padding(case, monkeypatch, backend, capturi
         tiling.assert_not_called()
 
 
-@pytest.mark.parametrize("ascend950,aicpu,sinks", [
-    (False, False, 0), (False, True, 1), (True, False, 1), (True, True, 1),
+@pytest.mark.parametrize("aicpu,sinks", [
+    (False, 0), (True, 1),
 ])
-def test_direct_prefill_preserves_token_sinks(case, monkeypatch, ascend950, aicpu, sinks):
+def test_direct_prefill_preserves_token_sinks(case, monkeypatch, aicpu, sinks):
     a = case.attention
-    a.on_ascend950, a.use_aicpu_fa_tiling, a.param_sink_number = ascend950, aicpu, sinks
+    a.use_aicpu_fa_tiling, a.param_sink_number = aicpu, sinks
     a.kv_a_layernorm = Mock(side_effect=lambda value: value)
     a.param_sink_compressed_kv = torch.ones(1, 3)
     a.param_sink_k_pe = torch.ones(1, 1)
@@ -202,10 +196,7 @@ def test_direct_prefill_preserves_token_sinks(case, monkeypatch, ascend950, aicp
     native = torch.arange(12, dtype=torch.float32).reshape(3, 2, 2)
     op = Mock(return_value=(native, torch.empty(0)))
     monkeypatch.setattr(torch.ops.custom, "npu_fused_infer_attention_sink", op)
-    monkeypatch.setattr(torch.ops.custom, "npu_ai_infra_attention_pioneer", op)
-    monkeypatch.setattr(mod.torch_npu, "_npu_attention_pioneer", op, raising=False)
     tiling = Mock(return_value=torch.empty(1))
-    monkeypatch.setattr(mod, "npu_ai_infra_attention_pioneer_metadata", tiling)
     monkeypatch.setattr(mod, "npu_fused_infer_attention_sink_metadata", tiling)
     output = a._apply_SWA_attention_prefill(
         case.q, case.pe, case.q, case.pe, native, case.metadata,
@@ -338,11 +329,9 @@ def test_fc2_epilog_preserves_mome_and_token_padding(case, monkeypatch, mome, sp
         all_to_all.assert_not_called()
 
 
-@pytest.mark.parametrize("on_ascend950", [False, True])
 @pytest.mark.parametrize("decode", [False, True])
-def test_unquant_kv_uses_pa_cache_without_expanding_values(case, monkeypatch, on_ascend950, decode):
+def test_unquant_kv_uses_pa_cache_without_expanding_values(case, monkeypatch, decode):
     a, metadata = case.attention, case.metadata
-    a.on_ascend950 = on_ascend950
     if decode:
         a.first_chunk_pa = False
         metadata.decode = SimpleNamespace()
@@ -350,27 +339,17 @@ def test_unquant_kv_uses_pa_cache_without_expanding_values(case, monkeypatch, on
     monkeypatch.setattr(a, "_kv_rmsnorm_rope_cache_v2_kwargs", lambda *args: {})
     op = Mock(return_value=(case.pe, case.q))
     monkeypatch.setattr(torch.ops.custom, "npu_ai_infra_kv_rmsnorm_rope_cache_v2", op)
-    naive = Mock(return_value=(case.pe, case.q))
-    monkeypatch.setattr(a, "_naive_kvrmsnorm_rope_cache", naive)
     a.kv_b_proj = Mock(side_effect=AssertionError("absorb must not expand values"))
     kv = torch.ones(3, a.kv_lora_rank + a.qk_rope_head_dim)
     result, indices = a._npu_kvrmsnorm_rope_cache_unquant(kv, case.cache, case.pe, case.pe, metadata)
     assert result is case.cache and indices is None
     a.kv_b_proj.assert_not_called()
-    if on_ascend950:
-        naive.assert_called_once()
-        assert naive.call_args.kwargs["update_k_cache"] is True
-        op.assert_not_called()
-    else:
-        op.assert_called_once()
-        torch.testing.assert_close(op.call_args.kwargs["k_cache"], case.cache[1].unsqueeze(2))
-        naive.assert_not_called()
+    op.assert_called_once()
+    torch.testing.assert_close(op.call_args.kwargs["k_cache"], case.cache[1].unsqueeze(2))
 
 
-@pytest.mark.parametrize("on_ascend950", [False, True])
-def test_non_absorb_prefill_preserves_three_tensors_without_custom_op(case, monkeypatch, on_ascend950):
+def test_non_absorb_prefill_preserves_three_tensors_without_custom_op(case, monkeypatch):
     a, metadata = case.attention, case.metadata
-    a.on_ascend950 = on_ascend950
     a.first_chunk_pa = a.is_cla_reuse_layer = False
     a.side_stream = None
     a.cache_config = SimpleNamespace(cache_dtype="auto")
@@ -387,8 +366,6 @@ def test_non_absorb_prefill_preserves_three_tensors_without_custom_op(case, monk
     monkeypatch.setattr(a, "_kv_rmsnorm_rope_cache_v2_kwargs", lambda *args: {})
     kernel = Mock(return_value=(cos, hidden[:, :3]))
     monkeypatch.setattr(torch.ops.custom, "npu_ai_infra_kv_rmsnorm_rope_cache_v2", kernel)
-    naive = Mock(return_value=(cos, hidden[:, :3]))
-    monkeypatch.setattr(a, "_naive_kvrmsnorm_rope_cache", naive)
     kv_up = torch.arange(30, dtype=torch.float32).reshape(3, 2, 5)
     a.kv_b_proj = Mock(return_value=kv_up.reshape(3, 10))
     wrapper = Mock(side_effect=AssertionError("non-absorb must bypass the custom op"))
@@ -400,13 +377,7 @@ def test_non_absorb_prefill_preserves_three_tensors_without_custom_op(case, monk
     output = a._forward_prefill(hidden, cos, cos, metadata)
 
     wrapper.assert_not_called()
-    if on_ascend950:
-        naive.assert_called_once()
-        assert naive.call_args.kwargs["update_k_cache"] is True
-        kernel.assert_not_called()
-    else:
-        kernel.assert_called_once()
-        naive.assert_not_called()
+    kernel.assert_called_once()
     attention.assert_called_once()
     _, _, k_up_nope, k_pe, v_up = attention.call_args.args
     torch.testing.assert_close(k_up_nope, kv_up[..., :3])
@@ -502,7 +473,7 @@ def _install_custom_op(monkeypatch, name, fn):
 
 
 def test_cache_dtype_groups_keep_indexer_and_kv_apart(case, monkeypatch):
-    """li_int8 quantizes the indexer only; KV C8 stays on int8/hif8/fp8."""
+    """li_int8 stays in the indexer set and out of the KV C8 set."""
     assert "li_int8_ds_mla" in mod.INDEXER_QUANT_CACHE_DTYPES
     assert "li_int8_ds_mla" not in mod.KV_QUANT_CACHE_DTYPES
     assert mod.KV_QUANT_CACHE_DTYPES == mod.HIF8_FP8_DTYPES | mod.INT8_C8_DTYPES
@@ -545,14 +516,8 @@ def test_cache_dtype_groups_keep_indexer_and_kv_apart(case, monkeypatch):
     query = torch.zeros(1, 2, 4)
     weights = torch.zeros(1, 2)
     kv_cache = (torch.zeros(1, 4, 8), torch.zeros(1, 4, 8), torch.ones(1, 4, 1))
-    indexer.on_ascend950 = True
     indexer.index_topk = 4
     indexer.layer_idx = 0
-    indexer.cache_config.cache_dtype = "hif8_ds_mla"
-    assert mod.NPUPanguIndexer._apply_lightning_indexer_quant(
-        indexer, query, weights, metadata, kv_cache,
-    ).shape == (1,)
-    indexer.on_ascend950 = False
     indexer.cache_config.cache_dtype = "int8_ds_mla"
     assert mod.NPUPanguIndexer._apply_lightning_indexer_quant(
         indexer, query, weights, metadata, kv_cache,
@@ -594,47 +559,26 @@ def test_cache_dtype_groups_keep_indexer_and_kv_apart(case, monkeypatch):
     attention._init_attention_layers()
     assert "block_size" not in built
 
-    page_layer = mod.NPUPanguSparseAttention.__new__(mod.NPUPanguSparseAttention)
-    page_layer.kv_lora_rank = 8
-    page_layer.qk_rope_head_dim = 4
-    page_layer.use_mome = False
-    page_layer.block_size_c8 = 8
-    page = page_layer._calculate_page_size_padded(
-        SimpleNamespace(block_size=16),
-        "hif8_ds_mla",
-        SimpleNamespace(index_topk=2048, index_head_dim=8),
-    )
-    assert page == 8 * 788
-
     attention.use_gpt_oss_sink = False
     attention.param_sink_number = 0
-    attention.on_ascend950 = True
-    attention.cache_config = SimpleNamespace(cache_dtype="hif8_ds_mla")
-    attention.dummy_value_cache_hif8_fp8 = torch.zeros(1, 4, 8)
+    attention.cache_config = SimpleNamespace(cache_dtype="int8_ds_mla")
     attention.dummy_value_cache = torch.zeros(1, 4, 8)
     kernel = Mock(return_value=torch.zeros(2, 3))
     _install_custom_op(monkeypatch, "npu_ai_infra_kv_quant_sparse_flash_attention", kernel)
     topk = torch.zeros(3, 1, dtype=torch.int32)
-    hif8_out = attention._apply_DSA_attention(
-        case.q, case.pe, case.cache, topk, case.metadata,
-    )
-    assert hif8_out.shape[-1] == attention.num_local_heads * attention.v_head_dim
-    attention.on_ascend950 = False
-    attention.cache_config.cache_dtype = "int8_ds_mla"
     int8_out = attention._apply_DSA_attention(
         case.q, case.pe, case.cache, topk, case.metadata,
     )
-    assert int8_out.shape == hif8_out.shape
+    assert int8_out.shape[-1] == attention.num_local_heads * attention.v_head_dim
     cp_manager = SimpleNamespace(cp_attn_meta=lambda: (
         torch.tensor([3]), torch.tensor([3]), None, torch.zeros(1, 1, dtype=torch.int32),
     ))
     cp_out = attention._apply_DSA_attention_cp(
         case.q, case.pe, case.cache, topk, cp_manager, case.metadata,
     )
-    assert cp_out.shape == hif8_out.shape
+    assert cp_out.shape == int8_out.shape
 
     attention.is_dsa_layer = True
-    attention.on_ascend950 = False
     attention.cache_config.cache_dtype = "int8_ds_mla"
     attention._kv_rmsnorm_rope_cache_v2_kwargs = lambda *args, **kwargs: {"kv": torch.zeros(1)}
     _install_custom_op(
@@ -693,12 +637,6 @@ def test_mla_prolog_output_is_a_named_tuple(case, monkeypatch):
     )
     attention._mla_prolog.return_value = swa
     assert attention._forward_prefill(case.q, case.pe, case.pe, case.metadata).shape == (3, 4)
-
-    decode_only = SimpleNamespace(num_decodes=1, num_prefills=0, decode=object(), prefill=None)
-    attention.cache_config = SimpleNamespace(cache_dtype="hif8_ds_mla")
-    del attention._mla_prolog
-    attention._mla_prolog_hif8_fp8_decode_multistream = Mock(return_value=prolog)
-    assert attention._mla_prolog(case.q, case.pe, case.pe, decode_only) is prolog
 
     attention.use_mome = False
     attention.is_dsa_layer = False

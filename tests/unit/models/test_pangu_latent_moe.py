@@ -31,7 +31,6 @@ def build_moe(monkeypatch, default_vllm_config):
     monkeypatch.setattr(model, "get_tp_group", lambda: group)
     monkeypatch.setattr(model, "get_ep_group", lambda: group)
     monkeypatch.setattr(model, "current_platform", SimpleNamespace(device_type="cpu"))
-    monkeypatch.setattr(model, "on_ascend950", lambda: False)
     monkeypatch.setattr(model, "on_ascend910b", lambda: False)
     monkeypatch.setattr(model.OpenPanguV2MOE, "_is_graph_mode", property(lambda self: False))
     monkeypatch.setitem(sys.modules, "omni_training_custom_ops", SimpleNamespace())

@@ -610,8 +610,7 @@ direct_register_custom_op(
 
 # ---------------------------------------------------------------------------
 # npu_pangu_mome_conv: wraps npu_ai_infra_fused_causal_conv1d (mode 0 / mode 1)
-# Replaces direct conv1d calls inside _apply_MOME's SP branch and the
-# layer.forward call on non-Ascend950 path.
+# Wraps direct conv1d calls inside _apply_MOME.
 # ---------------------------------------------------------------------------
 def npu_pangu_mome_conv(
     x: torch.Tensor,

@@ -323,30 +323,23 @@ class TestPanguKVTransferLifecycle:
         _assert_lifecycle(events, kv_cache, attn_metadata)
         assert out.shape == hidden.shape
 
-    @pytest.mark.parametrize("on_ascend950", [True, False])
-    def test_forward_passes_the_two_names_on_both_paths(
-        self, monkeypatch, on_ascend950
-    ):
-        """A5 (op) and non-950 (direct call) must pass the same two names."""
+    def test_forward_passes_the_two_names(self, monkeypatch):
         import omni_npu.v1.layers.attention.npu_pangu as pangu_mod
         from omni_npu.v1.layers.attention.npu_pangu import NPUPanguSparseAttention
 
-        op = MagicMock(return_value="a5")
-        monkeypatch.setattr(torch.ops.vllm, "npu_pangu_forward", op, raising=False)
         direct = MagicMock(return_value="direct")
         monkeypatch.setattr(pangu_mod, "npu_pangu_forward", direct)
 
         fake = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
-        fake.on_ascend950 = on_ascend950
         fake.layer_name = MODULE_NAME
         fake.attn = SimpleNamespace(layer_name=KV_LAYER_NAME)
 
         out = fake.forward("hs", "cos", "sin")
 
-        (op if on_ascend950 else direct).assert_called_once_with(
+        direct.assert_called_once_with(
             "hs", "cos", "sin", MODULE_NAME, KV_LAYER_NAME
         )
-        assert out == ("a5" if on_ascend950 else "direct")
+        assert out == "direct"
 
 
 # =========================

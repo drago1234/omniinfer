@@ -94,7 +94,6 @@ def _build_sparse_attention(
             "get_tp_group",
             return_value=SimpleNamespace(world_size=tp_size),
         ),
-        patch.object(pangu_mod, "on_ascend950", return_value=False),
         patch.object(
             pangu_mod,
             "get_current_vllm_config",
@@ -434,7 +433,6 @@ class TestPanguIndexShare(unittest.TestCase):
 
     def test_mixed_batch_slices_inputs_with_phase(self):
         attention = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
-        attention.on_ascend950 = False
         metadata = SimpleNamespace(
             num_decode_tokens=2,
             num_actual_tokens=5,
@@ -1169,7 +1167,6 @@ class TestPanguGptOssSink(unittest.TestCase):
         attention.v_head_dim = 3
         attention.W_UV = object()
         attention.scaling = 0.125
-        attention.on_ascend950 = True
         attention.sink_kv = torch.randn(1, 3)
         attention.sink_k_nope = torch.randn(1, 2)
         attention.dummy_value_cache = torch.empty(0)
@@ -1180,11 +1177,10 @@ class TestPanguGptOssSink(unittest.TestCase):
         cp_query, cp_lens, cp_table = torch.tensor([1, 2]), torch.tensor([3, 5]), object()
         manager = SimpleNamespace(cp_attn_meta=lambda: (cp_query, cp_lens, None, cp_table))
         for use_cp in (False, True):
-            for dtype in ("auto", "int8_ds_mla", "fp8_ds_mla"):
+            for dtype in ("auto", "int8_ds_mla"):
                 attention.cache_config = SimpleNamespace(cache_dtype=dtype)
-                attention.dummy_value_cache_hif8_fp8 = torch.empty(0)
                 latent, projected = torch.randn(2, 1, 2), torch.randn(2, 1, 3)
-                quantized = dtype == "int8_ds_mla" or (dtype == "fp8_ds_mla" and not use_cp)
+                quantized = dtype == "int8_ds_mla"
                 op_name = "npu_ai_infra_kv_quant_sparse_flash_attention" if quantized else (
                     "npu_ai_infra_sparse_flash_attention_pioneer"
                 )
@@ -1293,7 +1289,6 @@ class TestPanguCLA(unittest.TestCase):
             patch("omni_npu.v1.layers.attention.npu_pangu.npu_fused_infer_attention_sink_metadata", None),
             patch("omni_npu.v1.layers.attention.npu_pangu.CrossLayerSharedOp") as shared_op,
         ):
-            attention.on_ascend950 = False
             attention._init_cross_layer_shared_ops()
         callers = shared_op.call_args.kwargs["callers"]
         self.assertIn("cla_prefill_absorb_cp", callers)
@@ -1668,7 +1663,6 @@ class TestPanguCLA(unittest.TestCase):
 
     def test_prepare_cla_swa_kv_uses_noncontiguous_scatter(self):
         attention = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
-        attention.on_ascend950 = False
         attention.kv_lora_rank = 4
         attention.qk_rope_head_dim = 2
         attention.rope_interleave = True
@@ -1932,7 +1926,6 @@ class TestPanguCLA(unittest.TestCase):
 
     def test_mixed_batch_slices_both_cla_metadata_objects(self):
         attention = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
-        attention.on_ascend950 = False
 
         def make_metadata(offset):
             metadata = SimpleNamespace(
@@ -2053,13 +2046,11 @@ class TestPanguFAMetadataIsolation(unittest.TestCase):
                 created.append(kwargs)
 
         attention = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
-        attention.on_ascend950 = True
         attention.use_gpt_oss_sink = True
         attention.use_gpt_oss_sink_rescale = False
         attention.hf_config = SimpleNamespace()
         fake_ops = SimpleNamespace(
             _npu_fused_infer_attention_sink_metadata=object(),
-            npu_ai_infra_attention_pioneer_metadata=object(),
             npu_ai_infra_flash_attention_metadata=object(),
         )
         with patch.object(pangu_mod, "CrossLayerSharedOp", FakeSharedOp), \
@@ -2067,21 +2058,16 @@ class TestPanguFAMetadataIsolation(unittest.TestCase):
                     pangu_mod, "npu_fused_infer_attention_sink_metadata", None
                 ), \
                 patch.object(
-                    pangu_mod, "npu_ai_infra_attention_pioneer_metadata", None
-                ), \
-                patch.object(
                     pangu_mod, "npu_ai_infra_flash_attention_metadata", None
                 ), \
                 patch.object(pangu_mod.torch.ops, "custom", fake_ops, create=True):
             attention._init_cross_layer_shared_ops()
 
-        self.assertEqual(len(created), 3)
+        self.assertEqual(len(created), 2)
         self.assertEqual(created[0]["callers"], _FA_CALLERS)
         self.assertEqual(created[1]["callers"], _FA_CALLERS)
+        self.assertIs(created[1]["op"], fake_ops.npu_ai_infra_flash_attention_metadata)
         self.assertEqual(created[1]["shape"], (1024,))
-        self.assertEqual(created[2]["callers"], _FA_CALLERS)
-        self.assertIs(created[2]["op"], fake_ops.npu_ai_infra_flash_attention_metadata)
-        self.assertEqual(created[2]["shape"], (1024,))
 
     def test_kv_rmsnorm_rope_cache_kwargs_honor_rotary_mode(self):
         attention = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
@@ -2130,9 +2116,6 @@ class TestPanguFAMetadataIsolation(unittest.TestCase):
         config = SimpleNamespace(index_topk=2048, index_head_dim=8)
 
         cases = {
-            # 788 bytes per token: 512 fp8, 64 bf16, 4 fp32, 128 int8, 1 fp32
-            "fp8_ds_mla": 8 * 788,
-            "hif8_ds_mla": 8 * 788,
             # 786 bytes per token: 512 int8, 64 bf16, 4 fp32, 128 int8, 1 bf16
             "int8_ds_mla": 8 * 786,
             # 1282 bytes per token: 576 bf16, 128 int8, 1 bf16
@@ -2384,7 +2367,6 @@ def _bare_swa_attention(**attrs):
     """Build an uninitialized NPUPanguSparseAttention with SWA SP defaults."""
     attention = NPUPanguSparseAttention.__new__(NPUPanguSparseAttention)
     defaults = dict(
-        on_ascend950=False,
         _fa_meta_suffix="",
         is_fa_metadata_producer=True,
         use_gpt_oss_sink=False,
@@ -2750,17 +2732,6 @@ class TestPanguSWASeqParallel(unittest.TestCase):
             )
         self.assertEqual(tuple(out.shape), (local, 8))
         self.assertTrue(torch.equal(out[valid:], torch.zeros(local - valid, 8)))
-
-    def test_forward_prefill_sp_rejects_ascend950(self):
-        """SWA SP is A3-only."""
-        attention = _bare_swa_attention(on_ascend950=True)
-        meta = SimpleNamespace(
-            num_actual_tokens=4, prefill=SimpleNamespace(sp_manager=object())
-        )
-        with self.assertRaises(AssertionError):
-            attention._forward_prefill_sp(
-                torch.zeros(4, 8), torch.zeros(4, 2), torch.zeros(4, 2), meta
-            )
 
     def test_forward_prefill_sp_mome_inplace_and_prefetch(self):
         """MoME SP + sharded o_proj prefetch still returns local-token output."""

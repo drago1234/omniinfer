@@ -83,7 +83,7 @@ from omni_npu.v1.layers.linear import (
 )
 from omni_npu.v1.layers.logits_processor import NPULogitsProcessor
 from omni_npu.v1.layers.vocab_parallel_embedding import NPUParallelLMHead, NPUVocabParallelEmbedding
-from omni_npu.v1.utils import on_ascend910b, on_ascend950
+from omni_npu.v1.utils import on_ascend910b
 from .utils import (
     _has_mla_config,
     _normalize_rope_parameters,
@@ -268,14 +268,12 @@ class OpenPanguV2MOE(nn.Module):
         ep_backend = self.ep_group._get_backend(
             torch.device(current_platform.device_type)
         )
-        if not on_ascend950():
-            self.ep_comm_name = ep_backend.get_hccl_comm_name(
-                ep_comm_obj.rank_in_group
-            )
+        self.ep_comm_name = ep_backend.get_hccl_comm_name(
+            ep_comm_obj.rank_in_group
+        )
         self.n_routed_experts = config.n_routed_experts
         self.n_shared_experts = config.n_shared_experts
 
-        self.on_ascend950 = on_ascend950()
         self.on_ascend910b = on_ascend910b()
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
@@ -287,7 +285,7 @@ class OpenPanguV2MOE(nn.Module):
         swiglu_limit = getattr(config, "swiglu_limit", None)
         swiglu_limit = swiglu_limit if swiglu_limit is not None and swiglu_limit > 0 else None
         has_latent_or_clamp = latent_size is not None or swiglu_limit is not None
-        if has_latent_or_clamp and (quant_config is not None or self.on_ascend950):
+        if has_latent_or_clamp and quant_config is not None:
             raise NotImplementedError("Latent MoE and SwiGLU clamp currently require the unquantized A2/A3 MoE path")
         self.routed_expert_down_proj = None
         self.routed_expert_up_proj = None
@@ -491,11 +489,7 @@ class OpenPanguV2MOE(nn.Module):
         - "all2allv": All-to-All mode for MoE
         - "dispatch_combine": Dispatch -> MoE -> Combine
         """
-        if self.on_ascend950:
-            return self._forward_fused_moe(
-                hidden_states
-            )
-        elif self.moe_comm_strategy == "allreduce":
+        if self.moe_comm_strategy == "allreduce":
             return self._forward_allgather(
                 hidden_states,
                 use_allreduce=True,

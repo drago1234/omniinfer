@@ -64,7 +64,6 @@ def build_moe(monkeypatch):
         rank_in_group=0, world_size=1
     ))
     monkeypatch.setattr(model_mod, "current_platform", SimpleNamespace(device_type="cpu"))
-    monkeypatch.setattr(model_mod, "on_ascend950", lambda: False)
     monkeypatch.setattr(model_mod, "on_ascend910b", lambda: False)
     monkeypatch.setattr(model_mod, "ReplicatedLinear", lambda *args, **kwargs: torch.nn.Identity())
     monkeypatch.setattr(model_mod, "OpenPanguV2MLP", lambda **kwargs: torch.nn.Identity())
