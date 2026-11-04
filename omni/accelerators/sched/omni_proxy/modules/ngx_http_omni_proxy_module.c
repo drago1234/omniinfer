@@ -220,60 +220,39 @@ static inline omni_req_t *omni_get_req(ngx_http_request_t *r)
 
 static void omni_proxy_post_tokenized(omni_req_t *req)
 {
-    /* 1) snapshot pointers under lock */
-    ngx_shmtx_lock(&g_state->shmtx);
-    /* snapshot radix_tree pointers */
-    uint16_t num_prefill = g_state->num_prefill_endpoints;
-    omni_radix_tree_t *local_prefill_trees[MAX_PREFILL_UPSTREAMS];
-    ngx_memzero(local_prefill_trees, sizeof(omni_radix_tree_t *) * MAX_PREFILL_UPSTREAMS);
-    uint16_t prefill_cnt = 0;
-    for (int i = 0; i < MAX_PREFILL_UPSTREAMS && prefill_cnt < num_prefill; i++) {
-        omni_upstream_prefill_t *prefill = &g_state->prefill_states[i];
-        if (prefill->comm.status != STATUS_ENABLE) {
-            continue;
-        }
-        prefill_cnt++;
-        local_prefill_trees[i] = prefill->radix_tree;
-    }
-
-    uint16_t num_decode = g_state->num_decode_endpoints;
-    omni_radix_tree_t *local_decode_trees[MAX_DECODE_UPSTREAMS];
-    ngx_memzero(local_decode_trees, sizeof(omni_radix_tree_t *) * MAX_DECODE_UPSTREAMS);
-    uint16_t decode_cnt = 0;
-    for (int i = 0; i < MAX_DECODE_UPSTREAMS && decode_cnt < num_decode; i++) {
-        omni_upstream_decode_t *decode = &g_state->decode_states[i];
-        if (decode->comm.status != STATUS_ENABLE) {
-            continue;
-        }
-        decode_cnt++;
-        local_decode_trees[i] = decode->radix_tree;
-    }
-    ngx_shmtx_unlock(&g_state->shmtx);
-
-    /* 2) Compute matches without holding g_state lock */
-    // Prefill Matching
     uint32_t local_prefill_match_depths[MAX_PREFILL_UPSTREAMS];
-    ngx_uint_t computed_max_prefill = 0;
+    ngx_memzero(local_prefill_match_depths, sizeof(local_prefill_match_depths));
+    uint32_t local_decode_match_depths[MAX_DECODE_UPSTREAMS];
+    ngx_memzero(local_decode_match_depths, sizeof(local_decode_match_depths));
 
+    uint16_t num_prefill = g_state->num_prefill_endpoints;
+    uint16_t num_decode  = g_state->num_decode_endpoints;
+
+    /* Prefill APC matching — hold the lock for each endpoint to guard
+     * against radix_tree pointer replacement during a concurrent reload. */
+    ngx_uint_t computed_max_prefill = 0;
     for (uint16_t i = 0, cnt = 0; i < MAX_PREFILL_UPSTREAMS && cnt < num_prefill; i++) {
-        omni_radix_tree_t *tree = local_prefill_trees[i];
+        ngx_shmtx_lock(&g_state->shmtx);
+        omni_upstream_prefill_t *prefill = &g_state->prefill_states[i];
         ngx_uint_t match_depth = 0;
-        if (tree != NULL) {
+        if (prefill->comm.status == STATUS_ENABLE) {
             cnt++;
-            match_depth = omni_radix_tree_match_optimistic(tree,
-                                                            (uint64_t *)req->tokenizer_req.block_hashes,
-                                                            req->tokenizer_req.block_hashes_len);
+            omni_radix_tree_t *tree = prefill->radix_tree;
+            if (tree != NULL) {
+                match_depth = omni_radix_tree_match_optimistic(tree,
+                                                               (uint64_t *)req->tokenizer_req.block_hashes,
+                                                               req->tokenizer_req.block_hashes_len);
+            }
         }
+        ngx_shmtx_unlock(&g_state->shmtx);
+
         local_prefill_match_depths[i] = (uint32_t)match_depth;
         ngx_log_error(NGX_LOG_INFO,
                       omni_get_http_request(req)->connection->log,
                       0,
                       "[APC_MATCHING-%d] prefill[%ui] match_depth=%ui",
-                      req->slot_index,
-                      i,
-                      local_prefill_match_depths[i]);
-
-        if ((ngx_uint_t)match_depth > computed_max_prefill)
+                      req->slot_index, i, local_prefill_match_depths[i]);
+        if (match_depth > computed_max_prefill)
             computed_max_prefill = match_depth;
     }
 
@@ -281,32 +260,32 @@ static void omni_proxy_post_tokenized(omni_req_t *req)
                   omni_get_http_request(req)->connection->log,
                   0,
                   "[APC_MATCHING-%d] computed num_prefill=%ui, max_prefill_match_depth=%ui",
-                  req->slot_index,
-                  num_prefill,
-                  computed_max_prefill);
-    
-    // Decode Matching
-    uint32_t local_decode_match_depths[MAX_DECODE_UPSTREAMS];
+                  req->slot_index, num_prefill, computed_max_prefill);
+
+    /* Decode APC matching — same per-endpoint locking pattern. */
     ngx_uint_t computed_max_decode = 0;
     for (uint16_t i = 0, cnt = 0; i < MAX_DECODE_UPSTREAMS && cnt < num_decode; i++) {
-        omni_radix_tree_t *tree = local_decode_trees[i];
+        ngx_shmtx_lock(&g_state->shmtx);
+        omni_upstream_decode_t *decode = &g_state->decode_states[i];
         ngx_uint_t match_depth = 0;
-        if (tree != NULL) {
+        if (decode->comm.status == STATUS_ENABLE) {
             cnt++;
-            match_depth = omni_radix_tree_match_optimistic(tree,
-                                                            (uint64_t *)req->tokenizer_req.block_hashes,
-                                                            req->tokenizer_req.block_hashes_len);
+            omni_radix_tree_t *tree = decode->radix_tree;
+            if (tree != NULL) {
+                match_depth = omni_radix_tree_match_optimistic(tree,
+                                                               (uint64_t *)req->tokenizer_req.block_hashes,
+                                                               req->tokenizer_req.block_hashes_len);
+            }
         }
+        ngx_shmtx_unlock(&g_state->shmtx);
+
         local_decode_match_depths[i] = (uint32_t)match_depth;
         ngx_log_error(NGX_LOG_INFO,
                       omni_get_http_request(req)->connection->log,
                       0,
                       "[APC_MATCHING-%d] decode[%ui] match_depth=%ui",
-                      req->slot_index,
-                      i,
-                      local_decode_match_depths[i]);
-
-        if ((ngx_uint_t)match_depth > computed_max_decode)
+                      req->slot_index, i, local_decode_match_depths[i]);
+        if (match_depth > computed_max_decode)
             computed_max_decode = match_depth;
     }
 
@@ -314,9 +293,7 @@ static void omni_proxy_post_tokenized(omni_req_t *req)
                   omni_get_http_request(req)->connection->log,
                   0,
                   "[APC_MATCHING-%d] computed num_decode=%ui, max_decode_match_depth=%ui",
-                  req->slot_index,
-                  num_decode,
-                  computed_max_decode);
+                  req->slot_index, num_decode, computed_max_decode);
 
     /* 3) write results to shared request */
     ngx_memcpy(req->prefill_match_depths, local_prefill_match_depths, sizeof(local_prefill_match_depths));
@@ -376,6 +353,22 @@ static void omni_proxy_req_body_handler(ngx_http_request_t *r)
                   req->tokenizer_req.input_ids,
                   req->tokenizer_req.block_hashes);
     omni_tokenizer_worker_submit(&local_state.tokenize_worker, req->slot_index);
+}
+
+static inline void omni_atomic_saturating_sub_u32(uint32_t *value,
+                                                   uint32_t decrement)
+{
+    uint32_t current;
+    uint32_t updated;
+
+    if (decrement == 0) {
+        return;
+    }
+
+    do {
+        current = *value;
+        updated = current >= decrement ? current - decrement : 0;
+    } while (!ngx_atomic_cmp_set(value, current, updated));
 }
 
 static inline void omni_proxy_cleanup_req(omni_req_t *req)
@@ -1405,12 +1398,19 @@ static void omni_proxy_req_prefill_resched(omni_req_t *req, ngx_uint_t new_idx)
 {
     ngx_uint_t old_idx = req->prefill_upstream_endpoint_idx;
 
-    g_state->prefill_states[old_idx].num_running--;
-    g_state->prefill_states[old_idx].num_tokens -= req->metrics.prompt_num_tokens;
+    // Use atomic ops: nginx runs multiple worker processes, and the
+    // scheduler / prefill-done / cleanup paths update these same counters
+    // with ngx_atomic_fetch_add.  Non-atomic --/+= here races with those
+    // and silently drops decrements, leaving ghost load on the old slot.
+    ngx_atomic_fetch_add(&g_state->prefill_states[old_idx].num_running, -1);
+    omni_atomic_saturating_sub_u32(
+        &g_state->prefill_states[old_idx].num_tokens,
+        req->metrics.prompt_num_tokens);
     ngx_atomic_fetch_add(&g_state->prefill_states[old_idx].comm.ref, -1);
 
-    g_state->prefill_states[new_idx].num_running++;
-    g_state->prefill_states[new_idx].num_tokens += req->metrics.prompt_num_tokens;
+    ngx_atomic_fetch_add(&g_state->prefill_states[new_idx].num_running, 1);
+    ngx_atomic_fetch_add(&g_state->prefill_states[new_idx].num_tokens,
+                         req->metrics.prompt_num_tokens);
 
     req->prefill_upstream_endpoint_idx = new_idx;
     ngx_atomic_fetch_add(&g_state->prefill_states[new_idx].comm.ref, 1);
@@ -2458,19 +2458,10 @@ static ngx_int_t omni_upstream_add(bool is_prefill, ngx_cycle_t *cycle, ngx_http
         ngx_uint_t j;
         for (j = 0; j < max_num; j++) {
             comm = is_prefill ? &g_state->prefill_states[j].comm : &g_state->decode_states[j].comm;
-            if (comm->status == STATUS_ABANDON) {
-                if (comm->ref == 0 && abandon_idx == -1) {
-                    abandon_idx = j;
-                }
-                continue;
-            }
-            if (comm->status != STATUS_UNUSED) {
-                /* ip/port matches exist upstream, continue use it */
-                if (ngx_cmp_sockaddr(peer->sockaddr, peer->socklen, &comm->address.sockaddr, comm->address.socklen, 1) != NGX_OK) {
-                    continue;
-                }
-            } else {
-                /* not match any exist upstream, add */
+
+            if (comm->status == STATUS_UNUSED) {
+                /* No existing slot matched by IP:port; add this peer as a
+                 * new endpoint in this UNUSED slot. */
                 omni_upstream_addr_set(&comm->address, peer);
 
                 if (is_prefill && local_state.loc_conf->vllm_kv_port_offset != NGX_CONF_UNSET) {
@@ -2492,7 +2483,30 @@ static ngx_int_t omni_upstream_add(bool is_prefill, ngx_cycle_t *cycle, ngx_http
                         return NGX_ERROR;
                     }
                 }
+                comm->status = STATUS_ENABLE;
+                break;
             }
+
+            /* Non-UNUSED slot (ENABLE/DISABLE/ABANDON): match by IP:port so
+             * a restarted node reuses its original slot instead of drifting
+             * to a higher index. Previously ABANDON slots were skipped here,
+             * which made every swap allocate a fresh slot for the returning
+             * node and leak the old one as a permanent ABANDON. */
+            if (ngx_cmp_sockaddr(peer->sockaddr, peer->socklen,
+                    &comm->address.sockaddr, comm->address.socklen, 1) != NGX_OK) {
+                /* IP:port mismatch; remember a ref==0 ABANDON slot as a reuse
+                 * candidate for the fallback path below. */
+                if (comm->status == STATUS_ABANDON && comm->ref == 0 && abandon_idx == -1) {
+                    abandon_idx = j;
+                }
+                continue;
+            }
+
+            /* IP:port matched. Re-enable this slot regardless of its current
+             * status (DISABLE, ENABLE, or ABANDON).  Keep all counters as-is:
+             * drain already zeroed num_running/num_tokens naturally, and
+             * clearing them here would cause underflow when in-flight request
+             * cleanup decrements them.  This matches v1 behaviour. */
             comm->status = STATUS_ENABLE;
             break;
         }
