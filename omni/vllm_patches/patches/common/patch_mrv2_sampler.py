@@ -88,6 +88,7 @@ else:
 
 try:
     from omni_npu.worker.npu.ops import rejection_sampler_utils as npu_rejection_sampler_utils
+    from omni_npu.worker.npu.rejection_sampler import rejection_sampler_call
     import vllm.v1.sample.rejection_sampler as up_v1_rejection_sampler
     import vllm.v1.worker.gpu.spec_decode.rejection_sampler as up_rejection_sampler
     import vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils as up_rejection_sampler_utils
@@ -105,6 +106,13 @@ else:
         _attr_names_to_apply = ["rejection_sample"]
 
         rejection_sample = npu_rejection_sampler_utils.rejection_sample
+
+    @register_patch("MRv2RejectionSamplerPlaceholderPatch", up_rejection_sampler.RejectionSampler)
+    class MRv2RejectionSamplerPlaceholderPatch(VLLMPatch):
+        """Keep physical padding while rejecting never-proposed draft slots."""
+
+        _attr_names_to_apply = ["__call__"]
+        __call__ = rejection_sampler_call
 
     @register_patch("MRv2RejectionSamplerUtilsPatch", up_rejection_sampler_utils)
     class MRv2RejectionSamplerUtilsPatch(VLLMPatch):
