@@ -1,0 +1,81 @@
+diff --git a/vllm/entrypoints/openai/api_server.py b/vllm/entrypoints/openai/api_server.py
+--- a/vllm/entrypoints/openai/api_server.py
++++ b/vllm/entrypoints/openai/api_server.py
+@@ -1310,6 +1310,7 @@
+         state.openai_serving_models,
+         request_logger=request_logger,
+         return_tokens_as_token_ids=args.return_tokens_as_token_ids,
++        speculative_config=vllm_config.speculative_config,
+     ) if model_config.runner_type == "generate" else None
+     state.openai_serving_pooling = OpenAIServingPooling(
+         engine_client,
+diff --git a/vllm/entrypoints/openai/serving_chat.py b/vllm/entrypoints/openai/serving_chat.py
+--- a/vllm/entrypoints/openai/serving_chat.py
++++ b/vllm/entrypoints/openai/serving_chat.py
+@@ -196,6 +196,16 @@
+         if self.engine_client.errored:
+             raise self.engine_client.dead_error
+
++        # omni: logprobs are not implemented for the NPU MTP sampling path
++        # (omni/adaptors/vllm/sample/validator.py raises inside the engine
++        # step, which kills EngineCore and every co-batched request).
++        # Reject such requests at the API layer with a clean 400 instead.
++        if self.num_spec_tokens > 0 and (
++                request.logprobs or request.prompt_logprobs is not None):
++            return self.create_error_response(
++                "logprobs/prompt_logprobs are not supported when "
++                "speculative decoding (MTP) is enabled")
++
+         try:
+             (
+                 lora_request,
+diff --git a/vllm/entrypoints/openai/serving_completion.py b/vllm/entrypoints/openai/serving_completion.py
+--- a/vllm/entrypoints/openai/serving_completion.py
++++ b/vllm/entrypoints/openai/serving_completion.py
+@@ -11,7 +11,7 @@
+ from fastapi import Request
+ from typing_extensions import assert_never
+
+-from vllm.config import ModelConfig
++from vllm.config import ModelConfig, SpeculativeConfig
+ from vllm.engine.protocol import EngineClient
+ from vllm.entrypoints.logger import RequestLogger
+ # yapf conflicts with isort for this block
+@@ -54,12 +54,16 @@
+         *,
+         request_logger: Optional[RequestLogger],
+         return_tokens_as_token_ids: bool = False,
++        speculative_config: Optional["SpeculativeConfig"] = None,
+     ):
+         super().__init__(engine_client=engine_client,
+                          model_config=model_config,
+                          models=models,
+                          request_logger=request_logger,
+                          return_tokens_as_token_ids=return_tokens_as_token_ids)
++        self.num_spec_tokens = 0
++        if speculative_config is not None:
++            self.num_spec_tokens = speculative_config.num_speculative_tokens
+         self.default_sampling_params = (
+             self.model_config.get_diff_sampling_param())
+         if self.default_sampling_params:
+@@ -106,6 +110,20 @@
+             return self.create_error_response(
+                 "Echo is unsupported with prompt embeds.")
+
++        # omni: logprobs are not implemented for the NPU MTP sampling path
++        # (omni/adaptors/vllm/sample/validator.py raises inside the engine
++        # step, which kills EngineCore and every co-batched request).
++        # Reject such requests at the API layer with a clean 400 instead.
++        # Note: on the legacy /v1/completions API `echo=True` implies
++        # prompt_logprobs, so echo is rejected here as well.
++        if self.num_spec_tokens > 0 and (
++                request.logprobs is not None
++                or request.prompt_logprobs is not None
++                or request.echo):
++            return self.create_error_response(
++                "logprobs/prompt_logprobs are not supported when "
++                "speculative decoding (MTP) is enabled")
++
+         request_id = f"cmpl-{self._base_request_id(raw_request)}"
+         created_time = int(time.time())
+
