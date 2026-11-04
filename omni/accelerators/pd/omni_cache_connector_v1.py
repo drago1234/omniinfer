@@ -12,14 +12,19 @@ import struct
 import subprocess
 import threading
 import time
+from datetime import timedelta
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Tuple, List, Dict, Set
 from dataclasses import dataclass, field
-from omni.accelerators.pd.ox_process_manager import OxProcessManager
+from omni.accelerators.pd.ox_process_manager import (
+    OxProcessManager, close_retired_queue, isolate_connector_child_signals,
+    start_connector_process,
+)
 
 import torch
 import zmq
+import zmq.asyncio
 import uuid
 import msgpack
 from collections import deque
@@ -185,17 +190,21 @@ class DTypeUtils:
 
 
 class RouterDealerClient:
+    """Keep DEALER socket I/O on the owning asyncio event-loop thread."""
+
     def __init__(self, server_address="tcp://localhost:5555"):
-        self.context = zmq.Context()
+        self.context = zmq.asyncio.Context()
         self.socket = self.context.socket(zmq.DEALER)
 
         client_id = f"client_{uuid.uuid4().hex[:8]}".encode('utf-8')
         self.socket.setsockopt(zmq.IDENTITY, client_id)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
+        self.socket.setsockopt(zmq.RCVHWM, 0)
 
         self.socket.connect(server_address)
         print(f"Connected to server at {server_address} with ID: {client_id.decode()}")
 
-    def send_request(self, request_id: str, remote_ox_shard_list: str, src_id_list: List[int], dst_id_list: List[int], rank_id: int) -> bool:
+    async def send_request(self, request_id: str, remote_ox_shard_list: str, src_id_list: List[int], dst_id_list: List[int], rank_id: int) -> bool:
         try:
             request_data = {
                 'request_id': request_id,
@@ -205,16 +214,16 @@ class RouterDealerClient:
                 'remote_ox_shard_list': remote_ox_shard_list,
             }
             packed_data = msgpack.packb(request_data)
-            self.socket.send(packed_data)
+            await self.socket.send(packed_data)
             return True
         except Exception as e:
             print(f"Error sending request {request_id}: {e}")
             return False
 
-    def receive_response(self, timeout: int = 1000) -> Optional[Dict]:
+    async def receive_response(self, timeout: int = 1000) -> Optional[Dict]:
         try:
-            if self.socket.poll(timeout, zmq.POLLIN):
-                response_data = self.socket.recv()
+            if await self.socket.poll(timeout, zmq.POLLIN):
+                response_data = await self.socket.recv()
                 response = msgpack.unpackb(response_data)
                 return response
         except Exception as e:
@@ -222,7 +231,7 @@ class RouterDealerClient:
         return None
 
     def close(self):
-        self.socket.close()
+        self.socket.close(linger=0)
         self.context.term()
         print("Client closed")
 
@@ -363,9 +372,12 @@ class LLMDataDistConnector(KVConnectorBase_V1):
 
         Scheduler-side detection: requests preempted (recompute) after a
         successful KV pull. Delegates to the decode connector scheduler.
-        Returns None when there is no scheduler (worker role / prefill).
+        On the worker, returns failed OX transfers for the model runner.
         """
         if self.connector_scheduler is None:
+            if self.connector_worker is not None:
+                method = getattr(self.connector_worker, "get_load_kv_failure_reqs", None)
+                return method() if method is not None else None
             return None
         method = getattr(self.connector_scheduler, "get_load_kv_failure_reqs", None)
         if method is None:
@@ -519,7 +531,6 @@ class PrefillConnectorWorker:
     def _start_p_server_kv_transfer(self, kv_pool_mmap_path, data_type, block_len_dtype, omni_cache):
         data_type_size = DTypeUtils.size(data_type)
         if self.tp_rank_local == 0 and self.dp_rank == 0:
-            # TODO: 修改代码使得connector可以感知ox的异常
             cmd = [
                 str(OX_PATH),
                 "--addr", f"0.0.0.0:{BASE_PORT}",
@@ -533,12 +544,10 @@ class PrefillConnectorWorker:
 
             if not hasattr(self, '_ox_p_manager'):
                 self._ox_p_manager = OxProcessManager(log_prefix="ox-p-server")
-            proc = self._ox_p_manager.start(cmd)
-
-            ok, not_ready = _wait_ports(host_ports=[("127.0.0.1", BASE_PORT)], timeout_sec=300)
-            if not ok:
-                self._ox_p_manager.stop()
-                raise RuntimeError(f"[ERROR] P not ready: {sorted(list(not_ready))}")
+            self._ox_p_manager.start(
+                cmd, log_file_path=os.path.join(OX_LOG_PATH, "ox_log_p_server.log"),
+                ready_check=lambda: _wait_ports(
+                    [("127.0.0.1", BASE_PORT)], timeout_sec=300)[0])
             logger.info("[READY] P node is ready")
 
     def start_load_kv(self, metadata: DatadistConnectorMetadataPrefill):
@@ -747,7 +756,8 @@ class DecodeConnectorWorker:
         self.queues: Dict[str, queue.Queue] = {}     # cluster_id -> Queue
         self.threads: Dict[str, threading.Thread] = {}  # cluster_id -> Thread
 
-        self._transfer_lock = threading.Lock()
+        self._transfer_lock = threading.RLock()
+        self._recovery_lock = threading.RLock()
 
         self.ctx = zmq.Context()
         self.zmq_socket_map: Dict[str, zmq.Socket] = {}
@@ -765,7 +775,7 @@ class DecodeConnectorWorker:
             self.thread_on_fast_path_req.start()
             logger.warning("DecodeConnectorWorker initialized with self.async_pull_kv enabled.")
 
-        self._transfer_lock = getattr(self, "_transfer_lock", threading.Lock())
+        self._transfer_lock = getattr(self, "_transfer_lock", threading.RLock())
         self._recving_transfers = getattr(self, "_recving_transfers", queue.Queue())
         self._endpoint = f"tcp://127.0.0.1:{ZMQ_BASE_PORT}"
         self.zmq_client = None
@@ -787,6 +797,14 @@ class DecodeConnectorWorker:
 
         self._mgr = multiprocessing.Manager()
         self._pending = self._mgr.dict()
+        self._failed_transfers = queue.Queue()
+        self._process_failures = multiprocessing.Queue()
+        self._ox_generation_path = os.path.join(
+            "/tmp", f"omniinfer_ox_restart_{ZMQ_BASE_PORT}.generation")
+        self._ox_generation = self._read_ox_generation()
+        self._transport_generation = 0
+        self._retired_ipc = []
+        self._transfer_timeout = float(os.environ.get("OX_TRANSFER_TIMEOUT_SECONDS", "120"))
 
         # self.h2d_stream = torch.npu.Stream()
 
@@ -816,7 +834,6 @@ class DecodeConnectorWorker:
             self.block_len_dtype = block_len_dtype
             end_port = f"{ZMQ_BASE_PORT + omni_cache.dp_local_rank}"
             data_type_size = DTypeUtils.size(data_type)
-            # TODO: 增加代码使得connector可以感知ox的异常
             cmd = [
                 str(OX_PATH),
                 "--zmq-port", end_port,
@@ -831,7 +848,11 @@ class DecodeConnectorWorker:
 
             if not hasattr(self, '_ox_d_manager'):
                 self._ox_d_manager = OxProcessManager(log_prefix="ox-d-client")
-            proc = self._ox_d_manager.start(cmd, log_file_path=os.path.join(OX_LOG_PATH, "ox_log_d_client.log"))
+            self._ox_d_manager.start(
+                cmd, log_file_path=os.path.join(OX_LOG_PATH, "ox_log_d_client.log"),
+                ready_check=lambda: _wait_ports(
+                    [("127.0.0.1", ZMQ_BASE_PORT)], timeout_sec=30)[0],
+                before_restart=self._announce_ox_restart)
 
         self.zmq_client = None
         self.omni_cache = omni_cache
@@ -908,6 +929,7 @@ class DecodeConnectorWorker:
                 request_id=req_id,
                 remote_request_id=meta.remote_request_id,
                 remote_host_ip=meta.remote_host,
+                transport_generation=self._transport_generation,
             )
             futures.append(future)
 
@@ -921,8 +943,21 @@ class DecodeConnectorWorker:
         remote_ox_shard_list: str,
         request_id: str,
         remote_request_id: Optional[str],
-        remote_host_ip: str
+        remote_host_ip: str,
+        transport_generation=None,
     ):
+        with self._recovery_lock:
+            if transport_generation != self._transport_generation:
+                self._failed_transfers.put(request_id)
+                logger.error("OX_RECOVERY_STALE_SUBMIT request_id=%s", request_id)
+                return
+            self._read_blocks_locked(local_block_ids, remote_block_ids,
+                                     remote_ox_shard_list, request_id,
+                                     remote_request_id, remote_host_ip)
+
+    def _read_blocks_locked(self, local_block_ids, remote_block_ids,
+                            remote_ox_shard_list, request_id,
+                            remote_request_id, remote_host_ip):
         start = time.time()
 
         req = PendingReq(
@@ -949,6 +984,108 @@ class DecodeConnectorWorker:
         logger.warning("Adding Sent Queue req_id=%s in %.6f s",
                        request_id, time.time() - start)
 
+    def _read_ox_generation(self):
+        try:
+            with open(self._ox_generation_path, encoding="ascii") as stream:
+                return stream.read().strip()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            logger.error("Cannot read OX restart marker: %s", exc)
+            return getattr(self, "_ox_generation", None)
+
+    def _announce_ox_restart(self):
+        # Atomic replacement lets every local decode worker observe the same
+        # transition without sharing a multiprocessing Manager instance.
+        marker = uuid.uuid4().hex
+        temporary = f"{self._ox_generation_path}.{os.getpid()}"
+        with open(temporary, "w", encoding="ascii") as stream:
+            stream.write(marker)
+        os.replace(temporary, self._ox_generation_path)
+        self._check_ox_generation()
+
+    def _fail_transfer(self, request_id, reason, expected=None):
+        with self._transfer_lock:
+            if expected is not None:
+                current = self._pending.get(request_id)
+                if current is None or current.t_submit != expected.t_submit:
+                    return
+            ctx = self._pending.pop(request_id, None)
+            if ctx is None:
+                return
+            self._failed_transfers.put(request_id)
+        logger.error("KV transfer failed for request %s: %s", request_id, reason)
+
+    def _fail_pending(self, reason):
+        for request_id in list(self._pending.keys()):
+            self._fail_transfer(request_id, reason)
+
+    def _check_ox_generation(self):
+        with self._recovery_lock:
+            self._check_ox_generation_locked()
+
+    def _check_ox_generation_locked(self):
+        marker = self._read_ox_generation()
+        if marker == self._ox_generation:
+            return
+        self._replace_transport("OX restarted")
+        # Publish adoption only after cleanup; a failed attempt must be retried.
+        self._ox_generation = marker
+
+    def _replace_transport(self, reason):
+        """Quiesce old producers before invalidating work and replacing IPC.
+
+        Address may be building or enqueueing a DMA batch. Never kill it while
+        the H2D consumer can be reading that queue. A timeout keeps ownership
+        and retries recovery instead of declaring old addresses reusable.
+        """
+        logger.warning("OX_RECOVERY_BEGIN reason=%s", reason)
+        self._close_retired_ipc()
+        self._resp_stop.set()
+        self._address_stop.set()
+        if self._address_process:
+            self._address_process.join(timeout=3)
+            if self._address_process.is_alive():
+                raise RuntimeError("OX recovery waiting for Address process to quiesce")
+        if self._resp_process:
+            self._resp_process.join(timeout=3)
+            if self._resp_process.is_alive():
+                self._resp_process.terminate()
+                self._resp_process.join(timeout=2)
+            if self._resp_process.is_alive():
+                self._resp_process.kill()
+                self._resp_process.join(timeout=2)
+            if self._resp_process.is_alive():
+                raise RuntimeError("OX recovery could not reap ZMQ process")
+        with self._transfer_lock:
+            # This lock also encloses real DMA. No failed target can be freed
+            # while the old H2D thread is still writing it.
+            self._fail_pending(reason)
+            # Both H2D queue endpoints have exited their queue operations:
+            # producer is reaped; consumer accesses it under transfer_lock.
+            old_queues = (self._send_q, self._recv_q, self._h2d_q,
+                          self._process_failures)
+            self._send_q = multiprocessing.Queue()
+            self._recv_q = multiprocessing.Queue()
+            self._h2d_q = multiprocessing.Queue(maxsize=1024)
+            self._process_failures = multiprocessing.Queue()
+            self._transport_generation += 1
+            self.zmq_client = _ZMQSendProxy(self._send_q)
+            self._resp_process = None
+            self._address_process = None
+            self._retired_ipc.extend(old_queues)
+            self._close_retired_ipc()
+        logger.warning("OX_RECOVERY_IPC_REPLACED reason=%s", reason)
+
+    def _close_retired_ipc(self):
+        while self._retired_ipc:
+            close_retired_queue(self._retired_ipc[0])
+            self._retired_ipc.pop(0)
+
+    def get_load_kv_failure_reqs(self):
+        failures = self._pop_done_transfers(self._failed_transfers)
+        return failures or None
+
     def _ensure_process_started(self):
         # Process
         if not (self._resp_process and self._resp_process.is_alive()):
@@ -956,7 +1093,7 @@ class DecodeConnectorWorker:
             self._resp_process = multiprocessing.Process(
                 target=self._process_zmq, name="ZMQ-Recv-Thread", daemon=True
             )
-            self._resp_process.start()
+            start_connector_process(self._resp_process)
             self.zmq_client = _ZMQSendProxy(self._send_q)
             logger.info("ZMQ receive thread started at %s", self._endpoint)
         
@@ -965,16 +1102,18 @@ class DecodeConnectorWorker:
             self._address_process = multiprocessing.Process(
                 target=self._process_h2d_address, name="Address-Process", daemon=True
             )
-            self._address_process.start()
+            start_connector_process(self._address_process)
             logger.info("Address-Processat %s", self._endpoint)
         
         # Thread
         def monitor():
             while not self._process_monitor_stop.is_set():
-                is_alive = [self._resp_process.is_alive(), self._address_process.is_alive()]
-                if sum(is_alive) != len(is_alive):
-                    logger.warning(f"[self._resp_process.is_alive(), self._address_process.is_alive()] = {is_alive}")
-                time.sleep(1)
+                try:
+                    with self._recovery_lock:
+                        self._monitor_processes_once()
+                except Exception:
+                    logger.exception("OX_RECOVERY_FAILED; retaining old generation for retry")
+                self._process_monitor_stop.wait(1)
 
         if not (self._h2d_thread and self._h2d_thread.is_alive()):
             self._h2d_stop.clear()
@@ -983,7 +1122,7 @@ class DecodeConnectorWorker:
             )
             self._h2d_thread.start()
             logger.info("H2D worker thread started")
-        
+
         if not (self._process_monitor_thread and self._process_monitor_thread.is_alive()):
             self._process_monitor_stop.clear()
             self._process_monitor_thread = threading.Thread(
@@ -992,17 +1131,41 @@ class DecodeConnectorWorker:
             self._process_monitor_thread.start()
             logger.info("Process Monitor thread started")
 
-    def _process_zmq(self):
-        client = RouterDealerClient(self._endpoint)
+    def _monitor_processes_once(self):
+        self._check_ox_generation()
+        # Do not read a queue potentially left mid-frame by a dead producer.
+        if self._resp_process is None or self._address_process is None:
+            self._ensure_process_started()
+        elif not self._resp_process.is_alive() or not self._address_process.is_alive():
+            self._replace_transport("OX connector subprocess exited")
+            self._ensure_process_started()
+        while True:
+            try:
+                req_id, reason = self._process_failures.get_nowait()
+            except queue.Empty:
+                break
+            self._fail_transfer(req_id, reason)
+        for req_id, ctx in list(self._pending.items()):
+            if time.time() - ctx.t_submit > self._transfer_timeout:
+                self._fail_transfer(req_id, "OX transfer timed out", expected=ctx)
 
-        async def sender():
+    def _process_zmq(self):
+        isolate_connector_child_signals()
+        async def sender(client: RouterDealerClient):
             while not self._resp_stop.is_set():
                 try:
-                    item: _SendItem = await asyncio.to_thread(self._send_q.get)
+                    # Only the queue wait runs in a worker thread, never socket I/O.
+                    item: _SendItem = await asyncio.to_thread(self._send_q.get, True, 0.5)
                 except asyncio.CancelledError:
                     break
+                except queue.Empty:
+                    continue
+                if self._resp_stop.is_set():
+                    break
+                if item.request_id not in self._pending:
+                    continue
                 t0 = time.time()
-                ok = client.send_request(
+                ok = await client.send_request(
                     request_id=item.request_id,
                     remote_ox_shard_list=item.remote_ox_shard_list,
                     src_id_list=item.src_ids,
@@ -1010,23 +1173,29 @@ class DecodeConnectorWorker:
                     rank_id=item.rank_id,
                 )
                 if not ok:
-                    raise ValueError(f"Send failed for req_id={item.request_id}")
+                    self._process_failures.put((item.request_id, "OX request send failed"))
                 else:
                     logger.debug("Sent req_id=%s in %.6f s", item.request_id, time.time() - t0)
 
-        async def receiver():
+        async def receiver(client: RouterDealerClient):
             while not self._resp_stop.is_set():
                 try:
-                    resp = await asyncio.to_thread(client.receive_response, None)
+                    resp = await client.receive_response(1000)
                 except asyncio.CancelledError:
                     break
+                if resp is None:
+                    continue
 
                 req_id = resp.get("request_id")
                 success = bool(resp.get("success"))
                 if not req_id:
-                    raise ValueError(f"Received response without request_id: {resp}")
+                    logger.error("OX response missing request_id: %s", resp)
+                    continue
                 if not success:
-                    raise ValueError(f"Failed to pull kv of request {req_id}")
+                    self._process_failures.put((req_id, "OX returned unsuccessful response"))
+                    continue
+                if req_id not in self._pending:
+                    continue
 
                 try:
                     await asyncio.to_thread(self._recv_q.put, req_id)
@@ -1034,20 +1203,32 @@ class DecodeConnectorWorker:
                     break
 
         async def async_main():
-            sender_task = asyncio.create_task(sender())
-            receiver_task = asyncio.create_task(receiver())
-            while not self._resp_stop.is_set():
-                await asyncio.sleep(0.5)
-            sender_task.cancel()
-            receiver_task.cancel()
-        
+            client = RouterDealerClient(self._endpoint)
+            sender_task = asyncio.create_task(sender(client))
+            receiver_task = asyncio.create_task(receiver(client))
+            try:
+                while not self._resp_stop.is_set():
+                    done, _ = await asyncio.wait(
+                        (sender_task, receiver_task), timeout=0.5,
+                        return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        if not task.cancelled():
+                            task.result()
+                        raise RuntimeError("OX ZMQ task stopped unexpectedly")
+            finally:
+                sender_task.cancel()
+                receiver_task.cancel()
+                await asyncio.gather(sender_task, receiver_task, return_exceptions=True)
+                client.close()
+
         asyncio.run(async_main())
     
     def _process_h2d_address(self):
+        isolate_connector_child_signals()
         while not self._address_stop.is_set():
             batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs = [], [], [], [], []
             start_time = time.time()
-            while True:
+            while not self._address_stop.is_set():
                 try:
                     req_id = self._recv_q.get_nowait()
                 except queue.Empty:
@@ -1057,7 +1238,8 @@ class DecodeConnectorWorker:
                 if ctx:
                     ctx.t_resp = time.time()
                 if not ctx:
-                    raise ValueError("Orphan response for unknown req_id=%s", req_id)
+                    logger.warning("Ignoring late OX response for request %s", req_id)
+                    continue
                 self._log_network_timing(ctx)
 
                 micro_batch_device_mem, micro_batch_device_max, micro_batch_host_mem, micro_batch_host_sizes = self.omni_cache.build_h2d_ops(
@@ -1077,15 +1259,24 @@ class DecodeConnectorWorker:
     def _h2d_worker(self):
         self.omni_cache.host_cache.ascend_cl_stream.create()
         while not self._h2d_stop.is_set():
-            batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs = self._h2d_q.get()
+            # Serialize queue replacement with dequeuing; the lock is released
+            # before idle backoff and rechecked before issuing any real DMA.
+            with self._transfer_lock:
+                try:
+                    batch = self._h2d_q.get(timeout=0.05)
+                except queue.Empty:
+                    batch = None
+            if batch is None:
+                self._h2d_stop.wait(0.01)
+                continue
+            batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs = batch
             t_h2d_start = time.time()
             try:
                 self._post_success(batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs)
             except Exception as e:
                 logger.exception("H2D worker error on req_id=%s: %s", ",".join([str(ctx.request_id) for ctx in ctxs]), e)
-            finally:
                 for ctx in ctxs:
-                    self._pending.pop(ctx.request_id, None)
+                    self._fail_transfer(ctx.request_id, "H2D copy failed", expected=ctx)
             
             t_h2d_end = time.time()
             logger.debug(" **** Time cost of decode synchronize_h2d is %.3f ms len(req_id):%s", (t_h2d_end-t_h2d_start) * 1000.0, len(ctxs))
@@ -1109,6 +1300,18 @@ class DecodeConnectorWorker:
         )
 
     def _post_success(self, batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs):
+        with self._transfer_lock:
+            # Prepared addresses can outlive their pending request. Test BEFORE
+            # DMA and retain ownership through its actual completion.
+            if any((current := self._pending.get(ctx.request_id)) is None
+                   or current.t_submit != ctx.t_submit for ctx in ctxs):
+                for ctx in ctxs:
+                    self._fail_transfer(ctx.request_id, "stale H2D batch", expected=ctx)
+                return
+            self._post_success_locked(batch_device_mem, batch_device_max,
+                                      batch_host_mem, batch_host_sizes, ctxs)
+
+    def _post_success_locked(self, batch_device_mem, batch_device_max, batch_host_mem, batch_host_sizes, ctxs):
         
         if self.omni_cache is None or self.omni_cache.device_cache is None:
             raise RuntimeError("Error! omni_cache is None or device_cache is None.")
@@ -1117,17 +1320,26 @@ class DecodeConnectorWorker:
         
         for ctx in ctxs:
             tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            if tp_size > 1:
+                # A peer may have failed its pull during an OX restart. Bound
+                # the wait so a single missing rank cannot hang the service.
+                torch.distributed.monitored_barrier(
+                    group=get_tp_group().cpu_group, timeout=timedelta(seconds=30))
+            with self._transfer_lock:
+                if self._pending.pop(ctx.request_id, None) is None:
+                    continue
             if tp_size == 1:
                 if ctx.remote_request_id is not None:
                     self._send_pulled_kv_req_list(ctx.remote_host_ip, [ctx.remote_request_id])
                 self._recving_transfers.put(ctx.request_id)
             else:
-                torch.distributed.barrier(group=get_tp_group().cpu_group)
                 if get_tensor_model_parallel_rank() == 0 and ctx.remote_request_id is not None:
                     self._send_pulled_kv_req_list(ctx.remote_host_ip, [ctx.remote_request_id])
                 self._recving_transfers.put(ctx.request_id)
 
     def stop_zmq_thread(self, wait: bool = True):
+        if hasattr(self, "_ox_d_manager"):
+            self._ox_d_manager.stop()
         self._resp_stop.set()
         self._h2d_stop.set()
         self._address_stop.set()
@@ -1135,8 +1347,17 @@ class DecodeConnectorWorker:
 
         if self._resp_process and wait:
             self._resp_process.join(timeout=2.0)
+            if self._resp_process.is_alive():
+                self._resp_process.terminate()
+                self._resp_process.join(timeout=2.0)
+            if self._resp_process.is_alive():
+                self._resp_process.kill()
+                self._resp_process.join(timeout=2.0)
         if self._address_process and wait:
             self._address_process.join(timeout=2.0)
+            if self._address_process.is_alive():
+                self._address_process.terminate()
+                self._address_process.join(timeout=2.0)
 
         if self._h2d_thread and wait:
             self._h2d_thread.join(timeout=2.0)

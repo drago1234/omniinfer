@@ -13,8 +13,6 @@
 #include <boost/asio/experimental/awaitable_operators.hpp>
 
 #include <arpa/inet.h>
-#include <execinfo.h>
-#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -22,6 +20,7 @@
 #include <limits>
 #include <stdexcept>
 #include <ox_block_table.hpp>
+#include <ox_log.hpp>
 
 namespace asio = boost::asio;
 using asio::co_spawn;
@@ -33,30 +32,13 @@ using namespace boost::asio::experimental::awaitable_operators;
 
 inline constexpr uint32_t k_ox_max_block_ids_per_message = 8192;
 
-inline void print_ox_backtrace(std::ostream &out)
-{
-    void *frames[64];
-    const int frame_count = backtrace(frames, static_cast<int>(sizeof(frames) / sizeof(frames[0])));
-    char **symbols = backtrace_symbols(frames, frame_count);
-
-    out << "OX backtrace (" << frame_count << " frames):" << std::endl;
-    if (symbols == nullptr) {
-        out << "  backtrace_symbols failed" << std::endl;
-        return;
-    }
-    for (int i = 0; i < frame_count; ++i) {
-        out << "  " << symbols[i] << std::endl;
-    }
-    std::free(symbols);
-}
-
 inline void optimize_tcp_socket(tcp::socket &socket)
 {
     boost::system::error_code ec;
 
     socket.set_option(tcp::no_delay(true), ec);
     if (ec)
-        std::cerr << "Failed to set TCP_NODELAY: " << ec.message() << std::endl;
+        OX_LOG_WARN("tcp") << "Failed to set TCP_NODELAY: " << ec.message();
 
 #ifdef TCP_QUICKACK
     int quickack = 1;
@@ -103,15 +85,16 @@ private:
                 co_await asio::async_write(socket_, bt.get_buffers_layerwise(0, block_list, 0), use_awaitable);
             }
         } catch (const boost::system::system_error &e) {
-            std::cerr << "OX P transport error: peer=" << peer() << " phase=" << phase
-                      << " block_count=" << block_count << " ec=" << e.code().value()
-                      << " category=" << e.code().category().name() << " message=" << e.code().message()
-                      << std::endl;
-            print_ox_backtrace(std::cerr);
+            OX_LOG_ERROR("p_session") << "OX P transport error: peer=" << peer()
+                << " phase=" << phase << " block_count=" << block_count
+                << " ec=" << e.code().value() << " category=" << e.code().category().name()
+                << " message=" << e.code().message();
+            ox::print_ox_backtrace("p_session");
         } catch (const std::exception &e) {
-            std::cerr << "OX P request error: peer=" << peer() << " phase=" << phase
-                      << " block_count=" << block_count << " message=" << e.what() << std::endl;
-            print_ox_backtrace(std::cerr);
+            OX_LOG_ERROR("p_session") << "OX P request error: peer=" << peer()
+                << " phase=" << phase << " block_count=" << block_count
+                << " message=" << e.what();
+            ox::print_ox_backtrace("p_session");
         }
     }
 
@@ -156,10 +139,11 @@ public:
 
                 std::make_shared<Session>(std::move(socket), bt)->start();
             } catch (const boost::system::system_error &e) {
-                std::cerr << "Accept error: " << e.what() << std::endl;
                 if (e.code() == boost::asio::error::operation_aborted) {
                     break;
                 }
+                OX_LOG_ERROR("p_server") << "Accept error: " << e.what();
+                ox::print_ox_backtrace("p_server");
             }
         }
         co_return;

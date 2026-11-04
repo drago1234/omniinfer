@@ -1,3 +1,17 @@
+## OX 进程恢复 CPU UT
+
+OX Python 测试统一位于 `tests/test_ox_*.py`，生产实现位于
+`omni/accelerators/pd/`。从仓库根目录运行：
+
+```bash
+python3 -m unittest discover -s tests -p 'test_ox_*.py' -v
+```
+
+测试依赖 `pyzmq`、`msgpack`；不加载模型、不分配 NPU，也不向现有服务发送信号。
+Linux 上覆盖真实 fork、信号、IPC、ZMQ 以及连续 OX 模拟进程恢复；其他平台会跳过
+Linux 专用机制。测试中的 `SIGKILL/SIGSTOP` 等信号只发送给测试自行创建的进程。
+日志转发及请求失败交接的既有 OX UT 也由同一条命令执行。
+
 ✨ 特性
 ==================================== **SYSTEM INFO** ===========================================
 Kernel: 4.19.90-vhulk2211.3.0.h1543.eulerosv2r10.aarch64

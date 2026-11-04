@@ -130,10 +130,15 @@ public:
                     connected = true;
                     break;
                 } catch (const std::exception &e) {
-                    std::cerr << "Connect attempt " << (attempt + 1) << " to "
-                              << addr.address() << ":" << addr.port()
-                              << " failed: " << e.what() << std::endl;
-                    print_ox_backtrace(std::cerr);
+                    if (attempt + 1 == max_connect_retries) {
+                        OX_LOG_ERROR("connection") << "Connection to "
+                            << addr.address() << ":" << addr.port() << " failed after "
+                            << max_connect_retries << " attempts: " << e.what();
+                        ox::print_ox_backtrace("connection");
+                    } else {
+                        OX_LOG_WARN("connection") << "Connect attempt " << (attempt + 1) << " to "
+                            << addr.address() << ":" << addr.port() << " failed: " << e.what();
+                    }
                     boost::system::error_code ec;
                     socket.close(ec);
                     socket = tcp::socket(io_context);
@@ -197,11 +202,10 @@ public:
                     pending_request.reset();
                 }
             } catch (const std::exception &e) {
-                std::cerr << "OX request processing error: peer="
-                        << addr.address() << ":" << addr.port()
-                        << " retry=" << request_retries
-                        << " message=" << e.what() << std::endl;
-                print_ox_backtrace(std::cerr);
+                OX_LOG_ERROR("transfer") << "OX request processing error: peer="
+                    << addr.address() << ":" << addr.port()
+                    << " retry=" << request_retries << " message=" << e.what();
+                ox::print_ox_backtrace("transfer");
                 boost::system::error_code ec;
                 socket.close(ec);
                 socket = tcp::socket(io_context);
@@ -413,8 +417,8 @@ public:
                 }
             }
         } catch (const std::exception &e) {
-            std::cerr << "Response sender stopped: " << e.what() << std::endl;
-            print_ox_backtrace(std::cerr);
+            OX_LOG_ERROR("response_sender") << "Response sender stopped: " << e.what();
+            ox::print_ox_backtrace("response_sender");
         }
         co_return;
     }
@@ -520,12 +524,22 @@ asio::awaitable<void> response_sender(ZmqCoroutineSocket &router_socket, ZMQChan
             response_messages.emplace_back(response_data.data(), response_data.size());
 
             global_stats_update_running(-1);
-            co_await router_socket.async_send_multipart(std::move(response_messages));
-            ox_trace("OX trace: request=", request_id, " event=response_sent success=", success);
+            if (!success) {
+                OX_LOG_ERROR("response_sender") << "KV pull failed for request_id=" << request_id;
+            }
+            bool queued = co_await router_socket.async_send_multipart(std::move(response_messages));
+            if (!queued) {
+                OX_LOG_ERROR("response_sender") << "Failed to queue response for request_id="
+                    << request_id;
+            } else {
+                OX_LOG_DEBUG("response_sender") << "request_id=" << request_id
+                    << " success=" << success << " response_queued";
+                ox_trace("OX trace: request=", request_id, " event=response_queued success=", success);
+            }
         }
     } catch (const std::exception &e) {
-        std::cerr << "Response sender stopped: " << e.what() << std::endl;
-        print_ox_backtrace(std::cerr);
+        OX_LOG_ERROR("response_sender") << "Response sender stopped: " << e.what();
+        ox::print_ox_backtrace("response_sender");
     }
 }
 
@@ -545,6 +559,9 @@ asio::awaitable<void> router_receiver(ZmqCoroutineSocket &router_socket, TPGroup
                 msgpack::object_handle handle = msgpack::unpack(request_data.data(), request_data.size());
                 RequestMessage request;
                 handle.get().convert(request);
+                OX_LOG_DEBUG("router_receiver") << "request_id=" << request.request_id
+                    << " blocks=" << request.src_block_ids.size()
+                    << " remote_ox_shard_list=" << request.remote_ox_shard_list;
 
                 auto start = std::chrono::high_resolution_clock::now();
                 time_record[request.request_id] = make_tuple(request.src_block_ids.size(), start);
@@ -559,25 +576,22 @@ asio::awaitable<void> router_receiver(ZmqCoroutineSocket &router_socket, TPGroup
                 auto group = manager.get_or_create(request.remote_ox_shard_list);
                 co_spawn(co_await asio::this_coro::executor, group->gather(client_id, request), detached);
             } else {
-                std::cerr << "[DBG] router_receiver: Wrong msg size=" << msg->size() << std::endl;
-                print_ox_backtrace(std::cerr);
+                OX_LOG_ERROR("router_receiver") << "Wrong msg size="
+                    << (msg ? std::to_string(msg->size()) : "nullopt");
             }
         } catch (const std::exception &e) {
-            std::cerr << "[DBG] router_receiver error: " << e.what() << std::endl;
-            print_ox_backtrace(std::cerr);
+            OX_LOG_ERROR("router_receiver") << "Receive error: " << e.what();
+            ox::print_ox_backtrace("router_receiver");
         }
     }
 }
 
 int main(int argc, char *argv[])
 {
-    std::cout << "Omni Xfer v0.7.5 (dynamic) starting..." << std::endl;
+    OX_LOG_INFO("main") << "Omni Xfer v0.7.5 (dynamic) starting";
     try {
         Config config = parse_arguments(argc, argv);
         BlockTable bt(config);
-
-        block_list_t blocks = {0, 5, 11};
-        bt.get_buffers_layerwise(0, blocks, 1);
 
         asio::io_context &io_context = config.get_io_context();
 
@@ -607,7 +621,7 @@ int main(int argc, char *argv[])
             co_spawn(io_context, print_statistics(), detached);
         }
 
-        std::cout << "Omni Xfer D started. ZMQ: " << address << std::endl;
+        OX_LOG_INFO("main") << "Omni Xfer D started. ZMQ: " << address;
 
         std::vector<std::thread> threads;
         for (size_t i = 0; i < config.num_threads; ++i) {
@@ -619,8 +633,8 @@ int main(int argc, char *argv[])
         for (auto &thread : threads)
             thread.join();
     } catch (const std::exception &e) {
-        std::cerr << "main() Exception: " << e.what() << "\n";
-        print_ox_backtrace(std::cerr);
+        OX_LOG_ERROR("main") << "Exception: " << e.what();
+        ox::print_ox_backtrace("main");
         return 1;
     }
 

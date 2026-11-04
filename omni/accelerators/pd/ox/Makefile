@@ -11,12 +11,16 @@ LIBS     := -lzmq -lpthread
 
 # Final executable name
 TARGET   := ox
+.DEFAULT_GOAL := all
 
 # Source files (add more .cpp files here as needed)
 SRCS     := ox.cpp
 
 # Derive object file names automatically
 OBJS     := $(SRCS:.cpp=.o)
+
+# Rebuild when transport, logging, or block table logic changes.
+ox.o: zmq_coroutine.hpp ox_log.hpp ox_server.hpp ox_block_table.hpp
 
 # Default target
 all: $(TARGET)

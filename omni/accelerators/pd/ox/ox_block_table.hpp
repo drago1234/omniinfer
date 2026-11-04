@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <numeric>
 #include <functional>
+#include <limits>
+#include <stdexcept>
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -110,29 +112,36 @@ public:
 
     inline char *table_addr(table_id_t table_id)
     {
-        assert(table_id < config.num_block_tables);
-        return static_cast<char *>(base) + table_id * static_cast<ptrdiff_t>(config.table_size);
+        return static_cast<char *>(base) + checked_table_offset(table_id);
     }
 
     inline void *block_addr(table_id_t table_id, size_t block_id)
     {
-        assert(block_id < static_cast<size_t>(num_blocks));
-        char *ptr = static_cast<char *>(base) + table_id * static_cast<ptrdiff_t>(config.block_table_size()) +
-                    block_id * static_cast<ptrdiff_t>(config.block_size);
-
-        assert(ptr >= static_cast<char *>(base));
-        assert(ptr + config.block_size <= static_cast<char *>(base) + map_size);
-        return ptr;
+        if (block_id >= num_blocks) {
+            throw std::out_of_range("BlockTable::block_addr: invalid block_id " + std::to_string(block_id));
+        }
+        const size_t table = checked_table_offset(table_id);
+        const size_t offset = checked_add(table, checked_mul(block_id, config.block_size));
+        checked_span(offset, config.block_size, checked_add(table, checked_table_size()));
+        return static_cast<char *>(base) + offset;
     }
 
     inline size_t block_tp_size()
     {
-        return config.block_size / config.tp_size();
+        const size_t tp_size = config.tp_size();
+        if (tp_size == 0 || config.block_size % tp_size != 0) {
+            throw std::invalid_argument("BlockTable::block_tp_size: invalid TP partition");
+        }
+        return config.block_size / tp_size;
     }
 
     inline void *block_tp_addr(table_id_t table_id, size_t block_id, int rank)
     {
-        return static_cast<char *>(block_addr(table_id, block_id)) + block_tp_size() * rank;
+        const size_t tp_size = config.tp_size();
+        if (rank < 0 || tp_size == 0 || static_cast<size_t>(rank) >= tp_size) {
+            throw std::out_of_range("BlockTable::block_tp_addr: invalid TP rank");
+        }
+        return static_cast<char *>(block_addr(table_id, block_id)) + block_tp_size() * static_cast<size_t>(rank);
     }
 
     std::vector<boost::asio::mutable_buffer> get_buffers(table_id_t table_id, block_list_t &block_ids, int rank)
@@ -149,20 +158,33 @@ public:
     std::vector<boost::asio::mutable_buffer> get_buffers_layerwise(
         table_id_t table_id, block_list_t &block_ids, int rank, size_t tp_size_override = 0)
     {
-        char *ptr = table_addr(table_id);
-        size_t tp_size = (tp_size_override > 0) ? tp_size_override : config.tp_size();
+        const size_t table = checked_table_offset(table_id);
+        const size_t table_end = checked_add(table, checked_table_size());
+        const size_t tp_size = (tp_size_override > 0) ? tp_size_override : config.tp_size();
+        if (rank < 0 || tp_size == 0 || static_cast<size_t>(rank) >= tp_size) {
+            throw std::out_of_range("BlockTable::get_buffers_layerwise: invalid TP rank");
+        }
 
         std::vector<boost::asio::mutable_buffer> buffers;
         for (auto block_id : block_ids) {
+            if (block_id < 0 || static_cast<size_t>(block_id) >= num_blocks) {
+                throw std::out_of_range("BlockTable::get_buffers_layerwise: invalid block_id " +
+                                        std::to_string(block_id));
+            }
             for (size_t i = 0; i < blocks.size(); i++) {  // blocks: ..512, ..64, ..128
-                char *base = ptr + block_offset[i];
+                const size_t component_bytes = block_layer_size[i];
+                if (component_bytes % tp_size != 0) {
+                    throw std::invalid_argument("BlockTable::get_buffers_layerwise: component is not divisible by TP size");
+                }
+                const size_t rank_bytes = component_bytes / tp_size;
+                const size_t rank_offset = checked_mul(static_cast<size_t>(rank), rank_bytes);
                 for (size_t j = 0; j < blocks[i][0]; j++) {  // layers
-                    void *layer = base + j * layer_size[i] + block_id * block_layer_size[i] +
-                                  (block_layer_size[i] * rank) / tp_size;
-                    buffers.emplace_back(layer, block_layer_size[i] / tp_size);
-                    // std::cout << "block id: " << block_id << " segment: " << i << " layer: " << j
-                    //           << " addr: " << (((char *)layer) - ptr) << " size:" << block_layer_size[i] / tp_size
-                    //           << std::endl;
+                    size_t offset = checked_add(table, block_offset[i]);
+                    offset = checked_add(offset, checked_mul(j, layer_size[i]));
+                    offset = checked_add(offset, checked_mul(static_cast<size_t>(block_id), component_bytes));
+                    offset = checked_add(offset, rank_offset);
+                    checked_span(offset, rank_bytes, table_end);
+                    buffers.emplace_back(static_cast<char *>(base) + offset, rank_bytes);
                 }
             }
         }
@@ -246,6 +268,45 @@ public:
     // }
 
 private:
+    static size_t checked_add(size_t lhs, size_t rhs)
+    {
+        if (lhs > std::numeric_limits<size_t>::max() - rhs) {
+            throw std::out_of_range("BlockTable: address offset overflow");
+        }
+        return lhs + rhs;
+    }
+
+    static size_t checked_mul(size_t lhs, size_t rhs)
+    {
+        if (rhs != 0 && lhs > std::numeric_limits<size_t>::max() / rhs) {
+            throw std::out_of_range("BlockTable: address offset overflow");
+        }
+        return lhs * rhs;
+    }
+
+    size_t checked_table_size() const
+    {
+        return checked_mul(num_blocks, config.block_size);
+    }
+
+    size_t checked_table_offset(table_id_t table_id) const
+    {
+        if (table_id < 0 || static_cast<size_t>(table_id) >= config.num_block_tables) {
+            throw std::out_of_range("BlockTable: invalid table_id " + std::to_string(table_id));
+        }
+        const size_t table_bytes = checked_table_size();
+        const size_t offset = checked_mul(static_cast<size_t>(table_id), table_bytes);
+        checked_span(offset, table_bytes, map_size);
+        return offset;
+    }
+
+    static void checked_span(size_t offset, size_t length, size_t limit)
+    {
+        if (offset > limit || length > limit - offset) {
+            throw std::out_of_range("BlockTable: buffer exceeds mapped table");
+        }
+    }
+
     //     static bool try_mlock_onfault(void* addr, size_t len) {
     // // #if defined(__linux__) && defined(MLOCK_ONFAULT)
     //         return (::mlock2(addr, len, MLOCK_ONFAULT) == 0);
