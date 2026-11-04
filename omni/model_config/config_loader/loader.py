@@ -236,6 +236,7 @@ class ModelOperatorOptConfig:
     swa_prefill_absorb_max_tokens: int = 8192  # Ascend 950 SWA global prefill tokens; 0 keeps standard path
     optimize_first_chunk: bool = False # Whether turn off PA (non-absorb mode) and use MoME SP for the first chunk
     use_w4a8_enk_gmm: bool = False # W4A8 MoE EnK 优化，仅对称量化，默认关闭
+    defer_mhc_repeat: bool = False # 是否推迟多模态projection层在开启mhc时的repeat操作，开启后可以减少encoder_cache显存占用
     # Let prefill batches run inside the ACL graph (P side). Off keeps the
     # upstream split, prefill always eager. On, a pure-prefill batch within the
     # largest captured size keeps its per-request metadata in the persistent
