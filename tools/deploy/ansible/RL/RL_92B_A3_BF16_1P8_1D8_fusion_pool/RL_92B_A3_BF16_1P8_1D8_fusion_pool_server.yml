@@ -47,10 +47,10 @@
           -exec rm -rf -- '{}' + &&
           docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/.'
           "${DOCKER_NAME_P}:{{ container_workspace }}/omniinfer/" &&
-          if [ -d '{{ ansible_env.CODE_PATH }}/Pangu-Fusion' ]; then
+          if [ -d '{{ ansible_env.CODE_PATH }}/omniinfer/components/Pangu-Fusion' ]; then
           docker exec "$DOCKER_NAME_P" rm -rf
           '{{ container_workspace }}/omniinfer/components/Pangu-Fusion' &&
-          docker cp '{{ ansible_env.CODE_PATH }}/Pangu-Fusion'
+          docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/components/Pangu-Fusion'
           "${DOCKER_NAME_P}:{{ container_workspace }}/omniinfer/components/";
           fi
         decode: >-
@@ -62,10 +62,10 @@
           -exec rm -rf -- '{}' + &&
           docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/.'
           "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/" &&
-          if [ -d '{{ ansible_env.CODE_PATH }}/Pangu-Fusion' ]; then
+          if [ -d '{{ ansible_env.CODE_PATH }}/omniinfer/components/Pangu-Fusion' ]; then
           docker exec "$DOCKER_NAME_D" rm -rf
           '{{ container_workspace }}/omniinfer/components/Pangu-Fusion' &&
-          docker cp '{{ ansible_env.CODE_PATH }}/Pangu-Fusion'
+          docker cp '{{ ansible_env.CODE_PATH }}/omniinfer/components/Pangu-Fusion'
           "${DOCKER_NAME_D}:{{ container_workspace }}/omniinfer/components/";
           fi
 
