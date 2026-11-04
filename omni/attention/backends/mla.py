@@ -163,6 +163,7 @@ class NPUMLADecodeMetadata(MLACommonDecodeMetadata):
 
 @dataclass
 class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
+    engram_seq_lens: torch.Tensor | None = None
     causal: bool = True
     mc2_mask: torch.Tensor | None = None
     decode_threshold: int = 1
@@ -521,6 +522,7 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
             )
 
         metadata = self.metadata_cls(
+            engram_seq_lens=common_attn_metadata.seq_lens,
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
             max_seq_len=max_seq_len,

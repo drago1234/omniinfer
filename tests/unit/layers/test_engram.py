@@ -333,6 +333,95 @@ def test_history_cache_follows_bound_kv_allocation():
     assert not state.ensure_cache() and state._cache is None
 
 
+def _hash_state_and_inputs():
+    from omni_npu.layers.engram import NgramHashState
+
+    attention = torch.nn.Module()
+    attention.layer_name = "model.layers.2.self_attn.attn"
+    attention.kv_cache = torch.empty(0)
+    state = NgramHashState(EngramLayout(_config()), torch.device("cpu"), attention)
+    # Keep the attention module alive: tests that bind its KV cache need the
+    # weakref target to survive the helper's return.
+    state._cache_module_ref = lambda: attention
+    inputs = (
+        torch.tensor([5, 6, 7], dtype=torch.int64),
+        torch.arange(3, dtype=torch.int64),
+        torch.tensor([0, 2, 3], dtype=torch.int32),
+        torch.zeros(3, dtype=torch.bool),
+        torch.full((2, 2), -1, dtype=torch.int64),
+        torch.zeros(2, 2, dtype=torch.bool),
+    )
+    return state, inputs
+
+
+def test_hash_rejects_mrope_positions_without_context_lengths():
+    """mRoPE coordinates are not logical positions; hashing needs explicit lengths."""
+    state, (ids, positions, starts, dead, lookbacks, lookback_dead) = _hash_state_and_inputs()
+    mrope = positions[:, None, None].expand(3, 3, 1)
+    with pytest.raises(ValueError, match="mRoPE"):
+        state(ids, mrope, starts, dead, lookbacks, lookback_dead,
+              slot_mapping=None, block_table=None)
+
+
+@pytest.mark.parametrize("context", [
+    pytest.param(torch.zeros(2, 1, dtype=torch.int64), id="nested_rows"),
+    pytest.param(torch.zeros(1, dtype=torch.int64), id="missing_requests"),
+])
+def test_hash_rejects_malformed_context_lengths(context):
+    state, inputs = _hash_state_and_inputs()
+    with pytest.raises(ValueError, match="one device entry per request"):
+        state(*inputs, slot_mapping=None, block_table=None, num_computed_tokens=context)
+
+
+def test_hash_rejects_cross_device_context_lengths():
+    state, inputs = _hash_state_and_inputs()
+    context = torch.zeros(2, dtype=torch.int64, device="meta")
+    with pytest.raises(ValueError, match="one device entry per request"):
+        state(*inputs, slot_mapping=None, block_table=None, num_computed_tokens=context)
+
+
+def test_compute_hashes_derives_context_lengths_from_engram_seq_lens(monkeypatch):
+    """Without explicit lengths, global seq_lens minus the current chunk are used."""
+    state, (ids, positions, starts, dead, lookbacks, lookback_dead) = _hash_state_and_inputs()
+    state.block_size = 4
+    state._cache_module_ref().kv_cache = torch.zeros(2, 4, 1)
+    assert state.ensure_cache()
+    slots = torch.tensor([0, 1, -1], dtype=torch.int64)
+    block_tables = torch.arange(4, dtype=torch.int32).reshape(2, 2)
+    captured = {}
+
+    def forward(input_ids, positions_, query_start_loc, dead_mask, lookback_ids,
+                lookback_dead_mask, *, slot_mapping, block_table, out=None,
+                num_computed_tokens=None):
+        captured.update(
+            slot_mapping=slot_mapping, block_table=block_table,
+            num_computed_tokens=num_computed_tokens, dead_mask=dead_mask,
+            lookback_ids=lookback_ids,
+        )
+        return torch.zeros(3, 1, 4, dtype=torch.int32)
+
+    monkeypatch.setattr(state, "forward", forward)
+    seq_lens = torch.tensor([4, 5], dtype=torch.int64)
+    metadata = SimpleNamespace(
+        query_start_loc=starts, slot_mapping=slots,
+        engram_seq_lens=seq_lens, block_tables=block_tables,
+    )
+    hashes = state.compute_hashes(metadata, ids, positions, None)
+    torch.testing.assert_close(
+        captured["num_computed_tokens"],
+        seq_lens[:2] - (starts[1:] - starts[:-1]),
+    )
+    assert captured["slot_mapping"].tolist() == [0, 1, -1]
+    assert captured["block_table"] is block_tables
+    assert captured["lookback_ids"].shape == (2, 2) and captured["lookback_ids"].min() == -1
+    assert (hashes[2] == -1).all() and (hashes[:2] == 0).all()
+
+    # No seq lens: the kernel falls back to positions for context boundaries.
+    del metadata.engram_seq_lens
+    state.compute_hashes(metadata, ids, positions, None)
+    assert captured["num_computed_tokens"] is None
+
+
 @pytest.mark.parametrize("stage", ["capacity", "create"])
 def test_shared_allocation_failure_is_broadcast_with_rank_and_stage(monkeypatch, stage):
     from unittest.mock import Mock

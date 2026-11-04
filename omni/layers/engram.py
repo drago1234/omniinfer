@@ -632,6 +632,7 @@ def _hash_ids_kernel(
     input_ids,
     dead_mask,
     positions,
+    num_computed_tokens,
     block_table,
     query_start_loc,
     multipliers,
@@ -649,6 +650,7 @@ def _hash_ids_kernel(
     input_stride,
     mask_stride,
     position_stride,
+    computed_stride,
     table_stride,
     table_col_stride,
     query_stride,
@@ -686,7 +688,10 @@ def _hash_ids_kernel(
     num_layers = tl.num_programs(1)
     if SINGLE_QUERY:
         single_chunk_idx = tl.minimum(tl.load(query_start_loc), num_tokens - 1).to(tl.int64)
-        single_chunk_start = tl.load(positions + single_chunk_idx * position_stride)
+        if num_computed_tokens is not None:
+            single_chunk_start = tl.load(num_computed_tokens).to(tl.int64)
+        else:
+            single_chunk_start = tl.load(positions + single_chunk_idx * position_stride)
     # Respect the current stream's program budget; each program walks
     # disjoint token tiles.
     for base in tl.range(token_start + tl.program_id(0) * BLOCK_T, token_end, tl.num_programs(0) * BLOCK_T):
@@ -694,6 +699,7 @@ def _hash_ids_kernel(
         valid = token < token_end
         if SINGLE_QUERY:
             req = tl.full((), 0, tl.int64)
+            chunk_idx = single_chunk_idx
             chunk_start = single_chunk_start
         else:
             # Upper bound in query_start_loc[1:], including repeated padding rows.
@@ -710,8 +716,15 @@ def _hash_ids_kernel(
             req = tl.minimum(lo, num_query_rows - 1).to(tl.int64)
             chunk_idx = tl.load(query_start_loc + req * query_stride)
             chunk_idx = tl.minimum(chunk_idx, num_tokens - 1).to(tl.int64)
-            chunk_start = tl.load(positions + chunk_idx * position_stride)
-        position = tl.load(positions + token * position_stride, valid, other=0).to(tl.int64)
+            if num_computed_tokens is not None:
+                chunk_start = tl.load(num_computed_tokens + req * computed_stride).to(tl.int64)
+            else:
+                chunk_start = tl.load(positions + chunk_idx * position_stride)
+        if num_computed_tokens is not None: 
+            # KV history follows flattened token order, never mRoPE's t/h/w axes.
+            position = chunk_start + token.to(tl.int64) - chunk_idx
+        else:
+            position = tl.load(positions + token * position_stride, valid, other=0).to(tl.int64)
         head = tl.arange(0, BLOCK_H)
         blocked = tl.full((BLOCK_T,), False, tl.int1)
         rolling = tl.full((BLOCK_T,), 0, tl.int64)
@@ -853,11 +866,14 @@ class NgramHashState(nn.Module):
         slot_mapping: torch.Tensor,
         block_table: torch.Tensor,
         out: torch.Tensor | None = None,
+        num_computed_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Hash device inputs into absolute int32 [token, layer, hash column] row IDs.
 
-        The NPU kernel finds request boundaries itself. Positions within each
-        chunk must be contiguous. Missing explicit lookbacks are -1; the
+        The NPU kernel finds request boundaries itself. num_computed_tokens
+        supplies logical context lengths independently of mRoPE coordinates.
+        Without it, positions must be contiguous one-dimensional logical positions.
+        Missing explicit lookbacks are -1; the
         separate dead mask terminates the n-gram prefix.
 
         Optional cache entries hold raw token IDs (or -1 for DEAD) indexed by KV
@@ -887,6 +903,15 @@ class NgramHashState(nn.Module):
             out.fill_(-1)
         if not num_tokens:
             return out
+        if num_computed_tokens is None:
+            if positions.ndim != 1:
+                raise ValueError("Engram mRoPE inputs require logical num_computed_tokens")
+        elif (
+            num_computed_tokens.ndim != 1
+            or num_computed_tokens.numel() < query_start_loc.numel() - 1
+            or num_computed_tokens.device != input_ids.device
+        ):
+            raise ValueError("Engram num_computed_tokens must have one device entry per request")        
         if self._cache is not None:
             if slot_mapping is None or block_table is None:
                 raise ValueError("Engram slot cache requires slot_mapping and block_table")
@@ -915,6 +940,7 @@ class NgramHashState(nn.Module):
             input_ids=input_ids,
             dead_mask=dead_mask,
             positions=positions,
+            num_computed_tokens=num_computed_tokens if positions.ndim == 2 else None,
             block_table=block_table,
             query_start_loc=query_start_loc,
             multipliers=self.multipliers,
@@ -932,6 +958,7 @@ class NgramHashState(nn.Module):
             input_stride=input_ids.stride(0),
             mask_stride=dead_mask.stride(0),
             position_stride=positions.stride(0),
+            computed_stride=num_computed_tokens.stride(0) if num_computed_tokens is not None else 0,
             table_stride=block_table.stride(0) if self._cache is not None else 0,
             table_col_stride=block_table.stride(1) if self._cache is not None else 0,
             query_stride=query_start_loc.stride(0),
@@ -991,6 +1018,13 @@ class NgramHashState(nn.Module):
         num_tokens = input_ids.numel()
         starts = metadata.query_start_loc
         num_reqs = starts.numel() - 1
+        num_computed_tokens = getattr(metadata, "num_computed_tokens", None)
+        if num_computed_tokens is None:
+            # Global lengths before DCP/sink transformations. Calculate inside
+            # the custom op so graph replay reads the current device lengths.
+            seq_lens = getattr(metadata, "engram_seq_lens", None)
+            if seq_lens is not None:
+                num_computed_tokens = seq_lens[:num_reqs] - (starts[1:] - starts[:-1])
         slots = metadata.slot_mapping[:num_tokens]
         if hasattr(metadata, "block_tables"):
             block_table = metadata.block_tables
@@ -1005,6 +1039,7 @@ class NgramHashState(nn.Module):
             input_ids, positions, starts, dead, lookbacks,
             torch.zeros_like(lookbacks, dtype=torch.bool),
             slot_mapping=slots, block_table=block_table,
+            num_computed_tokens=num_computed_tokens,
         )
         hashes.masked_fill_(dead[:, None, None], -1)
         return hashes

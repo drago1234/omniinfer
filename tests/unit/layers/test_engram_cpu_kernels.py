@@ -13,6 +13,7 @@ import sys
 from types import FunctionType, ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -92,6 +93,48 @@ class TestEngramCpuKernels:
             validator.cache_cases(sp_rank=rank, sp_size=4)
         with pytest.raises(ValueError, match="slot_mapping and block_table"):
             validator.run(validator.upload(batch(42, 3, 2)), cache=torch.zeros(32, dtype=torch.int32))
+
+    @staticmethod
+    @pytest.mark.parametrize("requests", [1, 3])
+    def test_context_lengths_override_positions_with_arbitrary_coordinates(cpu_kernels, requests):
+        """num_computed_tokens supplies logical context for 2D mRoPE coordinates.
+
+        The kernel derives each token's logical position from the request's
+        context length, so 2D positions may hold arbitrary per-axis coordinates.
+        The reference sees the equivalent one-dimensional logical positions.
+        1D positions already carry logical order, so context lengths are ignored.
+        """
+        validator = Validator(torch.device("cpu"))
+        validator.set_config(validator.config)
+        for tokens in (1, 7, 257):
+            inputs = batch(42 + tokens, tokens, 2, num_reqs=requests)
+            ids, positions, starts, dead, lookbacks, lookback_dead = inputs
+            starts_np = starts.numpy()
+            rng = np.random.default_rng(1000 + tokens)
+            # Two requests may share an entry: chunked prefill keeps the context
+            # of earlier chunks; fresh requests restart from zero.
+            context = rng.integers(0, 9, requests)
+            request_of = np.searchsorted(starts_np[1:], np.arange(tokens), side="right")
+            offset_within = np.arange(tokens) - np.repeat(starts_np[:-1], np.diff(starts_np))
+            logical = context[request_of] + offset_within
+            # 2D mRoPE coordinates (t/h/w axes) that do not encode logical positions.
+            coordinates = torch.from_numpy(rng.integers(0, 5, (tokens, 3)))
+            context_t = torch.from_numpy(context).to(torch.int64)
+            out = validator.state(
+                ids, coordinates, starts, dead, lookbacks, lookback_dead,
+                slot_mapping=None, block_table=None,
+                num_computed_tokens=context_t,
+            )
+            reference_inputs = (ids, torch.from_numpy(logical), starts, dead, lookbacks, lookback_dead)
+            expected = validator.expected(reference_inputs)
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            # 1D positions are already logical: mismatching lengths must not apply.
+            ignored = validator.state(
+                ids, positions, starts, dead, lookbacks, lookback_dead,
+                slot_mapping=None, block_table=None,
+                num_computed_tokens=context_t + 1000,
+            )
+            torch.testing.assert_close(ignored, validator.expected(inputs), rtol=0, atol=0)
 
     @staticmethod
     @pytest.mark.parametrize("requests", [1, 3])

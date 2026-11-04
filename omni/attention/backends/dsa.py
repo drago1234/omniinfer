@@ -201,6 +201,7 @@ class NPUDSADecodeMetadata(MLACommonDecodeMetadata):
 
 @dataclass
 class NPUDSAMetadata(MLACommonMetadata[NPUDSADecodeMetadata]):
+    engram_seq_lens: torch.Tensor | None = None
     mc2_mask: torch.Tensor | None = None
     slot_mapping_cache = None
     first_layer_idx = -1
@@ -543,6 +544,7 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
             )
 
         metadata = self.metadata_cls(
+            engram_seq_lens=common_attn_metadata.seq_lens,
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
             max_seq_len=max_seq_len,
